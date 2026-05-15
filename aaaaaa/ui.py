@@ -189,30 +189,47 @@ def adui(
         infotext_fields.append((ad_enable, "ADetailer enable"))
         infotext_fields.append((ad_skip_img2img, "ADetailer skip img2img"))
 
-        first_tab_widgets: Widgets | None = None
+        # Shared clipboard for per-tab copy/paste. Tuple of (source_tab_idx,
+        # list_of_values_in_copyable_attrs_order). source_tab_idx == -1 means
+        # "clipboard empty" — paste buttons stay disabled until the first copy.
+        clipboard_state = gr.State((-1, []))
+
+        all_widgets: list[Widgets] = []
+        all_copy_btns: list[gr.Button] = []
+        all_paste_btns: list[gr.Button] = []
+
         with gr.Group(), gr.Tabs():
             for n in range(num_models):
                 with gr.Tab(ordinal(n + 1)):
-                    w, state, infofields = one_ui_group(
+                    w, copy_btn, paste_btn, state, infofields = one_ui_group(
                         n=n,
                         is_img2img=is_img2img,
                         webui_info=webui_info,
-                        first_tab_widgets=first_tab_widgets,
                     )
-                    if n == 0:
-                        first_tab_widgets = w
 
+                all_widgets.append(w)
+                all_copy_btns.append(copy_btn)
+                all_paste_btns.append(paste_btn)
                 states.append(state)
                 infotext_fields.extend(infofields)
+
+        # Second pass: now that every tab's widgets + buttons exist, wire the
+        # cross-tab copy/paste handlers. We need refs to ALL paste buttons to
+        # update their labels when ANY tab does a copy, so this can't be done
+        # inside one_ui_group.
+        _wire_copy_paste(
+            all_widgets, all_copy_btns, all_paste_btns, clipboard_state, num_models
+        )
 
     # components: [bool, bool, dict, dict, ...]
     components = [ad_enable, ad_skip_img2img, *states]
     return components, infotext_fields
 
 
-# Attrs that should NOT be copied by the "Copy from 1st" button. Detector,
-# class filter and per-tab enable are intentionally left independent so that
-# each tab can target a different region/class while sharing prompt/denoise/etc.
+# Attrs that the copy/paste clipboard ignores. Each tab keeps its own
+# detector + class filter + enable checkbox — those are the levers that make
+# each tab DIFFERENT. The copy/paste is for sharing processing settings
+# (prompt, denoise, padding, sampler, controlnet, etc.) across tabs.
 _COPY_EXCLUDE_ATTRS = frozenset((
     "ad_model",
     "ad_model_classes",
@@ -227,11 +244,75 @@ def _copyable_attrs() -> list[str]:
     return [a for a in ALL_ARGS.attrs if a not in _COPY_EXCLUDE_ATTRS]
 
 
+def _wire_copy_paste(
+    all_widgets: list[Widgets],
+    all_copy_btns: list[gr.Button],
+    all_paste_btns: list[gr.Button],
+    clipboard_state: gr.State,
+    num_models: int,
+) -> None:
+    attrs = _copyable_attrs()
+
+    # Wire each Copy button: capture this tab's values into clipboard_state and
+    # update all paste-button labels in one event.
+    for src_idx in range(num_models):
+        src_widget_refs = [getattr(all_widgets[src_idx], a) for a in attrs]
+
+        def _make_copy_fn(idx: int):
+            def _copy_fn(*values):
+                new_clip = (idx, list(values))
+                label = f"Paste settings from {ordinal(idx + 1)} tab here"
+                paste_updates = []
+                for j in range(num_models):
+                    if j == idx:
+                        paste_updates.append(
+                            gr.update(value="Paste settings", interactive=False)
+                        )
+                    else:
+                        paste_updates.append(
+                            gr.update(value=label, interactive=True)
+                        )
+                return (new_clip, *paste_updates)
+
+            return _copy_fn
+
+        all_copy_btns[src_idx].click(
+            fn=_make_copy_fn(src_idx),
+            inputs=src_widget_refs,
+            outputs=[clipboard_state, *all_paste_btns],
+            queue=False,
+        )
+
+    # Wire each Paste button: read clipboard_state and apply to this tab's
+    # widgets. No-op if clipboard is empty or paste is on the source tab.
+    for dst_idx in range(num_models):
+        dst_widget_refs = [getattr(all_widgets[dst_idx], a) for a in attrs]
+
+        def _make_paste_fn(idx: int, n_attrs: int):
+            def _paste_fn(clipboard):
+                source_idx, values = clipboard
+                if (
+                    source_idx < 0
+                    or source_idx == idx
+                    or len(values) != n_attrs
+                ):
+                    return [gr.update() for _ in range(n_attrs)]
+                return values
+
+            return _paste_fn
+
+        all_paste_btns[dst_idx].click(
+            fn=_make_paste_fn(dst_idx, len(attrs)),
+            inputs=clipboard_state,
+            outputs=dst_widget_refs,
+            queue=False,
+        )
+
+
 def one_ui_group(
     n: int,
     is_img2img: bool,
     webui_info: WebuiInfo,
-    first_tab_widgets: "Widgets | None" = None,
 ):
     w = Widgets()
     eid = partial(elem_id, n=n, is_img2img=is_img2img)
@@ -241,6 +322,22 @@ def one_ui_group(
         if n == 0
         else ["None", *webui_info.ad_model_list]
     )
+
+    # Copy/paste pair at the top of every tab. Initial state: paste disabled
+    # (clipboard empty). After any tab's Copy is clicked, all other tabs'
+    # Paste buttons enable with the source-tab label.
+    with gr.Row(variant="compact"):
+        copy_btn = gr.Button(
+            value="Copy settings",
+            elem_id=eid("ad_copy_settings"),
+            size="sm",
+        )
+        paste_btn = gr.Button(
+            value="Paste settings",
+            elem_id=eid("ad_paste_settings"),
+            interactive=False,
+            size="sm",
+        )
 
     with gr.Group():
         with gr.Row(variant="compact"):
@@ -397,25 +494,7 @@ def one_ui_group(
 
     infotext_fields = [(getattr(w, attr), name + suffix(n)) for attr, name in ALL_ARGS]
 
-    # "Copy from 1st" — replicate processing settings (everything except
-    # detector / classes / tab_enable) from the 1st tab into this one.
-    if n > 0 and first_tab_widgets is not None:
-        with gr.Row():
-            copy_btn = gr.Button(
-                value=f"Copy settings from 1st tab to {ordinal(n + 1)}",
-                elem_id=eid("ad_copy_from_first"),
-            )
-            attrs = _copyable_attrs()
-            src = [getattr(first_tab_widgets, a) for a in attrs]
-            dst = [getattr(w, a) for a in attrs]
-            copy_btn.click(
-                fn=lambda *vals: vals,
-                inputs=src,
-                outputs=dst,
-                queue=False,
-            )
-
-    return w, state, infotext_fields
+    return w, copy_btn, paste_btn, state, infotext_fields
 
 
 def detection(w: Widgets, n: int, is_img2img: bool):

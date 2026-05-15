@@ -106,9 +106,16 @@ Sequential mode is **ignored** for MediaPipe models, in NOT/exclude mode, and wh
 
 ## Copy Settings Between Tabs
 
-Tabs 2 through 4 each show a **"Copy settings from 1st tab to Nth"** button at the bottom. One click pastes all the 1st tab's processing settings — prompt, negative prompt, confidence, denoise, padding, sampler/checkpoint overrides, ControlNet, restore-faces, all the masking and inpainting knobs — into the current tab.
+Every tab — 1st through whatever you set as **Max tabs** in `Settings → ADetailer` (default 2, can be raised to 15+) — has a **"Copy settings"** + **"Paste settings"** button pair at the top.
 
-The detector model and the class filter selection are **deliberately left untouched** so you can replicate the workflow of the 1st tab while pointing each tab at a different detector (e.g. tab 1 = `face_yolov8n.pt`, tab 2 = `hand_yolov8n.pt`, both with identical denoise/prompt). The "Enable this tab" checkbox of the target tab is also left alone.
+The flow:
+
+1. Click **Copy settings** in any tab. The clipboard captures that tab's processing settings (prompt, negative prompt, confidence, denoise, padding, sampler/checkpoint/VAE overrides, sampler, ControlNet, restore-faces, all the masking and inpainting knobs).
+2. Every OTHER tab's **Paste settings** button enables itself and re-labels to **"Paste settings from Nth tab here"** so you can see at a glance what would be pasted.
+3. Click **Paste settings** in any target tab to apply the stashed values. The source tab's own Paste button stays disabled (you can't paste a tab's settings back into itself).
+4. The clipboard stays sticky — paste into multiple tabs in sequence, or do another Copy from a different tab to overwrite it.
+
+The detector model and the class filter selection are **deliberately not part of the copy** so that each tab can target a different region or model while sharing all downstream processing. The "Enable this tab" checkbox of the destination tab is also left alone.
 
 ## ControlNet Inpainting
 
