@@ -189,14 +189,18 @@ def adui(
         infotext_fields.append((ad_enable, "ADetailer enable"))
         infotext_fields.append((ad_skip_img2img, "ADetailer skip img2img"))
 
+        first_tab_widgets: Widgets | None = None
         with gr.Group(), gr.Tabs():
             for n in range(num_models):
                 with gr.Tab(ordinal(n + 1)):
-                    state, infofields = one_ui_group(
+                    w, state, infofields = one_ui_group(
                         n=n,
                         is_img2img=is_img2img,
                         webui_info=webui_info,
+                        first_tab_widgets=first_tab_widgets,
                     )
+                    if n == 0:
+                        first_tab_widgets = w
 
                 states.append(state)
                 infotext_fields.extend(infofields)
@@ -206,7 +210,29 @@ def adui(
     return components, infotext_fields
 
 
-def one_ui_group(n: int, is_img2img: bool, webui_info: WebuiInfo):
+# Attrs that should NOT be copied by the "Copy from 1st" button. Detector,
+# class filter and per-tab enable are intentionally left independent so that
+# each tab can target a different region/class while sharing prompt/denoise/etc.
+_COPY_EXCLUDE_ATTRS = frozenset((
+    "ad_model",
+    "ad_model_classes",
+    "ad_model_classes_exclude",
+    "ad_model_classes_excluded",
+    "ad_classes_sequential",
+    "ad_tab_enable",
+))
+
+
+def _copyable_attrs() -> list[str]:
+    return [a for a in ALL_ARGS.attrs if a not in _COPY_EXCLUDE_ATTRS]
+
+
+def one_ui_group(
+    n: int,
+    is_img2img: bool,
+    webui_info: WebuiInfo,
+    first_tab_widgets: "Widgets | None" = None,
+):
     w = Widgets()
     eid = partial(elem_id, n=n, is_img2img=is_img2img)
 
@@ -260,6 +286,13 @@ def one_ui_group(n: int, is_img2img: bool, webui_info: WebuiInfo):
                 value=False,
                 visible=True,
                 elem_id=eid("ad_model_classes_exclude"),
+            )
+            w.ad_classes_sequential = gr.Checkbox(
+                label="Process classes sequentially" + suffix(n),
+                value=False,
+                visible=True,
+                elem_id=eid("ad_classes_sequential"),
+                info="Run one detection+inpaint pass per selected class, in dropdown order. Each pass uses the previous pass's output as input. Ignored in NOT mode or with fewer than 2 classes selected.",
             )
             # Mirror of the dropdown when exclude=True; hidden, used as the
             # backing arg in ALL_ARGS.
@@ -364,7 +397,25 @@ def one_ui_group(n: int, is_img2img: bool, webui_info: WebuiInfo):
 
     infotext_fields = [(getattr(w, attr), name + suffix(n)) for attr, name in ALL_ARGS]
 
-    return state, infotext_fields
+    # "Copy from 1st" — replicate processing settings (everything except
+    # detector / classes / tab_enable) from the 1st tab into this one.
+    if n > 0 and first_tab_widgets is not None:
+        with gr.Row():
+            copy_btn = gr.Button(
+                value=f"Copy settings from 1st tab to {ordinal(n + 1)}",
+                elem_id=eid("ad_copy_from_first"),
+            )
+            attrs = _copyable_attrs()
+            src = [getattr(first_tab_widgets, a) for a in attrs]
+            dst = [getattr(w, a) for a in attrs]
+            copy_btn.click(
+                fn=lambda *vals: vals,
+                inputs=src,
+                outputs=dst,
+                queue=False,
+            )
+
+    return w, state, infotext_fields
 
 
 def detection(w: Widgets, n: int, is_img2img: bool):
