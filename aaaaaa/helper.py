@@ -40,9 +40,12 @@ def change_torch_load():
 
 @contextmanager
 def disable_safe_unpickle():
+    # Forge Neo (>= neo-2.x) dropped the `disable_safe_unpickle` attribute from
+    # cmd_opts. patch.object(..., create=True) makes the patch resilient: it
+    # creates the attribute if missing, restores it (or deletes it) afterward.
     with (
         patch.dict(os.environ, {"TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1"}, clear=False),
-        patch.object(cmd_opts, "disable_safe_unpickle", True),
+        patch.object(cmd_opts, "disable_safe_unpickle", True, create=True),
     ):
         yield
 
