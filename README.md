@@ -1,13 +1,19 @@
-# ADetailer Plus
+# ADetailer (xXIlRizzoXx fork)
 
-> **About this fork** — `adetailer-plus` is a soft-fork of [Bing-su/adetailer](https://github.com/Bing-su/adetailer) that adds workflow features on top of upstream ADetailer. The features so far:
+> **⚠️ This is an unofficial fork.** This project is **not affiliated with or endorsed by Bing-su**, the original ADetailer author. For the official ADetailer go to [Bing-su/adetailer](https://github.com/Bing-su/adetailer).
+>
+> **About this fork** — a soft-fork of [Bing-su/adetailer](https://github.com/Bing-su/adetailer) that adds workflow features on top of upstream ADetailer. The features so far:
 >
 > - **Per-class filtering** for multiclass YOLO detection models — auto-populated dropdown + "Exclude selected (NOT)" mode (see [Class Filtering](#class-filtering)).
 > - **Sequential class detection** — process selected classes one at a time, each pass refining the previous (see [Sequential Mode](#sequential-class-detection)).
-> - **Copy settings from 1st** — replicate the 1st tab's processing settings to the 2nd/3rd/4th tabs with one click (see [Copy Between Tabs](#copy-settings-between-tabs)).
+> - **Copy/Paste between tabs** — clipboard-style copy of every tab field, with one Copy + one Paste button per tab (see [Copy Between Tabs](#copy-settings-between-tabs)).
+> - **`ad_prompt_append` / `ad_negative_prompt_append`** — single-line fields appended to the resolved prompt without having to duplicate the main prompt.
+> - **Persistent last-used settings** — every Generate click stashes the tab settings to disk; restored at the next WebUI start. Toggle in `Settings → ADetailer`.
 > - **Forge Neo compatibility fixes** — `disable_safe_unpickle` patch, JSON sidecar tolerance for civitai_helper-generated metadata.
 >
 > The implementation was authored by **Claude** (Anthropic's coding assistant) at the request of the repository owner, who is not a Python developer. The class-filtering pattern is borrowed from [wkpark/uddetailer](https://github.com/wkpark/uddetailer). All credit for the original ADetailer goes to **Bing-su**; this fork extends that work — it does not replace it.
+>
+> This fork is distributed under the same AGPL-3.0 license as the upstream. See `LICENSE.md` for the full text; Bing-su's copyright notices are intact.
 >
 > If you only need single-class face/hand detection, use upstream ADetailer instead — the additional widgets in this fork are harmless but unnecessary for that case.
 
@@ -27,11 +33,11 @@ Or
 
 1. Open "Extensions" tab.
 2. Open "Install from URL" tab in the tab.
-3. Enter `https://github.com/Bing-su/adetailer.git` to "URL for extension's git repository".
+3. Enter `https://github.com/xXIlRizzoXx/adetailer.git` to "URL for extension's git repository". (Replace with `https://github.com/Bing-su/adetailer.git` if you want the upstream version instead.)
 4. Press "Install" button.
 5. Wait 5 seconds, and you will see the message "Installed into stable-diffusion-webui\extensions\adetailer. Use Installed tab to restart".
 6. Go to "Installed" tab, click "Check for updates", and then click "Apply and restart UI". (The next time you can also use this method to update extensions.)
-7. Completely restart A1111 webui including your terminal. (If you do not know what is a "terminal", you can reboot your computer: turn your computer off and turn it on again.)
+7. Completely restart A1111/Forge/Forge Neo webui including your terminal. (If you do not know what is a "terminal", you can reboot your computer: turn your computer off and turn it on again.)
 
 ## Options
 

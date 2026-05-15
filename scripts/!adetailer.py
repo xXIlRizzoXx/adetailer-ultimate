@@ -1101,15 +1101,15 @@ def on_ui_settings():
         ),
     )
 
-    # adetailer-plus addition: persist last-used widget values across restarts.
+    # Fork addition: persist last-used widget values across WebUI restarts.
     shared.opts.add_option(
         "ad_remember_last_settings",
         shared.OptionInfo(
             default=True,
-            label="Remember last-used settings between restarts (adetailer-plus)",
+            label="Remember last-used settings between restarts",
             section=section,
         ).info(
-            "When enabled, ADetailer's tab settings (detector, prompts, denoise, padding, etc.) are saved on every Generate click and restored at the next WebUI start. Cache file: extensions/<this-extension>/user_state.json. Disable to always start with defaults."
+            "When enabled, ADetailer's tab settings (detector, prompts, denoise, padding, etc.) are saved on every Generate click and restored at the next WebUI start. Cache file: extensions/<this-extension>/user_state.json. Disable to always start with the extension's defaults."
         ),
     )
 
