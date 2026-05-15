@@ -192,20 +192,22 @@ def adui(
         label=ADETAILER,
         visible=True,
     ) as ad_enable:
-        with gr.Row():
-            with gr.Column(scale=8):
-                ad_skip_img2img = gr.Checkbox(
-                    label="Skip img2img",
-                    value=False,
-                    visible=is_img2img,
-                    elem_id=eid("ad_skip_img2img"),
-                )
+        # Version "about" badge — CSS pulls it out of normal flow and overlays
+        # it onto the accordion header. Lives inside the accordion content so
+        # it's automatically hidden when the accordion is collapsed.
+        gr.Markdown(
+            f"v{__version__}",
+            elem_id=eid("ad_version"),
+            elem_classes=["ad-version-overlay"],
+        )
 
-            with gr.Column(scale=1, min_width=180):
-                gr.Markdown(
-                    f"v{__version__}",
-                    elem_id=eid("ad_version"),
-                )
+        with gr.Row():
+            ad_skip_img2img = gr.Checkbox(
+                label="Skip img2img",
+                value=False,
+                visible=is_img2img,
+                elem_id=eid("ad_skip_img2img"),
+            )
 
         infotext_fields.append((ad_enable, "ADetailer enable"))
         infotext_fields.append((ad_skip_img2img, "ADetailer skip img2img"))

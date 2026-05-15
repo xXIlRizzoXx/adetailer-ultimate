@@ -33,3 +33,42 @@ button[id*="adetailer_ad_preset_save"] {
     font-size: 11px !important;
     opacity: 0.75;
 }
+
+/* ---------- Version "about" overlay on the accordion header ----------
+ * The version markdown lives inside the accordion's content area (so
+ * it auto-hides when the accordion is collapsed), but we pull it out
+ * of normal flow and pin it to the top-right of the accordion. The
+ * accordion's wrapper is the closest positioned ancestor we set up
+ * with position:relative below.
+ */
+div[id*="adetailer_ad_main_accordion"] {
+    position: relative;
+}
+
+/* Gradio sets width:100% on .block elements; we must force fit-content so
+ * the overlay is content-sized, otherwise position:absolute + width:100%
+ * stretches it across the column making it overlap unrelated UI. */
+div[id*="adetailer_ad_version"].ad-version-overlay {
+    position: absolute !important;
+    top: -28px !important;     /* pull onto the accordion header bar */
+    right: 60px !important;    /* clear the chevron at the far right */
+    left: auto !important;
+    width: fit-content !important;
+    min-width: 0 !important;
+    max-width: 220px !important;
+    z-index: 5;
+    pointer-events: none;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
+}
+
+div[id*="adetailer_ad_version"].ad-version-overlay p {
+    margin: 0 !important;
+    padding: 0 !important;
+    font-size: 11px !important;
+    opacity: 0.55 !important;
+    white-space: nowrap;
+    text-align: right;
+}
