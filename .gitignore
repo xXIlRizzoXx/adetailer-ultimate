@@ -1,6 +1,8 @@
 # Per-user runtime cache — last-used widget values stashed by
 # adetailer.persistence. Lives in the install dir, never in the repo.
 /user_state.json
+# Per-user named preset library — stored by adetailer.presets.
+/user_presets.json
 
 # Dev-only artifacts (preview UI, Claude harness config) — not shipped with the extension
 /preview.py

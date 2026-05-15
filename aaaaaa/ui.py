@@ -13,6 +13,12 @@ from adetailer import ADETAILER, __version__
 from adetailer.args import ALL_ARGS, MASK_MERGE_INVERT
 from adetailer.classes import get_model_class_names
 from adetailer.persistence import load_state, save_tab_state
+from adetailer.presets import (
+    delete_preset,
+    get_preset,
+    get_preset_names,
+    save_preset,
+)
 from controlnet_ext import controlnet_exists, controlnet_type, get_cn_models
 
 if controlnet_type == "forge":
@@ -212,11 +218,19 @@ def adui(
         all_widgets: list[Widgets] = []
         all_copy_btns: list[gr.Button] = []
         all_paste_btns: list[gr.Button] = []
+        all_presets: list[tuple] = []
 
         with gr.Group(), gr.Tabs():
             for n in range(num_models):
                 with gr.Tab(ordinal(n + 1)):
-                    w, copy_btn, paste_btn, state, infofields = one_ui_group(
+                    (
+                        w,
+                        copy_btn,
+                        paste_btn,
+                        preset_widgets,
+                        state,
+                        infofields,
+                    ) = one_ui_group(
                         n=n,
                         is_img2img=is_img2img,
                         webui_info=webui_info,
@@ -226,6 +240,7 @@ def adui(
                 all_widgets.append(w)
                 all_copy_btns.append(copy_btn)
                 all_paste_btns.append(paste_btn)
+                all_presets.append(preset_widgets)
                 states.append(state)
                 infotext_fields.extend(infofields)
 
@@ -236,6 +251,7 @@ def adui(
         _wire_copy_paste(
             all_widgets, all_copy_btns, all_paste_btns, clipboard_state, num_models
         )
+        _wire_presets(all_widgets, all_presets, num_models)
 
     # components: [bool, bool, dict, dict, ...]
     components = [ad_enable, ad_skip_img2img, *states]
@@ -320,6 +336,116 @@ def _wire_copy_paste(
         )
 
 
+def _wire_presets(
+    all_widgets: list[Widgets],
+    all_presets: list[tuple],
+    num_models: int,
+) -> None:
+    """Wire each tab's preset Load/Save/Delete buttons.
+
+    Layout reminder — each entry of `all_presets` is the 6-tuple returned
+    from one_ui_group: (dropdown, load_btn, delete_btn, name_box,
+    save_btn, status_md).
+
+    Saving or deleting from any tab must refresh ALL tabs' dropdown choices
+    so the user sees the new list without reloading the page.
+    """
+    attrs = list(ALL_ARGS.attrs)
+    all_dropdowns = [p[0] for p in all_presets]
+
+    def _refresh_dropdowns_update(selected: str | None = None) -> list:
+        names = get_preset_names()
+        return [
+            gr.update(choices=names, value=(selected if selected in names else None))
+            for _ in range(num_models)
+        ]
+
+    for idx in range(num_models):
+        dropdown, load_btn, delete_btn, name_box, save_btn, status_md = all_presets[idx]
+        widget_refs = [getattr(all_widgets[idx], a) for a in attrs]
+
+        # LOAD: pull the selected preset from disk, apply its values to this
+        # tab's widgets. No-op if the preset name is missing or unknown.
+        def _make_load(idx: int, n_attrs: int):
+            def _load(selected: str | None):
+                if not selected:
+                    return ["", *(gr.update() for _ in range(n_attrs))]
+                preset = get_preset(selected)
+                if not preset:
+                    return [
+                        f"⚠️ Preset '{selected}' not found.",
+                        *(gr.update() for _ in range(n_attrs)),
+                    ]
+                widget_updates = [
+                    gr.update(value=preset[a]) if a in preset else gr.update()
+                    for a in attrs
+                ]
+                return [f"✅ Loaded '{selected}'.", *widget_updates]
+
+            return _load
+
+        load_btn.click(
+            fn=_make_load(idx, len(attrs)),
+            inputs=dropdown,
+            outputs=[status_md, *widget_refs],
+            queue=False,
+        )
+
+        # SAVE: capture current widget values and write a new preset. Refresh
+        # every tab's dropdown so the preset becomes selectable everywhere.
+        def _make_save(idx: int):
+            def _save(name: str, *values):
+                name = (name or "").strip()
+                if not name:
+                    return ["⚠️ Enter a preset name first.", *_refresh_dropdowns_update()]
+                state_dict = {a: v for a, v in zip(attrs, values)}
+                ok = save_preset(name, state_dict)
+                if not ok:
+                    return [
+                        f"⚠️ Invalid preset name '{name}'.",
+                        *_refresh_dropdowns_update(),
+                    ]
+                return [
+                    f"✅ Saved preset '{name}'.",
+                    *_refresh_dropdowns_update(selected=name),
+                ]
+
+            return _save
+
+        save_btn.click(
+            fn=_make_save(idx),
+            inputs=[name_box, *widget_refs],
+            outputs=[status_md, *all_dropdowns],
+            queue=False,
+        )
+
+        # DELETE: remove the selected preset; refresh dropdowns.
+        def _make_delete():
+            def _delete(selected: str | None):
+                selected = (selected or "").strip()
+                if not selected:
+                    return ["⚠️ Pick a preset first.", *_refresh_dropdowns_update()]
+                ok = delete_preset(selected)
+                if not ok:
+                    return [
+                        f"⚠️ Preset '{selected}' not found.",
+                        *_refresh_dropdowns_update(),
+                    ]
+                return [
+                    f"\U0001F5D1 Deleted '{selected}'.",
+                    *_refresh_dropdowns_update(),
+                ]
+
+            return _delete
+
+        delete_btn.click(
+            fn=_make_delete(),
+            inputs=dropdown,
+            outputs=[status_md, *all_dropdowns],
+            queue=False,
+        )
+
+
 def one_ui_group(
     n: int,
     is_img2img: bool,
@@ -337,6 +463,49 @@ def one_ui_group(
         if n == 0
         else ["None", *webui_info.ad_model_list]
     )
+
+    # Preset row: load/save/delete named tab configurations. Shared storage
+    # across tabs — saving from one tab makes the preset visible in all
+    # tabs' dropdowns. The wiring (which needs refs to every tab's dropdown
+    # for cross-tab refresh) is done in _wire_presets() called from adui().
+    initial_presets = get_preset_names()
+    with gr.Row(variant="compact"):
+        preset_dropdown = gr.Dropdown(
+            choices=initial_presets,
+            value=None,
+            label="Saved presets" + suffix(n),
+            show_label=False,
+            interactive=True,
+            scale=4,
+            elem_id=eid("ad_preset_dropdown"),
+        )
+        preset_load_btn = gr.Button(
+            value="\U0001F4C2 Load",
+            elem_id=eid("ad_preset_load"),
+            size="sm",
+            scale=1,
+        )
+        preset_delete_btn = gr.Button(
+            value="\U0001F5D1 Delete",
+            elem_id=eid("ad_preset_delete"),
+            size="sm",
+            scale=1,
+        )
+    with gr.Row(variant="compact"):
+        preset_name_box = gr.Textbox(
+            value="",
+            placeholder="Preset name to save (letters, digits, basic punctuation)",
+            show_label=False,
+            scale=4,
+            elem_id=eid("ad_preset_name"),
+        )
+        preset_save_btn = gr.Button(
+            value="\U0001F4BE Save preset",
+            elem_id=eid("ad_preset_save"),
+            size="sm",
+            scale=2,
+        )
+    preset_status = gr.Markdown(value="", elem_id=eid("ad_preset_status"))
 
     # Copy/paste pair at the top of every tab. Initial state: paste disabled
     # (clipboard empty). After any tab's Copy is clicked, all other tabs'
@@ -538,7 +707,15 @@ def one_ui_group(
 
     infotext_fields = [(getattr(w, attr), name + suffix(n)) for attr, name in ALL_ARGS]
 
-    return w, copy_btn, paste_btn, state, infotext_fields
+    preset_widgets = (
+        preset_dropdown,
+        preset_load_btn,
+        preset_delete_btn,
+        preset_name_box,
+        preset_save_btn,
+        preset_status,
+    )
+    return w, copy_btn, paste_btn, preset_widgets, state, infotext_fields
 
 
 def detection(
