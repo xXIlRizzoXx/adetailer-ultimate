@@ -467,6 +467,16 @@ def one_ui_group(
                 elem_id=eid("ad_prompt"),
             )
 
+        with gr.Row(elem_id=eid("ad_toprow_prompt_append")):
+            w.ad_prompt_append = gr.Textbox(
+                value=sv("ad_prompt_append", ""),
+                label="ad_prompt_append" + suffix(n),
+                show_label=False,
+                lines=1,
+                placeholder="Always appended to the prompt above (e.g. 'detailed eyes, sharp pupils')",
+                elem_id=eid("ad_prompt_append"),
+            )
+
         with gr.Row(elem_id=eid("ad_toprow_negative_prompt")):
             w.ad_negative_prompt = gr.Textbox(
                 value=sv("ad_negative_prompt", ""),
@@ -477,6 +487,16 @@ def one_ui_group(
                 + suffix(n)
                 + "\nIf blank, the main negative prompt is used.",
                 elem_id=eid("ad_negative_prompt"),
+            )
+
+        with gr.Row(elem_id=eid("ad_toprow_negative_prompt_append")):
+            w.ad_negative_prompt_append = gr.Textbox(
+                value=sv("ad_negative_prompt_append", ""),
+                label="ad_negative_prompt_append" + suffix(n),
+                show_label=False,
+                lines=1,
+                placeholder="Always appended to the negative prompt above",
+                elem_id=eid("ad_negative_prompt_append"),
             )
 
     with gr.Group():

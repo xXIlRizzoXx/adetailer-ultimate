@@ -295,9 +295,11 @@ class AfterDetailerScript(scripts.Script):
         i: int,
         default: str,
         replacements: list[PromptSR],
+        append: str = "",
     ) -> list[str]:
         prompts = re.split(r"\s*\[SEP\]\s*", ad_prompt)
         blank_replacement = self.prompt_blank_replacement(all_prompts, i, default)
+        append_clean = append.strip().lstrip(",").strip()
         for n in range(len(prompts)):
             if not prompts[n]:
                 prompts[n] = blank_replacement
@@ -306,6 +308,13 @@ class AfterDetailerScript(scripts.Script):
 
             for pair in replacements:
                 prompts[n] = prompts[n].replace(pair.s, pair.r)
+
+            # Apply the always-appended suffix AFTER substitution so the
+            # text the user typed there is literal — not subject to
+            # [PROMPT]/replacement logic.
+            if append_clean:
+                base = prompts[n].rstrip().rstrip(",").rstrip()
+                prompts[n] = f"{base}, {append_clean}" if base else append_clean
         return prompts
 
     def get_prompt(self, p, args: ADetailerArgs) -> tuple[list[str], list[str]]:
@@ -318,6 +327,7 @@ class AfterDetailerScript(scripts.Script):
             i=i,
             default=p.prompt,
             replacements=prompt_sr,
+            append=args.ad_prompt_append,
         )
         negative_prompt = self._get_prompt(
             ad_prompt=args.ad_negative_prompt,
@@ -325,6 +335,7 @@ class AfterDetailerScript(scripts.Script):
             i=i,
             default=p.negative_prompt,
             replacements=prompt_sr,
+            append=args.ad_negative_prompt_append,
         )
 
         return prompt, negative_prompt

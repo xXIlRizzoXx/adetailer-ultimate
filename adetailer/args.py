@@ -62,6 +62,8 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
     ad_tab_enable: bool = True
     ad_prompt: str = ""
     ad_negative_prompt: str = ""
+    ad_prompt_append: str = ""
+    ad_negative_prompt_append: str = ""
     ad_confidence: confloat(ge=0.0, le=1.0) = 0.3
     ad_mask_filter_method: Literal["Area", "Confidence"] = "Area"
     ad_mask_k: NonNegativeInt = 0
@@ -137,6 +139,8 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
         ppop("ADetailer classes sequential")
         ppop("ADetailer prompt")
         ppop("ADetailer negative prompt")
+        ppop("ADetailer prompt append")
+        ppop("ADetailer negative prompt append")
         p.pop("ADetailer tab enable", None)  # always pop
         ppop(
             "ADetailer mask only top k",
@@ -230,6 +234,8 @@ _all_args = [
     ("ad_tab_enable", "ADetailer tab enable"),
     ("ad_prompt", "ADetailer prompt"),
     ("ad_negative_prompt", "ADetailer negative prompt"),
+    ("ad_prompt_append", "ADetailer prompt append"),
+    ("ad_negative_prompt_append", "ADetailer negative prompt append"),
     ("ad_confidence", "ADetailer confidence"),
     ("ad_mask_filter_method", "ADetailer method to decide top k masks"),
     ("ad_mask_k", "ADetailer mask only top k"),
