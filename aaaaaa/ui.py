@@ -689,24 +689,35 @@ def one_ui_group(
         elem_classes=["ad-preset-status"],
     )
 
-    # Copy/paste pair at the top of every tab. Initial state: paste disabled
-    # (clipboard empty). After any tab's Copy is clicked, all other tabs'
-    # Paste buttons enable with the source-tab label.
-    gr.Markdown("Tab clipboard", elem_classes=["ad-section-label"])
-    with gr.Row(variant="compact"):
-        copy_btn = gr.Button(
-            value="\U0001F4CB Copy settings",
-            elem_id=eid("ad_copy_settings"),
-            scale=0,
-            min_width=160,
-        )
-        paste_btn = gr.Button(
-            value="\U0001F4E5 Paste settings",
-            elem_id=eid("ad_paste_settings"),
-            interactive=False,
-            scale=0,
-            min_width=160,
-        )
+    # 'Tab clipboard' accordion grouping the tab-level toggles + Copy/Paste
+    # inter-tab clipboard. Closed by default; user opens it when they need
+    # to enable/disable the tab or move settings between tabs.
+    with gr.Accordion(
+        "Tab clipboard",
+        open=False,
+        elem_id=eid("ad_tab_clipboard_accordion"),
+    ):
+        with gr.Row(variant="compact"):
+            w.ad_tab_enable = gr.Checkbox(
+                label=f"Enable this tab ({ordinal(n + 1)})",
+                value=sv("ad_tab_enable", True),
+                visible=True,
+                elem_id=eid("ad_tab_enable"),
+            )
+        with gr.Row(variant="compact"):
+            copy_btn = gr.Button(
+                value="\U0001F4CB Copy settings",
+                elem_id=eid("ad_copy_settings"),
+                scale=0,
+                min_width=160,
+            )
+            paste_btn = gr.Button(
+                value="\U0001F4E5 Paste settings",
+                elem_id=eid("ad_paste_settings"),
+                interactive=False,
+                scale=0,
+                min_width=160,
+            )
 
     # Saved model name may refer to a model the user deleted between sessions.
     # Fall back to the default first choice if it's not in current choices.
@@ -715,14 +726,6 @@ def one_ui_group(
         _saved_model = model_choices[0]
 
     with gr.Group():
-        with gr.Row(variant="compact"):
-            w.ad_tab_enable = gr.Checkbox(
-                label=f"Enable this tab ({ordinal(n + 1)})",
-                value=sv("ad_tab_enable", True),
-                visible=True,
-                elem_id=eid("ad_tab_enable"),
-            )
-
         with gr.Row():
             w.ad_model = gr.Dropdown(
                 label="ADetailer detector" + suffix(n),
@@ -805,10 +808,11 @@ def one_ui_group(
             queue=False,
         )
 
-    gr.HTML("<br>")
-
-    with gr.Group():
-        gr.Markdown("Inpaint prompts", elem_classes=["ad-section-label"])
+    with gr.Accordion(
+        "Inpaint prompts",
+        open=False,
+        elem_id=eid("ad_prompts_accordion"),
+    ):
         with gr.Row(elem_id=eid("ad_toprow_prompt"), elem_classes=["ad-prompt-row"]):
             w.ad_prompt = gr.Textbox(
                 value=sv("ad_prompt", ""),
