@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import chain
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -77,6 +78,66 @@ class WebuiInfo:
 
 def gr_interactive(value: bool = True):
     return gr.update(interactive=value)
+
+
+def _read_git_short_hash() -> str:
+    """Best-effort: return the current commit's 7-char short hash by
+    reading `<extension_root>/.git/HEAD` and following the ref chain.
+
+    Falls back to an empty string if anything goes wrong (e.g. the user
+    installed from a downloaded zip with no .git directory, or the
+    HEAD/ref files are corrupt). Used by the accordion header overlay
+    so the user can tell at a glance which commit they have installed —
+    the overlay auto-updates the next time `adui()` rebuilds the panel
+    after a `git pull`.
+
+    Implementation note: avoids `subprocess` so this is cheap (just two
+    file reads) and works on any platform without needing `git` on PATH.
+    """
+    try:
+        # Walk up from aaaaaa/ui.py to the extension root (which has .git).
+        ext_root = Path(__file__).resolve().parent.parent
+        git_dir = ext_root / ".git"
+        head_file = git_dir / "HEAD"
+        if not head_file.is_file():
+            return ""
+        head = head_file.read_text(encoding="utf-8").strip()
+        if not head:
+            return ""
+        if head.startswith("ref: "):
+            # Symbolic ref → resolve to actual hash.
+            ref_name = head[5:].strip()
+            ref_file = git_dir / ref_name
+            if ref_file.is_file():
+                return ref_file.read_text(encoding="utf-8").strip()[:7]
+            # Packed refs fallback (after `git gc`).
+            packed = git_dir / "packed-refs"
+            if packed.is_file():
+                for line in packed.read_text(encoding="utf-8").splitlines():
+                    if not line or line.startswith("#") or line.startswith("^"):
+                        continue
+                    parts = line.split()
+                    if len(parts) == 2 and parts[1] == ref_name:
+                        return parts[0][:7]
+            return ""
+        # Detached HEAD — `head` itself is the full hash.
+        return head[:7]
+    except OSError:
+        return ""
+
+
+def _build_overlay_text() -> str:
+    """Assemble the top-right header overlay text:
+    `ADetailer Ultimate · v<version> · <git-short>`
+
+    The git short-hash is appended only when readable, so packaged
+    installs without a .git directory degrade to the brand+version form.
+    """
+    git_short = _read_git_short_hash()
+    base = f"ADetailer Ultimate · v{__version__}"
+    if git_short:
+        return f"{base} · {git_short}"
+    return base
 
 
 def _format_preset_preview(name: str | None) -> str:
@@ -285,13 +346,13 @@ def adui(
         # Version "about" badge — CSS pulls it out of normal flow and overlays
         # it onto the accordion header. Lives inside the accordion content so
         # it's automatically hidden when the accordion is collapsed.
-        # Brand prefix added 2026-05-16: the upstream accordion title just
-        # says "ADetailer", and the `+plus.2` build-metadata is a historical
-        # reference to a previous name of this fork. Showing the current
-        # brand here keeps the overlay self-explanatory without bumping the
-        # locked __version__ string.
+        # Format (since 2026-05-16): brand prefix + locked __version__ +
+        # current git short-hash. The hash gives a live, auto-updating
+        # indicator of "which commit is installed" — refreshes every time
+        # adui() rebuilds the panel after a `git pull`. Locked __version__
+        # is left alone per the no-auto-bump rule.
         gr.Markdown(
-            f"ADetailer Ultimate · v{__version__}",
+            _build_overlay_text(),
             elem_id=eid("ad_version"),
             elem_classes=["ad-version-overlay"],
         )

@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-05-16 (ui: overlay auto-updates with current git short-hash)
+
+The top-right overlay used to be a static `"ADetailer Ultimate · v26.2.0+plus.2"` string — informative but unable to signal "is my install current?" because the locked `__version__` never changes between commits. Now the overlay also appends the current commit's 7-char short hash, read directly from `<extension_root>/.git/HEAD` at UI-build time:
+
+```
+ADetailer Ultimate · v26.2.0+plus.2 · 63a9dd2
+```
+
+- `aaaaaa/ui.py`: two new helpers `_read_git_short_hash()` (reads HEAD + the referenced ref file, with packed-refs fallback) and `_build_overlay_text()` (composes the final string). The `gr.Markdown` for the overlay now calls `_build_overlay_text()` instead of a hardcoded f-string.
+- `style.css`: `.ad-version-overlay` `max-width` raised from 280px → 360px to fit the longer string (~47 chars at 11px).
+- No `subprocess` call — pure file reads, works without `git` on PATH, degrades to brand-only when `.git` is missing (e.g. zip installs).
+- The hash auto-updates every time `adui()` rebuilds the panel (Forge Neo restart, full UI reload). User can verify their install is at the latest commit by comparing the overlay hash to the one reported at the end of each push report.
+
 ## 2026-05-16 (ui: version overlay now brand-prefixed)
 
 - The version badge in the top-right of the accordion header used to read just `v26.2.0+plus.2`. After the rename to **ADetailer Ultimate** + the addition of ~37 fork features, that string alone was ambiguous (the `+plus.2` build-metadata refers to a previous fork name kept locked per the no-auto-bump rule). The overlay now reads `ADetailer Ultimate · v26.2.0+plus.2` so the brand is visible at a glance without altering the locked version string.

@@ -113,10 +113,14 @@ div[id*="adetailer_ad_version"].ad-version-overlay {
     left: auto !important;
     width: fit-content !important;
     min-width: 0 !important;
-    /* Increased from 220px on 2026-05-16 to fit the new brand-prefixed
-     * overlay text "ADetailer Ultimate · v26.2.0+plus.2" (~36 chars)
-     * without horizontal clipping. */
-    max-width: 280px !important;
+    /* Sizing history (2026-05-16):
+     *   220px (original, just "v<version>")
+     *   280px (brand prefix added: "ADetailer Ultimate · v<version>")
+     *   360px (current — also appends the git short-hash, e.g.
+     *          "ADetailer Ultimate · v26.2.0+plus.2 · 63a9dd2" ~ 47 chars).
+     * The hash auto-updates on every commit, giving a live signal of
+     * which build is installed. */
+    max-width: 360px !important;
     z-index: 5;
     pointer-events: none;
     margin: 0 !important;
