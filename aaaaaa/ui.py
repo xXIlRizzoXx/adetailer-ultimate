@@ -629,9 +629,12 @@ def one_ui_group(
         else ["None", *webui_info.ad_model_list]
     )
 
-    # 'Enable this tab' is the first thing right below the 1st/2nd/3rd/4th
-    # tab selector — directly visible (no accordion wrapping) so the user
-    # can flip a tab on/off in one click without opening anything.
+    # Top of the tab content — all directly visible, no accordion wrapping:
+    #   - Enable this tab (per-tab on/off)
+    #   - Copy / Paste settings (inter-tab clipboard)
+    # The 'Tab clipboard' accordion has been removed at user request — the
+    # two buttons sit right below the Enable checkbox so they're available
+    # in one click without opening anything.
     with gr.Row(variant="compact"):
         w.ad_tab_enable = gr.Checkbox(
             label=f"Enable this tab ({ordinal(n + 1)})",
@@ -640,28 +643,20 @@ def one_ui_group(
             elem_id=eid("ad_tab_enable"),
         )
 
-    # 'Tab clipboard' accordion (open) — Copy/Paste between tabs. The
-    # accordion stays open by default so the buttons are immediately
-    # accessible too.
-    with gr.Accordion(
-        "Tab clipboard",
-        open=True,
-        elem_id=eid("ad_tab_clipboard_accordion"),
-    ):
-        with gr.Row(variant="compact"):
-            copy_btn = gr.Button(
-                value="\U0001F4CB Copy settings",
-                elem_id=eid("ad_copy_settings"),
-                scale=0,
-                min_width=160,
-            )
-            paste_btn = gr.Button(
-                value="\U0001F4E5 Paste settings",
-                elem_id=eid("ad_paste_settings"),
-                interactive=False,
-                scale=0,
-                min_width=160,
-            )
+    with gr.Row(variant="compact"):
+        copy_btn = gr.Button(
+            value="\U0001F4CB Copy settings",
+            elem_id=eid("ad_copy_settings"),
+            scale=0,
+            min_width=160,
+        )
+        paste_btn = gr.Button(
+            value="\U0001F4E5 Paste settings",
+            elem_id=eid("ad_paste_settings"),
+            interactive=False,
+            scale=0,
+            min_width=160,
+        )
 
     # Preset library — load/save/delete/rename named tab configurations.
     # Shared storage across tabs; cross-tab dropdown refresh on save/delete
