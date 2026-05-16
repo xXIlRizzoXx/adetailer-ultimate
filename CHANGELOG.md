@@ -2,7 +2,7 @@
 
 ## 2026-05-16 (rename → ADetailer Ultimate)
 
-- Project renamed to **ADetailer Ultimate**: GitHub repo `xXIlRizzoXx/adetailer-plus` → `xXIlRizzoXx/adetailer_ultimate`. README title and install URL updated. `style.css` header comment updated. All previous URLs (`xXIlRizzoXx/adetailer` from the original soft-fork, then `xXIlRizzoXx/adetailer-plus` from the same-day rename) continue to work via GitHub's automatic redirect chain.
+- Project renamed to **ADetailer Ultimate**: GitHub repo `xXIlRizzoXx/adetailer-plus` → `xXIlRizzoXx/adetailer-ultimate`. README title and install URL updated. `style.css` header comment updated. The slug was briefly `adetailer_ultimate` (underscore) for a few minutes before being normalised to `adetailer-ultimate` (hyphen) to match the SD WebUI extension-ecosystem convention. All previous URLs continue to work via GitHub's automatic redirect chain (`xXIlRizzoXx/adetailer` → `adetailer-plus` → `adetailer_ultimate` → `adetailer-ultimate`).
 
 ## 2026-05-16 (rename → ADetailer Plus + roadmap expansion)
 
