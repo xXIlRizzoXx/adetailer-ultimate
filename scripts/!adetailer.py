@@ -985,6 +985,14 @@ class AfterDetailerScript(scripts.Script):
         if getattr(p, "_ad_disabled", False) or not self.is_ad_enabled(*args_):
             return
 
+        # Manual-mode short-circuit: user wants to review the raw image first
+        # and only apply ADetailer on selected results (e.g. via img2img +
+        # disable this setting). The Generate produces the unmodified image
+        # and ADetailer is fully bypassed here.
+        if opts.data.get("ad_manual_mode", False):
+            print("[-] ADetailer: manual mode is ON, skipping auto-run.")
+            return
+
         pp.image = self.get_i2i_init_image(p, pp)
         pp.image = ensure_pil_image(pp.image, "RGB")
         init_image = copy(pp.image)
@@ -1093,6 +1101,17 @@ def on_ui_settings():
             section=section,
         ).info(
             "When enabled, save the image after each ADetailer tab completes — so you keep a copy after the 1st pass (e.g. face), another after the 2nd (e.g. hands), and so on. Useful for rolling back when the last pass spoils something. Files use suffix '-ad-step-N'."
+        ),
+    )
+
+    shared.opts.add_option(
+        "ad_manual_mode",
+        shared.OptionInfo(
+            default=False,
+            label="Manual mode — don't auto-run ADetailer after generation",
+            section=section,
+        ).info(
+            "When enabled, ADetailer no longer runs automatically after each generation. The image goes straight to the gallery untouched. To actually apply ADetailer, use the 'Detection preview' accordion in any ADetailer tab to test detections on an image, then send the image to img2img and disable this option to apply the inpaint. Useful when you want to review the generated image first and only run ADetailer on the ones worth refining."
         ),
     )
 
