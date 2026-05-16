@@ -154,6 +154,31 @@ def _merge_lora_tags(prompt: str, extras: list[str]) -> str:
     return f"{base} {tail}" if base else tail
 
 
+def _should_skip_for_hires_only(p, args) -> bool:
+    """Return True when the per-tab `ad_apply_on_hires_only` toggle is on and
+    the current `postprocess_image` call is NOT the post-hires-upscale call.
+
+    Semantics:
+      - Toggle off → never skip (this helper is a no-op).
+      - Toggle on AND hires.fix is enabled AND we're in the hires sampling
+        pass (`p.is_hr_pass == True`) → run normally.
+      - Toggle on AND hires.fix is enabled AND we're still in the lowres
+        pre-hires call → skip (the lowres detail will be overwritten anyway).
+      - Toggle on AND hires.fix is NOT enabled (or this is an img2img run
+        with no hires concept) → skip entirely, since the user asked for
+        "hires only" and there is no hires step coming.
+
+    `getattr` is used throughout so the helper degrades gracefully on
+    forks that don't expose `enable_hr` / `is_hr_pass` (it just becomes a
+    "skip when toggle is on" no-op).
+    """
+    if not getattr(args, "ad_apply_on_hires_only", False):
+        return False
+    hires_enabled = bool(getattr(p, "enable_hr", False))
+    in_hires_pass = bool(getattr(p, "is_hr_pass", False))
+    return not (hires_enabled and in_hires_pass)
+
+
 def _append_lora_triggers(prompt: str, triggers: list[str]) -> str:
     """Append `triggers` as a comma-separated tail to `prompt`, skipping any
     phrase that already appears in the prompt (case-insensitive whole-substring
@@ -1067,6 +1092,11 @@ class AfterDetailerScript(scripts.Script):
         with CNHijackRestore(), pause_total_tqdm(), cn_allow_script_control():
             for n, args in enumerate(arg_list):
                 if args.need_skip():
+                    continue
+                # Per-tab "Apply only on hires.fix" toggle — if on, run only
+                # during the post-hires-upscale postprocess call. See helper
+                # for the full decision matrix.
+                if _should_skip_for_hires_only(p, args):
                     continue
                 tab_processed = self._postprocess_image_inner(p, pp, args, n=n)
                 is_processed |= tab_processed

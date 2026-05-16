@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-05-16 (feat: "Apply only on hires.fix" toggle)
+
+- **"Apply only on hires.fix"** — new per-tab checkbox `ad_apply_on_hires_only` (default off) that skips the tab's ADetailer pass during the lowres pre-hires.fix postprocess call and runs it only when the post-upscale image is ready. Saves compute when hires.fix is going to overwrite the lowres detail anyway. Inspired by [Anzhc/aadetailer-reforge](https://github.com/Anzhc/aadetailer-reforge).
+- Decision matrix (helper `_should_skip_for_hires_only(p, args)`):
+  - Toggle off → never skip.
+  - Toggle on, hires.fix enabled, **in hires pass** (`p.is_hr_pass == True`) → run normally.
+  - Toggle on, hires.fix enabled, lowres pre-hires call (`is_hr_pass == False`) → skip.
+  - Toggle on, hires.fix off, or img2img run → skip entirely (the user explicitly asked for hires-only and no hires step is coming).
+- Files:
+  - `adetailer/args.py`: new pydantic field + infotext mapping `"ADetailer apply on hires only"`.
+  - `scripts/!adetailer.py`: new helper `_should_skip_for_hires_only`, called inside the per-tab loop in `postprocess_image` right after `args.need_skip()`.
+  - `aaaaaa/ui.py`: new `gr.Checkbox` on its own row below the LoRA checkboxes.
+- Status: implemented, **awaiting hands-on verification** by the repo owner (Test 21 added to the pending list).
+
 ## 2026-05-16 (feat: LoRA trigger extraction)
 
 - **LoRA trigger extraction** — new sub-toggle `Append LoRA triggers from name` (`ad_use_lora_triggers`, default off) under the existing `Use LoRAs from main prompt` checkbox. When both checkboxes are on, ADetailer parses the convention `<lora:name (trigger phrase):weight>` (from [Anzhc/aadetailer-reforge](https://github.com/Anzhc/aadetailer-reforge)) and appends the parenthesised trigger phrase to the inpaint prompt. Triggers are deduplicated case-insensitively against the existing prompt body. Backwards-compatible: LoRA tags without parentheses are unaffected, and the negative-prompt pipeline is left untouched (triggers only make sense in the positive).

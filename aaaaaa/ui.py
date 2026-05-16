@@ -873,6 +873,18 @@ def one_ui_group(
                 elem_id=eid("ad_use_lora_triggers"),
             )
 
+        # Hires-only toggle on its own row below the LoRA checkboxes — keeps
+        # related top-level prompt/pipeline toggles in the same visual area
+        # of the tab without needing an accordion expansion.
+        with gr.Row(variant="compact"):
+            w.ad_apply_on_hires_only = gr.Checkbox(
+                label="Apply only on hires.fix" + suffix(n),
+                info="Skip the lowres pre-hires call; run ADetailer only on the upscale output. Has no effect in img2img or when hires.fix is off.",
+                value=sv("ad_apply_on_hires_only", False),
+                visible=True,
+                elem_id=eid("ad_apply_on_hires_only"),
+            )
+
     with gr.Group():
         with gr.Accordion(
             "Detection", open=False, elem_id=eid("ad_detection_accordion")
