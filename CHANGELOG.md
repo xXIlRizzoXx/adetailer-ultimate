@@ -1,11 +1,37 @@
 # Changelog
 
-## 2026-05-15 (plus: workflow ergonomics)
+## 2026-05-15 → 2026-05-16 (plus: workflow ergonomics — extended)
 
-- v26.2.0+plus.2
-- Project renamed `adetailer-classfilter` → `adetailer-plus` to reflect broader scope.
-- **Sequential class detection** — new "Process classes sequentially" checkbox. When multiple classes are selected in the dropdown, runs one detect+inpaint pass per class in dropdown order, each operating on the output of the previous. Better separation of regions and cleaner per-class inpainting at the cost of longer runtime. Ignored for MediaPipe, NOT mode, and single-class selections.
-- **Copy settings between tabs** — new "Copy settings from 1st tab to Nth" button in tabs 2-4. One click replicates the processing settings from the 1st tab (prompt, denoise, sampler, padding, ControlNet, etc.) into the current tab. Detector, class filter and per-tab enable are intentionally left alone so each tab can target a different region with the same downstream settings.
+- v26.2.0+plus.2 (version locked here per repo-owner request; further fork features ship under the same string until an explicit bump)
+- Project renamed `adetailer-classfilter` → `adetailer-plus` → `adetailer` (final). The GitHub repo URL is now `https://github.com/xXIlRizzoXx/adetailer`; old URLs redirect automatically.
+
+### Detection
+
+- **Sequential class detection** — new "Process classes sequentially" checkbox. When multiple classes are selected in the dropdown, runs one detect+inpaint pass per class in dropdown order, each operating on the output of the previous. Better separation of regions and cleaner per-class inpainting at the cost of longer runtime. Ignored for MediaPipe, NOT mode, and single-class selections. Implemented via top-of-function recursion in `_postprocess_image_inner` with single-class `args.copy(update=...)`.
+- **Drag-and-drop class reorder** — the tokens of the multi-select class dropdown are draggable so the user can dictate the order of sequential passes. Implemented in `javascript/class-reorder.js` with HTML5 drag-and-drop + a click-based re-sync to push the new order through Gradio's reactive store.
+- **Detection preview** — accordion at the bottom of each tab with a "Run detection preview" button. Runs the configured detector against the most recent generation (or img2img input) and renders bounding boxes / mask without inpainting. Useful for tuning confidence + mask preprocessing without burning a full generation.
+
+### Workflow & prompting
+
+- **`ad_prompt_append` / `ad_negative_prompt_append`** — two new single-line fields under the main prompt textboxes that append to the resolved inpaint prompt without forcing the user to duplicate the main prompt. New pydantic fields with empty-string defaults; stripped from infotext when at defaults.
+- **Include LoRAs from main prompt** — when the tab's prompt is blank and the checkbox is on, `<lora:name:weight>` tags are scraped out of the main txt2img/img2img prompt and merged into the inpaint prompt. New pydantic field `ad_use_main_loras: bool`.
+- **Copy / Paste between tabs** — clipboard-style flow: one "Copy settings" button per tab snapshots the current tab's processing settings; every other tab's "Paste settings" button enables and re-labels to "Paste settings from Nth tab here", clicking it applies the snapshot. Detector, class filter and per-tab enable are deliberately excluded from the snapshot. The clipboard is sticky — paste into multiple tabs in a row, or overwrite by Copying from a different tab.
+- **Named preset library** — Load / Save / Delete / Rename per tab, dropdown shared across tabs. Each preset stores every widget value in the tab. Persisted to `<extension_root>/user_presets.json` with atomic writes; corruption-tolerant. A `(none)` sentinel entry sits at the top of every dropdown for explicit clearing without touching widget state. `Reset preset` clears the dropdown label without modifying widgets. Implemented in `adetailer/presets.py`.
+- **Persistent last-used settings** — every Generate click stashes per-tab widget state to `<extension_root>/user_state.json` (atomic write). Restored as initial values at the next WebUI start. Toggle in `Settings → ADetailer → Remember last used settings` (default on). Implemented in `adetailer/persistence.py`.
+- **Manual mode** — `Settings → ADetailer → Manual mode` short-circuits `postprocess_image` while preserving widget state, for iterating on prompt/seed/sampler without ADetailer between every run.
+- **Save intermediate steps** — `Settings → ADetailer → Save intermediate steps` writes out the after-each-tab images alongside the final result (`_adetailer_step1.png`, `_adetailer_step2.png`, …).
+
+### Forge Neo compatibility
+
+- `aaaaaa/helper.py`: `disable_safe_unpickle` switched to `patch.object(..., create=True)` so Forge Neo's slimmer `modules.shared.cmd_opts` (which doesn't expose the legacy `disable_safe_unpickle` attribute) no longer crashes ADetailer's model loading.
+- `adetailer/classes.py`: `_names_from_json` is tolerant of civitai_helper-style metadata JSON sidecars — when the file shape doesn't look like a class-name container, it returns `[]` so the loader falls back to `model.names` instead of raising.
+
+### UI polish
+
+- Section labels (`.ad-section-label`) in bright white, small uppercase, scoped via CSS.
+- Action buttons (`Copy`, `Paste`, preset Load/Save/Rename/Delete/Reset, detection preview) get rounded corners (8px) and `white-space: nowrap` so widths don't double the height on label wrap.
+- Version badge overlay (`.ad-version-overlay`) pinned to the top-right of the accordion header — auto-hides when the accordion collapses.
+- Top of every tab: `Enable this tab` checkbox + `Copy settings` + `Paste settings` row as direct top-level widgets (no nested accordion).
 
 ## 2026-05-15 (fork: class-filtering)
 

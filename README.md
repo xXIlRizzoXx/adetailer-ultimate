@@ -2,20 +2,57 @@
 
 > **⚠️ This is an unofficial fork.** This project is **not affiliated with or endorsed by Bing-su**, the original ADetailer author. For the official ADetailer go to [Bing-su/adetailer](https://github.com/Bing-su/adetailer).
 >
-> **About this fork** — a soft-fork of [Bing-su/adetailer](https://github.com/Bing-su/adetailer) that adds workflow features on top of upstream ADetailer. The features so far:
+> **About this fork** — a soft-fork of [Bing-su/adetailer](https://github.com/Bing-su/adetailer) that adds workflow features on top of upstream ADetailer. Everything upstream still works the same way; the additions are opt-in widgets layered on top of the existing UI. See the [NEW IN THIS FORK](#new-in-this-fork) section below for the complete list of additions, each compared side-by-side with upstream behavior.
 >
-> - **Per-class filtering** for multiclass YOLO detection models — auto-populated dropdown + "Exclude selected (NOT)" mode (see [Class Filtering](#class-filtering)).
-> - **Sequential class detection** — process selected classes one at a time, each pass refining the previous (see [Sequential Mode](#sequential-class-detection)).
-> - **Copy/Paste between tabs** — clipboard-style copy of every tab field, with one Copy + one Paste button per tab (see [Copy Between Tabs](#copy-settings-between-tabs)).
-> - **`ad_prompt_append` / `ad_negative_prompt_append`** — single-line fields appended to the resolved prompt without having to duplicate the main prompt.
-> - **Persistent last-used settings** — every Generate click stashes the tab settings to disk; restored at the next WebUI start. Toggle in `Settings → ADetailer`.
-> - **Forge Neo compatibility fixes** — `disable_safe_unpickle` patch, JSON sidecar tolerance for civitai_helper-generated metadata.
->
-> The implementation was authored by **Claude** (Anthropic's coding assistant) at the request of the repository owner, who is not a Python developer. The class-filtering pattern is borrowed from [wkpark/uddetailer](https://github.com/wkpark/uddetailer). All credit for the original ADetailer goes to **Bing-su**; this fork extends that work — it does not replace it.
+> The implementation was authored by **Claude** (Anthropic's coding assistant) at the request of the repository owner, who is not a Python developer. The class-filtering pattern is borrowed from [wkpark/uddetailer](https://github.com/wkpark/uddetailer); the preset library is conceptually inspired by uddetailer too. All credit for the original ADetailer goes to **Bing-su**; this fork extends that work — it does not replace it.
 >
 > This fork is distributed under the same AGPL-3.0 license as the upstream. See `LICENSE.md` for the full text; Bing-su's copyright notices are intact.
 >
 > If you only need single-class face/hand detection, use upstream ADetailer instead — the additional widgets in this fork are harmless but unnecessary for that case.
+
+---
+
+## NEW IN THIS FORK
+
+Every row below is an addition this fork makes on top of upstream [Bing-su/adetailer](https://github.com/Bing-su/adetailer). The **Upstream** column describes how the official extension behaves today; the **This fork** column describes what the same workflow looks like here. Anything not listed below works identically to upstream.
+
+> **A note on verification status.** Rows that end with **Status: _still being tested by the repo owner_** are implemented and shipped in the codebase, but the repo owner has not finished hands-on verification of them yet. They should work — issue reports are welcome. The note is removed from a row as soon as the corresponding manual test is signed off.
+
+### Detection
+
+| Feature | Upstream Bing-su | This fork |
+| --- | --- | --- |
+| Multiclass detector classes | Either everything the model produces is inpainted (no per-class control), or for YOLO-World a text field accepts open-vocabulary class names. There is no UI to choose among the trained classes of a multiclass YOLO detector. | Auto-populated multi-select dropdown reading class names from `model.names` (or a sidecar `.json`). Choose any subset; the include path uses Ultralytics' native `model(classes=[ids])` so non-matching detections are dropped at inference time. |
+| Exclude / NOT mode | Not available. | "Exclude selected (NOT)" checkbox inverts the filter — every class the model produces *except* the selected ones gets inpainted. Implemented as a post-filter on `pred.boxes.cls`. |
+| Sequential class detection | All selected classes run in a single inference batch; the inpaint passes all use the same prompt and settings. | Optional "Process classes sequentially" checkbox: runs one detect+inpaint pass per selected class in dropdown order, each pass operating on the output of the previous. Cleaner per-region inpainting at the cost of longer runtime. Top-of-function recursion in `_postprocess_image_inner` with single-class `args.copy(update=...)`.<br>**Status:** _still being tested by the repo owner._ |
+| Class reorder | N/A (no class-selection UI). | Drag-and-drop the selected class tokens to dictate the order of sequential passes. HTML5 drag-and-drop + click-based re-sync into Gradio's reactive store.<br>**Status:** _still being tested by the repo owner (experimental — Chromium is reliable, Firefox occasionally needs a retry)._ |
+| Detection preview | Not available — you run a full generation to see what the detector matches. | "Run detection preview" button in a per-tab accordion. Runs the configured detector against the most recent generation (or the img2img input) and returns the image annotated with bounding boxes / mask, without inpainting.<br>**Status:** _still being tested by the repo owner._ |
+| Civitai_helper JSON sidecars | A `.json` next to a `.pt` is assumed to contain class names; civitai_helper-generated metadata files break the loader. | `_names_from_json` returns `[]` for shapes that don't look like class containers (lists / `{names: [...]}` / `{0: "...", 1: "..."}`); the loader falls back to `model.names` so unrelated `.json` sidecars are silently ignored.<br>**Status:** _still being tested by the repo owner._ |
+
+### Workflow & prompting
+
+| Feature | Upstream Bing-su | This fork |
+| --- | --- | --- |
+| `ad_prompt_append` / `ad_negative_prompt_append` | To add a few inpaint-only tokens you must duplicate the entire main prompt into the tab's `Prompt` field, or leave it blank and use the main one verbatim. | Two single-line "append" fields under the prompts. Their content is appended to the resolved inpaint prompt without forcing you to duplicate the main one. Empty by default, stripped from infotext so workflows that don't use them are byte-identical.<br>**Status:** _still being tested by the repo owner._ |
+| Include LoRAs from main prompt | LoRAs in the main txt2img/img2img prompt are not auto-applied to the inpaint pass — if the tab's prompt is blank the LoRA tags are inherited verbatim, but if you write a custom inpaint prompt you must restate the tags yourself. | Checkbox `ad_use_main_loras`. When on and the tab's prompt is blank, `<lora:name:weight>` tags from the main prompt are scraped and merged into the inpaint prompt automatically. Helpers `_LORA_TAG_RE`, `_extract_lora_tags`, `_merge_lora_tags`.<br>**Status:** _still being tested by the repo owner._ |
+| Copy / Paste between tabs | Each tab is configured by hand; there is no built-in way to clone a tab's settings into another. | Clipboard model. Per-tab `Copy settings` button stashes the tab's processing settings into a shared state; every other tab's `Paste settings` button enables and re-labels to `Paste settings from Nth tab here`. The clipboard is sticky — paste into multiple tabs in sequence, or overwrite by Copying from a different tab. Detector / class filter / per-tab enable are deliberately excluded from the snapshot.<br>**Status:** _layout and button wiring confirmed; the class-dropdown sync after Paste is still being tested by the repo owner._ |
+| Named preset library | `Settings → ADetailer` lets you set drop-in defaults (one shared default). There is no per-tab named-preset facility. | Per-tab dropdown + Load / Save / Delete / Rename / Reset row. Each preset is a full widget-state snapshot. Stored in `<extension_root>/user_presets.json` with atomic writes; gitignored. A reserved `(none)` entry at the top of every dropdown lets you clear the active-preset label without touching widget values. Implemented in `adetailer/presets.py`.<br>**Status:** _Save / Load / Delete confirmed; the `Reset preset` button and the `(none)` sentinel behavior are still being tested by the repo owner._ |
+| Persistent last-used settings | Tab values revert to their static defaults at WebUI restart unless you manually re-apply a "set defaults" through Settings. | Every Generate stashes per-tab widget state to `<extension_root>/user_state.json` (atomic write). Restored as initial values at the next WebUI start. Gated by `Settings → ADetailer → Remember last used settings` (default on). Implemented in `adetailer/persistence.py`.<br>**Status:** _still being tested by the repo owner._ |
+| Manual mode | No equivalent — disabling ADetailer means unticking the accordion's enable, which clears the tab's enable checkboxes as a side effect. | `Settings → ADetailer → Manual mode` is a global toggle that short-circuits the `postprocess_image` hook while leaving every widget value intact. Useful when iterating on prompt / seed / sampler between runs without recomputing the ADetailer pass each time.<br>**Status:** _still being tested by the repo owner._ |
+| Save intermediate steps | Only the final image (post all ADetailer passes) is saved. | `Settings → ADetailer → Save intermediate steps` writes the after-each-tab images alongside the final result (`_adetailer_step1.png`, `_adetailer_step2.png`, …). Pairs naturally with sequential class detection.<br>**Status:** _still being tested by the repo owner._ |
+
+### Forge Neo compatibility
+
+| Feature | Upstream Bing-su | This fork |
+| --- | --- | --- |
+| `disable_safe_unpickle` patch | Calls `unittest.mock.patch.object(modules.shared.cmd_opts, "disable_safe_unpickle")`. Forge Neo's slimmer `cmd_opts` doesn't expose that attribute, so the patch raises `AttributeError` and ADetailer fails to load the model. | Uses `patch.object(..., create=True)` so the attribute is materialised when missing, and the call is a no-op on Forge Neo. Single-line change in `aaaaaa/helper.py`. |
+
+### UI polish
+
+- Section labels (`.ad-section-label`) rendered in bright white, small uppercase — easier to scan the widget groups.
+- Action buttons (Copy / Paste / preset Load / Save / Rename / Delete / Reset / detection-preview) get rounded 8px corners and `white-space: nowrap` so all heights stay uniform when labels wrap.
+- A version-badge overlay pinned to the top-right of the accordion header. Auto-hides when the accordion collapses.
+- Top of every tab: `Enable this tab` + `Copy settings` + `Paste settings` row as direct top-level widgets (no nested clipboard accordion).
 
 ---
 
@@ -70,7 +107,7 @@ Each option corresponds to a corresponding option on the inpaint tab. Therefore,
 
 ## Class Filtering (fork feature)
 
-When a multiclass YOLO detection model is selected (one that exposes more than one class, such as the [fdetailer](https://civitai.com/models/1228695) model with classes `face / penis / pussy / anus / sheath / pawpads`, or any custom YOLOv8 segmentation model), the UI auto-populates a multi-select dropdown labelled **ADetailer detector classes** with the class names the model was trained on.
+When a multiclass YOLO detection or segmentation model is selected — that is, any `.pt` whose `model.names` exposes more than one class — the UI auto-populates a multi-select dropdown labelled **ADetailer detector classes** with the class names the model was trained on. Typical examples are community-published YOLO checkpoints trained to spot multiple facial features at once, or any custom multi-target YOLOv8 model you bring yourself.
 
 - **Include mode** (default): pick one or more classes. Only detections of those classes will be inpainted.
 - **Exclude / NOT mode**: tick the **Exclude selected (NOT)** checkbox. Detections of the selected classes will be skipped; everything else gets inpainted.
@@ -122,6 +159,67 @@ The flow:
 4. The clipboard stays sticky — paste into multiple tabs in sequence, or do another Copy from a different tab to overwrite it.
 
 The detector model and the class filter selection are **deliberately not part of the copy** so that each tab can target a different region or model while sharing all downstream processing. The "Enable this tab" checkbox of the destination tab is also left alone.
+
+## Preset Library
+
+Each tab gets a dropdown + Load / Save / Delete / Rename row. A preset is a named snapshot of **every widget value in that tab** — detector, classes, sequential flag, prompts (including the append fields), denoise, padding, sampler, ControlNet, restore-faces, mask preprocessing, the lot.
+
+- **Save** — type a name into the textbox (printable, no path separators or quotes, up to 80 chars) and hit **Save preset**. The dropdown in *every* tab refreshes immediately so you don't have to reload the UI.
+- **Load** — pick a name from the dropdown and hit **Load preset**. All widgets in the current tab snap to the preset's values, including the class dropdown for the detector model in use.
+- **Rename** — pick a preset, type the new name into the textbox, hit **Rename preset**. The on-disk file is updated atomically.
+- **Delete** — pick a preset, hit **Delete preset**. The selection clears.
+- **Reset** — hit **Reset preset** to clear the dropdown label to `(none)`. This is a label-only operation: widget values are not touched. Useful when you want to break the association with the currently displayed preset without changing what's on screen.
+
+Presets live in `<extension_root>/user_presets.json` and are also git-ignored. Corrupted JSON or permission errors are swallowed — the worst case is presets stop appearing in the dropdown, never a broken generation.
+
+A reserved `(none)` entry sits at the top of every dropdown so you always have an explicit way to clear the selection.
+
+## Persistent Last-Used Settings
+
+When `Settings → ADetailer → Remember last used settings` is on (default), every Generate click stashes each tab's widget state to `<extension_root>/user_state.json`. The file is rewritten atomically (`.tmp` + `os.replace`), so a crash mid-write can't corrupt it.
+
+On the next WebUI start the values are restored as the tab's initial state. Like presets, errors are silent — if the file goes missing or unreadable, tabs come up at their static defaults.
+
+This is separate from named presets — persistence is the "where did I leave off" recovery; presets are deliberate saved configurations.
+
+## Prompt Append Fields
+
+Below the main `Prompt` and `Negative prompt` textboxes there are two single-line fields:
+
+- **Prompt append** — content appended to whatever ADetailer resolves the inpaint prompt to (either the per-tab prompt or, if blank, the main txt2img/img2img prompt).
+- **Negative prompt append** — same idea for the negative.
+
+The point is to add inpaint-only tokens (`ultra sharp eyes`, `detailed iris`, `blurry, lowres` in the negative) without having to duplicate the full main prompt into the tab's prompt field just to tack a few words onto the end.
+
+## Include LoRAs From Main Prompt
+
+A checkbox under the prompt fields. When enabled and the tab's `Prompt` field is **empty**, ADetailer scans the main txt2img/img2img prompt for `<lora:name:weight>` tags and merges them into the inpaint prompt. This means you can leave the inpaint prompt blank and still inherit the style LoRAs from the outer generation.
+
+If the tab's `Prompt` field is non-empty, the main prompt is not consulted — your explicit prompt wins. To still inherit LoRAs in that case, put the LoRA tags in `Prompt append`.
+
+## Detection Preview
+
+Tucked inside an accordion at the bottom of each tab: a **Run detection preview** button. When clicked it loads the most recent generation's image (or the img2img input when in img2img), runs the configured detector against it, and renders the resulting bounding boxes / mask without doing any inpainting.
+
+Useful for tuning confidence threshold + mask preprocessing without burning a full generation each time.
+
+## Manual Mode
+
+`Settings → ADetailer → Manual mode` is a global toggle. When on, ADetailer's `postprocess_image` short-circuits — no detection, no inpainting — even if the accordion is enabled and tabs are configured. All widget values stay intact. Flip it back off and the next generation runs ADetailer as usual.
+
+The use case is iteration on prompt / sampler / seed without recomputing the ADetailer pass between every txt2img run.
+
+## Save Intermediate Steps
+
+`Settings → ADetailer → Save intermediate steps`, off by default. When on, each tab's inpaint output is saved as a separate file (`_adetailer_step1.png`, `_adetailer_step2.png`, …) alongside the final result. Each step image is the cumulative output of all tabs up to and including that one.
+
+This pairs naturally with sequential class detection — you can inspect what each class pass produced individually.
+
+## Drag-and-Drop Class Reorder
+
+When you have multiple classes selected in the class dropdown, the tokens shown in the input box are draggable (cursor turns into a `grab` hand). Drag a token to a new position to reorder the selection. The new order is what **Sequential class detection** uses for its pass order.
+
+This is experimental — the drag uses HTML5 drag-and-drop with a click-based re-sync to push the new order through Gradio's reactive store. It's reliable in Chromium-based browsers; in Firefox it occasionally needs a second drag attempt.
 
 ## ControlNet Inpainting
 
