@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-05-18 (ui: bump left padding on amber pill so text doesn't hug the border)
+
+User-reported follow-up on the amber preview-status pill: the text was
+sitting too close to the orange border-left, which made the pill feel
+visually unbalanced. Bumped the pill's left padding from 12px to 18px
+(symmetric became asymmetric: `6px 12px 6px 18px`) — text now has ~6px
+of extra breathing room from the amber border bar.
+
+style.css: `div.block.ad-preview-status` padding shorthand updated.
+Comment block notes the user-feedback rationale.
+
 ## 2026-05-18 (ui: gap + vertical-center on Detection-preview status pill)
 
 User-reported two micro-issues on the amber-pill warning that sits

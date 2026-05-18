@@ -88,7 +88,11 @@ div.block.ad-preview-status {
      * Vertical margin kept at 0 so the pill aligns with the button
      * baseline inside the flex row. */
     margin: 0 0 0 10px !important;
-    padding: 6px 12px !important;
+    /* Asymmetric horizontal padding: bigger left inset so the text
+     * doesn't hug the amber border-left bar. User-reported 2026-05-18
+     * "il testo spostalo leggermente a destra" — bumped left padding
+     * from 12px to 18px (+6px) for breathing room from the border. */
+    padding: 6px 12px 6px 18px !important;
     background: rgba(251, 191, 36, 0.08) !important;
     border-left: 2px solid rgba(251, 191, 36, 0.5) !important;
     border-radius: 4px !important;
