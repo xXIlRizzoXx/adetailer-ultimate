@@ -1174,7 +1174,11 @@ def one_ui_group(
                 value=sv("ad_class_prompts", ""),
                 label="ad_class_prompts" + suffix(n),
                 show_label=False,
-                lines=4,
+                # 5 visible lines so the multi-line placeholder example
+                # (4 lines: format intro + 'Example:' label + 2 sample
+                # entries) fits without scrolling. Bumped from 4 on
+                # 2026-05-18 per user UX feedback.
+                lines=5,
                 placeholder=(
                     "Per-class prompt overrides for Sequential class detection.\n"
                     "Format (one per line): classname: positive_prompt | negative_prompt\n"

@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-05-18 (ui + ux: native hover tooltips on buttons + taller class-prompts box)
+
+Two user-feedback follow-ups:
+
+**V66 — `ad_class_prompts` textbox felt cramped.** The multi-line
+placeholder example (4 lines: syntax intro + "Example:" label + 2
+sample entries) was bumping against the bottom of the box. Bumped
+`lines=4` → `lines=5` so the placeholder fits without scrolling.
+
+**V68 — buttons had no hover tooltips.** `gr.Button` doesn't expose an
+`info=` parameter the way `gr.Checkbox` / `gr.Dropdown` / `gr.Slider`
+do, so there was no built-in mechanism. Added a small standalone
+JavaScript file that walks the fork's action buttons and sets the
+native HTML `title` attribute — the browser then renders the standard
+tooltip after ~1 s of hover. Buttons covered:
+
+- Copy / Paste settings (top-of-tab clipboard)
+- Load / Rename / Delete / Save preset / Reset preset (preset library)
+- Export to JSON / Import (preset library export-import accordion)
+- Run detection preview (Detection preview accordion)
+
+Files:
+- `aaaaaa/ui.py`: `w.ad_class_prompts = gr.Textbox(..., lines=5, ...)`
+  (was 4). Comment block notes the user-feedback rationale.
+- `javascript/button-tooltips.js`: new file. ~70 LOC pure JS, no
+  dependencies. Maps each elem_id fragment to a tooltip string and
+  applies it via `el.title = "..."`. Re-runs via `MutationObserver`
+  so tooltips survive Gradio's reactive rerenders (preset load,
+  tab switches). Idempotent (guarded by `!target.title`).
+- `preview.py`: extended to read and inject every `javascript/*.js`
+  file via `gr.Blocks(head="<script>...</script>")`, the same way
+  Forge Neo auto-loads them at the extension root. Without this,
+  the Claude Preview tab wouldn't show the tooltips.
+
+Verified live via Claude Preview: tooltip text appears on hover for
+all 7 fork buttons (4 immediately, 3 after opening their parent
+accordions — the MutationObserver picks them up automatically).
+
 ## 2026-05-18 (fix: amber-pill not nested anymore — single chip)
 
 User-reported follow-up on the previous amber-pill commit: the warning
