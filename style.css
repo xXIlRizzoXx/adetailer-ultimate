@@ -83,16 +83,27 @@ div.block.ad-preview-status:has(.md:empty) {
  * wrapper they're nested under.
  */
 div.block.ad-preview-status {
-    margin: 6px 0 0 0 !important;
-    padding: 4px 10px !important;
+    /* Gap between the "Run detection preview" button and the pill on
+     * the same row (user-reported 2026-05-18 — the two were touching).
+     * Vertical margin kept at 0 so the pill aligns with the button
+     * baseline inside the flex row. */
+    margin: 0 0 0 10px !important;
+    padding: 6px 12px !important;
     background: rgba(251, 191, 36, 0.08) !important;
     border-left: 2px solid rgba(251, 191, 36, 0.5) !important;
     border-radius: 4px !important;
+    /* Flexbox so the inner markdown wrapper + <p> are vertically
+     * centered within the pill height. Matches the adjacent button's
+     * visual baseline so the text doesn't sit higher than the button
+     * label. */
+    display: flex !important;
+    align-items: center !important;
 }
 .ad-preview-status p {
     margin: 0 !important;
     padding: 0 !important;
     font-size: 12px !important;
+    line-height: 1.4 !important;
     opacity: 1 !important;
     color: #fbbf24 !important;
 }

@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-05-18 (ui: gap + vertical-center on Detection-preview status pill)
+
+User-reported two micro-issues on the amber-pill warning that sits
+next to the "Run detection preview" button:
+
+1. The pill was touching the button (no breathing room).
+2. The text inside the pill was vertically off-center compared to the
+   button's label.
+
+style.css fixes on `div.block.ad-preview-status`:
+- `margin: 0 0 0 10px` — adds a 10px gap from the button on its left,
+  zeroes out the top margin so the pill aligns with the button's flex
+  row baseline.
+- `padding: 6px 12px` (was `4px 10px`) — slightly more breathing room
+  inside the pill.
+- `display: flex; align-items: center` — vertically centers the inner
+  markdown wrapper / `<p>` within the pill height. Now the text sits
+  on the same horizontal centerline as the button's label.
+- Added `line-height: 1.4` on the `<p>` for cleaner text rhythm.
+
 ## 2026-05-18 (ui + ux: native hover tooltips on buttons + taller class-prompts box)
 
 Two user-feedback follow-ups:
