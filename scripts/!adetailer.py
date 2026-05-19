@@ -198,36 +198,36 @@ def _parse_class_prompts(text: str) -> dict[str, tuple[str, str]]:
 
 def _should_skip_for_hires_only(p, args) -> bool:
     """Return True when the per-tab `ad_apply_on_hires_only` toggle is on and
-    the current `postprocess_image` call is NOT the post-hires-upscale call.
+    the current postprocess call should be skipped.
 
-    Semantics:
-      - Toggle off → never skip (this helper is a no-op).
-      - **img2img** (any sub-mode: img2img, inpaint, sketch, batch) →
-        never skip. img2img has no hires.fix concept, so the toggle is
-        treated as inapplicable rather than as a hard skip — this avoids
-        the surprise of a tab silently doing nothing when a user enables
-        the toggle in txt2img and later switches to img2img.
-      - Toggle on AND txt2img AND hires.fix is enabled AND we're in the
-        hires sampling pass (`p.is_hr_pass == True`) → run normally.
-      - Toggle on AND txt2img AND hires.fix is enabled AND we're still in
-        the lowres pre-hires call → skip (the lowres detail will be
-        overwritten anyway).
-      - Toggle on AND txt2img AND hires.fix is NOT enabled → skip entirely,
-        since the user asked for "hires only" and there is no hires step
-        coming.
+    Important Forge Neo behaviour discovered 2026-05-19 during Test 21A:
+    `postprocess_image` is called ONCE per generation, AFTER the hires.fix
+    sampling pass has finished. Crucially, `p.is_hr_pass` is reset to
+    False before the callback fires (see `modules/processing.py:1565`).
+    So at our check time, `is_hr_pass` is ALWAYS False — checking it would
+    cause us to skip even the legitimate post-hires call. There is no
+    separate "pre-hires postprocess" pass in Forge Neo to opt out of.
 
-    `getattr` is used throughout so the helper degrades gracefully on
-    forks that don't expose `enable_hr` / `is_hr_pass` (it just becomes a
-    "skip when toggle is on" no-op for txt2img-without-hires).
+    Effective semantics in Forge Neo:
+      - Toggle off → run normally (helper is a no-op).
+      - img2img → run normally (no hires concept).
+      - Toggle on AND txt2img AND hires.fix enabled → run (the user wants
+        ADetailer on the hires output, which is what we have).
+      - Toggle on AND txt2img AND hires.fix disabled → SKIP (the user
+        explicitly opted into "hires only"; no hires means no ADetailer).
+
+    `getattr` defaults make the helper safe on forks/versions that don't
+    expose `enable_hr`.
     """
     if not getattr(args, "ad_apply_on_hires_only", False):
         return False
     # img2img short-circuit: no hires concept here → toggle is a no-op.
     if isinstance(p, StableDiffusionProcessingImg2Img):
         return False
-    hires_enabled = bool(getattr(p, "enable_hr", False))
-    in_hires_pass = bool(getattr(p, "is_hr_pass", False))
-    return not (hires_enabled and in_hires_pass)
+    # In Forge Neo there is no second "post-hires" postprocess call, so we
+    # decide purely on whether hires.fix was enabled at all. When it is,
+    # run ADetailer on the (already-hires) image. When it isn't, skip.
+    return not bool(getattr(p, "enable_hr", False))
 
 
 def _append_lora_triggers(prompt: str, triggers: list[str]) -> str:

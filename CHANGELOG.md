@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-05-19 (fix: apply-only-on-hires.fix toggle was always skipping ADetailer in Forge Neo)
+
+User-reported during Test 21A. With the toggle ON and hires.fix ON,
+ADetailer didn't run at all — terminal log showed only the two sampling
+passes (24 base + 24 hires) and zero detection/inpaint activity.
+
+Root cause: the helper `_should_skip_for_hires_only` checked
+`p.is_hr_pass` to decide whether the current `postprocess_image` call
+was the legitimate post-hires one. But in Forge Neo, `is_hr_pass` is
+reset to False in `modules/processing.py:1565` BEFORE the postprocess
+callback fires. Critically, Forge Neo only calls `postprocess_image`
+ONCE per generation (after hires is fully done), so there's no separate
+"pre-hires postprocess" call to opt out of — the original A1111
+double-call semantics don't apply.
+
+Fix: drop the `is_hr_pass` check. New logic:
+- toggle off → run normally
+- img2img → run normally (no hires concept)
+- toggle on + hires.fix enabled → RUN ADetailer (it's the only call,
+  and the image is already hires-upscaled)
+- toggle on + hires.fix disabled → SKIP (the user explicitly asked for
+  hires-only ADetailer)
+
+The toggle's effective meaning in Forge Neo is therefore "gate ADetailer
+on whether hires.fix is enabled" rather than "pick which postprocess
+pass to run". Useful when iterating fast on a base seed and only wanting
+ADetailer to engage on hires outputs. README updated to reflect this.
+
+File: `scripts/!adetailer.py::_should_skip_for_hires_only`.
+
 ## 2026-05-19 (fix: mask preview now matches the bbox-as-mask toggle state)
 
 When the per-tab `Use bbox as mask (segmentation models)` toggle was on,
