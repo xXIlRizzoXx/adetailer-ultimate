@@ -1,5 +1,30 @@
 # Changelog
 
+## v26.3.0+plus.1 — 2026-05-19 (Settings-page refresh + multi-feature reliability pass)
+
+Sigillo della sessione di test 2026-05-18..2026-05-19. Tutti i 28 test funzionali confermati hands-on dal repo owner, 4 bug-fix non triviali landed mid-test.
+
+**New feature**
+- `🔄 Reset ADetailer settings to defaults` button at the bottom of `Settings → ADetailer`. JS confirm()-gated, walks the WebUI options registry, restores every ADetailer-section entry, saves config, reloads the page. Per-tab user_state.json untouched.
+
+**Fixes**
+- Apply-only-on-hires.fix gate was always skipping ADetailer in Forge Neo (`is_hr_pass` is reset before `postprocess_image` fires; replaced with a simpler `enable_hr` check).
+- LoRA trigger extraction dedup was matching parens INSIDE the LoRA tag itself, causing the extracted trigger phrase to be silently skipped. Strip LoRA tags from the dedup haystack.
+- Bbox-as-mask saved preview (`*-ad-preview*.png`) now reflects the toggle state — previously always rendered the seg silhouette regardless of the toggle. The actual inpaint mask was correct, only the saved preview was misleading.
+- Settings-API gotcha documented: `OptionDiv` / `OptionHTML` don't set `.section` in their ctor; must be assigned manually or `opts.reorder()` crashes WebUI startup.
+
+**Docs / process**
+- README's "NEW IN THIS FORK" section reorganized by UI location (per-tab both modes, per-tab txt2img-only, per-tab img2img-only, Settings, Forge Neo compat, UI polish).
+- All 26 fork-added features flipped to 🟢 status after hands-on verification.
+- 4 internal "gotcha" memory entries documenting non-obvious Forge Neo behaviours (postprocess_image once vs twice, is_hr_pass timing, OptionDiv section requirement, LoRA-preferred-name interaction with trigger extraction).
+
+**Internal**
+- `_should_skip_for_hires_only` simplified to a 4-line decision tree.
+- `_append_lora_triggers` dedup haystack now excludes LoRA/LyCORIS tags.
+- `ultralytics_predict` clears `pred[0].masks` before `plot()` when bbox-mask substitution is active.
+
+Pending roadmap items (🔴, no code in main): ControlNet crop-aware toggle, WDv3 autotagging, Upstream PRs to Bing-su.
+
 ## 2026-05-19 (fix: LoRA trigger extraction dedup ignored parens inside the LoRA tag itself)
 
 User-reported during Test 20. With `Use LoRAs from main prompt` ON and
