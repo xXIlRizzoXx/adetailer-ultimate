@@ -232,12 +232,22 @@ def _should_skip_for_hires_only(p, args) -> bool:
 
 def _append_lora_triggers(prompt: str, triggers: list[str]) -> str:
     """Append `triggers` as a comma-separated tail to `prompt`, skipping any
-    phrase that already appears in the prompt (case-insensitive whole-substring
-    match — good enough for natural-language trigger words).
+    phrase that already appears in the prompt body (case-insensitive
+    whole-substring match).
+
+    Important: the dedup haystack EXCLUDES the LoRA tags themselves. Otherwise
+    a tag like `<lora:foo (cool trigger):1>` would have its parenthesised
+    trigger phrase falsely matched as "already present", causing the actual
+    append to be skipped — defeating the purpose of the feature. We strip
+    `<lora:...>` and `<lyco:...>` tags from the haystack before comparing,
+    while leaving them intact in the returned prompt.
     """
     if not triggers:
         return prompt
-    haystack = (prompt or "").lower()
+    # Compute the dedup haystack from the prompt with all LoRA/LyCORIS tags
+    # removed; the tags stay in the returned prompt because we only modify
+    # `haystack` for the membership check.
+    haystack = _LORA_TAG_RE.sub("", prompt or "").lower()
     to_add = [t for t in triggers if t.lower() not in haystack]
     if not to_add:
         return prompt

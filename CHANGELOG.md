@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-05-19 (fix: LoRA trigger extraction dedup ignored parens inside the LoRA tag itself)
+
+User-reported during Test 20. With `Use LoRAs from main prompt` ON and
+`Append LoRA triggers from name` ON, the trigger phrase parsed from the
+parenthesised section of a LoRA filename was never appended to the
+inpaint prompt. Terminal log showed the merged LoRA tag but no extracted
+trigger words after it.
+
+Root cause: `_append_lora_triggers` computed its dedup haystack from the
+WHOLE prompt — but by the time it ran, `_merge_lora_tags` had already
+appended `<lora:name (trigger phrase):weight>` to the prompt. The
+dedup check then found the trigger phrase inside the LoRA tag itself and
+flagged it as "already present", causing the actual append to be
+skipped. The feature looked broken from the outside.
+
+Fix: strip `<lora:...>` and `<lyco:...>` tags from the dedup haystack
+before the membership check. The LoRA tags themselves stay in the
+returned prompt (only the comparison string is changed). One-line
+substitution using the existing `_LORA_TAG_RE`.
+
+File: `scripts/!adetailer.py::_append_lora_triggers`.
+
 ## 2026-05-19 (fix: apply-only-on-hires.fix toggle was always skipping ADetailer in Forge Neo)
 
 User-reported during Test 21A. With the toggle ON and hires.fix ON,
