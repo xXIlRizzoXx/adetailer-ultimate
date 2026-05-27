@@ -418,7 +418,12 @@ class AfterDetailerScript(scripts.Script):
 
     @staticmethod
     def get_ultralytics_device() -> str:
-        if "adetailer" in shared.cmd_opts.use_cpu:
+        # Forge Neo (>= neo-2.x) ships a slimmer `cmd_opts` Namespace that
+        # doesn't expose `use_cpu`. Same pattern as the `disable_safe_unpickle`
+        # patch in aaaaaa/helper.py — fall back to an empty list when the
+        # attribute is missing (or None) so the check just no-ops.
+        use_cpu = getattr(shared.cmd_opts, "use_cpu", None) or []
+        if "adetailer" in use_cpu:
             return "cpu"
 
         if platform.system() == "Darwin":

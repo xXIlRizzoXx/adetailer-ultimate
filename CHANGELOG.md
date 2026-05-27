@@ -1,5 +1,35 @@
 # Changelog
 
+## v26.3.0+plus.2 — 2026-05-27 (Hotfix: Forge Neo `cmd_opts.use_cpu` AttributeError on script init)
+
+User-reported from a fresh Forge Neo startup log. The Script class failed
+to initialize with `AttributeError: 'Namespace' object has no attribute
+'use_cpu'` at `scripts/!adetailer.py:421`, raised inside
+`get_ultralytics_device()`. Result: ADetailer's *runtime* hooks never
+register — the boot banner still prints "ADetailer initialized" because
+the model index loads earlier, but the Script class is missing from
+`scripts_data`, so the UI accordion + img2img/txt2img hooks never appear.
+
+**Root cause**: Forge Neo's slimmer `modules.shared.cmd_opts` Namespace
+no longer exposes `use_cpu` (same trajectory that removed
+`disable_safe_unpickle`, fixed in upstream PR #846). The direct
+attribute access at line 421 raised on every startup.
+
+**Fix**: Single-call change — wrap the access in `getattr(shared.cmd_opts,
+"use_cpu", None) or []` so the membership check just no-ops on Forge Neo
+while continuing to work on stock A1111 / Forge classic. Mirrors the
+`disable_safe_unpickle` fix pattern (PR #846 merged upstream).
+
+**Internal**: Verified `cmd_opts.*` access across the whole codebase
+(`scripts/!adetailer.py`, `aaaaaa/`, etc.) — every other use already
+goes through `getattr(..., default)`. `use_cpu` was the last direct
+access remaining.
+
+**Upstream contribution**: not pursued. User decision 2026-05-27 — fork-only.
+After PR #847's silent close, the policy is "no further proactive upstream
+PRs unless Bing-su re-engages". This fix benefits all Forge Neo users but
+stays as a fork differentiator.
+
 ## v26.3.0+plus.1 — 2026-05-19 (Settings-page refresh + multi-feature reliability pass)
 
 Sigillo della sessione di test 2026-05-18..2026-05-19. Tutti i 28 test funzionali confermati hands-on dal repo owner, 4 bug-fix non triviali landed mid-test.
