@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — 2026-05-27 (Localisation: 10 UI languages)
+
+Ten `localizations/*.json` files added covering every fork-added widget — labels, accordion titles, info hints, placeholders, button captions, tooltips and Settings-page options. Languages: `it_IT`, `es_ES`, `fr_FR`, `de_DE`, `zh_CN`, `ja_JP`, `pt_BR`, `ru_RU`, `ko_KR`, `pl_PL`. All ten files share the same 133-key vocabulary, byte-identical keys, identical key order — straightforward to diff.
+
+Mechanism: Forge auto-merges any extension's `localizations/*.json` into `window.localization` at boot. Picking a language via the WebUI's localization setting (or via the [Language Diffusion](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion) extension's top-bar selector) translates the ADetailer panel in place — no restart, no Python changes.
+
+**Policy**: SD/AI technical vocabulary stays in English in every locale (ADetailer, LoRA, CFG, VAE, ControlNet, hires.fix, img2img, inpaint, bbox, YOLO, MediaPipe, CLIP, SDXL, sampler, scheduler, checkpoint, etc.). Rationale: civitai pages, tutorials, and forum threads keep these terms in English universally, so translating them creates friction.
+
+**Quality status**: machine-assisted seeds, native-speaker review welcome. Open an Issue or PR with locale corrections.
+
 ## v26.3.0+plus.2 — 2026-05-27 (Hotfix: Forge Neo `cmd_opts.use_cpu` AttributeError on script init)
 
 User-reported from a fresh Forge Neo startup log. The Script class failed
