@@ -1,8 +1,10 @@
 # Changelog
 
-## Unreleased — 2026-05-27 (Localisation: 10 UI languages)
+## Unreleased — 2026-05-27 (Localisation: 10 UI languages + emoji-button patch)
 
 Ten `localizations/*.json` files added covering every fork-added widget — labels, accordion titles, info hints, placeholders, button captions, tooltips and Settings-page options. Languages: `it_IT`, `es_ES`, `fr_FR`, `de_DE`, `zh_CN`, `ja_JP`, `pt_BR`, `ru_RU`, `ko_KR`, `pl_PL`. All ten files share the same 133-key vocabulary, byte-identical keys, identical key order — straightforward to diff.
+
+**Bonus fix — emoji-prefixed buttons now translate.** Forge's bundled `javascript/localization.js` explicitly skips any text node whose content matches its `re_emoji` regex (Extended_Pictographic + skin-tone + hair modifiers). All of this fork's action buttons carry an emoji prefix (📂 Load, ✏️ Rename, 🗑 Delete, 💾 Save preset, 🆕 Reset, 📋 Copy settings, 📥 Paste settings, 🔍 Run detection preview, 🔄 Reset ADetailer settings, 📤 Esport, 📥 Import) → the core walker bails on every one and they stay English. New `javascript/localize_emoji_buttons.js` re-applies the dict lookup to BUTTON text nodes only, mirroring Forge's `text.trim()` → `window.localization[text]` logic. Initial sweep on DOMContentLoaded + MutationObserver for Gradio re-renders. Idempotent, no-op on English locale.
 
 Mechanism: Forge auto-merges any extension's `localizations/*.json` into `window.localization` at boot. Picking a language via the WebUI's localization setting (or via the [Language Diffusion](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion) extension's top-bar selector) translates the ADetailer panel in place — no restart, no Python changes.
 
