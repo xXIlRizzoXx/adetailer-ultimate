@@ -5,7 +5,27 @@
  * non-ADetailer buttons / labels.
  */
 
-/* ---------- Rounded corners on the fork's action buttons ---------- */
+/* ---------- Action buttons (preset library + clipboard + preview) ----------
+ * Rounded corners, single-line labels, and — crucially for i18n —
+ * content-sized width.
+ *
+ * Why override `min_width`: the Python widgets ship hard-coded
+ * `min_width=90` / `110` / `130` / `160` values that were tuned for the
+ * English labels ("Load", "Reset", "Save preset", "Copy settings", …).
+ * Non-English locales have longer words ("Carica", "Ripristina",
+ * "Incolla impostazioni", …) which get clipped or padded asymmetrically
+ * inside the fixed pixel widths.
+ *
+ * `min-width: auto !important` lets each button grow only as wide as its
+ * own text + padding requires, locale-by-locale. The `scale=0` set in
+ * Python keeps the buttons compactly grouped on the LEFT of their row
+ * (Gradio packs scale=0 columns flush) — they never stretch to fill the
+ * row width, so the visual rhythm "stays left, content-fit" matches the
+ * original English design.
+ *
+ * The 12px horizontal padding gives a consistent inset around any label
+ * length so single-character labels don't look squished and long
+ * translations breathe properly. */
 button[id*="adetailer_ad_copy_settings"],
 button[id*="adetailer_ad_paste_settings"],
 button[id*="adetailer_ad_preset_load"],
@@ -15,16 +35,20 @@ button[id*="adetailer_ad_preset_save"],
 button[id*="adetailer_ad_preset_reset"],
 button[id*="adetailer_ad_preview_btn"],
 /* Export = gr.DownloadButton, Import = gr.UploadButton. Both render
- * as <button> at the root and were missing from the nowrap list —
- * the "Export to JSON" label was wrapping onto two lines, growing the
- * button taller than its single-line siblings. */
+ * as <button> at the root. */
 button[id*="adetailer_ad_preset_export_btn"],
 button[id*="adetailer_ad_preset_import_btn"] {
     border-radius: 8px !important;
     /* Keep label on a single line so all buttons end up the same height
-     * regardless of min_width — otherwise short content-sized buttons
-     * wrap and grow taller than their wider siblings. */
+     * regardless of width — otherwise short content-sized buttons wrap
+     * and grow taller than their wider siblings. */
     white-space: nowrap !important;
+    /* Locale-friendly sizing: override the Python min_width pixel values
+     * so any language's label sits comfortably. */
+    min-width: auto !important;
+    width: fit-content !important;
+    padding-left: 12px !important;
+    padding-right: 12px !important;
 }
 
 /* ---------- Section labels — bright white, small uppercase ---------- */
