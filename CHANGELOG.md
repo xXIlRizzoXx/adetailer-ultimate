@@ -1,18 +1,22 @@
 # Changelog
 
-## Unreleased — 2026-05-27 (Localisation: 10 UI languages + emoji-button patch)
+## Unreleased — 2026-05-27 (Localisation moved to Language Diffusion)
 
-Ten `localizations/*.json` files added covering every fork-added widget — labels, accordion titles, info hints, placeholders, button captions, tooltips and Settings-page options. Languages: `it_IT`, `es_ES`, `fr_FR`, `de_DE`, `zh_CN`, `ja_JP`, `pt_BR`, `ru_RU`, `ko_KR`, `pl_PL`. All ten files share the same 133-key vocabulary, byte-identical keys, identical key order — straightforward to diff.
+**Architectural change**: the `localizations/*.json` dictionaries previously shipped here have been **moved to the [Language Diffusion](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion) extension**. Rationale: Language Diffusion already owns the top-bar language selector, the per-locale flag icons, the auto-reload-on-change flow, and the 959-key Forge core dictionary — so consolidating the 138 ADetailer Ultimate translation keys there keeps i18n in a single home. The vocabulary is unchanged byte-for-byte; only its physical location moved.
 
-**Bonus fix — emoji-prefixed buttons now translate.** Forge's bundled `javascript/localization.js` explicitly skips any text node whose content matches its `re_emoji` regex (Extended_Pictographic + skin-tone + hair modifiers). All of this fork's action buttons carry an emoji prefix (📂 Load, ✏️ Rename, 🗑 Delete, 💾 Save preset, 🆕 Reset, 📋 Copy settings, 📥 Paste settings, 🔍 Run detection preview, 🔄 Reset ADetailer settings, 📤 Esport, 📥 Import) → the core walker bails on every one and they stay English. New `javascript/localize_emoji_buttons.js` re-applies the dict lookup to BUTTON text nodes only, mirroring Forge's `text.trim()` → `window.localization[text]` logic. Initial sweep on DOMContentLoaded + MutationObserver for Gradio re-renders. Idempotent, no-op on English locale.
+**This repo keeps the two UI fixes that COMPLEMENT the dictionaries** — they would belong nowhere else because they patch ADetailer-specific DOM that Forge's core walker can't reach:
 
-**Bonus fix — action buttons now content-sized.** The Python widgets hard-code `min_width=90/110/130/160` values that were tuned for the English labels. Non-English translations have longer words ("Carica", "Ripristina", "Incolla impostazioni", …) that got clipped inside the fixed pixel widths. `style.css` now applies `min-width: auto !important; width: fit-content !important; padding: 0 12px !important;` to every action button (preset library row + clipboard row + detection-preview), so each button grows exactly as wide as its own label + padding regardless of locale. The `scale=0` Python setting still groups them flush-left on their row — the visual rhythm stays "left-aligned, content-fit" as the original English design intended.
+- `javascript/localize_emoji_buttons.js` — re-applies translations to:
+  1. Emoji-prefixed button text nodes (📂 Load, ✏️ Rename, 🗑 Delete, 💾 Save preset, 🆕 Reset, 📋 Copy settings, 📥 Paste settings, 🔍 Run detection preview, 🔄 Reset ADetailer settings, 📤 Esport, 📥 Import) — Forge's bundled `javascript/localization.js` explicitly skips any text node whose content matches its `re_emoji` regex (Extended_Pictographic + skin-tone + hair modifiers).
+  2. `<input value="…">` sentinel values inside Gradio dropdowns ("Use same checkpoint / VAE / sampler / scheduler") — Forge's walker handles `placeholder` and `title` but not `value`.
 
-Mechanism: Forge auto-merges any extension's `localizations/*.json` into `window.localization` at boot. Picking a language via the WebUI's localization setting (or via the [Language Diffusion](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion) extension's top-bar selector) translates the ADetailer panel in place — no restart, no Python changes.
+  Initial sweep on `DOMContentLoaded` + `MutationObserver` for Gradio re-renders (preset Load, cross-tab Paste, Reload UI). Idempotent (`if (tl !== text)` guards the assignment), no-op on English locale.
 
-**Policy**: SD/AI technical vocabulary stays in English in every locale (ADetailer, LoRA, CFG, VAE, ControlNet, hires.fix, img2img, inpaint, bbox, YOLO, MediaPipe, CLIP, SDXL, sampler, scheduler, checkpoint, etc.). Rationale: civitai pages, tutorials, and forum threads keep these terms in English universally, so translating them creates friction.
+- `style.css` — action buttons (preset library row + clipboard row + detection-preview) now grow content-sized: `min-width: auto !important; width: fit-content !important; padding: 0 12px !important;`. The Python widgets hard-code `min_width=90/110/130/160` values that were tuned for the English labels and clipped longer translations (Italian "Ripristina", German "Einstellungen einfügen", …). The `scale=0` Python setting still groups buttons flush-left on their row.
 
-**Quality status**: machine-assisted seeds, native-speaker review welcome. Open an Issue or PR with locale corrections.
+**Recommended install path**: both extensions installed side-by-side in `extensions/` — Language Diffusion handles the locale picker + serves the translations; this repo handles the ADetailer functionality + the two UI-walker fixes.
+
+**Quality status of the 138 ADetailer keys**: machine-assisted seeds. Native-speaker review welcome — open an Issue or PR on the [Language Diffusion repo](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion).
 
 ## v26.3.0+plus.2 — 2026-05-27 (Hotfix: Forge Neo `cmd_opts.use_cpu` AttributeError on script init)
 
