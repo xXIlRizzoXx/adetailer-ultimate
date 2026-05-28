@@ -64,24 +64,20 @@
             }
         }
 
-        // (2) <input value="..."> for Gradio dropdown selected values —
+        // (2) <input> for Gradio dropdown selected values —
         // Forge's walker only handles `placeholder` and `title`, not
-        // `value`. Scope to inputs that look like dropdown selectors
-        // (Gradio renders them inside a wrapper with role="combobox"
-        // or class containing "wrap"); apply the dict lookup to their
-        // current value. We don't filter by id because every dropdown
-        // in any extension benefits from the same fix, but the lookup
-        // is a no-op when the value isn't a known translation key, so
-        // it's safe to apply broadly.
+        // `value`. Gradio's dropdown <input> is rendered WITHOUT a
+        // `type` attribute (defaults to "text") and CARRIES
+        // `role="listbox"` — we target by that role so we hit only
+        // dropdown selectors and never plain text fields where
+        // overwriting `value` would clobber the user's typing. Every
+        // dropdown in any extension benefits from the same fix, but
+        // the dict lookup is a no-op when the value isn't a known
+        // translation key, so it's safe to apply broadly.
         const inputs = (root.nodeType === 1 ? root : document).querySelectorAll(
-            'input[type="text"]'
+            'input[role="listbox"]'
         );
         for (const inp of inputs) {
-            // Only target inputs that are inside a dropdown wrapper —
-            // skip text fields the user types into (prompts, preset
-            // name) where overwriting `value` would clobber input.
-            const wrapper = inp.closest(".wrap, [role='combobox'], .secondary-wrap");
-            if (!wrapper) continue;
             const tl = translateText(inp.value);
             if (tl !== null) {
                 inp.value = tl;
