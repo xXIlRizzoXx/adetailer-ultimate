@@ -85,6 +85,14 @@ if TYPE_CHECKING:
 
 PARAMS_TXT = "params.txt"
 
+# Sub-folder (relative to the resolved ADetailer output directory) where every
+# NON-final ADetailer image is written: mask previews (-ad-preview), the
+# pre-ADetailer image (-ad-before), and the per-pass intermediate steps
+# (-ad-step-N). Keeps the main gallery folder containing ONLY the final
+# results. The final image itself is saved by the WebUI's own pipeline, never
+# through Script.save_image, so routing the whole method here doesn't touch it.
+AD_EXTRA_SUBDIR = "adetailer-steps"
+
 no_huggingface = getattr(cmd_opts, "ad_no_huggingface", False)
 adetailer_dir = Path(paths.models_path, "adetailer")
 safe_mkdir(adetailer_dir)
@@ -788,9 +796,57 @@ class AfterDetailerScript(scripts.Script):
         if not ad_save_images_dir.strip():
             ad_save_images_dir = p.outpath_samples
 
+        # Route every non-final ADetailer image into the AD_EXTRA_SUBDIR
+        # sub-folder, placed INSIDE the same date/pattern folder the final
+        # image uses (e.g. <out>/2026-06-03/adetailer-steps/), NOT beside it.
+        #
+        # images.save_image() applies the `directories_filename_pattern`
+        # (the "[date]" sub-dir) to whatever `path` we give it — so if we
+        # passed it "<out>/adetailer-steps" it would produce
+        # "<out>/adetailer-steps/<date>", the wrong nesting order. Instead we
+        # resolve the date folder ourselves first (reusing Forge's own
+        # FilenameGenerator + the same pattern, so it matches the final image
+        # byte-for-byte), append AD_EXTRA_SUBDIR, and call save_image with
+        # save_to_dirs=False so it doesn't add the date folder a second time.
+        base_dir = Path(ad_save_images_dir)
+        if getattr(opts, "save_to_dirs", False):
+            try:
+                namegen = images.FilenameGenerator(
+                    p, seed, save_prompt, image, basename=""
+                )
+                pattern = (
+                    getattr(opts, "directories_filename_pattern", "")
+                    or "[prompt_words]"
+                )
+                dirname = namegen.apply(pattern).lstrip(" ").rstrip("\\ /")
+                if dirname:
+                    base_dir = base_dir / dirname
+            except Exception as e:  # noqa: BLE001
+                # Pattern API changed / unexpected shape: fall back to the
+                # flat base dir. Worse layout, but never lose the image.
+                print(
+                    f"[-] ADetailer: couldn't resolve the date sub-dir "
+                    f"({e}); saving '{AD_EXTRA_SUBDIR}' at the output root.",
+                    file=sys.stderr,
+                )
+                base_dir = Path(ad_save_images_dir)
+
+        save_dir = base_dir / AD_EXTRA_SUBDIR
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            # Fall back to the parent rather than losing the image if the
+            # sub-folder can't be created (permissions, read-only mount, …).
+            print(
+                f"[-] ADetailer: couldn't create '{save_dir}' ({e}); "
+                f"saving to the parent folder instead.",
+                file=sys.stderr,
+            )
+            save_dir = base_dir
+
         images.save_image(
             image=image,
-            path=ad_save_images_dir,
+            path=str(save_dir),
             basename="",
             seed=seed,
             prompt=save_prompt,
@@ -798,6 +854,9 @@ class AfterDetailerScript(scripts.Script):
             info=self.infotext(p),
             p=p,
             suffix=suffix,
+            # We already resolved the date folder above; don't let save_image
+            # append it again (that's what nested it wrong before).
+            save_to_dirs=False,
         )
 
     def get_ad_model(self, name: str):
@@ -1026,7 +1085,13 @@ class AfterDetailerScript(scripts.Script):
         p.extra_generation_params.update(extra_params)
 
     def _postprocess_image_inner(
-        self, p, pp: PPImage, args: ADetailerArgs, *, n: int = 0
+        self,
+        p,
+        pp: PPImage,
+        args: ADetailerArgs,
+        *,
+        n: int = 0,
+        _seq_sub_pass: bool = False,
     ) -> bool:
         """
         Returns
@@ -1034,6 +1099,16 @@ class AfterDetailerScript(scripts.Script):
             bool
 
             `True` if image was processed, `False` otherwise.
+
+        Parameters
+        ----------
+        _seq_sub_pass : bool
+            Internal flag set to `True` when this call is a sub-pass dispatched
+            by the sequential-class branch (every class but the first). Used to
+            suppress the per-class mask preview save so the output folder ends
+            up with at most ONE preview per tab instead of N (one per class).
+            The live preview area still updates per-class via
+            `shared.state.assign_current_image`.
         """
         if state.interrupted or state.skipped:
             return False
@@ -1055,9 +1130,21 @@ class AfterDetailerScript(scripts.Script):
                 # _parse_class_prompts.
                 class_prompts = _parse_class_prompts(args.ad_class_prompts)
 
+                # Snapshot pp.image BEFORE any class pass so we can roll
+                # back if the user presses Skip / Interrupt mid-sequential.
+                # Without this, a half-finished result (some classes
+                # applied, others skipped) would leak to the final image —
+                # which is exactly what the user wanted to discard by
+                # pressing Skip. Uses the stdlib `copy` (already imported
+                # at module top) for consistency with the snapshot in the
+                # outer postprocess_image.
+                initial_image = copy(pp.image)
+                was_skipped = False
+
                 is_processed = False
-                for cls in classes:
+                for idx, cls in enumerate(classes):
                     if state.interrupted or state.skipped:
+                        was_skipped = True
                         break
                     update: dict[str, Any] = {
                         "ad_model_classes": cls,
@@ -1072,9 +1159,28 @@ class AfterDetailerScript(scripts.Script):
                         if neg:
                             update["ad_negative_prompt"] = neg
                     sub_args = args.copy(update=update)
+                    # `_seq_sub_pass=True` for every class AFTER the first
+                    # — suppresses the per-class preview save so a tab
+                    # produces ONE preview file (the first class's) rather
+                    # than N. Step-image / before-image saves happen in the
+                    # outer postprocess_image, after the whole sequential
+                    # finishes, so they're already 1-per-tab.
                     is_processed |= self._postprocess_image_inner(
-                        p, pp, sub_args, n=n
+                        p, pp, sub_args, n=n, _seq_sub_pass=(idx > 0)
                     )
+
+                # Late-skip catch: the last class's inpaint loop may have
+                # set state.skipped after returning. Treat that the same
+                # as breaking mid-loop.
+                if was_skipped or state.interrupted or state.skipped:
+                    pp.image = initial_image
+                    print(
+                        f"[-] ADetailer: sequential class pass on tab "
+                        f"{n + 1} was skipped — rolled back to the "
+                        f"pre-sequential image."
+                    )
+                    return False
+
                 return is_processed
 
         i = get_i(p)
@@ -1113,12 +1219,19 @@ class AfterDetailerScript(scripts.Script):
         masks = self.pred_preprocessing(p, pred, args)
         shared.state.assign_current_image(pred.preview)
 
-        self.save_image(
-            p,
-            pred.preview,
-            condition="ad_save_previews",
-            suffix="-ad-preview" + suffix(n, "-"),
-        )
+        # Skip the disk preview save when we're a sub-pass of a sequential
+        # class loop (every class but the first). Saving once per class
+        # would litter the output folder with N near-identical files; the
+        # first class's preview already documents "the detector found these
+        # bboxes" for the tab. Live preview area (assign_current_image
+        # above) still updates per class so the user sees each pass.
+        if not _seq_sub_pass:
+            self.save_image(
+                p,
+                pred.preview,
+                condition="ad_save_previews",
+                suffix="-ad-preview" + suffix(n, "-"),
+            )
 
         steps = len(masks)
         processed = None
