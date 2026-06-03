@@ -31,7 +31,7 @@ Features registered through `adui()` with mode-agnostic visibility — every wid
 | :---: | --- | --- | --- |
 | 🟢 | Multiclass detector classes | Either everything the model produces is inpainted (no per-class control), or for YOLO-World a text field accepts open-vocabulary class names. There is no UI to choose among the trained classes of a multiclass YOLO detector. | Auto-populated multi-select dropdown reading class names from `model.names` (or a sidecar `.json`). Choose any subset; the include path uses Ultralytics' native `model(classes=[ids])` so non-matching detections are dropped at inference time. |
 | 🟢 | Exclude / NOT mode | Not available. | "Exclude selected (NOT)" checkbox inverts the filter — every class the model produces *except* the selected ones gets inpainted. Implemented as a post-filter on `pred.boxes.cls`. |
-| 🟢 | Sequential class detection | All selected classes run in a single inference batch; the inpaint passes all use the same prompt and settings. | Optional "Process classes sequentially" checkbox: runs one detect+inpaint pass per selected class in dropdown order, each pass operating on the output of the previous. Cleaner per-region inpainting at the cost of longer runtime. Top-of-function recursion in `_postprocess_image_inner` with single-class `args.copy(update=...)`. |
+| 🟢 | Sequential class detection | All selected classes run in a single inference batch; the inpaint passes all use the same prompt and settings. | Optional "Process classes sequentially" checkbox: runs one detect+inpaint pass per selected class in dropdown order, each pass operating on the output of the previous. Cleaner per-region inpainting at the cost of longer runtime. Top-of-function recursion in `_postprocess_image_inner` with single-class `args.copy(update=...)`.<br>_Mask preview is saved once per tab (first class only) rather than once per class; Skip / Interrupt mid-sequential rolls back the entire tab to the pre-sequential image — see [Sequential Class Detection](#sequential-class-detection) for both behaviours._ |
 | 🟢 | Class pass order (activation order) | N/A (no class-selection UI). | The order in which you click classes in the dropdown is the order they're processed when **Sequential class detection** is on. Gradio's multi-select natively appends each selection to the end of the value list, and the sequential pipeline reads that order verbatim. To re-order, click the × on a token to deselect it, then click its name in the dropdown again — it goes to the end. |
 | 🟢 | Detection preview | Not available — you run a full generation to see what the detector matches. | "Run detection preview" button in a per-tab accordion. Runs the configured detector against the most recent generation (or the img2img input) and returns the image annotated with bounding boxes / mask, without inpainting.<br>**Note:** select a model in the **ADetailer detector** dropdown of the same tab *first* — the preview uses the tab's currently-selected detector and the button is a no-op when no detector is chosen. |
 
@@ -81,7 +81,7 @@ Options registered through `on_ui_settings()` in `scripts/!adetailer.py`. Each o
 | Status | Feature | Upstream Bing-su | This fork |
 | :---: | --- | --- | --- |
 | 🟢 | Manual mode | No equivalent — disabling ADetailer means unticking the accordion's enable, which clears the tab's enable checkboxes as a side effect. | `Settings → ADetailer → Manual mode` is a global toggle that short-circuits the `postprocess_image` hook while leaving every widget value intact. Useful when iterating on prompt / seed / sampler between runs without recomputing the ADetailer pass each time. Primary use case is **batch triage**: generate N raw candidates without burning ADetailer time on each, pick the keepers, then disable Manual mode and Generate again to run ADetailer only on the chosen images. |
-| 🟢 | Save intermediate steps | Only the final image (post all ADetailer passes) is saved. | `Settings → ADetailer → Save intermediate steps` writes the after-each-tab images alongside the final result (`_adetailer_step1.png`, `_adetailer_step2.png`, …). Pairs naturally with sequential class detection. |
+| 🟢 | Save intermediate steps | Only the final image (post all ADetailer passes) is saved. | `Settings → ADetailer → Save intermediate steps` writes the after-each-tab images (`*-ad-step-1`, `*-ad-step-2`, …). Pairs naturally with sequential class detection.<br>_Saved into an `adetailer-steps/` sub-folder of the output directory (along with mask previews and the before-image), so the main gallery folder holds only final images — see [Output Folder Layout](#output-folder-layout)._ |
 | 🟢 | Remember last-used settings (toggle) | N/A — no such option exists upstream. | `Settings → ADetailer → Remember last-used settings between restarts` (default on). Gates the per-tab persistence feature listed above: when off, tabs always start with the extension's static defaults; when on, the last `user_state.json` snapshot is restored at boot. |
 | 🟢 | Reset ADetailer settings | There is no built-in way to roll back the entire `Settings → ADetailer` page to its factory defaults short of editing `config.json` manually or wiping it entirely. | New red `🔄 Reset ADetailer settings to defaults` button at the bottom of `Settings → ADetailer`. Walks the WebUI options registry and restores every entry registered under the `ADetailer` section to its declared default in the extension's source, then saves `config.json` and reloads the page. Gated by a JS `confirm()` prompt so a stray click can't wipe everything. Per-tab widget state (`user_state.json`) is left untouched — only Settings-page options are reset. Implementation: `_reset_adetailer_settings()` + `_make_reset_settings_button()` in `scripts/!adetailer.py`. |
 
@@ -211,6 +211,18 @@ The benefit: each pass operates on a cleaner input. The `hand` detector is not c
 
 Sequential mode is **ignored** for MediaPipe models, in NOT/exclude mode, and when fewer than 2 classes are selected — in those cases it has no effect and the regular single-pass flow runs.
 
+**Saved files behaviour with sequential mode:**
+
+- **Mask preview** (`Settings → ADetailer → Save mask previews`) — saved **once per tab**, from the first class pass. Without this rule a tab with 3 selected classes would drop 3 near-identical `*-ad-preview*.png` files in the output folder. The live preview area (the small image in the WebUI gallery during generation) still updates per class so you can watch each pass run.
+- **Intermediate step image** (`Settings → ADetailer → Save intermediate steps`) — saved once per tab, after all class passes complete (unchanged: the outer save loop is per-tab, not per-class).
+- **Before-ADetailer image** (`Settings → ADetailer → Save images before ADetailer`) — saved once per generation, unchanged.
+
+**Skip / Interrupt mid-sequential rolls back the tab:**
+
+If you press **Skip** or **Interrupt** while a sequential pass is running — for instance, after seeing class 1 (face) succeed but class 2 (hand) produce a bad result — the entire tab is rolled back. `pp.image` is restored to the pre-sequential state, no `*-ad-step-N.png` is saved for that tab, and the final image saved by the WebUI is the untouched original. The terminal logs `[-] ADetailer: sequential class pass on tab N was skipped — rolled back to the pre-sequential image.` so you can confirm what happened.
+
+The rollback only applies to the sequential code path. Pressing Skip during a single-class tab or with `Process classes sequentially` off behaves as before (the inpaint stops where it is, partial result kept).
+
 ## Copy Settings Between Tabs
 
 Every tab — 1st through whatever you set as **Max tabs** in `Settings → ADetailer` (default 2, can be raised to 15+) — has a **"Copy settings"** + **"Paste settings"** button pair at the top.
@@ -277,9 +289,28 @@ The use case is iteration on prompt / sampler / seed without recomputing the ADe
 
 ## Save Intermediate Steps
 
-`Settings → ADetailer → Save intermediate steps`, off by default. When on, each tab's inpaint output is saved as a separate file (`_adetailer_step1.png`, `_adetailer_step2.png`, …) alongside the final result. Each step image is the cumulative output of all tabs up to and including that one.
+`Settings → ADetailer → Save intermediate steps`, off by default. When on, each tab's inpaint output is saved as a separate file (`*-ad-step-1`, `*-ad-step-2`, …). Each step image is the cumulative output of all tabs up to and including that one.
 
 This pairs naturally with sequential class detection — you can inspect what each class pass produced individually.
+
+## Output Folder Layout
+
+Every **non-final** image ADetailer produces is written to an **`adetailer-steps/` sub-folder** inside the output directory, not next to the final images. The main gallery folder therefore contains only the final results:
+
+```
+txt2img-images/2026-06-03/
+├── 00123-1234567890.png          ← final image (saved by the WebUI)
+├── 00124-1234567891.png          ← final image
+└── adetailer-steps/
+    ├── …-ad-before.png           ← "Save images before ADetailer"
+    ├── …-ad-preview.png          ← "Save mask previews"
+    ├── …-ad-step-1.png           ← "Save intermediate steps" (tab 1 / class 1)
+    └── …-ad-step-2.png           ← "Save intermediate steps" (tab 2 / class 2)
+```
+
+Which of those three file types actually appear depends on the matching `Settings → ADetailer` toggle (`Save mask previews`, `Save images before ADetailer`, `Save intermediate steps`) — the sub-folder only changes **where** they go, never **whether** they're saved. If you've set a custom `Output directory for adetailer images`, the `adetailer-steps/` folder is created inside that instead. If the sub-folder can't be created (e.g. a read-only mount), ADetailer falls back to saving flat in the parent folder and logs a warning rather than dropping the image.
+
+The final image is always saved by the WebUI's own pipeline and never passes through this routing, so it stays in the main folder regardless of any ADetailer setting.
 
 ## Reset Settings
 

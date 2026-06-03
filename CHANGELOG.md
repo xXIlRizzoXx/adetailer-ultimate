@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — 2026-06-03 (ADetailer extra images go to an `adetailer-steps/` sub-folder)
+
+Every **non-final** ADetailer image — mask previews (`-ad-preview`), the pre-ADetailer image (`-ad-before`), and the per-pass intermediate steps (`-ad-step-N`) — is now written to an `adetailer-steps/` sub-folder **inside** the normal output directory, instead of being dropped alongside the final images. The main gallery folder (e.g. `txt2img-images/2026-06-03/`) now contains **only the final results**; everything ADetailer produces along the way lands in `txt2img-images/2026-06-03/adetailer-steps/`.
+
+This applies to whichever of the three Settings toggles you have on (`Save mask previews`, `Save images before ADetailer`, `Save intermediate steps`) — each still independently controls *whether* its image is saved; the sub-folder only changes *where*. It also respects a custom `ad_save_images_dir` (the sub-folder is created inside it).
+
+Implementation: `Script.save_image` resolves `<output dir>/adetailer-steps`, `mkdir(parents=True, exist_ok=True)` (idempotent), and passes that as the save `path`. The final image is saved by the WebUI's own pipeline and never goes through `save_image`, so it's untouched. If the sub-folder can't be created (permissions / read-only mount) the save falls back to the flat parent dir and logs a stderr warning rather than losing the image. Sub-folder name is the module constant `AD_EXTRA_SUBDIR`.
+
+## Unreleased — 2026-05-28 (Sequential-class polish: one preview per tab + Skip rollback)
+
+Two user-reported papercuts fixed in `scripts/!adetailer.py::_postprocess_image_inner`:
+
+1. **One preview per tab when `Process classes sequentially` is on** — the recursive design dispatched one inner call per selected class, and each call independently honoured the `ad_save_previews` Settings toggle. With three classes selected, you ended up with three `*-ad-preview*.png` files (auto-numbered by the WebUI to avoid filename collisions) for a single tab. The intermediate-step / before-image saves were already 1-per-tab; only the mask preview misbehaved. New behaviour: the preview is saved on the **first** class pass only — subsequent classes still update the live preview area (`shared.state.assign_current_image`) so you watch each pass run, but they don't litter the output folder. Implementation: new private kwarg `_seq_sub_pass: bool = False` on `_postprocess_image_inner`, set to `True` for every class after the first; the disk preview save is gated on `not _seq_sub_pass`.
+
+2. **Skip mid-sequential now rolls back to the pre-sequential image** — pressing Skip / Interrupt while class 2 of 3 was running used to leave `pp.image` with class 1's work baked in. The outer `postprocess_image` then saved that partial result as `*-ad-step-N.png` (if `ad_save_intermediate_steps` was on) and Forge auto-saved it as the final image. From the user's standpoint they'd just asked to discard the run, so a half-finished image leaking through was confusing. New behaviour: the sequential branch now snapshots `pp.image` before the class loop. If `state.skipped` or `state.interrupted` triggers at any point during the loop (or even on the LAST class's inpaint return), the snapshot is restored and the function returns `False`. The outer loop then sees `tab_processed=False`, skips the step save, and Forge saves the original untouched image. Terminal log line: `"[-] ADetailer: sequential class pass on tab N was skipped — rolled back to the pre-sequential image."`
+
+Both fixes are limited to the sequential-class code path — single-class or `Process classes sequentially=False` runs are unaffected. No new Settings toggles; the new behaviour is the only sensible default.
+
 ## Unreleased — 2026-05-27 (Localisation moved to Language Diffusion)
 
 **Architectural change**: the `localizations/*.json` dictionaries previously shipped here have been **moved to the [Language Diffusion](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion) extension**. Rationale: Language Diffusion already owns the top-bar language selector, the per-locale flag icons, the auto-reload-on-change flow, and the 959-key Forge core dictionary — so consolidating the 138 ADetailer Ultimate translation keys there keeps i18n in a single home. The vocabulary is unchanged byte-for-byte; only its physical location moved.
