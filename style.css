@@ -139,6 +139,13 @@ div.block.ad-preview-status {
     color: #fbbf24 !important;
 }
 
+/* "Combine all tabs" checkbox sits on the same row as the Run button;
+ * detach it a bit so the two aren't glued together (user-requested
+ * 2026-06-04 "staccandolo un po' dal tasto"). */
+.ad-preview-combine {
+    margin-left: 28px !important;
+}
+
 /* Preset preview block: shows the selected preset's content live.
  * Slightly indented, smaller font, no border — should feel like a
  * helper hint, not a UI panel. */

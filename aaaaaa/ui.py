@@ -302,8 +302,14 @@ def on_ad_model_update(
     names = get_model_class_names(path) if path else []
     # Preserve selections that still exist in the new model's class list.
     preserved = [s for s in (current_selection or []) if s in names]
+    # Also feed the preserved classes into the hidden backing textbox.
+    # Programmatic dropdown updates don't fire `.change`, so without this the
+    # textbox would stay empty even though the dropdown shows the preserved
+    # tokens (e.g. after Copy/Paste or re-selecting the same model), desyncing
+    # the filter. Checkbox is reset to include-mode here, so the value goes to
+    # ad_model_classes (not ad_model_classes_excluded).
     return (
-        gr.update(visible=False, value=""),
+        gr.update(visible=False, value=",".join(preserved)),
         gr.update(visible=True, choices=names, value=preserved),
         gr.update(visible=True, value=False),
         gr.update(value=""),
@@ -423,10 +429,212 @@ def adui(
             clipboard_state,
             num_models,
         )
+        # Cross-tab Detection-preview wiring (also a post-loop "second pass"):
+        # lets each tab's "Combine all tabs" checkbox run every tab's detector.
+        _wire_detection_previews(all_widgets, webui_info, num_models)
 
     # components: [bool, bool, dict, dict, ...]
     components = [ad_enable, ad_skip_img2img, *states]
     return components, infotext_fields
+
+
+def _wire_detection_previews(all_widgets, webui_info, num_models):
+    """Wire every tab's Detection-preview button AFTER all tabs exist, so the
+    per-tab "Combine all tabs" checkbox can run EVERY configured tab's detector
+    on one image and overlay all the boxes.
+
+    Index-safe by construction: registers exactly ONE ``.click`` per tab — the
+    same count the old per-tab wiring inside ``one_ui_group`` had, just
+    relocated here (mirrors ``_wire_copy_paste`` / ``_wire_presets``). The net
+    number of Gradio event listeners is unchanged, so Forge's gallery buttons
+    (wired after the scripts' UI) keep their fn_index and don't break. The
+    checkbox has NO listener of its own; it is only read as an ``inputs`` value.
+    """
+    model_mapping = webui_info.model_mapping
+    tab_colors = [
+        (255, 64, 64),
+        (64, 200, 64),
+        (64, 160, 255),
+        (255, 200, 0),
+        (210, 64, 255),
+        (0, 210, 210),
+    ]
+
+    def _predict(image, model_name, classes_csv, exclude_csv, exclude_mode, confidence):
+        """Run one detector. Returns (PredictOutput | None, error_str | None)."""
+        if not model_name or model_name == "None":
+            return None, "no model"
+        try:
+            if model_name.lower().startswith("mediapipe"):
+                from adetailer.mediapipe import mediapipe_predict
+
+                return mediapipe_predict(model_name, image, float(confidence)), None
+            from adetailer.ultralytics import ultralytics_predict
+
+            path = model_mapping.get(model_name, "")
+            if not path:
+                return None, f"path not found for '{model_name}'"
+            try:
+                from aaaaaa.helper import disable_safe_unpickle
+
+                cm = disable_safe_unpickle()
+            except Exception:  # noqa: BLE001
+                from contextlib import nullcontext
+
+                cm = nullcontext()
+            with cm:
+                pred = ultralytics_predict(
+                    path,
+                    image=image,
+                    confidence=float(confidence),
+                    device="",
+                    classes=classes_csv or "",
+                    exclude_classes=(exclude_csv if exclude_mode and exclude_csv else ""),
+                )
+            return pred, None
+        except Exception as e:  # noqa: BLE001 — surface to the UI
+            return None, str(e)
+
+    def _make_handler(tab_idx):
+        def _run(image, combine, *flat):
+            if image is None:
+                return None, "⚠️ Drop an image into the Input box first."
+            per_tab = [flat[i * 5 : (i + 1) * 5] for i in range(num_models)]
+
+            # Single-tab: reuse the rich ultralytics/mediapipe plot (class
+            # labels + confidence baked in by the detector's own plotter).
+            if not combine:
+                model_name, classes_csv, exclude_csv, exclude_mode, confidence = per_tab[
+                    tab_idx
+                ]
+                if not model_name or model_name == "None":
+                    return None, "⚠️ Pick a detector model first."
+                pred, err = _predict(
+                    image, model_name, classes_csv, exclude_csv, exclude_mode, confidence
+                )
+                if err:
+                    return None, f"⚠️ Preview failed: {err}"
+                n = len(pred.bboxes) if pred and pred.bboxes else 0
+                if (pred is None or pred.preview is None) and n == 0:
+                    return None, "ℹ️ No detections."
+                return pred.preview, f"✅ {n} detection(s)."
+
+            # Combined: overlay every configured tab's detections on one
+            # canvas. For SEGMENTATION models we tint the real mask SHAPE (not
+            # just the bbox square) so the analysed part is shown in full;
+            # box-only models fall back to a filled rectangle. Readable labels
+            # (tab# + class name + confidence on a filled background) go on top.
+            from PIL import Image as _PILImage, ImageDraw, ImageFont
+
+            targets = [
+                i for i in range(num_models) if per_tab[i][0] and per_tab[i][0] != "None"
+            ]
+            if not targets:
+                return None, "⚠️ No tab has a detector model selected."
+
+            # Run each tab's detector once; collect its results.
+            results = []  # (tab_idx, color, bboxes, confs, names, masks)
+            summary = []
+            total = 0
+            for i in targets:
+                model_name, classes_csv, exclude_csv, exclude_mode, confidence = per_tab[i]
+                pred, err = _predict(
+                    image, model_name, classes_csv, exclude_csv, exclude_mode, confidence
+                )
+                if err:
+                    summary.append(f"Tab{i + 1}: ERR")
+                    continue
+                bboxes = (pred.bboxes if pred else None) or []
+                results.append(
+                    (
+                        i,
+                        tab_colors[i % len(tab_colors)],
+                        bboxes,
+                        (pred.confidences if pred else None) or [],
+                        getattr(pred, "class_names", None) or [],
+                        (pred.masks if pred else None) or [],
+                    )
+                )
+                total += len(bboxes)
+                summary.append(f"Tab{i + 1}: {len(bboxes)}")
+
+            if total == 0:
+                return (
+                    image.convert("RGB"),
+                    "ℹ️ No detections across tabs — " + " | ".join(summary),
+                )
+
+            # Pass 1: tint each region with its tab colour using the detector's
+            # mask (real seg shape, or bbox rectangle for box-only models) at
+            # ~43% opacity via alpha compositing.
+            canvas = image.convert("RGBA")
+            for _i, color, _bb, _cf, _nm, masks in results:
+                for m in masks:
+                    if m is None:
+                        continue
+                    try:
+                        alpha = m.convert("L").point(lambda v: v * 110 // 255)
+                        tint = _PILImage.new("RGBA", canvas.size, color + (0,))
+                        tint.putalpha(alpha)
+                        canvas = _PILImage.alpha_composite(canvas, tint)
+                    except Exception:  # noqa: BLE001 — cosmetic; skip a bad mask
+                        continue
+            canvas = canvas.convert("RGB")
+
+            # Pass 2: box outline + readable label on top of the tints.
+            draw = ImageDraw.Draw(canvas)
+            fsize = max(15, canvas.height // 45)
+            line_w = max(3, canvas.height // 320)
+            font = None
+            for _fname in ("arialbd.ttf", "arial.ttf", "DejaVuSans-Bold.ttf"):
+                try:
+                    font = ImageFont.truetype(_fname, fsize)
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            if font is None:
+                try:
+                    font = ImageFont.load_default(size=fsize)  # Pillow >= 10.1
+                except Exception:  # noqa: BLE001
+                    font = ImageFont.load_default()
+
+            for i, color, bboxes, confs, names, _masks in results:
+                for j, box in enumerate(bboxes):
+                    x1, y1, x2, y2 = [int(v) for v in box[:4]]
+                    draw.rectangle([x1, y1, x2, y2], outline=color, width=line_w)
+                    cls = names[j] if j < len(names) else f"T{i + 1}"
+                    c = confs[j] if j < len(confs) else None
+                    label = f"{i + 1}:{cls}" + (f" {c:.2f}" if c is not None else "")
+                    tb = draw.textbbox((0, 0), label, font=font)
+                    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+                    ly = y1 - th - 7 if (y1 - th - 7) >= 0 else y1 + 2
+                    draw.rectangle([x1, ly, x1 + tw + 8, ly + th + 7], fill=color)
+                    draw.text((x1 + 4, ly + 3), label, fill=(255, 255, 255), font=font)
+
+            return (
+                canvas,
+                f"✅ {total} detection(s) across {len(targets)} tab(s) — "
+                + " | ".join(summary),
+            )
+
+        return _run
+
+    for i, w in enumerate(all_widgets):
+        inputs = [w.ad_preview_input, w.ad_preview_all_tabs]
+        for t in all_widgets:
+            inputs += [
+                t.ad_model,
+                t.ad_model_classes,
+                t.ad_model_classes_excluded,
+                t.ad_model_classes_exclude,
+                t.ad_confidence,
+            ]
+        w.ad_preview_btn.click(
+            fn=_make_handler(i),
+            inputs=inputs,
+            outputs=[w.ad_preview_output, w.ad_preview_status],
+            queue=False,
+        )
 
 
 # Copy/paste includes EVERY ADetailer arg by default — user explicitly
@@ -1107,17 +1315,24 @@ def one_ui_group(
             csv = ",".join(selected or [])
             return ("" if exclude else csv), (csv if exclude else "")
 
+        # NOTE: deliberately NOT queue=False here. With queue=False each
+        # selection fires an independent, unordered request; selecting two
+        # classes quickly (face then pussy) could let the earlier "face"
+        # response land last and overwrite "face,pussy", silently dropping the
+        # 2nd class. Going through the queue serialises the syncs so the final
+        # value wins. We do NOT add a `.input` handler — adding a Gradio event
+        # handler shifts dependency indices and breaks Forge's gallery JS
+        # (learned the hard way 2026-06-04). Same 2 handlers as before, just
+        # without queue=False → index-safe.
         w.ad_model_classes_dropdown.change(
             _sync_dropdown,
             inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude],
             outputs=[w.ad_model_classes, w.ad_model_classes_excluded],
-            queue=False,
         )
         w.ad_model_classes_exclude.change(
             _sync_dropdown,
             inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude],
             outputs=[w.ad_model_classes, w.ad_model_classes_excluded],
-            queue=False,
         )
 
     with gr.Accordion(
@@ -1265,6 +1480,23 @@ def one_ui_group(
                     scale=0,
                     min_width=200,
                 )
+                # Sits NEXT TO the Run button (user-requested placement: on the
+                # same row, right under the two detection image boxes).
+                # Component only — it has NO event listener of its own (adding
+                # one would shift Gradio dependency indices and break Forge's
+                # gallery); it is read purely as an INPUT by the preview
+                # button's .click, wired later in _wire_detection_previews()
+                # once every tab exists. When on, the button runs EVERY
+                # configured tab's detector on the input image and overlays all
+                # the bounding boxes at once; when off, only this tab's.
+                w.ad_preview_all_tabs = gr.Checkbox(
+                    label="🔁 Combine all tabs",
+                    value=False,
+                    scale=0,
+                    min_width=220,
+                    elem_classes=["ad-preview-combine"],
+                    elem_id=eid("ad_preview_all_tabs"),
+                )
                 # Status line for the "Run detection preview" button.
                 # Uses `.ad-preview-status` (NOT `.ad-preset-status`) because
                 # the messages here are user-facing warnings ("Pick a
@@ -1293,76 +1525,13 @@ def one_ui_group(
     with gr.Group():
         controlnet(w, n, is_img2img, saved)
 
-    # Wire the detection-preview button now that w.ad_confidence and the
-    # class-filter widgets all exist. The handler is closed over
-    # webui_info.model_mapping so it can resolve the dropdown choice to
-    # the on-disk model path.
-    _model_mapping = webui_info.model_mapping
-
-    def _run_detection_preview(
-        image, model_name, classes_csv, exclude_csv, exclude_mode, confidence
-    ):
-        if image is None:
-            return None, "⚠️ Drop an image into the Input box first."
-        if not model_name or model_name == "None":
-            return None, "⚠️ Pick a detector model first."
-        try:
-            if model_name.lower().startswith("mediapipe"):
-                from adetailer.mediapipe import mediapipe_predict
-
-                pred = mediapipe_predict(model_name, image, confidence)
-            else:
-                from adetailer.ultralytics import ultralytics_predict
-
-                path = _model_mapping.get(model_name, "")
-                if not path:
-                    return None, f"⚠️ Model path not found for '{model_name}'."
-
-                # disable_safe_unpickle is a contextmanager defined in
-                # aaaaaa.helper that toggles torch.load weights-only +
-                # cmd_opts.disable_safe_unpickle. Imported lazily because
-                # the preview module is shared with the standalone Gradio
-                # preview which doesn't have modules.shared.
-                try:
-                    from aaaaaa.helper import disable_safe_unpickle
-
-                    cm = disable_safe_unpickle()
-                except Exception:  # noqa: BLE001
-                    from contextlib import nullcontext
-
-                    cm = nullcontext()
-                with cm:
-                    pred = ultralytics_predict(
-                        path,
-                        image=image,
-                        confidence=float(confidence),
-                        device="",
-                        classes=classes_csv or "",
-                        exclude_classes=(
-                            exclude_csv if exclude_mode and exclude_csv else ""
-                        ),
-                    )
-        except Exception as e:  # noqa: BLE001 — surface error to the UI
-            return None, f"⚠️ Preview failed: {e}"
-
-        n_detections = len(pred.bboxes) if pred.bboxes else 0
-        if pred.preview is None and n_detections == 0:
-            return None, "ℹ️ No detections."
-        return pred.preview, f"✅ {n_detections} detection(s)."
-
-    w.ad_preview_btn.click(
-        fn=_run_detection_preview,
-        inputs=[
-            w.ad_preview_input,
-            w.ad_model,
-            w.ad_model_classes,
-            w.ad_model_classes_excluded,
-            w.ad_model_classes_exclude,
-            w.ad_confidence,
-        ],
-        outputs=[w.ad_preview_output, w.ad_preview_status],
-        queue=False,
-    )
+    # The Detection-preview button's .click is wired LATER, in
+    # _wire_detection_previews(), AFTER every tab's widgets exist — so the
+    # per-tab "Combine all tabs" checkbox can feed every tab's detector
+    # settings into one handler and overlay all the boxes on a single image.
+    # This mirrors how _wire_copy_paste / _wire_presets do cross-tab wiring.
+    # Index-safe: still exactly one .click per tab (count unchanged), just
+    # relocated, so Forge's gallery buttons keep their fn_index.
 
     state = gr.State(lambda: state_init(w))
 

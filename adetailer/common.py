@@ -24,6 +24,11 @@ class PredictOutput(Generic[T]):
     masks: list[Image.Image] = field(default_factory=list)
     confidences: list[float] = field(default_factory=list)
     preview: Optional[Image.Image] = None
+    # Per-box class-name strings (parallel to `bboxes`), populated by
+    # ultralytics_predict. Used by the combined multi-tab Detection Preview
+    # to label each box like the single-tab plot. Empty for MediaPipe / when
+    # unavailable. Added at the END so any positional construction is safe.
+    class_names: list[str] = field(default_factory=list)
 
 
 def hf_download(file: str, repo_id: str = REPO_ID, check_remote: bool = True) -> str:
