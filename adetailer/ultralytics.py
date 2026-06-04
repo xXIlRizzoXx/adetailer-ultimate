@@ -96,6 +96,18 @@ def ultralytics_predict(
 
     confidences = pred[0].boxes.conf.cpu().numpy().tolist()
 
+    # Per-box class names (parallel to bboxes/confidences) so the combined
+    # multi-tab Detection Preview can label each box like single mode does.
+    # Cosmetic only — wrapped so a names lookup never breaks prediction.
+    try:
+        _names = get_model_class_names(str(model_path))
+        _cids = pred[0].boxes.cls.cpu().numpy().astype(int).tolist()
+        class_names = [
+            _names[c] if 0 <= c < len(_names) else str(c) for c in _cids
+        ]
+    except Exception:  # noqa: BLE001
+        class_names = []
+
     # When `use_bbox_mask` is on we discard the seg silhouette in favour of
     # the bbox rectangle; clear `pred[0].masks` so `plot()` skips the seg
     # overlay and the saved preview accurately reflects what the inpaint
@@ -112,7 +124,11 @@ def ultralytics_predict(
     preview = Image.fromarray(preview)
 
     return PredictOutput(
-        bboxes=bboxes, masks=masks, confidences=confidences, preview=preview
+        bboxes=bboxes,
+        masks=masks,
+        confidences=confidences,
+        class_names=class_names,
+        preview=preview,
     )
 
 

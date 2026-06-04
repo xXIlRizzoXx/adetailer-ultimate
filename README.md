@@ -81,7 +81,7 @@ Options registered through `on_ui_settings()` in `scripts/!adetailer.py`. Each o
 | Status | Feature | Upstream Bing-su | This fork |
 | :---: | --- | --- | --- |
 | 🟢 | Manual mode | No equivalent — disabling ADetailer means unticking the accordion's enable, which clears the tab's enable checkboxes as a side effect. | `Settings → ADetailer → Manual mode` is a global toggle that short-circuits the `postprocess_image` hook while leaving every widget value intact. Useful when iterating on prompt / seed / sampler between runs without recomputing the ADetailer pass each time. Primary use case is **batch triage**: generate N raw candidates without burning ADetailer time on each, pick the keepers, then disable Manual mode and Generate again to run ADetailer only on the chosen images. |
-| 🟢 | Save intermediate steps | Only the final image (post all ADetailer passes) is saved. | `Settings → ADetailer → Save intermediate steps` writes the after-each-tab images (`*-ad-step-1`, `*-ad-step-2`, …). Pairs naturally with sequential class detection.<br>_Saved into an `adetailer-steps/` sub-folder of the output directory (along with mask previews and the before-image), so the main gallery folder holds only final images — see [Output Folder Layout](#output-folder-layout)._ |
+| 🟢 | Save intermediate steps | Only the final image (post all ADetailer passes) is saved. | `Settings → ADetailer → Save intermediate steps` writes the inpaint output at each stage: one file per tab (`*-ad-step-1`, …) and, inside a sequential-class tab, **one file per class pass** (`*-ad-step-1-1-face`, `*-ad-step-1-2-hands`, …) so each correction is kept separately.<br>_All step images, mask previews and the before-image go into an `adetailer-steps/` sub-folder of the output directory, so the main gallery folder holds only final images — see [Output Folder Layout](#output-folder-layout)._ |
 | 🟢 | Remember last-used settings (toggle) | N/A — no such option exists upstream. | `Settings → ADetailer → Remember last-used settings between restarts` (default on). Gates the per-tab persistence feature listed above: when off, tabs always start with the extension's static defaults; when on, the last `user_state.json` snapshot is restored at boot. |
 | 🟢 | Reset ADetailer settings | There is no built-in way to roll back the entire `Settings → ADetailer` page to its factory defaults short of editing `config.json` manually or wiping it entirely. | New red `🔄 Reset ADetailer settings to defaults` button at the bottom of `Settings → ADetailer`. Walks the WebUI options registry and restores every entry registered under the `ADetailer` section to its declared default in the extension's source, then saves `config.json` and reloads the page. Gated by a JS `confirm()` prompt so a stray click can't wipe everything. Per-tab widget state (`user_state.json`) is left untouched — only Settings-page options are reset. Implementation: `_reset_adetailer_settings()` + `_make_reset_settings_button()` in `scripts/!adetailer.py`. |
 
@@ -213,13 +213,15 @@ Sequential mode is **ignored** for MediaPipe models, in NOT/exclude mode, and wh
 
 **Saved files behaviour with sequential mode:**
 
-- **Mask preview** (`Settings → ADetailer → Save mask previews`) — saved **once per tab**, from the first class pass. Without this rule a tab with 3 selected classes would drop 3 near-identical `*-ad-preview*.png` files in the output folder. The live preview area (the small image in the WebUI gallery during generation) still updates per class so you can watch each pass run.
-- **Intermediate step image** (`Settings → ADetailer → Save intermediate steps`) — saved once per tab, after all class passes complete (unchanged: the outer save loop is per-tab, not per-class).
-- **Before-ADetailer image** (`Settings → ADetailer → Save images before ADetailer`) — saved once per generation, unchanged.
+- **Mask preview** (`Settings → ADetailer → Save mask previews`) — saved **once per class pass**, labelled by class: `…-ad-preview-1-1-face.png`, `…-ad-preview-1-2-hands.png`, … So every correction has its own preview, matching the step images below. (Non-sequential tabs keep one preview per tab, `…-ad-preview-1.png`, `…-ad-preview-2.png`, … — cardinal, pairing with `…-ad-step-1.png`, `…-ad-step-2.png`.)
+- **Intermediate step image** (`Settings → ADetailer → Save intermediate steps`) — saved **once per class pass**, so you keep a copy of the image after each correction. A face→hands sequential tab produces `…-ad-step-1-1-face.png` (face fixed) and `…-ad-step-1-2-hands.png` (face+hands), letting you roll back to the face-only result if the hands pass spoils something. The suffix is `-ad-step-<tab>-<pass>-<class>`. (Non-sequential tabs keep the single per-tab `…-ad-step-<tab>.png`.)
+- **Before-ADetailer image** (`Settings → ADetailer → Save images before ADetailer`) — saved once per generation, unchanged: the raw image before any ADetailer pass.
+
+So with all three toggles on, a face→hands sequential tab gives you, in `adetailer-steps/`, the full progression per correction: the raw `-ad-before`, then for each class a matched `-ad-preview-1-N-<class>` (detected boxes) + `-ad-step-1-N-<class>` (result after that correction). Because they all live in the `adetailer-steps/` sub-folder, the per-class previews no longer clutter the main gallery folder.
 
 **Skip / Interrupt mid-sequential rolls back the tab:**
 
-If you press **Skip** or **Interrupt** while a sequential pass is running — for instance, after seeing class 1 (face) succeed but class 2 (hand) produce a bad result — the entire tab is rolled back. `pp.image` is restored to the pre-sequential state, no `*-ad-step-N.png` is saved for that tab, and the final image saved by the WebUI is the untouched original. The terminal logs `[-] ADetailer: sequential class pass on tab N was skipped — rolled back to the pre-sequential image.` so you can confirm what happened.
+If you press **Skip** or **Interrupt** while a sequential pass is running — for instance, after seeing class 1 (face) succeed but class 2 (hand) produce a bad result — the entire tab is rolled back. `pp.image` is restored to the pre-sequential state and the final image saved by the WebUI is the untouched original. The terminal logs `[-] ADetailer: sequential class pass on tab N was skipped — rolled back to the pre-sequential image.` so you can confirm what happened. (If `Save intermediate steps` is on, the step files written for the classes that *did* complete before the skip remain in `adetailer-steps/` — they document what ran; only the final gallery image is rolled back.)
 
 The rollback only applies to the sequential code path. Pressing Skip during a single-class tab or with `Process classes sequentially` off behaves as before (the inpaint stops where it is, partial result kept).
 
@@ -281,6 +283,8 @@ Tucked inside an accordion at the bottom of each tab: a **Run detection preview*
 
 Useful for tuning confidence threshold + mask preprocessing without burning a full generation each time.
 
+**Combine all tabs.** Next to the Run button is a **🔁 Combine all tabs** checkbox. With it off, the preview runs only the current tab's detector (the detector's own rich plot, with class names + confidence). With it **on**, the button runs **every configured tab's detector** on the dropped image and overlays all results on one image at once — each tab's regions tinted in its own colour following the real segmentation shape (or the bounding box for box-only models), labelled `tab#:class confidence`. The status line summarises per tab, e.g. `3 detection(s) across 2 tab(s) — Tab1: 2 | Tab2: 1`. Handy for seeing at a glance what your whole multi-tab setup will catch on a given image before committing to a full generation. (No event listener is added for this — the checkbox is read by the existing preview button — so it stays compatible with the host WebUI's gallery wiring.)
+
 ## Manual Mode
 
 `Settings → ADetailer → Manual mode` is a global toggle. When on, ADetailer's `postprocess_image` short-circuits — no detection, no inpainting — even if the accordion is enabled and tabs are configured. All widget values stay intact. Flip it back off and the next generation runs ADetailer as usual.
@@ -289,9 +293,12 @@ The use case is iteration on prompt / sampler / seed without recomputing the ADe
 
 ## Save Intermediate Steps
 
-`Settings → ADetailer → Save intermediate steps`, off by default. When on, each tab's inpaint output is saved as a separate file (`*-ad-step-1`, `*-ad-step-2`, …). Each step image is the cumulative output of all tabs up to and including that one.
+`Settings → ADetailer → Save intermediate steps`, off by default. When on, the inpaint output is saved as a separate file at each stage:
 
-This pairs naturally with sequential class detection — you can inspect what each class pass produced individually.
+- **Across tabs** — one file per tab (`*-ad-step-1`, `*-ad-step-2`, …), each the cumulative output of all tabs up to and including that one.
+- **Within a sequential-class tab** — one file per class pass (`*-ad-step-1-1-face`, `*-ad-step-1-2-hands`, …), so you keep the image after each individual correction, not just the tab's final state.
+
+This is what lets you roll back by hand: if the second correction spoils something, the file from after the first correction is still on disk. All step files live in the `adetailer-steps/` sub-folder (see [Output Folder Layout](#output-folder-layout)).
 
 ## Output Folder Layout
 
@@ -299,14 +306,17 @@ Every **non-final** image ADetailer produces is written to an **`adetailer-steps
 
 ```
 txt2img-images/2026-06-03/
-├── 00123-1234567890.png          ← final image (saved by the WebUI)
-├── 00124-1234567891.png          ← final image
+├── 00123-1234567890.png            ← final image (saved by the WebUI)
+├── 00124-1234567891.png            ← final image
 └── adetailer-steps/
-    ├── …-ad-before.png           ← "Save images before ADetailer"
-    ├── …-ad-preview.png          ← "Save mask previews"
-    ├── …-ad-step-1.png           ← "Save intermediate steps" (tab 1 / class 1)
-    └── …-ad-step-2.png           ← "Save intermediate steps" (tab 2 / class 2)
+    ├── …-ad-before.png             ← "Save images before ADetailer" (raw, pre-ADetailer)
+    ├── …-ad-preview-1-1-face.png   ← "Save mask previews" — boxes for the face pass
+    ├── …-ad-step-1-1-face.png      ← "Save intermediate steps" — after the face pass
+    ├── …-ad-preview-1-2-hands.png  ← "Save mask previews" — boxes for the hands pass
+    └── …-ad-step-1-2-hands.png     ← "Save intermediate steps" — after the hands pass (= final)
 ```
+
+(For a non-sequential tab the files are simply `…-ad-preview-1.png` / `…-ad-step-1.png` — cardinal per-tab; sequential tabs use the per-class `-<tab>-<pass>-<class>` form shown above, so each preview pairs with its step.)
 
 Which of those three file types actually appear depends on the matching `Settings → ADetailer` toggle (`Save mask previews`, `Save images before ADetailer`, `Save intermediate steps`) — the sub-folder only changes **where** they go, never **whether** they're saved. If you've set a custom `Output directory for adetailer images`, the `adetailer-steps/` folder is created inside that instead. If the sub-folder can't be created (e.g. a read-only mount), ADetailer falls back to saving flat in the parent folder and logs a warning rather than dropping the image.
 

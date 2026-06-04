@@ -1,6 +1,27 @@
 # Changelog
 
-## Unreleased — 2026-06-03 (ADetailer extra images go to an `adetailer-steps/` sub-folder)
+## v26.3.0+plus.3 — 2026-06-04 (Combined multi-tab detection preview + per-class preview naming)
+
+**Combined multi-tab detection preview.** The "Detection preview (no inpaint)" accordion gains a per-tab **🔁 Combine all tabs** checkbox, next to the Run button. When enabled, the preview runs **every configured tab's detector** on the dropped image and overlays all results on a single image: each tab's regions are tinted in its own colour following the real segmentation shape (or the bounding box for box-only models), with readable labels (`tab#:class confidence`) on a filled background — matching the single-tab plot's legibility. With the checkbox off, the button behaves exactly as before (current tab only, the detector's own rich plot). The status line summarises per tab, e.g. `3 detection(s) across 2 tab(s) — Tab1: 2 | Tab2: 1`.
+
+Implemented index-safe: the per-tab preview `.click` is wired in a post-loop helper (`_wire_detection_previews`, alongside the existing copy/paste and preset cross-tab wiring), so the total Gradio event-listener count is unchanged and the host UI's gallery button bindings are untouched. The checkbox is a plain input with no listener of its own. A new `class_names` field on `PredictOutput` (populated by `ultralytics_predict`, cosmetic and try/except-guarded) carries per-box class names so the combined overlay can label like single mode.
+
+**Per-class preview file naming aligned with steps.** In a non-sequential tab the saved mask preview now uses a cardinal suffix (`-ad-preview-1`, `-ad-preview-2`, …) that pairs with its step file (`-ad-step-1`, `-ad-step-2`, …); previously the preview used an ordinal suffix (`-ad-preview-2nd`) that didn't line up. Sequential per-class names (`-ad-preview-<tab>-<pass>-<class>`) are unchanged.
+
+## v26.3.0+plus.3 — 2026-06-03 (Sequential mode: one preview AND one step image per correction)
+
+In a sequential-class tab, **both** the mask preview and the intermediate step image are now saved **per class pass**, with matching labels:
+
+- `…-ad-preview-1-1-face.png` + `…-ad-step-1-1-face.png` (face pass)
+- `…-ad-preview-1-2-hands.png` + `…-ad-step-1-2-hands.png` (hands pass)
+
+So a single sequential generation records the full progression per correction: raw (`-ad-before`) → for each class, detection boxes (`-ad-preview-…`) + result after that correction (`-ad-step-…`). You can roll back by hand to the face-only result if the hands pass spoils something.
+
+This **supersedes** the 2026-05-28 "one preview per tab" behaviour: per-class previews were briefly collapsed to a single file to avoid cluttering the output folder, but now that every extra image lives in the `adetailer-steps/` sub-folder the clutter concern is gone, and per-class previews are more useful (you see each pass). Non-sequential tabs are unchanged (one `…-ad-preview.png` / `…-ad-step-<tab>.png` per tab). The per-tab step save is skipped for sequential tabs to avoid duplicating the last class's result; the `_will_run_sequential()` helper keeps the inner branch and the outer save loop in sync.
+
+This also clears up a confusing impression that sequential mode "skipped" later corrections: it never did — each class was always detected and inpainted — but with only one preview and one step image per tab there was no on-disk evidence of the intermediate passes. There now is.
+
+## v26.3.0+plus.3 — 2026-06-03 (ADetailer extra images go to an `adetailer-steps/` sub-folder)
 
 Every **non-final** ADetailer image — mask previews (`-ad-preview`), the pre-ADetailer image (`-ad-before`), and the per-pass intermediate steps (`-ad-step-N`) — is now written to an `adetailer-steps/` sub-folder **inside** the normal output directory, instead of being dropped alongside the final images. The main gallery folder (e.g. `txt2img-images/2026-06-03/`) now contains **only the final results**; everything ADetailer produces along the way lands in `txt2img-images/2026-06-03/adetailer-steps/`.
 
@@ -8,11 +29,11 @@ This applies to whichever of the three Settings toggles you have on (`Save mask 
 
 Implementation: `Script.save_image` resolves `<output dir>/adetailer-steps`, `mkdir(parents=True, exist_ok=True)` (idempotent), and passes that as the save `path`. The final image is saved by the WebUI's own pipeline and never goes through `save_image`, so it's untouched. If the sub-folder can't be created (permissions / read-only mount) the save falls back to the flat parent dir and logs a stderr warning rather than losing the image. Sub-folder name is the module constant `AD_EXTRA_SUBDIR`.
 
-## Unreleased — 2026-05-28 (Sequential-class polish: one preview per tab + Skip rollback)
+## v26.3.0+plus.3 — 2026-05-28 (Sequential-class polish: preview handling + Skip rollback)
 
 Two user-reported papercuts fixed in `scripts/!adetailer.py::_postprocess_image_inner`:
 
-1. **One preview per tab when `Process classes sequentially` is on** — the recursive design dispatched one inner call per selected class, and each call independently honoured the `ad_save_previews` Settings toggle. With three classes selected, you ended up with three `*-ad-preview*.png` files (auto-numbered by the WebUI to avoid filename collisions) for a single tab. The intermediate-step / before-image saves were already 1-per-tab; only the mask preview misbehaved. New behaviour: the preview is saved on the **first** class pass only — subsequent classes still update the live preview area (`shared.state.assign_current_image`) so you watch each pass run, but they don't litter the output folder. Implementation: new private kwarg `_seq_sub_pass: bool = False` on `_postprocess_image_inner`, set to `True` for every class after the first; the disk preview save is gated on `not _seq_sub_pass`.
+1. **Per-class preview saving** — ⚠️ **SUPERSEDED by the 2026-06-03 entry above.** This release briefly collapsed sequential previews to one file per tab (to avoid cluttering the output folder); 2026-06-03 reverts that to one preview *per class pass* (labelled by class) now that all extra images live in the `adetailer-steps/` sub-folder. The `_seq_sub_pass` kwarg introduced here was replaced by `_seq_label`.
 
 2. **Skip mid-sequential now rolls back to the pre-sequential image** — pressing Skip / Interrupt while class 2 of 3 was running used to leave `pp.image` with class 1's work baked in. The outer `postprocess_image` then saved that partial result as `*-ad-step-N.png` (if `ad_save_intermediate_steps` was on) and Forge auto-saved it as the final image. From the user's standpoint they'd just asked to discard the run, so a half-finished image leaking through was confusing. New behaviour: the sequential branch now snapshots `pp.image` before the class loop. If `state.skipped` or `state.interrupted` triggers at any point during the loop (or even on the LAST class's inpaint return), the snapshot is restored and the function returns `False`. The outer loop then sees `tab_processed=False`, skips the step save, and Forge saves the original untouched image. Terminal log line: `"[-] ADetailer: sequential class pass on tab N was skipped — rolled back to the pre-sequential image."`
 

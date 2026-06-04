@@ -1084,6 +1084,24 @@ class AfterDetailerScript(scripts.Script):
         extra_params = self.extra_params(arg_list)
         p.extra_generation_params.update(extra_params)
 
+    @staticmethod
+    def _will_run_sequential(args: ADetailerArgs) -> bool:
+        """True when the sequential-class branch in `_postprocess_image_inner`
+        will engage for these args: sequential ON, a multiclass include
+        filter (>1 class), and neither MediaPipe nor exclude/NOT mode.
+
+        Kept byte-for-byte in sync with that branch's guard so the outer save
+        loop can decide whether step images are saved per-class (inside the
+        branch) or per-tab (the normal path) — and avoid saving both.
+        """
+        if (
+            not args.ad_classes_sequential
+            or args.is_mediapipe()
+            or args.ad_model_classes_exclude
+        ):
+            return False
+        return len(parse_csv(args.ad_model_classes)) > 1
+
     def _postprocess_image_inner(
         self,
         p,
@@ -1091,7 +1109,7 @@ class AfterDetailerScript(scripts.Script):
         args: ADetailerArgs,
         *,
         n: int = 0,
-        _seq_sub_pass: bool = False,
+        _seq_label: str | None = None,
     ) -> bool:
         """
         Returns
@@ -1102,13 +1120,14 @@ class AfterDetailerScript(scripts.Script):
 
         Parameters
         ----------
-        _seq_sub_pass : bool
-            Internal flag set to `True` when this call is a sub-pass dispatched
-            by the sequential-class branch (every class but the first). Used to
-            suppress the per-class mask preview save so the output folder ends
-            up with at most ONE preview per tab instead of N (one per class).
-            The live preview area still updates per-class via
-            `shared.state.assign_current_image`.
+        _seq_label : str | None
+            Set by the sequential-class branch to a per-class label like
+            ``"1-face"`` (1-based pass index + sanitised class name). When
+            present, this call's mask preview is saved with that label in its
+            filename, so EACH class pass produces its own preview file and the
+            names line up with the per-class step images. ``None`` for normal /
+            non-sequential calls, which keep the original per-tab preview
+            suffix.
         """
         if state.interrupted or state.skipped:
             return False
@@ -1159,15 +1178,33 @@ class AfterDetailerScript(scripts.Script):
                         if neg:
                             update["ad_negative_prompt"] = neg
                     sub_args = args.copy(update=update)
-                    # `_seq_sub_pass=True` for every class AFTER the first
-                    # — suppresses the per-class preview save so a tab
-                    # produces ONE preview file (the first class's) rather
-                    # than N. Step-image / before-image saves happen in the
-                    # outer postprocess_image, after the whole sequential
-                    # finishes, so they're already 1-per-tab.
-                    is_processed |= self._postprocess_image_inner(
-                        p, pp, sub_args, n=n, _seq_sub_pass=(idx > 0)
+                    # Per-class label shared by this pass's preview AND step
+                    # files so their names line up: e.g. preview
+                    # "-ad-preview-1-1-face" pairs with step "-ad-step-1-1-face".
+                    safe_cls = re.sub(r"[^\w-]", "_", cls) or f"c{idx + 1}"
+                    seq_label = f"{idx + 1}-{safe_cls}"
+                    # Each class is a full detect+inpaint pass. `_seq_label`
+                    # makes the child save THIS class's mask preview (one
+                    # preview per pass, not one per tab).
+                    cls_processed = self._postprocess_image_inner(
+                        p, pp, sub_args, n=n, _seq_label=seq_label
                     )
+                    is_processed |= cls_processed
+                    # Save the cumulative image AFTER this class pass, so the
+                    # user keeps one copy per correction — e.g. face-only,
+                    # then face+hands — not just the tab's final result.
+                    # Gated by the "Save intermediate steps" toggle. The outer
+                    # postprocess_image loop skips its per-tab step save for
+                    # sequential tabs (see `_will_run_sequential`), so these
+                    # per-class files are the single source of steps and
+                    # nothing is duplicated.
+                    if cls_processed and not is_skip_img2img(p):
+                        self.save_image(
+                            p,
+                            pp.image,
+                            condition="ad_save_intermediate_steps",
+                            suffix=f"-ad-step-{n + 1}-{seq_label}",
+                        )
 
                 # Late-skip catch: the last class's inpaint loop may have
                 # set state.skipped after returning. Treat that the same
@@ -1219,19 +1256,25 @@ class AfterDetailerScript(scripts.Script):
         masks = self.pred_preprocessing(p, pred, args)
         shared.state.assign_current_image(pred.preview)
 
-        # Skip the disk preview save when we're a sub-pass of a sequential
-        # class loop (every class but the first). Saving once per class
-        # would litter the output folder with N near-identical files; the
-        # first class's preview already documents "the detector found these
-        # bboxes" for the tab. Live preview area (assign_current_image
-        # above) still updates per class so the user sees each pass.
-        if not _seq_sub_pass:
-            self.save_image(
-                p,
-                pred.preview,
-                condition="ad_save_previews",
-                suffix="-ad-preview" + suffix(n, "-"),
-            )
+        # Save the mask preview. In a sequential-class run each pass saves
+        # its OWN preview (labelled by class via `_seq_label`) so the user
+        # gets one preview per correction — matching the per-class step
+        # images. Non-sequential calls use a CARDINAL per-tab suffix so the
+        # preview file PAIRS with its step file: `-ad-preview-N` lines up with
+        # `-ad-step-N` (previously the ordinal `suffix()` gave `-ad-preview-2nd`
+        # against `-ad-step-2`, which didn't match). Everything lands in the
+        # adetailer-steps/ sub-folder, so per-class previews no longer clutter
+        # the main gallery folder.
+        if _seq_label is not None:
+            preview_suffix = f"-ad-preview-{n + 1}-{_seq_label}"
+        else:
+            preview_suffix = f"-ad-preview-{n + 1}"
+        self.save_image(
+            p,
+            pred.preview,
+            condition="ad_save_previews",
+            suffix=preview_suffix,
+        )
 
         steps = len(masks)
         processed = None
@@ -1313,7 +1356,15 @@ class AfterDetailerScript(scripts.Script):
                 # Save the image right after THIS tab finished its inpaint
                 # pass(es), so the user gets one file per ADetailer stage and
                 # can roll back to a previous one if the next pass spoils it.
-                if tab_processed and not is_skip_img2img(p):
+                # Sequential-class tabs are EXCLUDED here: they already save
+                # one step image per class inside `_postprocess_image_inner`,
+                # and the last of those equals this tab's final image — saving
+                # again would just duplicate it.
+                if (
+                    tab_processed
+                    and not is_skip_img2img(p)
+                    and not self._will_run_sequential(args)
+                ):
                     self.save_image(
                         p,
                         pp.image,
