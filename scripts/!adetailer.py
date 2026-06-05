@@ -1632,7 +1632,7 @@ def on_ui_settings():
             label="Remember last-used settings between restarts",
             section=section,
         ).info(
-            "When enabled, ADetailer's tab settings (detector, prompts, denoise, padding, etc.) are saved on every Generate click and restored at the next WebUI start. Cache file: extensions/<this-extension>/user_state.json. Disable to always start with the extension's defaults."
+            "When enabled, ADetailer's tab settings (detector, prompts, denoise, padding, etc.) are saved on every Generate click and restored at the next WebUI start. Cache file: extensions/&lt;this-extension&gt;/user_state.json. Disable to always start with the extension's defaults."
         ),
     )
 
