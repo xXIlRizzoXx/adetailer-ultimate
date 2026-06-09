@@ -1275,7 +1275,7 @@ def one_ui_group(
                 elem_id=eid("ad_model_classes_dropdown"),
             )
 
-        with gr.Row(variant="compact"):
+        with gr.Row(variant="compact", elem_classes=["ad-2up-row"]):
             w.ad_model_classes_exclude = gr.Checkbox(
                 label="Exclude selected (NOT)" + suffix(n),
                 value=sv("ad_model_classes_exclude", False),
@@ -1408,7 +1408,7 @@ def one_ui_group(
                 elem_id=eid("ad_class_prompts"),
             )
 
-        with gr.Row(variant="compact"):
+        with gr.Row(variant="compact", elem_classes=["ad-2up-row"]):
             w.ad_use_main_loras = gr.Checkbox(
                 label="Use LoRAs from main prompt" + suffix(n),
                 value=sv("ad_use_main_loras", False),
@@ -1574,7 +1574,7 @@ def detection(
     eid = partial(elem_id, n=n, is_img2img=is_img2img)
     sv = partial(_sv, saved or {})
 
-    with gr.Row():
+    with gr.Row(elem_classes=["ad-2col-row"]):
         with gr.Column(variant="compact"):
             w.ad_confidence = gr.Slider(
                 label="Detection model confidence threshold" + suffix(n),
@@ -1631,7 +1631,7 @@ def mask_preprocessing(
     sv = partial(_sv, saved or {})
 
     with gr.Group():
-        with gr.Row():
+        with gr.Row(elem_classes=["ad-2col-row"]):
             with gr.Column(variant="compact"):
                 w.ad_x_offset = gr.Slider(
                     label="Mask x(→) offset" + suffix(n),
@@ -1697,7 +1697,7 @@ def inpainting(  # noqa: PLR0915
     sv = partial(_sv, saved or {})
 
     with gr.Group():
-        with gr.Row():
+        with gr.Row(elem_classes=["ad-2up-row"]):
             w.ad_mask_blur = gr.Slider(
                 label="Inpaint mask blur" + suffix(n),
                 minimum=0,
@@ -1718,7 +1718,7 @@ def inpainting(  # noqa: PLR0915
                 elem_id=eid("ad_denoising_strength"),
             )
 
-        with gr.Row():
+        with gr.Row(elem_classes=["ad-2col-row"]):
             with gr.Column(variant="compact"):
                 w.ad_inpaint_only_masked = gr.Checkbox(
                     label="Inpaint only masked" + suffix(n),
@@ -1807,7 +1807,7 @@ def inpainting(  # noqa: PLR0915
                     queue=False,
                 )
 
-        with gr.Row():
+        with gr.Row(elem_classes=["ad-2col-row"]):
             with gr.Column(variant="compact"):
                 w.ad_use_steps = gr.Checkbox(
                     label="Use separate steps" + suffix(n),
@@ -1858,7 +1858,7 @@ def inpainting(  # noqa: PLR0915
                     queue=False,
                 )
 
-        with gr.Row():
+        with gr.Row(elem_classes=["ad-2col-row"]):
             with gr.Column(variant="compact"):
                 w.ad_use_checkpoint = gr.Checkbox(
                     label="Use separate checkpoint" + suffix(n),
@@ -1917,7 +1917,7 @@ def inpainting(  # noqa: PLR0915
             if _saved_sampler not in sampler_names:
                 _saved_sampler = sampler_names[1]
 
-            with gr.Row():
+            with gr.Row(elem_classes=["ad-2up-row"]):
                 w.ad_sampler = gr.Dropdown(
                     label="ADetailer sampler" + suffix(n),
                     choices=sampler_names,
@@ -1949,7 +1949,7 @@ def inpainting(  # noqa: PLR0915
                     queue=False,
                 )
 
-        with gr.Row():
+        with gr.Row(elem_classes=["ad-2col-row"]):
             with gr.Column(variant="compact"):
                 w.ad_use_noise_multiplier = gr.Checkbox(
                     label="Use separate noise multiplier" + suffix(n),

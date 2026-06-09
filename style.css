@@ -199,6 +199,24 @@ div.block.ad-preview-status {
     margin-top: 10px !important;
 }
 
+/* General breathing room for the two-up rows in Detection / Mask
+ * Preprocessing / Inpainting (user-requested 2026-06-05 "spazia tutto un
+ * po"). `ad-2col-row` = rows built from two compact gr.Column; `ad-2up-row`
+ * = rows with two widgets placed directly (mask-blur/denoising,
+ * sampler/scheduler). Both get a horizontal gap between the two halves plus
+ * a little space below; the column variant also gets a vertical gap between
+ * its stacked controls. ControlNet (`ad-cn-row`) joins the horizontal-gap
+ * rule so its two columns line up the same way. Light values on purpose. */
+.ad-2col-row,
+.ad-2up-row,
+.ad-cn-row {
+    gap: 16px !important;
+    margin-bottom: 6px !important;
+}
+.ad-2col-row > div > div + div {
+    margin-top: 8px !important;
+}
+
 /* Small vertical gap between consecutive prompt textboxes
  * (ad_prompt, ad_prompt_append, ad_negative_prompt,
  * ad_negative_prompt_append). The first row is unaffected — only
