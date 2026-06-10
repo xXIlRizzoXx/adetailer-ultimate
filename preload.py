@@ -9,11 +9,23 @@ def preload(parser: argparse.ArgumentParser):
     # extension scan, which is the only window early enough to suppress it.
     _suppress_forge_neo_outdated_nudge()
 
-    parser.add_argument(
-        "--ad-no-huggingface",
-        action="store_true",
-        help="Don't use adetailer models from huggingface",
-    )
+    # Guarded since 2026-06-10 (community issue #1): when another
+    # ADetailer-family extension (the original Bing-su adetailer, a fork,
+    # ADetailer-Neo, ...) is installed alongside this one, BOTH preloads
+    # register --ad-no-huggingface and argparse raises ArgumentError on the
+    # second registration — the webui then prints a scary
+    # "Error running preload()" traceback at startup. The flag means the
+    # same thing in every variant, so reusing the existing registration is
+    # correct. (Running two ADetailers remains unsupported — they still
+    # duplicate the UI — but it must not crash the startup.)
+    try:
+        parser.add_argument(
+            "--ad-no-huggingface",
+            action="store_true",
+            help="Don't use adetailer models from huggingface",
+        )
+    except argparse.ArgumentError:
+        pass
 
 
 def _suppress_forge_neo_outdated_nudge() -> None:
