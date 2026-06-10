@@ -1,5 +1,9 @@
 # Changelog
 
+## v26.3.0+plus.3 — 2026-06-10 (Coexistence guard: no more preload error next to another ADetailer)
+
+**Startup no longer errors when another ADetailer-family extension is installed.** When this fork sits in `extensions/` alongside the original ADetailer (or another variant), both extensions register the same `--ad-no-huggingface` launch option and the second one to load raised an `Error running preload()` traceback at WebUI startup (reported in issue #1). The registration is now guarded: if the option already exists, the existing one is reused. Running two ADetailer variants at once remains unsupported — they duplicate the accordion and compete over the same pipeline — so keep only one and move the other out of `extensions/` as a backup. The README's Install section now states this explicitly.
+
 ## v26.3.0+plus.3 — 2026-06-04 (Combined multi-tab detection preview + per-class preview naming)
 
 **Combined multi-tab detection preview.** The "Detection preview (no inpaint)" accordion gains a per-tab **🔁 Combine all tabs** checkbox, next to the Run button. When enabled, the preview runs **every configured tab's detector** on the dropped image and overlays all results on a single image: each tab's regions are tinted in its own colour following the real segmentation shape (or the bounding box for box-only models), with readable labels (`tab#:class confidence`) on a filled background — matching the single-tab plot's legibility. With the checkbox off, the button behaves exactly as before (current tab only, the detector's own rich plot). The status line summarises per tab, e.g. `3 detection(s) across 2 tab(s) — Tab1: 2 | Tab2: 1`.

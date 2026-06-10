@@ -9,6 +9,8 @@
 > This fork is distributed under the same AGPL-3.0 license as the upstream. See `LICENSE.md` for the full text; Bing-su's copyright notices are intact.
 >
 > If you only need single-class face/hand detection, use upstream ADetailer instead — the additional widgets in this fork are harmless but unnecessary for that case.
+>
+> **Quick start:** jump to [Install](#install).
 
 ---
 
@@ -123,6 +125,8 @@ Candidate items that are not in `main` yet. None is committed to a release date 
 ADetailer is an extension for the stable diffusion webui that does automatic masking and inpainting. It is similar to the Detection Detailer.
 
 ## Install
+
+> **⚠️ Run only ONE ADetailer.** This fork is a complete replacement for the original ADetailer — don't run both. If you already have `adetailer` (the original), `ADetailer-Neo` or another ADetailer-family extension in your `extensions/` folder, **move that folder somewhere outside `extensions/` first**, keeping it as a backup you can restore at any time. With two ADetailer variants installed at once the accordion shows up twice, and older builds printed an `Error running preload()` traceback at startup (both variants register the same `--ad-no-huggingface` launch option — current builds of this fork tolerate it, but running two copies remains unsupported).
 
 You can install it directly from the Extensions tab.
 
