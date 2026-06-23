@@ -251,6 +251,21 @@ def on_generate_click(
     # don't overwrite each other. Never raise — see adetailer.persistence
     # for the swallowed-error policy.
     save_tab_state(mode, tab_index, state)
+    # Diagnostic log (console) — show exactly what each active tab persisted on
+    # this Generate, so saved settings are visible/auditable in the log (paired
+    # with the restore log in one_ui_group). Only logs tabs with a real
+    # detector to avoid noise. Plain print → index-safe.
+    if state.get("ad_model") and state.get("ad_model") != "None":
+        _cls = (
+            state.get("ad_model_classes_excluded")
+            if state.get("ad_model_classes_exclude")
+            else state.get("ad_model_classes")
+        )
+        _mode_word = "NOT/exclude" if state.get("ad_model_classes_exclude") else "include"
+        print(
+            f"[-] ADetailer: saved tab {tab_index + 1} ({mode}) — "
+            f"detector={state.get('ad_model')!r}, classes[{_mode_word}]={_cls!r}"
+        )
     return state
 
 
@@ -1300,6 +1315,26 @@ def one_ui_group(
             else:
                 _dd_choices = []
                 _dd_value = []
+
+            # Diagnostic log (console) — surfaces, at every UI build / WebUI
+            # restart, exactly which detector + classes each tab restored from
+            # user_state.json. Confirms persistence is working and, crucially,
+            # flags when a SAVED detector is no longer present in the current
+            # model list (so it fell back to the default) — the usual reason a
+            # tab "resets" on restart. Plain print → index-safe.
+            _saved_model_raw = saved.get("ad_model")
+            if _saved_model_raw and _saved_model_raw != _saved_model:
+                print(
+                    f"[-] ADetailer: tab {n + 1} — saved detector "
+                    f"{_saved_model_raw!r} is NOT in the current model list; "
+                    f"fell back to {_saved_model!r}. (saved classes: "
+                    f"{_wanted_classes!r})"
+                )
+            elif _saved_model_raw and _saved_model_raw != "None":
+                print(
+                    f"[-] ADetailer: tab {n + 1} restored — detector="
+                    f"{_saved_model!r}, classes={_dd_value!r}"
+                )
 
             # UI-only dropdown: not in ALL_ARGS. It syncs into ad_model_classes
             # (CSV) for the include path or ad_model_classes_excluded for exclude.
