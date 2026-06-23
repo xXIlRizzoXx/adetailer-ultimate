@@ -1603,6 +1603,25 @@ def one_ui_group(
     with gr.Group():
         controlnet(w, n, is_img2img, saved)
 
+    # Opt every persistence-managed widget OUT of the host WebUI's
+    # ui-config.json. Forge/A1111's modules/ui_loadsave.py tracks each
+    # labelled component BY LABEL and, on every restart, OVERRIDES its value
+    # with whatever it froze in ui-config.json — which silently defeated
+    # "Remember last-used settings": it forced the detector back to the first
+    # model (e.g. face_yolov8n.pt) and emptied the CLASSES dropdown, no matter
+    # what user_state.json had saved. ui_loadsave honours a per-component
+    # `do_not_save_to_config` flag (ui_loadsave.py: `if getattr(obj,
+    # "do_not_save_to_config", False): return`), so setting it makes our
+    # persistence the single source of truth for these widgets. Covers all
+    # ALL_ARGS widgets (detector, classes textboxes, confidence, prompts,
+    # denoise, …) plus the UI-only visible classes dropdown. Plain attribute
+    # set → NO Gradio listener added → index-safe.
+    for _persisted in (*w.tolist(), w.ad_model_classes_dropdown):
+        try:
+            _persisted.do_not_save_to_config = True
+        except Exception:  # noqa: BLE001 — never break UI build over a flag
+            pass
+
     # The Detection-preview button's .click is wired LATER, in
     # _wire_detection_previews(), AFTER every tab's widgets exist — so the
     # per-tab "Combine all tabs" checkbox can feed every tab's detector
