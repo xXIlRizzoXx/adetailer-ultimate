@@ -1258,6 +1258,48 @@ def one_ui_group(
                 visible=False,
                 elem_id=eid("ad_model_classes"),
             )
+            # Restore the saved class filter into the VISIBLE dropdown on load.
+            # The dropdown is UI-only (not in ALL_ARGS): its backing values live
+            # in the hidden ad_model_classes / ad_model_classes_excluded
+            # textboxes, which ARE restored from user_state.json. But Gradio
+            # `.change` events don't fire on initial render, so on_ad_model_update
+            # never runs at startup — leaving this dropdown empty even though the
+            # filter was saved. Worse, the first interaction could then sync the
+            # empty dropdown back over the restored textbox, silently wiping the
+            # user's classes. Fix: pre-seed `choices`/`value` here from the saved
+            # model + saved selection so the filter is visible AND preserved
+            # across restarts. Only does work when a class filter was actually
+            # saved (face-only users pay nothing). Index-safe: this only changes
+            # an existing widget's initial values — no event listener is added.
+            _saved_exclude = bool(sv("ad_model_classes_exclude", False))
+            _saved_classes_csv = (
+                sv("ad_model_classes_excluded", "")
+                if _saved_exclude
+                else sv("ad_model_classes", "")
+            )
+            _wanted_classes = [
+                c.strip() for c in (_saved_classes_csv or "").split(",") if c.strip()
+            ]
+            _dd_choices: list[str] = []
+            _dd_value: list[str] = []
+            if (
+                _wanted_classes
+                and _saved_model
+                and _saved_model != "None"
+                and not _saved_model.lower().startswith("mediapipe")
+                and "-world" not in _saved_model
+            ):
+                _model_path = webui_info.model_mapping.get(_saved_model, "")
+                _names = get_model_class_names(_model_path) if _model_path else []
+                if _names:
+                    _dd_choices = _names
+                    _dd_value = [c for c in _wanted_classes if c in _names]
+                else:
+                    # Couldn't resolve the model's full class list — at least show
+                    # the saved tokens so the selection stays valid and visible.
+                    _dd_choices = list(_wanted_classes)
+                    _dd_value = list(_wanted_classes)
+
             # UI-only dropdown: not in ALL_ARGS. It syncs into ad_model_classes
             # (CSV) for the include path or ad_model_classes_excluded for exclude.
             # Info text added 2026-05-18 per user UX feedback: the dropdown is
@@ -1268,8 +1310,8 @@ def one_ui_group(
             w.ad_model_classes_dropdown = gr.Dropdown(
                 label="ADetailer detector CLASSES" + suffix(n),
                 info="If empty, ALL classes the model produces are inpainted. Select to narrow down to specific classes.",
-                choices=[],
-                value=[],
+                choices=_dd_choices,
+                value=_dd_value,
                 multiselect=True,
                 visible=True,
                 elem_id=eid("ad_model_classes_dropdown"),
