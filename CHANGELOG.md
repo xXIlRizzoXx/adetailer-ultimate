@@ -1,6 +1,12 @@
 # Changelog
 
-## v26.3.0+plus.3 — 2026-06-10 (Coexistence guard: no more preload error next to another ADetailer)
+## v26.3.0+plus.4 — 2026-06-23 (Class filter restored on reload + UI spacing + multi-ADetailer coexistence)
+
+**Class filter is now restored into the visible dropdown across restarts.** With "Remember last-used settings" on, the detector and the chosen classes were already saved to disk, but after a restart the class multi-select came back **empty** — because Gradio doesn't fire its populate-on-model-change event on initial render, so the dropdown was never refilled (and the first interaction could then sync the empty dropdown back over the saved value, wiping it). The dropdown now pre-seeds its choices and selection from the saved model + saved classes (both the include and the exclude/NOT paths), so your class filter survives a restart visibly and intact. Setups without a class filter (e.g. face-only) are unaffected. Index-safe change: only an existing widget's initial values were touched — no event listener added.
+
+**Lighter spacing across the two-column rows.** Detection, Mask preprocessing, Inpainting, the class/LoRA toggle rows and ControlNet get a small horizontal gap plus a little vertical breathing room, so the paired controls are no longer glued together.
+
+**The "🔁 Combine all tabs" checkbox and the Settings reset help now localise.** They translate via the companion Language Diffusion dictionaries like the rest of the UI (previously they stayed English because of emoji/nested-tag edge cases in the host translator).
 
 **Startup no longer errors when another ADetailer-family extension is installed.** When this fork sits in `extensions/` alongside the original ADetailer (or another variant), both extensions register the same `--ad-no-huggingface` launch option and the second one to load raised an `Error running preload()` traceback at WebUI startup (reported in issue #1). The registration is now guarded: if the option already exists, the existing one is reused. Running two ADetailer variants at once remains unsupported — they duplicate the accordion and compete over the same pipeline — so keep only one and move the other out of `extensions/` as a backup. The README's Install section now states this explicitly.
 
