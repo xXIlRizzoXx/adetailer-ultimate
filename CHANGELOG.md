@@ -1,5 +1,11 @@
 # Changelog
 
+## v26.3.0+plus.5 — 2026-06-23 (Last-used settings now truly persist across restarts)
+
+**"Remember last-used settings" now actually sticks.** The detector and the class filter (and every other ADetailer tab value) were being saved to `user_state.json` correctly, but the host WebUI's own `ui-config.json` tracks UI components by label and re-applies its frozen values on every restart — which silently overrode the restore, forcing the detector back to the first model and emptying the CLASSES dropdown no matter what had been saved. ADetailer's persistence-managed widgets now opt out of `ui-config.json` (via `do_not_save_to_config`, honoured by the host's `modules/ui_loadsave.py`), so the saved per-tab state is authoritative again. The class multi-select is additionally re-seeded from the saved selection at build time, since Gradio doesn't fire its populate-on-model-change event on the initial render. Net result: detector + classes (and the rest of the tab) come back exactly as you left them.
+
+**Saved/restored settings are now visible in the console log.** At startup each tab prints what it restored (`[-] ADetailer: tab N restored — detector=…, classes=…`, or a clear notice when a saved detector is no longer installed and it fell back); on each Generate, every active tab prints what it persisted. Makes it easy to confirm at a glance that persistence is working.
+
 ## v26.3.0+plus.4 — 2026-06-23 (Class filter restored on reload + UI spacing + multi-ADetailer coexistence)
 
 **Class filter is now restored into the visible dropdown across restarts.** With "Remember last-used settings" on, the detector and the chosen classes were already saved to disk, but after a restart the class multi-select came back **empty** — because Gradio doesn't fire its populate-on-model-change event on initial render, so the dropdown was never refilled (and the first interaction could then sync the empty dropdown back over the saved value, wiping it). The dropdown now pre-seeds its choices and selection from the saved model + saved classes (both the include and the exclude/NOT paths), so your class filter survives a restart visibly and intact. Setups without a class filter (e.g. face-only) are unaffected. Index-safe change: only an existing widget's initial values were touched — no event listener added.
