@@ -1,24 +1,19 @@
 # Changelog
 
-## v26.3.0+plus.5.beta.2 — 2026-07-03 (BETA · text-encoder swap reworked + A1111 install/UI fixes)
+## v26.3.0+plus.5 — 2026-07-03 (Per-pass text encoder + universal-WebUI compatibility)
 
-> ⚠️ **Beta for testing — not the stable release.** This lives on the `beta` branch for validation on real Forge / Forge Neo / AUTOMATIC1111 before merging into `main`. The confirmed stable version stays **v26.3.0+plus.4.1**. To try it: `git fetch && git checkout beta && git pull`; to go back: `git checkout main`.
+**New: a separate text encoder for the ADetailer step (Forge / Forge Neo).** A new per-tab **"Use separate text encoder"** checkbox + dropdown lets the detailer pass use a different text encoder than the base generation — e.g. drop a ZiT (Z-Image) encoder so an SDXL detailer checkpoint can run without an architecture mismatch (requested in #3). Choose *"Use same text encoder"* (default, no change), *"None (use detailer checkpoint's own)"*, or a specific encoder. On Forge, VAE + text encoders are unified into `forge_additional_modules`; the swap is applied for the pass through `override_settings` (which never touches the base model's load state) and restored afterward. Fully guarded: an inert no-op on A1111 (which has no such concept), and a no-op — never a crash — if a Forge build doesn't reload modules from `override_settings`. Confirmed working on Forge Neo by @koblue.
 
-### New in beta.2 (from tester feedback)
+**The per-model "ADetailer VAE" override now targets the right key on Forge Neo.** Forge Neo deprecated `sd_vae` (VAE + text encoders were merged into `forge_additional_modules`), so the VAE override was silently doing nothing there. It is now routed through the module list on Forge, while A1111 / classic paths keep using `sd_vae` exactly as before.
 
-**Text-encoder / VAE swap reworked to the safe path (#3, @koblue).** The first beta forced a Forge model-module reload, which could unload the base model and crash the *outer* generation (`'FakeInitialModel' object has no attribute 'use_distilled_cfg_scale'`). The swap now goes purely through the `override_settings` contract — it never touches the base model's load state, so it can no longer crash a normal generation. (If a given Forge build doesn't reload modules from `override_settings`, the swap simply no-ops rather than crashing.)
+**Universal-WebUI compatibility, verified on A1111 / Forge / Forge Neo.** A round of guards so the extension degrades gracefully everywhere instead of crashing:
 
-**AUTOMATIC1111 no longer breaks its own NumPy on install (#2, @arch-official).** Installing our dependencies (ultralytics/mediapipe) on a NumPy-1.x WebUI dragged NumPy up to 2.x and broke the whole install with a binary-incompatibility crash (skimage / gradio). The installer now keeps the host's NumPy 1.x.
+- **AUTOMATIC1111 install no longer breaks NumPy (#2).** Installing our dependencies (ultralytics / mediapipe) could drag NumPy up to 2.x and break the whole install (skimage / gradio binary incompatibility); the installer now keeps the host's NumPy 1.x.
+- **The preset "Export" button no longer crashes the tab on A1111 (#2).** `gr.DownloadButton` (Gradio 4 only) falls back to a plain button on A1111's Gradio 3, so the ADetailer tab builds normally (Import and everything else still work).
+- **ControlNet / import hardening.** The ControlNet backend import falls back on *any* import error (not just `ImportError`), so a broken/drifted Forge `lib_controlnet` degrades to the standard backend; `img2img`, `huggingface_hub` (offline installs) and `modules.safe` imports are guarded.
+- **Signature-drift guards.** `shared.sd_model.is_sdxl`, `checkpoint_tiles(use_short=…)` and `create_infotext(...)` are protected against missing attributes / signature changes across WebUI versions.
 
-**The preset "Export" button no longer crashes the ADetailer tab on A1111 (#2).** `gr.DownloadButton` needs Gradio 4 (Forge / Forge Neo); AUTOMATIC1111 ships Gradio 3, which lacks it. It now falls back to a plain button so the tab builds normally (preset export just isn't one-click-downloadable on Gradio 3; everything else, including Import, works).
-
-### From beta.1
-
-**New: a separate text encoder for the ADetailer step (Forge / Forge Neo).** A new per-tab **"Use separate text encoder"** checkbox + dropdown lets the detailer pass use a different text encoder than the base generation — e.g. drop a ZiT (Z-Image) encoder so an SDXL detailer checkpoint can run without an architecture mismatch (requested in #3). Choose *"Use same text encoder"* (default, no change), *"None (use detailer checkpoint's own)"*, or a specific encoder. On Forge, VAE + text encoders are unified into `forge_additional_modules`; this swaps them for the pass and restores them afterward. Fully guarded: on A1111 (which has no such concept) the option is an inert no-op, and if Forge's internal module API is unavailable it degrades to a no-op instead of ever crashing the pass.
-
-**Fix: the per-model "ADetailer VAE" override now targets the right key on Forge Neo.** Forge Neo deprecated `sd_vae` (VAE + text encoders were merged into `forge_additional_modules`), so the VAE override was silently doing nothing there. It is now routed through the module list on Forge, while A1111 / classic paths keep using `sd_vae` exactly as before.
-
-**Universal-WebUI compatibility hardening (seven guards).** So the extension degrades gracefully on A1111, Forge, Forge Neo, reForge and stripped/offline setups instead of crashing: the ControlNet backend import now falls back on *any* import error (not just `ImportError`), so a broken/drifted Forge `lib_controlnet` degrades to the standard backend; `img2img`, `huggingface_hub` (offline installs) and `modules.safe` imports are guarded; `shared.sd_model.is_sdxl`, `checkpoint_tiles(use_short=…)` and `create_infotext(...)` are protected against missing attributes / signature drift. No behaviour change on standard installs (verified: 0 regressions).
+No behaviour change on standard installs. Confirmed on real AUTOMATIC1111 v1.10.1 and Forge Neo by the reporters of #2 and #3.
 
 ## v26.3.0+plus.4.1 — 2026-07-03 (AUTOMATIC1111 compatibility)
 
