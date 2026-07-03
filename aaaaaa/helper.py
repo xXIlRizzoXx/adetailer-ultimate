@@ -10,7 +10,10 @@ import torch
 from PIL import Image
 from typing_extensions import Protocol
 
-from modules import safe
+try:
+    from modules import safe
+except Exception:  # variant without modules.safe (Forge Neo is moving off it)
+    safe = None
 from modules.shared import cmd_opts, opts
 
 if TYPE_CHECKING:
@@ -32,7 +35,8 @@ PT = Union[StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img]
 def change_torch_load():
     orig = torch.load
     try:
-        torch.load = safe.unsafe_torch_load
+        if safe is not None and hasattr(safe, "unsafe_torch_load"):
+            torch.load = safe.unsafe_torch_load
         yield
     finally:
         torch.load = orig

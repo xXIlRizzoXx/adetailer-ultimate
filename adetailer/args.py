@@ -95,6 +95,8 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
     ad_checkpoint: Optional[str] = None
     ad_use_vae: bool = False
     ad_vae: Optional[str] = None
+    ad_use_text_encoder: bool = False
+    ad_text_encoder: Optional[str] = None
     ad_use_sampler: bool = False
     ad_sampler: str = "DPM++ 2M Karras"
     ad_scheduler: str = "Use same scheduler"
@@ -186,6 +188,13 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
             ["ADetailer use separate VAE", "ADetailer VAE"],
         )
         ppop(
+            "ADetailer use separate text encoder",
+            [
+                "ADetailer use separate text encoder",
+                "ADetailer text encoder",
+            ],
+        )
+        ppop(
             "ADetailer use separate sampler",
             [
                 "ADetailer use separate sampler",
@@ -275,6 +284,8 @@ _all_args = [
     ("ad_checkpoint", "ADetailer checkpoint"),
     ("ad_use_vae", "ADetailer use separate VAE"),
     ("ad_vae", "ADetailer VAE"),
+    ("ad_use_text_encoder", "ADetailer use separate text encoder"),
+    ("ad_text_encoder", "ADetailer text encoder"),
     ("ad_use_sampler", "ADetailer use separate sampler"),
     ("ad_sampler", "ADetailer sampler"),
     ("ad_scheduler", "ADetailer scheduler"),

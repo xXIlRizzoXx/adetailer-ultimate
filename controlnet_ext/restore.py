@@ -2,13 +2,20 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from modules import img2img, processing, shared
+from modules import processing, shared
+
+try:
+    from modules import img2img
+except Exception:  # some WebUI variants (e.g. Forge Neo) refactor img2img away
+    img2img = None
 
 
 class CNHijackRestore:
     def __init__(self):
         self.process = hasattr(processing, "__controlnet_original_process_images_inner")
-        self.img2img = hasattr(img2img, "__controlnet_original_process_batch")
+        self.img2img = img2img is not None and hasattr(
+            img2img, "__controlnet_original_process_batch"
+        )
 
     def __enter__(self):
         if self.process:

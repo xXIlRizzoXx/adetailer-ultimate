@@ -73,6 +73,10 @@ class WebuiInfo:
     i2i_button: gr.Button
     checkpoints_list: list[str]
     vae_list: list[str]
+    # Forge / Forge Neo only: available text-encoder modules for the per-pass
+    # "separate text encoder" option. Empty on A1111 (no such concept there), so
+    # the dropdown just offers the pass-through / "None" choices — index-safe.
+    text_encoders_list: list[str] = field(default_factory=list)
     model_mapping: dict[str, str] = field(default_factory=dict)
 
 
@@ -1997,6 +2001,38 @@ def inpainting(  # noqa: PLR0915
                     visible=True,
                     elem_id=eid("ad_vae"),
                 )
+
+        # Per-pass text encoder (Forge / Forge Neo). Lets the detailer step use
+        # a different text encoder than the base generation — e.g. drop a ZiT
+        # (Z-Image) encoder so an SDXL detailer checkpoint can run (issue #3).
+        # Index-safe: mirrors the checkpoint/VAE pair — the checkbox has NO
+        # grey-out .change() of its own, so only the uniform per-ALL_ARGS
+        # listener is added. On A1111 the encoders list is empty and the whole
+        # thing is a harmless no-op (guarded again at override time).
+        with gr.Row(), gr.Column(variant="compact"):
+            w.ad_use_text_encoder = gr.Checkbox(
+                label="Use separate text encoder (Forge/Forge Neo)" + suffix(n),
+                value=sv("ad_use_text_encoder", False),
+                visible=True,
+                elem_id=eid("ad_use_text_encoder"),
+            )
+
+            tes = [
+                "Use same text encoder",
+                "None (use detailer checkpoint's own)",
+                *webui_info.text_encoders_list,
+            ]
+            _saved_te = sv("ad_text_encoder", tes[0])
+            if _saved_te not in tes:
+                _saved_te = tes[0]
+
+            w.ad_text_encoder = gr.Dropdown(
+                label="ADetailer text encoder" + suffix(n),
+                choices=tes,
+                value=_saved_te,
+                visible=True,
+                elem_id=eid("ad_text_encoder"),
+            )
 
         with gr.Row(), gr.Column(variant="compact"):
             w.ad_use_sampler = gr.Checkbox(

@@ -8,7 +8,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, Optional, TypeVar
 
-from huggingface_hub import hf_hub_download
+try:
+    from huggingface_hub import hf_hub_download
+except Exception:  # offline / stripped venv without huggingface_hub installed
+    # Every call site lives inside `with suppress(Exception)`, so a None here
+    # degrades gracefully to "INVALID" instead of crashing at import time.
+    hf_hub_download = None
 from PIL import Image, ImageDraw
 from rich import print  # noqa: A004  Shadowing built-in 'print'
 from torchvision.transforms.functional import to_pil_image

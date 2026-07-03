@@ -294,8 +294,13 @@ class AfterDetailerScript(scripts.Script):
         sampler_names = [sampler.name for sampler in all_samplers]
         scheduler_names = [x.label for x in schedulers]
 
-        checkpoint_list = modules.sd_models.checkpoint_tiles(use_short=True)
+        try:
+            checkpoint_list = modules.sd_models.checkpoint_tiles(use_short=True)
+        except TypeError:
+            # Pre-1.6 WebUI forks lack the `use_short` kwarg — fall back.
+            checkpoint_list = modules.sd_models.checkpoint_tiles()
         vae_list = modules.shared_items.sd_vae_items()
+        text_encoders_list = _get_forge_text_encoders()
 
         webui_info = WebuiInfo(
             ad_model_list=ad_model_list,
@@ -305,6 +310,7 @@ class AfterDetailerScript(scripts.Script):
             i2i_button=img2img_submit_button,
             checkpoints_list=checkpoint_list,
             vae_list=vae_list,
+            text_encoders_list=text_encoders_list,
             model_mapping=model_mapping,
         )
 
@@ -632,7 +638,12 @@ class AfterDetailerScript(scripts.Script):
             args.ad_use_vae
             and args.ad_vae
             and args.ad_vae not in ("None", "Use same VAE")
+            and not _is_forge_modules()
         ):
+            # A1111 / classic path honours sd_vae here. On Forge / Forge Neo the
+            # VAE + text encoders are unified into forge_additional_modules
+            # (sd_vae is deprecated there), so the VAE and text-encoder swap is
+            # applied per-pass by _forge_apply_modules() in the detailing loop.
             d["sd_vae"] = args.ad_vae
         return d
 
@@ -641,9 +652,15 @@ class AfterDetailerScript(scripts.Script):
 
     @staticmethod
     def infotext(p) -> str:
-        return create_infotext(
-            p, p.all_prompts, p.all_seeds, p.all_subseeds, None, 0, 0
-        )
+        try:
+            return create_infotext(
+                p, p.all_prompts, p.all_seeds, p.all_subseeds, None, 0, 0
+            )
+        except TypeError:
+            # create_infotext's positional signature has drifted across
+            # WebUI/fork versions; degrade to no ADetailer infotext rather
+            # than aborting the pass.
+            return ""
 
     def read_params_txt(self) -> str:
         params_txt = Path(paths.data_path, PARAMS_TXT)
@@ -991,7 +1008,7 @@ class AfterDetailerScript(scripts.Script):
 
         # Strict (SDXL only)
         if calculate_optimal_crop == InpaintBBoxMatchMode.STRICT.value:
-            if not shared.sd_model.is_sdxl:
+            if not getattr(shared.sd_model, "is_sdxl", False):
                 msg = "[-] ADetailer: strict inpaint bounding box size matching is only available for SDXL. Use Free mode instead."
                 print(msg)
                 return (inpaint_width, inpaint_height)
@@ -1291,33 +1308,45 @@ class AfterDetailerScript(scripts.Script):
         if is_mediapipe:
             print(f"mediapipe: {steps} detected.")
 
-        p2 = copy(i2i)
-        for j in range(steps):
-            p2.image_mask = masks[j]
-            p2.init_images[0] = ensure_pil_image(p2.init_images[0], "RGB")
-            self.i2i_prompts_replace(p2, ad_prompts, ad_negatives, j)
-
-            if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
-                continue
-
-            self.fix_p2(p, p2, pp, args, pred, j)
-
-            try:
-                processed = process_images(p2)
-            except NansException as e:
-                msg = f"[-] ADetailer: 'NansException' occurred with {ordinal(n + 1)} settings.\n{e}"
-                print(msg, file=sys.stderr)
-                continue
-            finally:
-                p2.close()
-
-            if not processed.images:
-                processed = None
-                break
-
-            self.compare_prompt(p.extra_generation_params, processed, n=n)
+        # Forge only: swap the text-encoder / VAE modules for this detailer pass,
+        # then restore them afterward. Fully guarded — a no-op (and never a crash)
+        # on A1111 or if Forge's module API differs. See _forge_apply_modules /
+        # issue #3 (e.g. an SDXL detailer checkpoint under a ZiT base).
+        try:
+            _want_mods = _forge_wanted_modules(args)
+        except Exception:  # noqa: BLE001 — keep the "never crash" guarantee
+            _want_mods = None
+        _mods_orig, _mods_applied = _forge_apply_modules(_want_mods)
+        try:
             p2 = copy(i2i)
-            p2.init_images = [processed.images[0]]
+            for j in range(steps):
+                p2.image_mask = masks[j]
+                p2.init_images[0] = ensure_pil_image(p2.init_images[0], "RGB")
+                self.i2i_prompts_replace(p2, ad_prompts, ad_negatives, j)
+
+                if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
+                    continue
+
+                self.fix_p2(p, p2, pp, args, pred, j)
+
+                try:
+                    processed = process_images(p2)
+                except NansException as e:
+                    msg = f"[-] ADetailer: 'NansException' occurred with {ordinal(n + 1)} settings.\n{e}"
+                    print(msg, file=sys.stderr)
+                    continue
+                finally:
+                    p2.close()
+
+                if not processed.images:
+                    processed = None
+                    break
+
+                self.compare_prompt(p.extra_generation_params, processed, n=n)
+                p2 = copy(i2i)
+                p2.init_images = [processed.images[0]]
+        finally:
+            _forge_restore_modules(_mods_orig, _mods_applied)
 
         if processed is not None:
             pp.image = processed.images[0]
@@ -1392,6 +1421,165 @@ class AfterDetailerScript(scripts.Script):
                 p.scripts.process(copy_p)
 
         self.write_params_txt(params_txt_content)
+
+
+def _is_forge_modules() -> bool:
+    """True on Forge / Forge Neo, where VAE + text encoders are unified into the
+    ``forge_additional_modules`` opts list (so the classic ``sd_vae`` key is
+    deprecated there)."""
+    try:
+        return "forge_additional_modules" in shared.opts.data
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _get_forge_text_encoders() -> list:
+    """Text-encoder module names for the per-pass "separate text encoder" option.
+    Forge / Forge Neo only; returns ``[]`` everywhere else so the dropdown only
+    offers the pass-through / "None" choices. Fully guarded (never raises)."""
+    names: list = []
+    try:
+        import modules_forge.main_entry as _fme  # Forge / Forge Neo only
+
+        module_list = getattr(_fme, "module_list", None)
+        if isinstance(module_list, dict):
+            for name, path in module_list.items():
+                p = str(path).replace("\\", "/").lower()
+                if "text_encoder" in p or "text encoder" in p:
+                    names.append(str(name))
+    except Exception:  # noqa: BLE001 — not Forge, or the API differs
+        names = []
+
+    if not names:
+        try:
+            te_dir = Path(paths.models_path) / "text_encoder"
+            if te_dir.is_dir():
+                names = sorted(
+                    f.name
+                    for f in te_dir.iterdir()
+                    if f.suffix.lower()
+                    in {".safetensors", ".pt", ".ckpt", ".bin", ".gguf"}
+                )
+        except Exception:  # noqa: BLE001
+            names = []
+    return names
+
+
+def _forge_wanted_modules(args: ADetailerArgs) -> "list | None":
+    """Target ``forge_additional_modules`` for this detailer pass, or ``None`` if
+    not on Forge / nothing to change. Forge unifies VAE + text encoders into one
+    module list; start from the live list and swap only the requested pieces."""
+    te_choice = args.ad_text_encoder
+    want_te = bool(
+        args.ad_use_text_encoder and te_choice and te_choice != "Use same text encoder"
+    )
+    want_vae = bool(
+        args.ad_use_vae
+        and args.ad_vae
+        and args.ad_vae not in ("None", "Use same VAE")
+    )
+    if not (want_te or want_vae):
+        return None
+
+    try:
+        import modules_forge.main_entry as _fme  # Forge only
+    except Exception:  # noqa: BLE001
+        return None
+
+    base = list(getattr(shared.opts, "forge_additional_modules", []) or [])
+    module_list = getattr(_fme, "module_list", {}) or {}
+
+    def _resolve(name: str):
+        if name in module_list:
+            return module_list[name]
+        for _n, _pth in module_list.items():
+            if _n == name or Path(str(_pth)).name == name:
+                return _pth
+        print(
+            f"[-] ADetailer: text-encoder/VAE '{name}' not found in Forge's "
+            f"module list; the detailer step keeps the base module for that slot.",
+            file=sys.stderr,
+        )
+        return name
+
+    def _is_te(path: str) -> bool:
+        p = str(path).replace("\\", "/").lower()
+        return "text_encoder" in p or "text encoder" in p
+
+    def _is_vae(path: str) -> bool:
+        p = str(path).replace("\\", "/").lower()
+        return "/vae/" in p or Path(p).parent.name.lower() == "vae"
+
+    result = list(base)
+
+    if want_te:
+        result = [m for m in result if not _is_te(str(m))]
+        # "None (...)" drops the TE with no replacement; a real name is added.
+        if not str(te_choice).startswith("None"):
+            resolved = _resolve(te_choice)
+            if resolved:
+                result.append(resolved)
+
+    if want_vae:
+        result = [m for m in result if not _is_vae(str(m))]
+        resolved = _resolve(args.ad_vae)
+        if resolved:
+            result.append(resolved)
+
+    if sorted(map(str, result)) == sorted(map(str, base)):
+        return None
+    return result
+
+
+def _forge_apply_modules(want):
+    """Apply ``want`` as the live ``forge_additional_modules`` and force Forge to
+    rebuild its model-loading cache so the swap takes effect for the next pass.
+    Returns ``(orig_modules, applied)``. Fully guarded: on any failure it degrades
+    to ``(None, False)`` — no crash, no state change."""
+    if want is None:
+        return None, False
+    try:
+        import modules_forge.main_entry as _fme
+        from modules import sd_models
+
+        orig = list(getattr(shared.opts, "forge_additional_modules", []) or [])
+        skip = getattr(sd_models, "SkipWritingToConfig", None)
+        if skip is not None:
+            with skip():
+                _fme.modules_change(want, save=False, refresh=False)
+                _fme.refresh_model_loading_parameters()
+        else:
+            _fme.modules_change(want, save=False, refresh=False)
+            _fme.refresh_model_loading_parameters()
+        return orig, True
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[-] ADetailer: per-pass text-encoder/VAE swap unavailable on this "
+            f"WebUI ({e}); the detailer step keeps the base modules.",
+            file=sys.stderr,
+        )
+        return None, False
+
+
+def _forge_restore_modules(orig, applied: bool) -> None:
+    """Restore the base ``forge_additional_modules`` captured by
+    ``_forge_apply_modules`` and rebuild the loading cache. Fully guarded."""
+    if not applied:
+        return
+    try:
+        import modules_forge.main_entry as _fme
+        from modules import sd_models
+
+        skip = getattr(sd_models, "SkipWritingToConfig", None)
+        if skip is not None:
+            with skip():
+                _fme.modules_change(orig, save=False, refresh=False)
+                _fme.refresh_model_loading_parameters()
+        else:
+            _fme.modules_change(orig, save=False, refresh=False)
+            _fme.refresh_model_loading_parameters()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def on_after_component(component, **_kwargs):

@@ -1,5 +1,15 @@
 # Changelog
 
+## v26.3.0+plus.5.beta.1 — 2026-07-03 (BETA · per-pass text encoder + universal-WebUI compat hardening)
+
+> ⚠️ **Beta for testing — not the stable release.** This lives on the `beta` branch for validation on real Forge / Forge Neo before merging into `main`. The confirmed stable version stays **v26.3.0+plus.4.1**. To try it: `git fetch && git checkout beta && git pull`; to go back: `git checkout main`.
+
+**New: a separate text encoder for the ADetailer step (Forge / Forge Neo).** A new per-tab **"Use separate text encoder"** checkbox + dropdown lets the detailer pass use a different text encoder than the base generation — e.g. drop a ZiT (Z-Image) encoder so an SDXL detailer checkpoint can run without an architecture mismatch (requested in #3). Choose *"Use same text encoder"* (default, no change), *"None (use detailer checkpoint's own)"*, or a specific encoder. On Forge, VAE + text encoders are unified into `forge_additional_modules`; this swaps them for the pass and restores them afterward. Fully guarded: on A1111 (which has no such concept) the option is an inert no-op, and if Forge's internal module API is unavailable it degrades to a no-op instead of ever crashing the pass.
+
+**Fix: the per-model "ADetailer VAE" override now targets the right key on Forge Neo.** Forge Neo deprecated `sd_vae` (VAE + text encoders were merged into `forge_additional_modules`), so the VAE override was silently doing nothing there. It is now routed through the module list on Forge, while A1111 / classic paths keep using `sd_vae` exactly as before.
+
+**Universal-WebUI compatibility hardening (seven guards).** So the extension degrades gracefully on A1111, Forge, Forge Neo, reForge and stripped/offline setups instead of crashing: the ControlNet backend import now falls back on *any* import error (not just `ImportError`), so a broken/drifted Forge `lib_controlnet` degrades to the standard backend; `img2img`, `huggingface_hub` (offline installs) and `modules.safe` imports are guarded; `shared.sd_model.is_sdxl`, `checkpoint_tiles(use_short=…)` and `create_infotext(...)` are protected against missing attributes / signature drift. No behaviour change on standard installs (verified: 0 regressions).
+
 ## v26.3.0+plus.4.1 — 2026-07-03 (AUTOMATIC1111 compatibility)
 
 **The extension now loads on AUTOMATIC1111, not only Forge / Forge Neo.** The "Reset ADetailer settings" area in Settings uses Forge-only `OptionDiv` / `OptionHTML` classes; a hard `from modules.options import OptionDiv` crashed the whole extension at load on A1111 vanilla, which doesn't ship `OptionDiv` (reported in #2). That import — and the two places those classes are used — are now guarded: on A1111 the extension loads normally and only the small cosmetic divider + help note above the Reset button is skipped (the Reset button itself, and every other feature, still work). Forge / Forge Neo behaviour is unchanged.
