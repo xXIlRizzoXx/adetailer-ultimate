@@ -1,5 +1,9 @@
 # Changelog
 
+## v26.3.0+plus.4.1 — 2026-07-03 (AUTOMATIC1111 compatibility)
+
+**The extension now loads on AUTOMATIC1111, not only Forge / Forge Neo.** The "Reset ADetailer settings" area in Settings uses Forge-only `OptionDiv` / `OptionHTML` classes; a hard `from modules.options import OptionDiv` crashed the whole extension at load on A1111 vanilla, which doesn't ship `OptionDiv` (reported in #2). That import — and the two places those classes are used — are now guarded: on A1111 the extension loads normally and only the small cosmetic divider + help note above the Reset button is skipped (the Reset button itself, and every other feature, still work). Forge / Forge Neo behaviour is unchanged.
+
 ## v26.3.0+plus.4 — 2026-06-23 (Last-used settings persist across restarts · UI spacing · multi-ADetailer coexistence)
 
 **"Remember last-used settings" now truly persists across restarts.** The detector and the class filter (and every other ADetailer tab value) are saved per tab, but the host WebUI's own `ui-config.json` tracks UI components by label and re-applied its frozen values on every restart — silently forcing the detector back to the first model and emptying the **CLASSES** dropdown no matter what had been saved. ADetailer's persistence-managed widgets now opt out of `ui-config.json` (via `do_not_save_to_config`, honoured by the host's `modules/ui_loadsave.py`), and the class multi-select is re-seeded from the saved selection on load (Gradio doesn't fire its populate-on-model-change event on the initial render). Net result: your detector + classes (and the rest of the tab) come back exactly as you left them. Requires "Remember last-used settings" enabled (default on).
