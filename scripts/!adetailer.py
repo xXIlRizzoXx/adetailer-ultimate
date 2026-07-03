@@ -69,7 +69,15 @@ from controlnet_ext import (
     get_cn_models,
 )
 from modules import images, paths, script_callbacks, scripts, shared
-from modules.options import OptionDiv  # not re-exported via modules.shared
+
+try:
+    from modules.options import OptionDiv  # Forge / Forge Neo only; not re-exported via modules.shared
+except ImportError:
+    # A1111 vanilla's `modules.options` doesn't ship `OptionDiv` (issue #2,
+    # arch-official). A hard import here crashed the whole extension at load
+    # on A1111. Degrade gracefully: the only thing we lose there is the
+    # cosmetic reset-settings divider, which is guarded on use below.
+    OptionDiv = None
 from modules.devices import NansException
 from modules.processing import (
     Processed,
@@ -1641,27 +1649,33 @@ def on_ui_settings():
     # `do_not_save=True` already (OptionHTML/OptionDiv set the flag in their
     # ctor), so they don't add anything to the saved config.
     #
-    # CRITICAL: `OptionDiv` and `OptionHTML` do NOT set `.section` in their
-    # ctor (verified in modules/options.py — only `OptionInfo.__init__` accepts
-    # a `section` kwarg, and the two subclasses don't forward it). Without a
-    # section, `opts.reorder()` crashes on `item.section[1]`
-    # (TypeError: 'NoneType' object is not subscriptable) at WebUI startup,
-    # blocking the entire UI. Set the section manually right after
-    # construction.
-    reset_divider = OptionDiv()
-    reset_divider.section = section
-    shared.opts.add_option("ad_reset_divider", reset_divider)
+    # COMPATIBILITY (issue #2): `OptionDiv` and `OptionHTML` are Forge / Forge
+    # Neo classes; A1111 vanilla's `modules.options` doesn't ship `OptionDiv`.
+    # Guard both so the extension still loads on A1111 — there we simply skip
+    # the cosmetic divider + help block; the Reset button itself (a plain
+    # `OptionInfo`, below) still registers and works everywhere.
+    #
+    # CRITICAL (Forge): `OptionDiv` / `OptionHTML` do NOT set `.section` in
+    # their ctor (only `OptionInfo.__init__` accepts a `section` kwarg), so
+    # `opts.reorder()` would crash on `item.section[1]` at startup. Set the
+    # section manually right after construction.
+    if OptionDiv is not None:
+        reset_divider = OptionDiv()
+        reset_divider.section = section
+        shared.opts.add_option("ad_reset_divider", reset_divider)
 
-    reset_help = shared.OptionHTML(
-        "<b>Reset ADetailer settings</b> — restores every option on this "
-        "page (max tabs, save paths, bbox sort, manual mode, remember-last, "
-        "etc.) to the value declared in the extension's source. Per-tab "
-        "widget values stashed in <code>user_state.json</code> are <i>not</i> "
-        "touched; clear them by toggling 'Remember last-used settings' off, "
-        "saving once, and toggling it back on."
-    )
-    reset_help.section = section
-    shared.opts.add_option("ad_reset_info", reset_help)
+    _OptionHTML = getattr(shared, "OptionHTML", None)
+    if _OptionHTML is not None:
+        reset_help = _OptionHTML(
+            "<b>Reset ADetailer settings</b> — restores every option on this "
+            "page (max tabs, save paths, bbox sort, manual mode, remember-last, "
+            "etc.) to the value declared in the extension's source. Per-tab "
+            "widget values stashed in <code>user_state.json</code> are <i>not</i> "
+            "touched; clear them by toggling 'Remember last-used settings' off, "
+            "saving once, and toggling it back on."
+        )
+        reset_help.section = section
+        shared.opts.add_option("ad_reset_info", reset_help)
     # The button itself. `OptionInfo` is used directly (not OptionHTML) so we
     # control `do_not_save` and pass our factory as `component`. The default
     # value doubles as the visible button label inside `_make_reset_settings_button`.
