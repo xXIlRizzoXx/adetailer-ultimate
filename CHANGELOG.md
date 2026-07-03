@@ -1,8 +1,18 @@
 # Changelog
 
-## v26.3.0+plus.5.beta.1 — 2026-07-03 (BETA · per-pass text encoder + universal-WebUI compat hardening)
+## v26.3.0+plus.5.beta.2 — 2026-07-03 (BETA · text-encoder swap reworked + A1111 install/UI fixes)
 
-> ⚠️ **Beta for testing — not the stable release.** This lives on the `beta` branch for validation on real Forge / Forge Neo before merging into `main`. The confirmed stable version stays **v26.3.0+plus.4.1**. To try it: `git fetch && git checkout beta && git pull`; to go back: `git checkout main`.
+> ⚠️ **Beta for testing — not the stable release.** This lives on the `beta` branch for validation on real Forge / Forge Neo / AUTOMATIC1111 before merging into `main`. The confirmed stable version stays **v26.3.0+plus.4.1**. To try it: `git fetch && git checkout beta && git pull`; to go back: `git checkout main`.
+
+### New in beta.2 (from tester feedback)
+
+**Text-encoder / VAE swap reworked to the safe path (#3, @koblue).** The first beta forced a Forge model-module reload, which could unload the base model and crash the *outer* generation (`'FakeInitialModel' object has no attribute 'use_distilled_cfg_scale'`). The swap now goes purely through the `override_settings` contract — it never touches the base model's load state, so it can no longer crash a normal generation. (If a given Forge build doesn't reload modules from `override_settings`, the swap simply no-ops rather than crashing.)
+
+**AUTOMATIC1111 no longer breaks its own NumPy on install (#2, @arch-official).** Installing our dependencies (ultralytics/mediapipe) on a NumPy-1.x WebUI dragged NumPy up to 2.x and broke the whole install with a binary-incompatibility crash (skimage / gradio). The installer now keeps the host's NumPy 1.x.
+
+**The preset "Export" button no longer crashes the ADetailer tab on A1111 (#2).** `gr.DownloadButton` needs Gradio 4 (Forge / Forge Neo); AUTOMATIC1111 ships Gradio 3, which lacks it. It now falls back to a plain button so the tab builds normally (preset export just isn't one-click-downloadable on Gradio 3; everything else, including Import, works).
+
+### From beta.1
 
 **New: a separate text encoder for the ADetailer step (Forge / Forge Neo).** A new per-tab **"Use separate text encoder"** checkbox + dropdown lets the detailer pass use a different text encoder than the base generation — e.g. drop a ZiT (Z-Image) encoder so an SDXL detailer checkpoint can run without an architecture mismatch (requested in #3). Choose *"Use same text encoder"* (default, no change), *"None (use detailer checkpoint's own)"*, or a specific encoder. On Forge, VAE + text encoders are unified into `forge_additional_modules`; this swaps them for the pass and restores them afterward. Fully guarded: on A1111 (which has no such concept) the option is an inert no-op, and if Forge's internal module API is unavailable it degrades to a no-op instead of ever crashing the pass.
 

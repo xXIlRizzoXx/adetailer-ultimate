@@ -1046,17 +1046,32 @@ def one_ui_group(
         elem_id=eid("ad_preset_io_accordion"),
     ):
         with gr.Row(variant="compact"):
-            preset_export_btn = gr.DownloadButton(
-                # Short label per user request 2026-05-18 — the previous
-                # "Export to JSON" wrapped on two lines until the CSS
-                # nowrap rule was extended; the user then asked for a
-                # tighter label outright. Emoji kept to mirror the
-                # Import button's 📥 marker visually.
-                label="\U0001F4E4 Esport",
-                elem_id=eid("ad_preset_export_btn"),
-                scale=0,
-                min_width=160,
-            )
+            # gr.DownloadButton needs Gradio 4 (Forge / Forge Neo). AUTOMATIC1111
+            # ships Gradio 3, which lacks it — a hard reference crashed the whole
+            # ADetailer tab at build there (#2). Fall back to a plain Button so the
+            # tab still loads; preset export just isn't one-click-downloadable on
+            # Gradio 3 (everything else, incl. Import, works). The .click wiring
+            # below is harmless on a Button.
+            _DownloadButton = getattr(gr, "DownloadButton", None)
+            if _DownloadButton is not None:
+                preset_export_btn = _DownloadButton(
+                    # Short label per user request 2026-05-18 — the previous
+                    # "Export to JSON" wrapped on two lines until the CSS
+                    # nowrap rule was extended; the user then asked for a
+                    # tighter label outright. Emoji kept to mirror the
+                    # Import button's 📥 marker visually.
+                    label="\U0001F4E4 Esport",
+                    elem_id=eid("ad_preset_export_btn"),
+                    scale=0,
+                    min_width=160,
+                )
+            else:
+                preset_export_btn = gr.Button(
+                    value="\U0001F4E4 Esport",
+                    elem_id=eid("ad_preset_export_btn"),
+                    scale=0,
+                    min_width=160,
+                )
             preset_import_btn = gr.UploadButton(
                 label="\U0001F4E5 Import",
                 file_types=[".json"],

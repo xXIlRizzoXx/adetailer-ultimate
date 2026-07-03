@@ -642,9 +642,22 @@ class AfterDetailerScript(scripts.Script):
         ):
             # A1111 / classic path honours sd_vae here. On Forge / Forge Neo the
             # VAE + text encoders are unified into forge_additional_modules
-            # (sd_vae is deprecated there), so the VAE and text-encoder swap is
-            # applied per-pass by _forge_apply_modules() in the detailing loop.
+            # (sd_vae is deprecated there) — handled just below.
             d["sd_vae"] = args.ad_vae
+
+        # Forge / Forge Neo: apply the per-pass VAE + text-encoder swap through the
+        # override_settings contract (Forge applies it before the pass and restores
+        # it after). This is the SAFE path: unlike a manual model reload it never
+        # unloads the base model, so it can't leave the outer generation with an
+        # unloaded "FakeInitialModel" checkpoint (root cause of the #3 beta crash).
+        # If the running Forge build doesn't reload modules from override_settings
+        # it simply no-ops — never a crash. None off Forge / when nothing changes.
+        try:
+            _fmods = _forge_wanted_modules(args)
+        except Exception:  # noqa: BLE001 — never break the pass over this
+            _fmods = None
+        if _fmods is not None:
+            d["forge_additional_modules"] = _fmods
         return d
 
     def get_initial_noise_multiplier(self, _p, args: ADetailerArgs) -> float | None:
@@ -1308,45 +1321,33 @@ class AfterDetailerScript(scripts.Script):
         if is_mediapipe:
             print(f"mediapipe: {steps} detected.")
 
-        # Forge only: swap the text-encoder / VAE modules for this detailer pass,
-        # then restore them afterward. Fully guarded — a no-op (and never a crash)
-        # on A1111 or if Forge's module API differs. See _forge_apply_modules /
-        # issue #3 (e.g. an SDXL detailer checkpoint under a ZiT base).
-        try:
-            _want_mods = _forge_wanted_modules(args)
-        except Exception:  # noqa: BLE001 — keep the "never crash" guarantee
-            _want_mods = None
-        _mods_orig, _mods_applied = _forge_apply_modules(_want_mods)
-        try:
+        p2 = copy(i2i)
+        for j in range(steps):
+            p2.image_mask = masks[j]
+            p2.init_images[0] = ensure_pil_image(p2.init_images[0], "RGB")
+            self.i2i_prompts_replace(p2, ad_prompts, ad_negatives, j)
+
+            if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
+                continue
+
+            self.fix_p2(p, p2, pp, args, pred, j)
+
+            try:
+                processed = process_images(p2)
+            except NansException as e:
+                msg = f"[-] ADetailer: 'NansException' occurred with {ordinal(n + 1)} settings.\n{e}"
+                print(msg, file=sys.stderr)
+                continue
+            finally:
+                p2.close()
+
+            if not processed.images:
+                processed = None
+                break
+
+            self.compare_prompt(p.extra_generation_params, processed, n=n)
             p2 = copy(i2i)
-            for j in range(steps):
-                p2.image_mask = masks[j]
-                p2.init_images[0] = ensure_pil_image(p2.init_images[0], "RGB")
-                self.i2i_prompts_replace(p2, ad_prompts, ad_negatives, j)
-
-                if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
-                    continue
-
-                self.fix_p2(p, p2, pp, args, pred, j)
-
-                try:
-                    processed = process_images(p2)
-                except NansException as e:
-                    msg = f"[-] ADetailer: 'NansException' occurred with {ordinal(n + 1)} settings.\n{e}"
-                    print(msg, file=sys.stderr)
-                    continue
-                finally:
-                    p2.close()
-
-                if not processed.images:
-                    processed = None
-                    break
-
-                self.compare_prompt(p.extra_generation_params, processed, n=n)
-                p2 = copy(i2i)
-                p2.init_images = [processed.images[0]]
-        finally:
-            _forge_restore_modules(_mods_orig, _mods_applied)
+            p2.init_images = [processed.images[0]]
 
         if processed is not None:
             pp.image = processed.images[0]
@@ -1529,57 +1530,6 @@ def _forge_wanted_modules(args: ADetailerArgs) -> "list | None":
     if sorted(map(str, result)) == sorted(map(str, base)):
         return None
     return result
-
-
-def _forge_apply_modules(want):
-    """Apply ``want`` as the live ``forge_additional_modules`` and force Forge to
-    rebuild its model-loading cache so the swap takes effect for the next pass.
-    Returns ``(orig_modules, applied)``. Fully guarded: on any failure it degrades
-    to ``(None, False)`` — no crash, no state change."""
-    if want is None:
-        return None, False
-    try:
-        import modules_forge.main_entry as _fme
-        from modules import sd_models
-
-        orig = list(getattr(shared.opts, "forge_additional_modules", []) or [])
-        skip = getattr(sd_models, "SkipWritingToConfig", None)
-        if skip is not None:
-            with skip():
-                _fme.modules_change(want, save=False, refresh=False)
-                _fme.refresh_model_loading_parameters()
-        else:
-            _fme.modules_change(want, save=False, refresh=False)
-            _fme.refresh_model_loading_parameters()
-        return orig, True
-    except Exception as e:  # noqa: BLE001
-        print(
-            f"[-] ADetailer: per-pass text-encoder/VAE swap unavailable on this "
-            f"WebUI ({e}); the detailer step keeps the base modules.",
-            file=sys.stderr,
-        )
-        return None, False
-
-
-def _forge_restore_modules(orig, applied: bool) -> None:
-    """Restore the base ``forge_additional_modules`` captured by
-    ``_forge_apply_modules`` and rebuild the loading cache. Fully guarded."""
-    if not applied:
-        return
-    try:
-        import modules_forge.main_entry as _fme
-        from modules import sd_models
-
-        skip = getattr(sd_models, "SkipWritingToConfig", None)
-        if skip is not None:
-            with skip():
-                _fme.modules_change(orig, save=False, refresh=False)
-                _fme.refresh_model_loading_parameters()
-        else:
-            _fme.modules_change(orig, save=False, refresh=False)
-            _fme.refresh_model_loading_parameters()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def on_after_component(component, **_kwargs):
