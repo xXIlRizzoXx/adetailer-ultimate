@@ -1006,7 +1006,9 @@ class AfterDetailerScript(scripts.Script):
             # CUDA-OOMs. Cap the working size to a sane max side, keeping aspect,
             # floored to a multiple of 8 (min 64). With "inpaint only masked"
             # (the default) the final image stays full-res; only the per-face
-            # regeneration resolution is capped.
+            # regeneration resolution is capped. In the non-default "inpaint
+            # whole picture" mode the output itself is produced at this capped
+            # size — an accepted tradeoff to avoid OOM on an auxiliary preview.
             max_side = 1024
             scale = min(1.0, max_side / max(w, h))
             w8 = max(64, (int(w * scale) // 8) * 8)
