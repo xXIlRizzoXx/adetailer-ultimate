@@ -999,7 +999,18 @@ class AfterDetailerScript(scripts.Script):
 
             image = ensure_pil_image(image, "RGB")
             w, h = image.size
-            w8, h8 = max(64, (w // 8) * 8), max(64, (h // 8) * 8)
+            # The detailer inpaints at p.width/p.height whenever the user hasn't
+            # set a separate inpaint size (get_width_height's fallback). Feeding
+            # the FULL source resolution here makes it VAE-encode the whole image
+            # — a large drop (e.g. a 97 MP upscale) asks for tens of GiB and
+            # CUDA-OOMs. Cap the working size to a sane max side, keeping aspect,
+            # floored to a multiple of 8 (min 64). With "inpaint only masked"
+            # (the default) the final image stays full-res; only the per-face
+            # regeneration resolution is capped.
+            max_side = 1024
+            scale = min(1.0, max_side / max(w, h))
+            w8 = max(64, (int(w * scale) // 8) * 8)
+            h8 = max(64, (int(h * scale) // 8) * 8)
 
             sampler = "Euler a"
             try:

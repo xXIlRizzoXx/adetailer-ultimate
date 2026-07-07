@@ -1638,6 +1638,9 @@ def one_ui_group(
                     value=False,
                     scale=0,
                     min_width=240,
+                    # Same left margin as "Combine all tabs" so it isn't glued
+                    # to the Run button.
+                    elem_classes=["ad-preview-combine"],
                     elem_id=eid("ad_preview_run_inpaint"),
                 )
                 # Status line for the "Run detection preview" button.
