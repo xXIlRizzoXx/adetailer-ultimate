@@ -70,9 +70,15 @@ def get_model_class_names(model_path: str) -> list[str]:
     """Resolve class names for a YOLO model.
 
     Resolution order:
-      1. Sidecar JSON file next to the .pt — only used if it parses into a
-         recognized class-names format. Unrelated JSONs (e.g. civitai_helper
-         metadata) are silently ignored.
+      1. A sidecar JSON next to the .pt, only if it parses into a recognized
+         class-names format. Two names are tried, in order:
+           a. <model>.names.json  — a DEDICATED file that never collides with
+              civitai_helper / Stability Matrix metadata (which claims the plain
+              <model>.json). This is the escape hatch for models whose .pt a
+              WebUI's safe-unpickle refuses to read (e.g. non-standard
+              segmentation models -> otherwise-empty class dropdown).
+           b. <model>.json        — legacy/plain sidecar; unrelated JSONs (e.g.
+              civitai_helper metadata) don't match the format and are ignored.
       2. model.names from a transient YOLO() load.
       3. [] if unknown (YOLO-World, MediaPipe, missing file, or load failure).
     """
@@ -80,8 +86,9 @@ def get_model_class_names(model_path: str) -> list[str]:
     if is_world_model(p) or not p.exists() or p.suffix != ".pt":
         return []
 
-    sidecar = p.with_suffix(".json")
-    if sidecar.is_file():
+    for sidecar in (p.with_name(p.stem + ".names.json"), p.with_suffix(".json")):
+        if not sidecar.is_file():
+            continue
         try:
             data = json.loads(sidecar.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
