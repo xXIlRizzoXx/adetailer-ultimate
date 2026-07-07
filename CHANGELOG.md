@@ -1,5 +1,15 @@
 # Changelog
 
+## v26.3.0+plus.6.beta.1 — 2026-07-07 (BETA · Run ADetailer on an existing image, no re-generation)
+
+> **Beta / pre-release.** New feature awaiting confirmation on real Forge Neo (requested in #4). `main` stays stable at v26.3.0+plus.5.
+
+**New: run the full ADetailer detect + inpaint pass on an image you already have — without regenerating it.** The **Detection preview** accordion gains an **"✨ Also run ADetailer (inpaint)"** checkbox next to the Run button. With it ticked, dropping an image into the preview box and pressing Run performs the complete detect-and-inpaint pass on that exact image — using the current tab's detector, detailer checkpoint, prompt, LoRAs, text encoder and VAE — and returns the retouched result, instead of only outlining what was detected. This makes it fast to try different detailer checkpoints / LoRAs on a finished image without re-rolling the base generation (requested by @koblue in #4).
+
+Implemented index-safe (no new Gradio event listeners: the new checkbox is a plain input on the existing preview button, like "Combine all tabs"). The pass runs on a minimal in-memory processing shell that the existing img2img detailer path reads its settings from — the actual inpaint still runs through the real `StableDiffusionProcessingImg2Img` pipeline, so behaviour matches a normal ADetailer pass. Fully guarded end-to-end: any failure degrades to a status message, never a crash.
+
+**Note:** you can already achieve the same today without this beta — send your result to **img2img**, enable ADetailer there and tick **"Skip img2img"** (the base img2img pass becomes a throwaway no-op, so only the detailer runs on your image). This feature just makes it one click from the txt2img preview.
+
 ## v26.3.0+plus.5 — 2026-07-03 (Per-pass text encoder + universal-WebUI compatibility)
 
 **New: a separate text encoder for the ADetailer step (Forge / Forge Neo).** A new per-tab **"Use separate text encoder"** checkbox + dropdown lets the detailer pass use a different text encoder than the base generation — e.g. drop a ZiT (Z-Image) encoder so an SDXL detailer checkpoint can run without an architecture mismatch (requested in #3). Choose *"Use same text encoder"* (default, no change), *"None (use detailer checkpoint's own)"*, or a specific encoder. On Forge, VAE + text encoders are unified into `forge_additional_modules`; the swap is applied for the pass through `override_settings` (which never touches the base model's load state) and restored afterward. Fully guarded: an inert no-op on A1111 (which has no such concept), and a no-op — never a crash — if a Forge build doesn't reload modules from `override_settings`. Confirmed working on Forge Neo by @koblue.

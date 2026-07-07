@@ -314,7 +314,7 @@ class AfterDetailerScript(scripts.Script):
             model_mapping=model_mapping,
         )
 
-        components, infotext_fields = adui(num_models, is_img2img, webui_info)
+        components, infotext_fields = adui(num_models, is_img2img, webui_info, script=self)
 
         self.infotext_fields = infotext_fields
         return components
@@ -669,10 +669,11 @@ class AfterDetailerScript(scripts.Script):
             return create_infotext(
                 p, p.all_prompts, p.all_seeds, p.all_subseeds, None, 0, 0
             )
-        except TypeError:
+        except Exception:  # noqa: BLE001
             # create_infotext's positional signature has drifted across
-            # WebUI/fork versions; degrade to no ADetailer infotext rather
-            # than aborting the pass.
+            # WebUI/fork versions (TypeError), and a minimal p-shell (the
+            # standalone preview run) may lack attrs it reads (AttributeError);
+            # degrade to no ADetailer infotext rather than aborting the pass.
             return ""
 
     def read_params_txt(self) -> str:
@@ -701,6 +702,13 @@ class AfterDetailerScript(scripts.Script):
     def script_filter(self, p, args: ADetailerArgs):
         script_runner = copy(p.scripts)
         script_args = self.script_args_copy(p.script_args)
+
+        if script_runner is None:
+            # Standalone / preview pass (p.scripts is None) — e.g. the
+            # Detection-preview "also run ADetailer" path (issue #4) builds a
+            # p-shell with no host ScriptRunner. Run the detailer with no
+            # alwayson scripts instead of crashing on None.alwayson_scripts.
+            return None, script_args
 
         ad_only_selected_scripts = opts.data.get("ad_only_selected_scripts", True)
         if not ad_only_selected_scripts:
@@ -957,6 +965,84 @@ class AfterDetailerScript(scripts.Script):
         if is_skip_img2img(p):
             return p.init_images[0]
         return pp.image
+
+    def run_detailer_on_image(self, image, args: ADetailerArgs):
+        """Run the ADetailer detect+inpaint pass on a standalone image, with NO
+        base generation — powers the Detection-preview "also run ADetailer"
+        option (issue #4). Builds a minimal p-shell that get_i2i_p reads its base
+        settings from (the actual inpaint still runs on a REAL
+        StableDiffusionProcessingImg2Img built by get_i2i_p), runs the detailer,
+        and returns (result_image, status_str). Fully guarded — never raises."""
+        try:
+            from types import SimpleNamespace
+
+            image = ensure_pil_image(image, "RGB")
+            w, h = image.size
+            w8, h8 = max(64, (w // 8) * 8), max(64, (h // 8) * 8)
+
+            sampler = "Euler a"
+            try:
+                if all_samplers:
+                    sampler = all_samplers[0].name
+            except Exception:  # noqa: BLE001
+                pass
+
+            outdir = opts.data.get("outdir_img2img_samples", "") or opts.data.get(
+                "outdir_samples", ""
+            )
+            outgrid = opts.data.get("outdir_img2img_grids", "") or opts.data.get(
+                "outdir_grids", ""
+            )
+
+            p = SimpleNamespace(
+                sd_model=shared.sd_model,
+                prompt="",
+                negative_prompt="",
+                all_prompts=[""],
+                all_negative_prompts=[""],
+                seed=-1,
+                subseed=-1,
+                all_seeds=[-1],
+                all_subseeds=[-1],
+                subseed_strength=0.0,
+                seed_resize_from_h=0,
+                seed_resize_from_w=0,
+                iteration=0,
+                batch_index=0,
+                batch_size=1,
+                width=w8,
+                height=h8,
+                steps=28,
+                cfg_scale=7.0,
+                sampler_name=sampler,
+                scheduler="Automatic",
+                styles=[],
+                tiling=False,
+                restore_faces=False,
+                outpath_samples=outdir,
+                outpath_grids=outgrid,
+                extra_generation_params={},
+                scripts=None,
+                script_args=[],
+                override_settings={},
+            )
+
+            # NB: PPImage is a typing Protocol (helper.py) and cannot be
+            # instantiated — _postprocess_image_inner only ever reads/reassigns
+            # pp.image, so a plain namespace is the correct carrier here.
+            pp = SimpleNamespace(image=image)
+            processed = self._postprocess_image_inner(p, pp, args)
+            if not processed:
+                return image, "ℹ️ Nothing detected — image unchanged."
+            return pp.image, "✅ ADetailer pass complete."
+        except Exception as e:  # noqa: BLE001
+            import traceback as _tb
+
+            print(
+                "[-] ADetailer: preview ADetailer run failed:\n" + _tb.format_exc(),
+                file=sys.stderr,
+            )
+            return None, f"⚠️ ADetailer run failed: {e}"
 
     @staticmethod
     def get_each_tab_seed(seed: int, i: int):

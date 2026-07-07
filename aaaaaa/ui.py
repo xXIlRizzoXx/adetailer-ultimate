@@ -358,6 +358,7 @@ def adui(
     num_models: int,
     is_img2img: bool,
     webui_info: WebuiInfo,
+    script=None,
 ):
     states = []
     infotext_fields = []
@@ -450,14 +451,14 @@ def adui(
         )
         # Cross-tab Detection-preview wiring (also a post-loop "second pass"):
         # lets each tab's "Combine all tabs" checkbox run every tab's detector.
-        _wire_detection_previews(all_widgets, webui_info, num_models)
+        _wire_detection_previews(all_widgets, webui_info, num_models, script)
 
     # components: [bool, bool, dict, dict, ...]
     components = [ad_enable, ad_skip_img2img, *states]
     return components, infotext_fields
 
 
-def _wire_detection_previews(all_widgets, webui_info, num_models):
+def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
     """Wire every tab's Detection-preview button AFTER all tabs exist, so the
     per-tab "Combine all tabs" checkbox can run EVERY configured tab's detector
     on one image and overlay all the boxes.
@@ -515,10 +516,32 @@ def _wire_detection_previews(all_widgets, webui_info, num_models):
             return None, str(e)
 
     def _make_handler(tab_idx):
-        def _run(image, combine, *flat):
+        def _run(image, combine, run_inpaint, *flat):
             if image is None:
                 return None, "⚠️ Drop an image into the Input box first."
             per_tab = [flat[i * 5 : (i + 1) * 5] for i in range(num_models)]
+
+            # "Also run ADetailer": run the FULL detect+inpaint pass on the
+            # input image using THIS tab's settings, without regenerating
+            # (issue #4). This tab's full ADetailerArgs are appended to `flat`
+            # after the per-tab detector fields; rebuild them and hand off to
+            # the script. run_detailer_on_image is guarded end-to-end.
+            if run_inpaint:
+                if script is None:
+                    return None, "⚠️ ADetailer run isn't available here."
+                from adetailer.args import ADetailerArgs
+
+                arg_vals = flat[num_models * 5 :]
+                try:
+                    args_obj = ADetailerArgs(
+                        **dict(zip(list(ALL_ARGS.attrs), arg_vals)),
+                        is_api=False,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    return None, f"⚠️ Couldn't read this tab's settings: {e}"
+                if not args_obj.ad_model or args_obj.ad_model == "None":
+                    return None, "⚠️ Pick a detector model first."
+                return script.run_detailer_on_image(image, args_obj)
 
             # Single-tab: reuse the rich ultralytics/mediapipe plot (class
             # labels + confidence baked in by the detector's own plotter).
@@ -639,7 +662,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models):
         return _run
 
     for i, w in enumerate(all_widgets):
-        inputs = [w.ad_preview_input, w.ad_preview_all_tabs]
+        inputs = [w.ad_preview_input, w.ad_preview_all_tabs, w.ad_preview_run_inpaint]
         for t in all_widgets:
             inputs += [
                 t.ad_model,
@@ -648,11 +671,17 @@ def _wire_detection_previews(all_widgets, webui_info, num_models):
                 t.ad_model_classes_exclude,
                 t.ad_confidence,
             ]
+        # This tab's FULL ADetailerArgs (in ALL_ARGS order), read as inputs so
+        # the "Also run ADetailer" branch can rebuild the args. Appended AFTER
+        # the per-tab detector fields; adds NO new listener (index-safe).
+        inputs += w.tolist()
         w.ad_preview_btn.click(
             fn=_make_handler(i),
             inputs=inputs,
+            # queue=True so the GPU inpaint pass shows progress and can be
+            # interrupted (changing this flag adds no listener — still index-safe).
             outputs=[w.ad_preview_output, w.ad_preview_status],
-            queue=False,
+            queue=True,
         )
 
 
@@ -1593,6 +1622,20 @@ def one_ui_group(
                     min_width=220,
                     elem_classes=["ad-preview-combine"],
                     elem_id=eid("ad_preview_all_tabs"),
+                )
+                # "Also run ADetailer": when ON, the Run button runs the FULL
+                # detect+inpaint pass on the Input image using THIS tab's
+                # settings (issue #4 — test detailer checkpoints/LoRAs/text
+                # encoder without regenerating) and shows the result in the
+                # output box. Component only — NO listener of its own (read as
+                # an input by the existing preview .click), so it stays
+                # index-safe exactly like "Combine all tabs".
+                w.ad_preview_run_inpaint = gr.Checkbox(
+                    label="✨ Also run ADetailer (inpaint)",
+                    value=False,
+                    scale=0,
+                    min_width=240,
+                    elem_id=eid("ad_preview_run_inpaint"),
                 )
                 # Status line for the "Run detection preview" button.
                 # Uses `.ad-preview-status` (NOT `.ad-preset-status`) because
