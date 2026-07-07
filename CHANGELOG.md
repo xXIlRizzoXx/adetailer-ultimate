@@ -8,6 +8,12 @@
 
 Implemented index-safe (no new Gradio event listeners: the new checkbox is a plain input on the existing preview button, like "Combine all tabs"). The pass runs on a minimal in-memory processing shell that the existing img2img detailer path reads its settings from — the actual inpaint still runs through the real `StableDiffusionProcessingImg2Img` pipeline, so behaviour matches a normal ADetailer pass. Fully guarded end-to-end: any failure degrades to a status message, never a crash.
 
+**Also in this beta (found during testing on real A1111 + Forge Neo):**
+
+- **No CUDA out-of-memory on very large images.** The standalone pass caps its per-face working resolution to a 1024 max side (aspect-preserved). With "inpaint only masked" (the default) the final image stays full-resolution — only the region regeneration is capped — so dropping a very large image (e.g. a ~97 MP upscale) no longer asks for tens of GiB.
+- **Custom multi-class detectors can expose their classes even when a WebUI's safe-unpickle refuses to read the model.** A dedicated `<model>.names.json` sidecar — which never collides with civitai_helper / Stability Matrix metadata (the plain `<model>.json`) — is read first, so the **CLASSES** dropdown populates for models whose `.pt` the host won't introspect (e.g. some non-standard segmentation models). Format: `{"names": {"0": "face", "1": "hand", ...}}`.
+- **Checkbox spacing.** The "✨ Also run ADetailer (inpaint)" checkbox is spaced like "🔁 Combine all tabs" instead of being glued to the Run button.
+
 **Note:** you can already achieve the same today without this beta — send your result to **img2img**, enable ADetailer there and tick **"Skip img2img"** (the base img2img pass becomes a throwaway no-op, so only the detailer runs on your image). This feature just makes it one click from the txt2img preview.
 
 ## v26.3.0+plus.5 — 2026-07-03 (Per-pass text encoder + universal-WebUI compatibility)
