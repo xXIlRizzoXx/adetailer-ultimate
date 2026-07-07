@@ -669,11 +669,18 @@ class AfterDetailerScript(scripts.Script):
             return create_infotext(
                 p, p.all_prompts, p.all_seeds, p.all_subseeds, None, 0, 0
             )
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             # create_infotext's positional signature has drifted across
             # WebUI/fork versions (TypeError), and a minimal p-shell (the
             # standalone preview run) may lack attrs it reads (AttributeError);
             # degrade to no ADetailer infotext rather than aborting the pass.
+            # Log once so a genuine regression on the normal path is still
+            # diagnosable (this only affects auxiliary preview/step images).
+            print(
+                f"[-] ADetailer: create_infotext failed ({e}); saving the "
+                f"preview/step image without ADetailer infotext.",
+                file=sys.stderr,
+            )
             return ""
 
     def read_params_txt(self) -> str:
@@ -890,20 +897,34 @@ class AfterDetailerScript(scripts.Script):
             )
             save_dir = base_dir
 
-        images.save_image(
-            image=image,
-            path=str(save_dir),
-            basename="",
-            seed=seed,
-            prompt=save_prompt,
-            extension=opts.samples_format,
-            info=self.infotext(p),
-            p=p,
-            suffix=suffix,
-            # We already resolved the date folder above; don't let save_image
-            # append it again (that's what nested it wrong before).
-            save_to_dirs=False,
-        )
+        try:
+            images.save_image(
+                image=image,
+                path=str(save_dir),
+                basename="",
+                seed=seed,
+                prompt=save_prompt,
+                extension=opts.samples_format,
+                info=self.infotext(p),
+                p=p,
+                suffix=suffix,
+                # We already resolved the date folder above; don't let
+                # save_image append it again (that's what nested it wrong
+                # before).
+                save_to_dirs=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            # images.save_image builds its OWN FilenameGenerator from the
+            # user's samples_filename_pattern; a non-default token reading a
+            # p-attr the caller doesn't carry (e.g. the standalone-preview
+            # p-shell) would raise here. This is an auxiliary preview/step
+            # image, never the final result — skip it rather than abort the
+            # whole (possibly successful) ADetailer pass.
+            print(
+                f"[-] ADetailer: couldn't save the '{suffix}' preview/step "
+                f"image ({e}); skipping it and continuing.",
+                file=sys.stderr,
+            )
 
     def get_ad_model(self, name: str):
         if name not in model_mapping:
@@ -1010,6 +1031,7 @@ class AfterDetailerScript(scripts.Script):
                 iteration=0,
                 batch_index=0,
                 batch_size=1,
+                n_iter=1,
                 width=w8,
                 height=h8,
                 steps=28,

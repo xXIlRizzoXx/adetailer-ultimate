@@ -533,9 +533,12 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
 
                 arg_vals = flat[num_models * 5 :]
                 try:
+                    # is_api's pre-validator resolves the () sentinel to False
+                    # (a plain False would be inverted to True); () is exactly
+                    # what a real UI generation pass sends, so this is parity.
                     args_obj = ADetailerArgs(
                         **dict(zip(list(ALL_ARGS.attrs), arg_vals)),
-                        is_api=False,
+                        is_api=(),
                     )
                 except Exception as e:  # noqa: BLE001
                     return None, f"⚠️ Couldn't read this tab's settings: {e}"
