@@ -34,6 +34,7 @@ button[id*="adetailer_ad_preset_delete"],
 button[id*="adetailer_ad_preset_save"],
 button[id*="adetailer_ad_preset_reset"],
 button[id*="adetailer_ad_preview_btn"],
+button[id*="adetailer_ad_apply_btn"],
 /* Export = gr.DownloadButton, Import = gr.UploadButton. Both render
  * as <button> at the root. */
 button[id*="adetailer_ad_preset_export_btn"],

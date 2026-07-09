@@ -1,12 +1,12 @@
 # Changelog
 
-## v26.3.0+plus.6.beta.2 — 2026-07-09 (BETA · quality-of-life from #4 feedback)
+## v26.3.0+plus.6.beta.2 — 2026-07-09 (BETA · split into two tools + quality-of-life from #4 feedback)
 
-> **Beta / pre-release.** Follow-up to beta.1 with @koblue's quality-of-life requests after he confirmed the feature works. `main` stays stable at **v26.3.0+plus.5**.
+> **Beta / pre-release.** Follow-up to beta.1 with @koblue's feedback after he confirmed the feature works. `main` stays stable at **v26.3.0+plus.5**.
 
-- **Optional "💾 Save result to outputs" checkbox.** With **"✨ Also run ADetailer (inpaint)"** on, tick this to also write the retouched result to your outputs folder — previously it only lived in Gradio's temp directory. Off by default; guarded so a save failure never loses the result.
+- **Split into two clear sub-tools.** The old combined accordion is now two: **"Detection preview"** (detection only — bounding boxes, as before) and a dedicated **"Run ADetailer on an image"** (the full detect + inpaint pass on a dropped image, no regeneration). Each has its own Input / Run button / Output, so the mode is explicit instead of a checkbox — and the "(no inpaint)" label that no longer fit is gone. Index-safe: the extra button adds no persistence listener and the host output gallery is untouched.
+- **"💾 Save result to outputs" checkbox** in the new tool — tick it to also write the retouched result to your configured outputs folder, not just Gradio's temp directory. Off by default; guarded so a save failure never loses the result.
 - **Fullscreen "expand" button on the result image**, where the WebUI's Gradio supports it (Forge / Forge Neo) — click the result to fill the window like a normal generated image. Inert on A1111's Gradio 3 (which has no such control).
-- **Updated the accordion wording** to describe the new inpaint option — it no longer reads "WITHOUT inpainting", which was outdated once this feature existed.
 
 ## v26.3.0+plus.6.beta.1 — 2026-07-07 (BETA · Run ADetailer on an existing image, no re-generation)
 

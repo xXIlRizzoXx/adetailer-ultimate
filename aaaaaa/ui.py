@@ -662,28 +662,48 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 + " | ".join(summary),
             )
 
-        return _run
+        # Two thin wrappers over the one _run body, one per dedicated button.
+        # They bake the branch constants so _run's *flat layout is untouched:
+        # _detect -> detection only, _apply -> full detect+inpaint.
+        def _detect(image, combine, *flat):
+            return _run(image, combine, False, False, *flat)
+
+        def _apply(image, save, *flat):
+            return _run(image, False, True, save, *flat)
+
+        return _detect, _apply
 
     for i, w in enumerate(all_widgets):
-        inputs = [w.ad_preview_input, w.ad_preview_all_tabs, w.ad_preview_run_inpaint, w.ad_preview_save]
+        # Shared tail read by BOTH buttons: every tab's 5 detector fields (so
+        # "Combine all tabs" can reach them) + THIS tab's full ADetailerArgs in
+        # ALL_ARGS order (so the apply branch can rebuild the args). Read as
+        # inputs only — adds NO .change listener (index-safe).
+        tail = []
         for t in all_widgets:
-            inputs += [
+            tail += [
                 t.ad_model,
                 t.ad_model_classes,
                 t.ad_model_classes_excluded,
                 t.ad_model_classes_exclude,
                 t.ad_confidence,
             ]
-        # This tab's FULL ADetailerArgs (in ALL_ARGS order), read as inputs so
-        # the "Also run ADetailer" branch can rebuild the args. Appended AFTER
-        # the per-tab detector fields; adds NO new listener (index-safe).
-        inputs += w.tolist()
+        tail += w.tolist()
+
+        detect_fn, apply_fn = _make_handler(i)
+        # One dedicated button per sub-accordion. Two per-tab .click handlers are
+        # index-safe: the host gallery's send-to buttons don't depend on
+        # ADetailer's listener count (which already scales 1-15x with the "max
+        # models" slider). The checkboxes stay listener-free.
         w.ad_preview_btn.click(
-            fn=_make_handler(i),
-            inputs=inputs,
-            # queue=True so the GPU inpaint pass shows progress and can be
-            # interrupted (changing this flag adds no listener — still index-safe).
+            fn=detect_fn,
+            inputs=[w.ad_preview_input, w.ad_preview_all_tabs, *tail],
             outputs=[w.ad_preview_output, w.ad_preview_status],
+            queue=True,
+        )
+        w.ad_apply_btn.click(
+            fn=apply_fn,
+            inputs=[w.ad_apply_input, w.ad_apply_save, *tail],
+            outputs=[w.ad_apply_output, w.ad_apply_status],
             queue=True,
         )
 
@@ -1578,113 +1598,127 @@ def one_ui_group(
         ):
             detection(w, n, is_img2img, saved)
 
-        with gr.Accordion(
-            "Detection preview (no inpaint)",
-            open=False,
-            elem_id=eid("ad_preview_accordion"),
-        ):
-            gr.Markdown(
-                "Drop or paste an image and press the button. By default it only "
-                "**detects** — it runs the detector with the current settings "
-                "(classes, NOT, confidence) and outlines the detected regions with "
-                "bounding boxes, no inpainting. Tick **\"✨ Also run ADetailer "
-                "(inpaint)\"** to run the full detect + inpaint pass on that image "
-                "and get the retouched result (optionally saved to your outputs "
-                "folder).",
-                elem_classes=["ad-preview-hint"],
-            )
-            with gr.Row():
-                w.ad_preview_input = gr.Image(
-                    label="Input",
-                    type="pil",
-                    interactive=True,
-                    elem_id=eid("ad_preview_input"),
+        # Two sibling sub-accordions inside one group: a detection-only preview
+        # and the full "run ADetailer on an image" tool (issue #4). Each has its
+        # OWN Input / Run button / Output; settings are shared automatically
+        # because both handlers read the same per-tab detector fields + tolist().
+        with gr.Group():
+            with gr.Accordion(
+                "Detection preview",
+                open=False,
+                elem_id=eid("ad_preview_accordion"),
+            ):
+                gr.Markdown(
+                    "Drop or paste an image and press the button to run the "
+                    "detector with the current settings (classes, NOT, "
+                    "confidence) and outline the detected regions with bounding "
+                    "boxes — **detection only, no inpainting**. To actually run "
+                    "ADetailer on an image, use **\"Run ADetailer on an image\"** "
+                    "below.",
+                    elem_classes=["ad-preview-hint"],
                 )
-                # Gradio 4 (Forge / Forge Neo) can show a fullscreen "expand"
-                # button on the result image; Gradio 3 (A1111) has no such
-                # param, so pass it only where supported (koblue's request, #4).
-                _out_extra = {}
-                try:
-                    import inspect as _inspect
+                with gr.Row():
+                    w.ad_preview_input = gr.Image(
+                        label="Input",
+                        type="pil",
+                        interactive=True,
+                        elem_id=eid("ad_preview_input"),
+                    )
+                    w.ad_preview_output = gr.Image(
+                        label="Detections",
+                        type="pil",
+                        interactive=False,
+                        elem_id=eid("ad_preview_output"),
+                    )
+                with gr.Row():
+                    w.ad_preview_btn = gr.Button(
+                        "🔍 Run detection preview",
+                        elem_id=eid("ad_preview_btn"),
+                        scale=0,
+                        min_width=200,
+                    )
+                    # Component only — NO listener of its own (read purely as an
+                    # input by the preview button's .click, wired later in
+                    # _wire_detection_previews). When on, the button runs EVERY
+                    # configured tab's detector and overlays all boxes at once.
+                    w.ad_preview_all_tabs = gr.Checkbox(
+                        label="🔁 Combine all tabs",
+                        value=False,
+                        scale=0,
+                        min_width=220,
+                        elem_classes=["ad-preview-combine"],
+                        elem_id=eid("ad_preview_all_tabs"),
+                    )
+                    w.ad_preview_status = gr.Markdown(
+                        value="",
+                        elem_id=eid("ad_preview_status"),
+                        elem_classes=["ad-preview-status"],
+                    )
 
-                    if "show_fullscreen_button" in _inspect.signature(
-                        gr.Image.__init__
-                    ).parameters:
-                        _out_extra["show_fullscreen_button"] = True
-                except Exception:  # noqa: BLE001
-                    pass
-                w.ad_preview_output = gr.Image(
-                    label="Detections / result",
-                    type="pil",
-                    interactive=False,
-                    elem_id=eid("ad_preview_output"),
-                    **_out_extra,
+            with gr.Accordion(
+                "Run ADetailer on an image",
+                open=False,
+                elem_id=eid("ad_apply_accordion"),
+            ):
+                gr.Markdown(
+                    "Drop or paste an image and press the button to run the full "
+                    "ADetailer **detect + inpaint** pass on it — using this tab's "
+                    "detector, detailer checkpoint, prompt, LoRAs, text encoder "
+                    "and VAE — **without regenerating** the base image. Handy for "
+                    "trying different detailer setups on a finished picture "
+                    "(requested in #4).",
+                    elem_classes=["ad-preview-hint"],
                 )
-            with gr.Row():
-                w.ad_preview_btn = gr.Button(
-                    "🔍 Run detection preview",
-                    elem_id=eid("ad_preview_btn"),
-                    scale=0,
-                    min_width=200,
-                )
-                # Sits NEXT TO the Run button (user-requested placement: on the
-                # same row, right under the two detection image boxes).
-                # Component only — it has NO event listener of its own (adding
-                # one would shift Gradio dependency indices and break Forge's
-                # gallery); it is read purely as an INPUT by the preview
-                # button's .click, wired later in _wire_detection_previews()
-                # once every tab exists. When on, the button runs EVERY
-                # configured tab's detector on the input image and overlays all
-                # the bounding boxes at once; when off, only this tab's.
-                w.ad_preview_all_tabs = gr.Checkbox(
-                    label="🔁 Combine all tabs",
-                    value=False,
-                    scale=0,
-                    min_width=220,
-                    elem_classes=["ad-preview-combine"],
-                    elem_id=eid("ad_preview_all_tabs"),
-                )
-                # "Also run ADetailer": when ON, the Run button runs the FULL
-                # detect+inpaint pass on the Input image using THIS tab's
-                # settings (issue #4 — test detailer checkpoints/LoRAs/text
-                # encoder without regenerating) and shows the result in the
-                # output box. Component only — NO listener of its own (read as
-                # an input by the existing preview .click), so it stays
-                # index-safe exactly like "Combine all tabs".
-                w.ad_preview_run_inpaint = gr.Checkbox(
-                    label="✨ Also run ADetailer (inpaint)",
-                    value=False,
-                    scale=0,
-                    min_width=240,
-                    # Same left margin as "Combine all tabs" so it isn't glued
-                    # to the Run button.
-                    elem_classes=["ad-preview-combine"],
-                    elem_id=eid("ad_preview_run_inpaint"),
-                )
-                # "Save result to outputs": when ON (with "Also run ADetailer"
-                # on), the retouched result is also written to your outputs
-                # folder instead of only living in Gradio's temp dir (koblue's
-                # request, #4). Listener-free input — index-safe like the others.
-                w.ad_preview_save = gr.Checkbox(
-                    label="💾 Save result to outputs",
-                    value=False,
-                    scale=0,
-                    min_width=210,
-                    elem_classes=["ad-preview-combine"],
-                    elem_id=eid("ad_preview_save"),
-                )
-                # Status line for the "Run detection preview" button.
-                # Uses `.ad-preview-status` (NOT `.ad-preset-status`) because
-                # the messages here are user-facing warnings ("Pick a
-                # detector first.", "Drop an image first.") that need to be
-                # legible — the dim faded look of `.ad-preset-status` makes
-                # them blend into the background. The dedicated class
-                # carries full opacity + a subtle warning pill style.
-                w.ad_preview_status = gr.Markdown(
-                    value="",
-                    elem_id=eid("ad_preview_status"),
-                    elem_classes=["ad-preview-status"],
-                )
+                with gr.Row():
+                    w.ad_apply_input = gr.Image(
+                        label="Input",
+                        type="pil",
+                        interactive=True,
+                        elem_id=eid("ad_apply_input"),
+                    )
+                    # Gradio 4 (Forge / Forge Neo) can show a fullscreen "expand"
+                    # button on the result image; Gradio 3 (A1111) has no such
+                    # param, so pass it only where supported (koblue's request).
+                    _apply_out_extra = {}
+                    try:
+                        import inspect as _inspect
+
+                        if "show_fullscreen_button" in _inspect.signature(
+                            gr.Image.__init__
+                        ).parameters:
+                            _apply_out_extra["show_fullscreen_button"] = True
+                    except Exception:  # noqa: BLE001
+                        pass
+                    w.ad_apply_output = gr.Image(
+                        label="Result",
+                        type="pil",
+                        interactive=False,
+                        elem_id=eid("ad_apply_output"),
+                        **_apply_out_extra,
+                    )
+                with gr.Row():
+                    w.ad_apply_btn = gr.Button(
+                        "✨ Run ADetailer on this image",
+                        elem_id=eid("ad_apply_btn"),
+                        scale=0,
+                        min_width=240,
+                    )
+                    # "Save result to outputs": listener-free input — index-safe.
+                    # Writes the result to your outputs folder instead of only
+                    # Gradio's temp dir (koblue's request, #4).
+                    w.ad_apply_save = gr.Checkbox(
+                        label="💾 Save result to outputs",
+                        value=False,
+                        scale=0,
+                        min_width=210,
+                        elem_classes=["ad-preview-combine"],
+                        elem_id=eid("ad_apply_save"),
+                    )
+                    w.ad_apply_status = gr.Markdown(
+                        value="",
+                        elem_id=eid("ad_apply_status"),
+                        elem_classes=["ad-preview-status"],
+                    )
 
         with gr.Accordion(
             "Mask Preprocessing",

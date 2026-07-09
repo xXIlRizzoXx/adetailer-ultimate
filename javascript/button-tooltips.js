@@ -51,6 +51,10 @@
         // Detection preview
         adetailer_ad_preview_btn:
             "Run the configured detector against the input image WITHOUT inpainting. The result shows bounding boxes / masks so you can tune confidence + class filter before committing to a full generation.",
+
+        // Run ADetailer on an existing image (no re-generation)
+        adetailer_ad_apply_btn:
+            "Run the full ADetailer detect + inpaint pass on the input image, using this tab's detector / detailer checkpoint / prompt / LoRAs — without regenerating the base image. Tick 'Save result to outputs' to also write it to your outputs folder.",
     };
 
     function applyTooltips() {
