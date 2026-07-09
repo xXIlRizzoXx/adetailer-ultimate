@@ -147,6 +147,12 @@ div.block.ad-preview-status {
     margin-left: 28px !important;
 }
 
+/* A little breathing room between the accordion hint text and the Input/Result
+ * image row right below it (otherwise they sit glued together). */
+.ad-preview-hint {
+    margin-bottom: 10px !important;
+}
+
 /* Preset preview block: shows the selected preset's content live.
  * Slightly indented, smaller font, no border — should feel like a
  * helper hint, not a UI panel. */
