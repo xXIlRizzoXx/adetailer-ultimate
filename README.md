@@ -35,7 +35,8 @@ Features registered through `adui()` with mode-agnostic visibility — every wid
 | 🟢 | Exclude / NOT mode | Not available. | "Exclude selected (NOT)" checkbox inverts the filter — every class the model produces *except* the selected ones gets inpainted. Implemented as a post-filter on `pred.boxes.cls`. |
 | 🟢 | Sequential class detection | All selected classes run in a single inference batch; the inpaint passes all use the same prompt and settings. | Optional "Process classes sequentially" checkbox: runs one detect+inpaint pass per selected class in dropdown order, each pass operating on the output of the previous. Cleaner per-region inpainting at the cost of longer runtime. Top-of-function recursion in `_postprocess_image_inner` with single-class `args.copy(update=...)`.<br>_Mask preview is saved once per tab (first class only) rather than once per class; Skip / Interrupt mid-sequential rolls back the entire tab to the pre-sequential image — see [Sequential Class Detection](#sequential-class-detection) for both behaviours._ |
 | 🟢 | Class pass order (activation order) | N/A (no class-selection UI). | The order in which you click classes in the dropdown is the order they're processed when **Sequential class detection** is on. Gradio's multi-select natively appends each selection to the end of the value list, and the sequential pipeline reads that order verbatim. To re-order, click the × on a token to deselect it, then click its name in the dropdown again — it goes to the end. |
-| 🟢 | Detection preview | Not available — you run a full generation to see what the detector matches. | "Run detection preview" button in a per-tab accordion. Runs the configured detector against the most recent generation (or the img2img input) and returns the image annotated with bounding boxes / mask, without inpainting.<br>**Note:** select a model in the **ADetailer detector** dropdown of the same tab *first* — the preview uses the tab's currently-selected detector and the button is a no-op when no detector is chosen. |
+| 🟢 | Detection preview | Not available — you run a full generation to see what the detector matches. | **"Detection preview"** sub-accordion with a "Run detection preview" button. Drop or paste an image and it runs the configured detector against it, returning the image annotated with bounding boxes / mask — **detection only, no inpainting**. A **🔁 Combine all tabs** checkbox overlays every configured tab's detector at once.<br>**Note:** select a model in the **ADetailer detector** dropdown of the same tab *first* — the preview uses the tab's currently-selected detector and is a no-op when no detector is chosen. |
+| 🟡 | Run ADetailer on an image | Not available — the detailer only runs as part of a full txt2img / img2img generation. To detail an image you already have you must send it to img2img and use the "Skip img2img" trick. | **"Run ADetailer on an image"** sub-accordion (a dedicated sibling of Detection preview). Drop an image and press the button to run the **full detect + inpaint pass** on it — using this tab's detector, detailer checkpoint, prompt, LoRAs, text encoder and VAE — **without regenerating** the base image. Fast way to try different detailer setups on a finished picture. Optional **💾 Save result to outputs** writes the result to a dedicated **`ADetailer-Inpaint`** folder next to your txt2img / img2img outputs (off by default); on Gradio 4 (Forge / Forge Neo) the result image gets a fullscreen "expand" button. Requested in #4; fully guarded (any failure degrades to a status message, never a crash) and index-safe. |
 
 #### Prompting
 
@@ -288,13 +289,28 @@ If the tab's `Prompt` field is non-empty, the main prompt is not consulted — y
 
 ## Detection Preview
 
-Tucked inside an accordion at the bottom of each tab: a **Run detection preview** button. When clicked it loads the most recent generation's image (or the img2img input when in img2img), runs the configured detector against it, and renders the resulting bounding boxes / mask without doing any inpainting.
+The bottom of each tab has **two sibling sub-tools**, split so each does one clear job — a detection-only preview, and a full "run ADetailer on an image" tool.
 
-**Before clicking the button, pick a model in the tab's `ADetailer detector` dropdown.** The preview reuses the tab's currently-selected detector — there is no separate detector picker inside the preview accordion. If you haven't chosen one yet (the dropdown is still on the `None` placeholder), the button has nothing to run against.
+### Detection preview
+
+A **Run detection preview** button. Drop or paste an image into the Input box and it runs the configured detector against it, rendering the resulting bounding boxes / mask **without any inpainting** — just "what would this detector catch here?".
+
+**Before clicking the button, pick a model in the tab's `ADetailer detector` dropdown.** The preview reuses the tab's currently-selected detector — there is no separate detector picker inside the accordion. If you haven't chosen one yet (the dropdown is still on the `None` placeholder), the button has nothing to run against.
 
 Useful for tuning confidence threshold + mask preprocessing without burning a full generation each time.
 
 **Combine all tabs.** Next to the Run button is a **🔁 Combine all tabs** checkbox. With it off, the preview runs only the current tab's detector (the detector's own rich plot, with class names + confidence). With it **on**, the button runs **every configured tab's detector** on the dropped image and overlays all results on one image at once — each tab's regions tinted in its own colour following the real segmentation shape (or the bounding box for box-only models), labelled `tab#:class confidence`. The status line summarises per tab, e.g. `3 detection(s) across 2 tab(s) — Tab1: 2 | Tab2: 1`. Handy for seeing at a glance what your whole multi-tab setup will catch on a given image before committing to a full generation. (No event listener is added for this — the checkbox is read by the existing preview button — so it stays compatible with the host WebUI's gallery wiring.)
+
+### Run ADetailer on an Image
+
+A dedicated sub-tool (requested in [#4](https://github.com/xXIlRizzoXx/adetailer-ultimate/issues/4)) that runs the **full detect + inpaint pass on an image you already have — without regenerating it**. Drop or paste an image into the Input box and press **✨ Run ADetailer on this image**: ADetailer detects with this tab's settings, inpaints each region using this tab's detailer checkpoint / prompt / LoRAs / text encoder / VAE, and returns the retouched result in the Result box.
+
+This makes it fast to try different detailer checkpoints or LoRAs on a finished picture without re-rolling the base generation. (The same is achievable in plain img2img with the **Skip img2img** trick, but this is one click from the ADetailer tab.)
+
+- **💾 Save result to outputs** — off by default. When ticked, the result is also written to a dedicated **`ADetailer-Inpaint`** folder created right next to your txt2img / img2img output folders (it follows launcher symlinks, so on Stability Matrix it lands in your central images directory beside `Img2Img` / `Text2Img`), instead of only Gradio's temporary directory. These standalone results are kept out of your normal generation folders.
+- **Fullscreen result** — on Gradio 4 (Forge / Forge Neo) the Result image has an "expand" button to view it full-window, like a normal generated image (Gradio 3 / A1111 has no such control, so it's simply omitted there).
+
+The whole pass is guarded end-to-end: any failure degrades to a status message, never a crash. Very large drops are capped to a sane working resolution to avoid a CUDA out-of-memory (with "inpaint only masked" — the default — the final image still stays full-resolution; only the per-region regeneration is capped). Index-safe: the second button and its checkbox add no persistence listeners and don't disturb the host WebUI's gallery send-to buttons.
 
 ## Manual Mode
 
@@ -332,6 +348,8 @@ txt2img-images/2026-06-03/
 Which of those three file types actually appear depends on the matching `Settings → ADetailer` toggle (`Save mask previews`, `Save images before ADetailer`, `Save intermediate steps`) — the sub-folder only changes **where** they go, never **whether** they're saved. If you've set a custom `Output directory for adetailer images`, the `adetailer-steps/` folder is created inside that instead. If the sub-folder can't be created (e.g. a read-only mount), ADetailer falls back to saving flat in the parent folder and logs a warning rather than dropping the image.
 
 The final image is always saved by the WebUI's own pipeline and never passes through this routing, so it stays in the main folder regardless of any ADetailer setting.
+
+Separately, the **Run ADetailer on an image** tool's optional **💾 Save result** writes to its own top-level **`ADetailer-Inpaint/`** folder — a sibling of `txt2img-images` / `img2img-images`, not inside `adetailer-steps/` — so those standalone results are kept apart from your normal generation outputs. See [Run ADetailer on an Image](#run-adetailer-on-an-image).
 
 ## Reset Settings
 
