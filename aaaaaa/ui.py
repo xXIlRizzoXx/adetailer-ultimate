@@ -1754,13 +1754,15 @@ def one_ui_group(
         except Exception:  # noqa: BLE001 — never break UI build over a flag
             pass
 
-    # The Detection-preview button's .click is wired LATER, in
-    # _wire_detection_previews(), AFTER every tab's widgets exist — so the
-    # per-tab "Combine all tabs" checkbox can feed every tab's detector
-    # settings into one handler and overlay all the boxes on a single image.
-    # This mirrors how _wire_copy_paste / _wire_presets do cross-tab wiring.
-    # Index-safe: still exactly one .click per tab (count unchanged), just
-    # relocated, so Forge's gallery buttons keep their fn_index.
+    # The "Detection preview" and "Run ADetailer on an image" buttons' .click
+    # handlers are wired LATER, in _wire_detection_previews(), AFTER every tab's
+    # widgets exist — so the per-tab "Combine all tabs" checkbox can feed every
+    # tab's detector settings into one handler and overlay all the boxes on a
+    # single image. This mirrors how _wire_copy_paste / _wire_presets do
+    # cross-tab wiring. Index-safe: these two per-tab .click handlers add NO
+    # .change listener and don't disturb Forge's gallery send-to buttons, whose
+    # fn_index doesn't depend on ADetailer's .click count (that count already
+    # scales 1-15x with the max-models slider).
 
     state = gr.State(lambda: state_init(w))
 
