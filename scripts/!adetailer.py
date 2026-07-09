@@ -1021,11 +1021,16 @@ class AfterDetailerScript(scripts.Script):
             except Exception:  # noqa: BLE001
                 pass
 
-            outdir = opts.data.get("outdir_img2img_samples", "") or opts.data.get(
-                "outdir_samples", ""
+            # Attribute access (not opts.data.get) so an UNCHANGED output dir
+            # still resolves to its effective default (which lives in
+            # data_labels, not the saved-config dict) — otherwise the "Save
+            # result to outputs" option would land the file in <webui>/outputs
+            # instead of the configured img2img folder.
+            outdir = getattr(opts, "outdir_img2img_samples", "") or getattr(
+                opts, "outdir_samples", ""
             )
-            outgrid = opts.data.get("outdir_img2img_grids", "") or opts.data.get(
-                "outdir_grids", ""
+            outgrid = getattr(opts, "outdir_img2img_grids", "") or getattr(
+                opts, "outdir_grids", ""
             )
 
             p = SimpleNamespace(
