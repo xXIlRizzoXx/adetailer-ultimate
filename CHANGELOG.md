@@ -1,5 +1,13 @@
 # Changelog
 
+## v26.3.0+plus.6.beta.2 — 2026-07-09 (BETA · quality-of-life from #4 feedback)
+
+> **Beta / pre-release.** Follow-up to beta.1 with @koblue's quality-of-life requests after he confirmed the feature works. `main` stays stable at **v26.3.0+plus.5**.
+
+- **Optional "💾 Save result to outputs" checkbox.** With **"✨ Also run ADetailer (inpaint)"** on, tick this to also write the retouched result to your outputs folder — previously it only lived in Gradio's temp directory. Off by default; guarded so a save failure never loses the result.
+- **Fullscreen "expand" button on the result image**, where the WebUI's Gradio supports it (Forge / Forge Neo) — click the result to fill the window like a normal generated image. Inert on A1111's Gradio 3 (which has no such control).
+- **Updated the accordion wording** to describe the new inpaint option — it no longer reads "WITHOUT inpainting", which was outdated once this feature existed.
+
 ## v26.3.0+plus.6.beta.1 — 2026-07-07 (BETA · Run ADetailer on an existing image, no re-generation)
 
 > **Beta / pre-release.** New feature awaiting confirmation on real Forge Neo (requested in #4). `main` stays stable at v26.3.0+plus.5.

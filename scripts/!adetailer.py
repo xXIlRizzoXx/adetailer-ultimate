@@ -987,7 +987,7 @@ class AfterDetailerScript(scripts.Script):
             return p.init_images[0]
         return pp.image
 
-    def run_detailer_on_image(self, image, args: ADetailerArgs):
+    def run_detailer_on_image(self, image, args: ADetailerArgs, save: bool = False):
         """Run the ADetailer detect+inpaint pass on a standalone image, with NO
         base generation — powers the Detection-preview "also run ADetailer"
         option (issue #4). Builds a minimal p-shell that get_i2i_p reads its base
@@ -1069,7 +1069,26 @@ class AfterDetailerScript(scripts.Script):
             processed = self._postprocess_image_inner(p, pp, args)
             if not processed:
                 return image, "ℹ️ Nothing detected — image unchanged."
-            return pp.image, "✅ ADetailer pass complete."
+            status = "✅ ADetailer pass complete."
+            if save:
+                # koblue's request (#4): also write the result to the outputs
+                # folder, not just Gradio's temp dir. Guarded — a save failure
+                # (e.g. a custom filename pattern reading a shell-absent attr)
+                # never loses the result, which is still returned to the UI.
+                try:
+                    save_dir = p.outpath_samples or "outputs"
+                    images.save_image(
+                        pp.image, save_dir, "",
+                        extension=opts.samples_format, p=p,
+                    )
+                    status += " Saved to the outputs folder."
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"[-] ADetailer: couldn't save the preview result ({e}).",
+                        file=sys.stderr,
+                    )
+                    status += " (couldn't save — see console)"
+            return pp.image, status
         except Exception as e:  # noqa: BLE001
             import traceback as _tb
 

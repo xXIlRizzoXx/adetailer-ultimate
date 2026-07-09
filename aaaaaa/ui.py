@@ -516,7 +516,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             return None, str(e)
 
     def _make_handler(tab_idx):
-        def _run(image, combine, run_inpaint, *flat):
+        def _run(image, combine, run_inpaint, save, *flat):
             if image is None:
                 return None, "⚠️ Drop an image into the Input box first."
             per_tab = [flat[i * 5 : (i + 1) * 5] for i in range(num_models)]
@@ -544,7 +544,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     return None, f"⚠️ Couldn't read this tab's settings: {e}"
                 if not args_obj.ad_model or args_obj.ad_model == "None":
                     return None, "⚠️ Pick a detector model first."
-                return script.run_detailer_on_image(image, args_obj)
+                return script.run_detailer_on_image(image, args_obj, save=save)
 
             # Single-tab: reuse the rich ultralytics/mediapipe plot (class
             # labels + confidence baked in by the detector's own plotter).
@@ -665,7 +665,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         return _run
 
     for i, w in enumerate(all_widgets):
-        inputs = [w.ad_preview_input, w.ad_preview_all_tabs, w.ad_preview_run_inpaint]
+        inputs = [w.ad_preview_input, w.ad_preview_all_tabs, w.ad_preview_run_inpaint, w.ad_preview_save]
         for t in all_widgets:
             inputs += [
                 t.ad_model,
@@ -1584,9 +1584,13 @@ def one_ui_group(
             elem_id=eid("ad_preview_accordion"),
         ):
             gr.Markdown(
-                "Drop or paste an image, then click the button to run the detector "
-                "with the current settings (classes, NOT, confidence) WITHOUT inpainting. "
-                "The result shows the detected regions with bounding boxes.",
+                "Drop or paste an image and press the button. By default it only "
+                "**detects** — it runs the detector with the current settings "
+                "(classes, NOT, confidence) and outlines the detected regions with "
+                "bounding boxes, no inpainting. Tick **\"✨ Also run ADetailer "
+                "(inpaint)\"** to run the full detect + inpaint pass on that image "
+                "and get the retouched result (optionally saved to your outputs "
+                "folder).",
                 elem_classes=["ad-preview-hint"],
             )
             with gr.Row():
@@ -1596,11 +1600,25 @@ def one_ui_group(
                     interactive=True,
                     elem_id=eid("ad_preview_input"),
                 )
+                # Gradio 4 (Forge / Forge Neo) can show a fullscreen "expand"
+                # button on the result image; Gradio 3 (A1111) has no such
+                # param, so pass it only where supported (koblue's request, #4).
+                _out_extra = {}
+                try:
+                    import inspect as _inspect
+
+                    if "show_fullscreen_button" in _inspect.signature(
+                        gr.Image.__init__
+                    ).parameters:
+                        _out_extra["show_fullscreen_button"] = True
+                except Exception:  # noqa: BLE001
+                    pass
                 w.ad_preview_output = gr.Image(
-                    label="Detections",
+                    label="Detections / result",
                     type="pil",
                     interactive=False,
                     elem_id=eid("ad_preview_output"),
+                    **_out_extra,
                 )
             with gr.Row():
                 w.ad_preview_btn = gr.Button(
@@ -1642,6 +1660,18 @@ def one_ui_group(
                     # to the Run button.
                     elem_classes=["ad-preview-combine"],
                     elem_id=eid("ad_preview_run_inpaint"),
+                )
+                # "Save result to outputs": when ON (with "Also run ADetailer"
+                # on), the retouched result is also written to your outputs
+                # folder instead of only living in Gradio's temp dir (koblue's
+                # request, #4). Listener-free input — index-safe like the others.
+                w.ad_preview_save = gr.Checkbox(
+                    label="💾 Save result to outputs",
+                    value=False,
+                    scale=0,
+                    min_width=210,
+                    elem_classes=["ad-preview-combine"],
+                    elem_id=eid("ad_preview_save"),
                 )
                 # Status line for the "Run detection preview" button.
                 # Uses `.ad-preview-status` (NOT `.ad-preset-status`) because
