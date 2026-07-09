@@ -100,6 +100,11 @@ PARAMS_TXT = "params.txt"
 # results. The final image itself is saved by the WebUI's own pipeline, never
 # through Script.save_image, so routing the whole method here doesn't touch it.
 AD_EXTRA_SUBDIR = "adetailer-steps"
+# Dedicated top-level folder for "Run ADetailer on an image" results (issue #4),
+# created as a SIBLING of the txt2img / img2img output folders — see
+# run_detailer_on_image. Keeps these standalone results out of the normal
+# generation folders.
+AD_APPLY_SUBDIR = "ADetailer-Inpaint"
 
 no_huggingface = getattr(cmd_opts, "ad_no_huggingface", False)
 adetailer_dir = Path(paths.models_path, "adetailer")
@@ -1081,12 +1086,27 @@ class AfterDetailerScript(scripts.Script):
                 # (e.g. a custom filename pattern reading a shell-absent attr)
                 # never loses the result, which is still returned to the UI.
                 try:
-                    save_dir = p.outpath_samples or "outputs"
+                    # Save into a dedicated folder that sits NEXT TO the txt2img
+                    # / img2img output folders. resolve() follows the per-folder
+                    # symlinks a launcher like Stability Matrix uses, so the
+                    # folder lands in the real images dir (beside Img2Img /
+                    # Text2Img), not buried in the raw package output; on a plain
+                    # install it lands beside output/img2img-images.
+                    base_out = (
+                        getattr(opts, "outdir_img2img_samples", "")
+                        or getattr(opts, "outdir_samples", "")
+                        or "output"
+                    )
+                    try:
+                        parent = Path(base_out).resolve().parent
+                    except Exception:  # noqa: BLE001
+                        parent = Path(base_out).parent
+                    save_dir = str(parent / AD_APPLY_SUBDIR)
                     images.save_image(
                         pp.image, save_dir, "",
                         extension=opts.samples_format, p=p,
                     )
-                    status += " Saved to the outputs folder."
+                    status += f" Saved to the '{AD_APPLY_SUBDIR}' folder."
                 except Exception as e:  # noqa: BLE001
                     print(
                         f"[-] ADetailer: couldn't save the preview result ({e}).",
