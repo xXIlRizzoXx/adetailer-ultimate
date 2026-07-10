@@ -1612,8 +1612,8 @@ def one_ui_group(
                     "Drop or paste an image and press the button to run the "
                     "detector with the current settings (classes, NOT, "
                     "confidence) and outline the detected regions with bounding "
-                    "boxes — **detection only, no inpainting**. To actually run "
-                    "ADetailer on an image, use **\"Run ADetailer on an image\"** "
+                    "boxes — detection only, no inpainting. To actually run "
+                    "ADetailer on an image, use \"Run ADetailer on an image\" "
                     "below.",
                     elem_classes=["ad-preview-hint"],
                 )
@@ -1662,9 +1662,9 @@ def one_ui_group(
             ):
                 gr.Markdown(
                     "Drop or paste an image and press the button to run the full "
-                    "ADetailer **detect + inpaint** pass on it — using this tab's "
+                    "ADetailer detect + inpaint pass on it — using this tab's "
                     "detector, detailer checkpoint, prompt, LoRAs, text encoder "
-                    "and VAE — **without regenerating** the base image. Handy for "
+                    "and VAE — without regenerating the base image. Handy for "
                     "trying different detailer setups on a finished picture "
                     "(requested in #4).",
                     elem_classes=["ad-preview-hint"],
