@@ -669,7 +669,10 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             return _run(image, combine, False, False, *flat)
 
         def _apply(image, save, *flat):
-            return _run(image, False, True, save, *flat)
+            # ad_apply_output is a gr.Gallery, so wrap the single result image in
+            # a list (None -> clears the gallery on error / nothing detected).
+            img, status = _run(image, False, True, save, *flat)
+            return ([img] if img is not None else None), status
 
         return _detect, _apply
 
@@ -1676,25 +1679,21 @@ def one_ui_group(
                         interactive=True,
                         elem_id=eid("ad_apply_input"),
                     )
-                    # Gradio 4 (Forge / Forge Neo) can show a fullscreen "expand"
-                    # button on the result image; Gradio 3 (A1111) has no such
-                    # param, so pass it only where supported (koblue's request).
-                    _apply_out_extra = {}
-                    try:
-                        import inspect as _inspect
-
-                        if "show_fullscreen_button" in _inspect.signature(
-                            gr.Image.__init__
-                        ).parameters:
-                            _apply_out_extra["show_fullscreen_button"] = True
-                    except Exception:  # noqa: BLE001
-                        pass
-                    w.ad_apply_output = gr.Image(
+                    # A gr.Gallery (not gr.Image) for the result: on Forge Neo's
+                    # Gradio 4.40 gr.Image has NO fullscreen button, but a Gallery
+                    # enlarges the image to fill the window on click (allow_preview,
+                    # default True) — exactly like a normal generated image, which
+                    # is what koblue asked for in #4. Every param below exists on
+                    # BOTH Gradio 3.41.2 (A1111) and 4.40 (Forge/Neo); `interactive`
+                    # is omitted (4.x-only, and redundant for a display gallery).
+                    w.ad_apply_output = gr.Gallery(
                         label="Result",
-                        type="pil",
-                        interactive=False,
+                        columns=1,
+                        rows=1,
+                        object_fit="contain",
+                        preview=True,
+                        show_download_button=True,
                         elem_id=eid("ad_apply_output"),
-                        **_apply_out_extra,
                     )
                 with gr.Row():
                     w.ad_apply_btn = gr.Button(

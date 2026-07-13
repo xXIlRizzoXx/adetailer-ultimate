@@ -309,7 +309,7 @@ A dedicated sub-tool (requested in [#4](https://github.com/xXIlRizzoXx/adetailer
 This makes it fast to try different detailer checkpoints or LoRAs on a finished picture without re-rolling the base generation. (The same is achievable in plain img2img with the **Skip img2img** trick, but this is one click from the ADetailer tab.)
 
 - **💾 Save result to outputs** — off by default. When ticked, the result is also written to a dedicated **`ADetailer-Inpaint`** folder created right next to your txt2img / img2img output folders (it follows launcher symlinks, so on Stability Matrix it lands in your central images directory beside `Img2Img` / `Text2Img`), instead of only Gradio's temporary directory. These standalone results are kept out of your normal generation folders.
-- **Fullscreen result** — on Gradio 4 (Forge / Forge Neo) the Result image has an "expand" button to view it full-window, like a normal generated image (Gradio 3 / A1111 has no such control, so it's simply omitted there).
+- **Click the result to enlarge** — the Result is shown in a gallery (like your normal generated images), so clicking it opens it full-window. Works on both Forge Neo (Gradio 4.40) and A1111.
 
 The whole pass is guarded end-to-end: any failure degrades to a status message, never a crash. Very large drops are capped to a sane working resolution to avoid a CUDA out-of-memory (with "inpaint only masked" — the default — the final image still stays full-resolution; only the per-region regeneration is capped). Index-safe: the second button and its checkbox add no persistence listeners and don't disturb the host WebUI's gallery send-to buttons.
 
