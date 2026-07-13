@@ -1,35 +1,28 @@
 # Changelog
 
-## v26.3.0+plus.6.beta.3 — 2026-07-13 (BETA · the result now enlarges on click)
+## v26.3.0+plus.6 — 2026-07-13 (Run ADetailer on an image — no re-generation)
 
-> **Beta / pre-release.** Fixes @koblue's beta.2 feedback in #4. `main` stays stable at **v26.3.0+plus.5**.
+**New: run the full ADetailer detect + inpaint pass on an image you already have — without regenerating it.** The bottom of each ADetailer tab now has **two clearly-named sibling sub-tools**:
 
-- **The "Run ADetailer on an image" result now enlarges when you click it**, like a normal generated image. The beta.2 fullscreen button relied on a `gr.Image` parameter that Forge Neo's Gradio 4.40 doesn't have — so the button never appeared (as @koblue reported). The result box is now a `gr.Gallery` (with `allow_preview`), which enlarges the image on click on both Forge Neo (Gradio 4.40) and A1111. Index-safe: a display-only gallery with no new event listeners, so the host's output-gallery "send to" buttons are untouched.
+- **🔍 Detection preview** — detection only (bounding boxes / segmentation shapes), optionally combined across all tabs, exactly as before.
+- **✨ Run ADetailer on an image** — drop or paste an image, press the button, and it performs the complete detect-and-inpaint pass on that exact image — using the current tab's detector, detailer checkpoint, prompt, LoRAs, text encoder and VAE — and returns the retouched result. A fast way to try different detailer checkpoints / LoRAs on a finished picture without re-rolling the base generation (requested by @koblue in #4).
 
-## v26.3.0+plus.6.beta.2 — 2026-07-09 (BETA · split into two tools + quality-of-life from #4 feedback)
+Splitting the old single "Detection preview (no inpaint)" accordion into these two tools makes the mode explicit (instead of a checkbox) and retires the "(no inpaint)" label that no longer fit.
 
-> **Beta / pre-release.** Follow-up to beta.1 with @koblue's feedback after he confirmed the feature works. `main` stays stable at **v26.3.0+plus.5**.
+**Quality-of-life (from @koblue's testing on real Forge Neo):**
 
-- **Split into two clear sub-tools.** The old combined accordion is now two: **"Detection preview"** (detection only — bounding boxes, as before) and a dedicated **"Run ADetailer on an image"** (the full detect + inpaint pass on a dropped image, no regeneration). Each has its own Input / Run button / Output, so the mode is explicit instead of a checkbox — and the "(no inpaint)" label that no longer fit is gone. Index-safe: the extra button adds no persistence listener and the host output gallery is untouched.
-- **"💾 Save result to outputs" checkbox** in the new tool — tick it to write the retouched result into a dedicated **`ADetailer-Inpaint`** folder, created right next to your txt2img / img2img output folders (so these standalone results don't clutter your normal generations), instead of only Gradio's temp directory. Follows launcher symlinks so it lands in your real images directory. Off by default; guarded so a save failure never loses the result.
-- **Fullscreen "expand" button on the result image**, where the WebUI's Gradio supports it (Forge / Forge Neo) — click the result to fill the window like a normal generated image. Inert on A1111's Gradio 3 (which has no such control).
-- **The two sub-tool hint texts are now fully translatable** — dropped the inline bold so Language Diffusion (which swaps whole DOM text nodes) can translate each hint as a single string across all 10 locales, instead of the `<strong>` fragments breaking grammar in word-order-different languages.
+- **💾 Save result to outputs** (optional, off by default) — writes the result into a dedicated **`ADetailer-Inpaint`** folder created right next to your txt2img / img2img output folders (it follows launcher symlinks, so on Stability Matrix it lands in your central images directory beside `Img2Img` / `Text2Img`), instead of only Gradio's temporary directory. Guarded so a save failure never loses the result.
+- **Click the result to enlarge it full-window** — the result is shown in a gallery (like your normal generated images), which enlarges on click on both Forge Neo (Gradio 4.40) and A1111 (Gradio 3.41.2). (An earlier fullscreen-button approach relied on a `gr.Image` parameter Forge Neo's Gradio doesn't have, so it never appeared — the gallery works on both.)
+- **Fully translatable** — the two sub-tool hint texts are single plain-text strings, so Language Diffusion (which swaps whole DOM text nodes) can translate each across all 10 locales without inline-markup fragments breaking grammar.
 
-## v26.3.0+plus.6.beta.1 — 2026-07-07 (BETA · Run ADetailer on an existing image, no re-generation)
+**Robustness (found during testing on real A1111 + Forge Neo):**
 
-> **Beta / pre-release.** New feature awaiting confirmation on real Forge Neo (requested in #4). `main` stays stable at v26.3.0+plus.5.
-
-**New: run the full ADetailer detect + inpaint pass on an image you already have — without regenerating it.** The **Detection preview** accordion gains an **"✨ Also run ADetailer (inpaint)"** checkbox next to the Run button. With it ticked, dropping an image into the preview box and pressing Run performs the complete detect-and-inpaint pass on that exact image — using the current tab's detector, detailer checkpoint, prompt, LoRAs, text encoder and VAE — and returns the retouched result, instead of only outlining what was detected. This makes it fast to try different detailer checkpoints / LoRAs on a finished image without re-rolling the base generation (requested by @koblue in #4).
-
-Implemented index-safe (no new Gradio event listeners: the new checkbox is a plain input on the existing preview button, like "Combine all tabs"). The pass runs on a minimal in-memory processing shell that the existing img2img detailer path reads its settings from — the actual inpaint still runs through the real `StableDiffusionProcessingImg2Img` pipeline, so behaviour matches a normal ADetailer pass. Fully guarded end-to-end: any failure degrades to a status message, never a crash.
-
-**Also in this beta (found during testing on real A1111 + Forge Neo):**
-
-- **No CUDA out-of-memory on very large images.** The standalone pass caps its per-face working resolution to a 1024 max side (aspect-preserved). With "inpaint only masked" (the default) the final image stays full-resolution — only the region regeneration is capped — so dropping a very large image (e.g. a ~97 MP upscale) no longer asks for tens of GiB.
+- **No CUDA out-of-memory on very large images.** The standalone pass caps its per-region working resolution to a 1024 max side (aspect-preserved). With "inpaint only masked" (the default) the final image stays full-resolution — only the region regeneration is capped — so dropping a very large image (e.g. a ~97 MP upscale) no longer asks for tens of GiB.
 - **Custom multi-class detectors can expose their classes even when a WebUI's safe-unpickle refuses to read the model.** A dedicated `<model>.names.json` sidecar — which never collides with civitai_helper / Stability Matrix metadata (the plain `<model>.json`) — is read first, so the **CLASSES** dropdown populates for models whose `.pt` the host won't introspect (e.g. some non-standard segmentation models). Format: `{"names": {"0": "face", "1": "hand", ...}}`.
-- **Checkbox spacing.** The "✨ Also run ADetailer (inpaint)" checkbox is spaced like "🔁 Combine all tabs" instead of being glued to the Run button.
 
-**Note:** you can already achieve the same today without this beta — send your result to **img2img**, enable ADetailer there and tick **"Skip img2img"** (the base img2img pass becomes a throwaway no-op, so only the detailer runs on your image). This feature just makes it one click from the txt2img preview.
+Implemented index-safe (the two per-tab buttons add no persistence listeners and don't disturb the host WebUI's output-gallery "send to" buttons) and guarded end-to-end: any failure degrades to a status message, never a crash. The pass runs through the real `StableDiffusionProcessingImg2Img` pipeline, so behaviour matches a normal ADetailer pass. **Confirmed working by @koblue on Forge Neo, and tested on AUTOMATIC1111 v1.10.1 + Forge Neo (RTX 4070).**
+
+**Tip:** you can approximate this without the feature — send your result to **img2img**, enable ADetailer there and tick **"Skip img2img"** (the base img2img pass becomes a throwaway no-op, so only the detailer runs on your image). This just makes it one click from the txt2img tab.
 
 ## v26.3.0+plus.5 — 2026-07-03 (Per-pass text encoder + universal-WebUI compatibility)
 
