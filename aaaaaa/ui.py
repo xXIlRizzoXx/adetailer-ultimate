@@ -144,68 +144,170 @@ def _build_overlay_text() -> str:
     return base
 
 
-# In-extension user guide. Rendered read-only inside a collapsed accordion at
-# the bottom of the ADetailer panel (see `adui`). Deliberately English-only
-# reference text — like the technical vocabulary, it is not a translation key,
-# so the markdown formatting here does NOT fall under the single-plain-block
-# i18n rule. Keep it in sync with README.md when features change.
-_GUIDE_MD = """\
-Everything here is optional — turn ADetailer on, pick a detector, and the defaults already work. Expand a section to see what each control does. Items marked **(new)** are additions of this fork.
+# In-extension user guide — rendered as a dedicated top-level "ADetailer Guide"
+# tab (see `build_guide_blocks` here + the `on_ui_tabs` callback in
+# scripts/!adetailer.py): an intro, a table of contents, and one collapsible
+# section per topic. Deliberately English-only reference text — like the
+# technical vocabulary it is NOT a translation key, so the markdown formatting
+# here does NOT fall under the single-plain-block i18n rule. Keep it in sync
+# with README.md when features change. Items marked (new) are fork additions.
 
-### Getting started
-- **Enable ADetailer** (checkbox on the header) turns it on for this generation.
-- **ADetailer detector** — the detector that finds what to fix (face, hand, a segmentation or MediaPipe model…). "None" disables that tab.
-- Each numbered **tab** (1st, 2nd, …) is an independent detector + settings, run in order. Add more tabs in `Settings → ADetailer`.
+_GUIDE_INTRO_MD = """\
+# 📖 ADetailer Guide
 
-### Detection
-- **Detection model confidence threshold** — how sure the detector must be. Lower finds more (and more false) boxes.
-- **Detection resolution** *(new)* — run the detector at a higher resolution (e.g. 1024) to catch small or distant parts. `0` = default (640); higher = better detection but more VRAM and time.
+ADetailer automatically finds parts of an image — faces, hands, eyes, whole subjects… — and re-generates just those regions at higher quality, with no manual inpainting. It runs **after** your normal generation, on the finished image.
+
+Everything is optional: turn ADetailer on, pick a detector, and the defaults already work. Expand a topic below to read about it. Controls marked **(new)** are additions of this fork.
+"""
+
+_GUIDE_SECTIONS: list[tuple[str, str]] = [
+    (
+        "🚀 Getting started",
+        """
+- **Enable ADetailer** — the checkbox on the accordion header turns it on for this generation.
+- **ADetailer detector** — the first dropdown at the top of each tab. This is the model that finds what to fix (a face model, hand model, a segmentation or MediaPipe model…). `None` disables that tab.
+- **Tabs (1st, 2nd, …)** — each numbered tab is an independent detector + its own settings, and they run **in order** (e.g. tab 1 = faces, tab 2 = hands). Change how many tabs you have in `Settings → ADetailer`.
+- **First run:** enable ADetailer, pick `face_yolov8n.pt` in the detector dropdown, and generate — every face is detected and re-detailed automatically.
+""",
+    ),
+    (
+        "🔎 Choosing a detector",
+        """
+- **YOLO models** (`face_yolov8n`, `hand_yolov8n`, `person_yolov8n`, …) — fast detectors. The `n`/`s`/`m` suffix is size; `n` is fastest, larger is more accurate.
+- **Segmentation vs box** — segmentation models give a precise mask shape; box-only models give a rectangle. You can force the rectangle with *Use bbox as mask* (see Mask preprocessing).
+- **Multi-class models** — a model that knows several classes (e.g. a person/face/hand model, or a custom one) shows the **CLASSES** dropdown so you can pick which parts to detail.
+- **MediaPipe** — `mediapipe_face_mesh` and `..._eyes_only` detect faces/eyes by landmarks, without a model file.
+- **MediaPipe face features (new)** — `mediapipe_face_features` treats the face as classes **eyes, mouth, nose, eyebrows, face**; pick all, some, or just one in the CLASSES dropdown.
+- **YOLO-World (`…-world`)** — open vocabulary: type comma-separated words in the classes field to detect almost anything you can name.
+- **Custom models** — drop a `.pt` into your ADetailer models folder. If its classes don't appear, add a sidecar file `<model>.names.json` shaped like `{"names": {"0": "face", "1": "hand"}}`.
+""",
+    ),
+    (
+        "🎯 Detection settings",
+        """
+- **Detection model confidence threshold** — how sure the detector must be. Lower finds more (and more false) detections.
+- **Detection resolution (0 = default) (new)** — run the detector at a higher internal resolution (e.g. 1024 instead of the default 640) to catch **small or distant** parts. Higher finds more but uses more VRAM and time. The single-tab *Detection preview* honours it too.
 - **ADetailer detector CLASSES** — for multi-class models, choose which parts to detail. Empty = all of them.
-- **Exclude selected (NOT)** — invert the choice: detail everything EXCEPT the selected classes.
+- **Exclude selected (NOT)** — invert the choice: detail everything **except** the selected classes.
 - **Process classes sequentially** — one detect+inpaint pass per selected class, in the order you clicked them. Required for per-class prompts.
-- **Method to filter / Mask only the top k** — keep only the k biggest or most-confident detections; `0` keeps all.
-
-### Mask preprocessing
-- **Use bbox as mask (segmentation models)** — inpaint the rectangle instead of the tight segmentation shape (more blending room). No effect on box-only detectors.
-- **Mask erosion (-) / dilation (+)** — shrink or grow the detected mask.
+- **Method to filter / Mask only the top k** — keep only the `k` biggest or most-confident detections; `0` keeps all.
+""",
+    ),
+    (
+        "🖌️ Mask preprocessing",
+        """
+- **Use bbox as mask (segmentation models)** — inpaint the rectangle instead of the tight segmentation shape, giving the region more room to blend. No effect on box-only detectors.
+- **Mask erosion (−) / dilation (+)** — shrink or grow the detected mask.
 - **Mask x / y offset** — nudge the mask left/right or up/down.
-
-### Prompts
-- **Prompt / Negative prompt** — text for the detail pass. Leave blank to reuse the main prompt.
-- **Prompt append / Negative prompt append** — tack a few words onto the end without retyping the whole prompt.
-- **Per-class prompts** — a different prompt (and optional negative) per class. One line each: `classname: positive | negative`. Works only with **Process classes sequentially** on and 2+ classes selected (include mode).
-- **Inline `[CLASS=name] … [/CLASS]`** *(new)* — write class-specific text right inside the prompt: keep your normal prompt and wrap extra words in a block, e.g. `portrait [CLASS=hand] five fingers [/CLASS]`. Each detected region keeps only the blocks matching its class; text outside blocks applies to all. Works in normal AND sequential mode (no need for the per-class field), the tag can list several classes (`[CLASS=face,eyes]`), and `[CLASS=hand] [SKIP] [/CLASS]` skips only that class. Needs a class-aware detector (a multi-class model or the face-features detector); on a plain single-class model every block is kept. Inert unless you type the tags.
-- **Auto class-guard** *(new)* — for each detected region, adds its own class name to the positive and every OTHER class of the model to the negative, so a detected part isn't re-drawn as a different one. Your per-class prompts always override it. **Class-guard emphasis** weights the added class name.
-- **Use LoRAs from main prompt** (+ triggers) — copy the LoRA tags from the main prompt into the detail pass.
-- **Strip LoRAs from the detailer prompt** *(new)* — remove all `<lora:...>` / `<lyco:...>` tags from the detail prompt so the main prompt's LoRAs don't bleed onto the region. Wins over **Use LoRAs from main prompt** when both are on.
-
-### Inpainting
-- **Inpaint denoising strength** — how much the region changes. Lower keeps the original shape; higher redraws more. ~0.3–0.5 is typical, and low values help keep a detected class looking like itself.
-- **Dynamic denoise by area** *(new)* — automatically gives smaller detected regions more denoise. `0` = use the global Settings value; 2–4 is a good range.
+- **Mask merge mode** — None, Merge, or Merge and Invert: combine overlapping masks, optionally inverting what gets inpainted.
+""",
+    ),
+    (
+        "✍️ Prompts",
+        """
+- **Prompt / Negative prompt** — text used for the detail pass. Leave blank to reuse the main prompt.
+- **Prompt append / Negative prompt append** — add a few words to the end without retyping the whole prompt.
+- **Per-class prompts** — a different prompt (and optional negative) per class. One line each: `classname: positive | negative`. Works with **Process classes sequentially** on and 2+ classes selected.
+- **Inline `[CLASS=name] … [/CLASS]` (new)** — write class-specific text right inside the prompt, e.g. `portrait [CLASS=hand] five fingers [/CLASS]`. Each detected region keeps only the blocks matching its class; text outside blocks applies to every region. Works in **normal and sequential** mode, the tag can list several classes (`[CLASS=face,eyes]`), and `[CLASS=hand] [SKIP] [/CLASS]` skips only that class. Needs a class-aware detector; inert unless you type the tags.
+- **Auto class-guard (new)** — for each detected region, adds its own class name to the positive and every **other** class of the model to the negative, so a detected part isn't re-drawn as a different one. Your per-class prompts always override it. **Class-guard emphasis** weights the added class name (1.0 = plain).
+- **Use LoRAs from main prompt** (+ **Append LoRA triggers from name**) — copy the LoRA tags (and their trigger words) from the main prompt into the detail pass.
+- **Strip LoRAs from the detailer prompt (new)** — remove all `<lora:…>` / `<lyco:…>` tags from the detail prompt so the main prompt's LoRAs don't bleed onto the region. Wins over *Use LoRAs from main prompt* when both are on.
+""",
+    ),
+    (
+        "🎨 Inpainting",
+        """
+- **Inpaint denoising strength** — how much the region changes. Lower keeps the original shape; higher redraws more. ~0.3–0.5 is typical; low values help a detected class keep looking like itself.
+- **Dynamic denoise by area (new)** — automatically gives smaller detected regions more denoise. `0` = use the global Settings value; `2`–`4` is a good range.
 - **Inpaint mask blur** — soften the mask edge for smoother blending.
-- **Inpaint only masked** (+ padding) — regenerate just the region at full detail (recommended), with some surrounding context.
+- **Inpaint only masked** (+ padding) — regenerate just the region at full detail (recommended), keeping some surrounding context.
 - **Separate inpaint width/height** or **scale** — set the working resolution of the region.
-
-### Per-pass overrides (optional)
-- **Detailer checkpoint / VAE / text encoder / sampler / steps / CFG / CLIP skip** — use different settings only for the detail pass. Off = inherit from the main generation. (Text encoder override is Forge / Forge Neo only.)
-
-### Tools at the bottom of the tab
-- **Detection preview** — drop an image to see what the detector would find (boxes), without generating. The single-tab preview honours this tab's **Detection resolution**, so it reflects what the real pass will detect. **Combine all tabs** overlays every tab's detector at once (that combined view stays at the default resolution).
-- **Run ADetailer on an image** — drop a finished image and run the full detail pass on it, without regenerating. Optional **Save result to outputs** writes to a dedicated `ADetailer-Inpaint` folder; click the result to enlarge it.
-- **Batch a whole folder** *(new)* — paste a folder path in the same tool to detail every image inside it in one go; each result is always saved to the `ADetailer-Inpaint` folder. A folder path takes priority over a single dropped image.
-
-### Presets & sharing
-- **Preset library** — save / load / rename a whole tab's settings by name.
+""",
+    ),
+    (
+        "⚙️ Per-pass overrides (optional)",
+        """
+Use different settings **only** for the detail pass; each is off (inherits the main generation) by default.
+- **Detailer checkpoint / VAE** — run the detail pass with a different model / VAE.
+- **Separate text encoder** — Forge / Forge Neo only; use a different text encoder for the detail pass (e.g. an SDXL detailer under a different base).
+- **Sampler / scheduler / steps / CFG scale / CLIP skip** — per-pass sampling settings.
+- **Apply only on hires. fix** — run this tab only when hires.fix is on.
+""",
+    ),
+    (
+        "🧰 Preview & run-on-image tools",
+        """
+Two sibling tools live inside each tab's **Detection** section (roughly the middle of the tab, above Mask preprocessing):
+- **Detection preview** — drop an image to see what the detector would find (boxes), without generating. The single-tab preview honours this tab's **Detection resolution**. **Combine all tabs** overlays every tab's detector at once (that combined view stays at the default resolution).
+- **Run ADetailer on an image** — drop a finished image and run the full detect + inpaint pass on it, without regenerating. Optional **Save result to outputs** writes to a dedicated `ADetailer-Inpaint` folder; click the result to enlarge it.
+- **Batch a whole folder (new)** — paste a **folder path** in that same tool to detail every image inside it in one go; each result is always saved to the `ADetailer-Inpaint` folder. A folder path takes priority over a single dropped image.
+""",
+    ),
+    (
+        "💾 Presets, copy/paste & saving",
+        """
+- **Preset library** — save / load / rename / delete a whole tab's settings by name; **export / import** the library as a file to move it between machines.
 - **Copy settings / Paste settings** — clone one tab's settings into another.
 - **Remember last-used settings between restarts** (`Settings → ADetailer`) — restore your last setup after a restart.
 - **Reset ADetailer settings** (`Settings → ADetailer`) — restore factory defaults.
+- **Where files go** — intermediate step/preview files land in an `adetailer-steps/` sub-folder; the standalone *Run/Batch* results go in a top-level `ADetailer-Inpaint/` folder next to your normal outputs.
+""",
+    ),
+    (
+        "🛠️ Fixing common problems",
+        """
+- **The wrong thing gets regenerated** (e.g. one part redrawn as another) — keep denoise low and turn on **Auto class-guard**, or write **per-class prompts** / **inline `[CLASS=]`** so each class stays itself.
+- **Small or distant faces are missed** — raise **Detection resolution** (e.g. 1024), and/or lower the confidence threshold.
+- **The face no longer looks like the character** — lower **Inpaint denoising strength**.
+- **A style LoRA bleeds onto the detailed region** — turn on **Strip LoRAs from the detailer prompt**.
+- **The mask is too tight / edges show** — use **bbox as mask** or **dilation**, and increase **mask blur**.
+- **CUDA out of memory** — lower the inpaint resolution; for many images use **batch count**, not batch size; drop the `--cuda-malloc` / `--cuda-stream` / `--pin-shared-memory` launch flags; and turn off on-the-fly LoRA patching if your UI has it.
+""",
+    ),
+    (
+        "🔡 Special tokens (advanced)",
+        """
+These go inside the tab's **Prompt** field:
+- **`[SEP]`** — split the prompt so each detected region (1st, 2nd, …) gets its own part.
+- **`[SKIP]`** — skip a region entirely. On its own it skips all; inside a class block (`[CLASS=hand] [SKIP] [/CLASS]`) it skips only that class.
+- **`[PROMPT]`** — insert the main generation prompt at that spot.
+""",
+    ),
+    (
+        "✨ What's new in this fork",
+        """
+Highlights added on top of upstream ADetailer:
+- **Class filtering** (pick which parts), **Exclude (NOT)** mode, **sequential** per-class passes, and **per-class prompts**.
+- **Auto class-guard**, **inline `[CLASS=]`** prompts, **Strip LoRAs**, **LoRAs + triggers from the main prompt**.
+- **HD Detection resolution**, **Dynamic denoise by area**, **per-pass text encoder** (Forge/Neo).
+- **MediaPipe face-features** detector (eyes/mouth/nose/eyebrows/face).
+- **Run ADetailer on an image** and **batch a whole folder** without regenerating.
+- **Preset library** with export/import, **copy/paste between tabs**, **remembered settings**, and this guide.
+- Built to work across **A1111, Forge, Forge Neo and reForge**.
+""",
+    ),
+]
 
-**Tip for "the wrong thing gets regenerated":** keep denoise low and turn on **Auto class-guard** (or write per-class prompts in sequential mode) so each detected class stays itself.
-"""
 
-
-def _build_guide_text() -> str:
-    return _GUIDE_MD
+def build_guide_blocks():
+    """Build the standalone "📖 ADetailer Guide" top-level tab: an intro, a
+    table of contents, and one collapsible section per topic. Reference
+    documentation (English); static — no event listeners — so it is fully
+    isolated from the main UI wiring. Returns a `gr.Blocks` for `on_ui_tabs`.
+    """
+    with gr.Blocks(analytics_enabled=False) as blocks:
+        with gr.Column(elem_classes=["ad-guide-tab"]):
+            gr.Markdown(_GUIDE_INTRO_MD, elem_classes=["ad-guide"])
+            toc = "\n".join(f"1. {title}" for title, _ in _GUIDE_SECTIONS)
+            gr.Markdown(
+                "### Contents\n" + toc, elem_classes=["ad-guide", "ad-guide-toc"]
+            )
+            for i, (title, body) in enumerate(_GUIDE_SECTIONS):
+                with gr.Accordion(
+                    title, open=(i == 0), elem_classes=["ad-guide-section"]
+                ):
+                    gr.Markdown(body.strip(), elem_classes=["ad-guide"])
+    return blocks
 
 
 def _format_preset_preview(name: str | None):
@@ -524,15 +626,15 @@ def adui(
         # lets each tab's "Combine all tabs" checkbox run every tab's detector.
         _wire_detection_previews(all_widgets, webui_info, num_models, script)
 
-        # In-extension user guide — a read-only, collapsed accordion at the
-        # bottom of the panel. Static content only (no event listeners), so it
-        # cannot shift the host gallery's fn_index — index-safe by construction.
-        with gr.Accordion(
-            "📖 Guide — what each option does",
-            open=False,
-            elem_id=eid("ad_guide_accordion"),
-        ):
-            gr.Markdown(_build_guide_text(), elem_classes=["ad-guide"])
+        # The full user guide now lives in its own top-level "ADetailer Guide"
+        # tab (registered via on_ui_tabs). Leave a small, non-invasive pointer
+        # here. Static markdown only (no event listeners) → index-safe. Kept as a
+        # single plain-text line (no inline markdown) so it stays translatable.
+        gr.Markdown(
+            "📖 Full guide with a table of contents: open the ADetailer Guide "
+            "tab at the top of the page.",
+            elem_classes=["ad-guide-pointer"],
+        )
 
     # components: [bool, bool, dict, dict, ...]
     components = [ad_enable, ad_skip_img2img, *states]

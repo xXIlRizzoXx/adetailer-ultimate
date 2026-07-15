@@ -2322,7 +2322,22 @@ def add_api_endpoints(_: gr.Blocks, app: FastAPI):
         return {"ad_model": list(model_mapping)}
 
 
+def on_ui_tabs():
+    """Register the standalone "📖 ADetailer Guide" top-level tab (appears in the
+    main tab bar, near Settings). Fully guarded — a failure here returns no tab
+    and never blocks the extension from loading. Universal: `on_ui_tabs` is a
+    core callback on A1111 / Forge / Forge Neo / reForge."""
+    try:
+        from aaaaaa.ui import build_guide_blocks
+
+        return [(build_guide_blocks(), "ADetailer Guide", "adetailer_guide")]
+    except Exception as e:  # noqa: BLE001
+        print(f"[-] ADetailer: couldn't build the Guide tab ({e}).", file=sys.stderr)
+        return []
+
+
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_after_component(on_after_component)
 script_callbacks.on_app_started(add_api_endpoints)
 script_callbacks.on_before_ui(on_before_ui)
+script_callbacks.on_ui_tabs(on_ui_tabs)

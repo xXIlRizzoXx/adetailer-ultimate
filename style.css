@@ -285,7 +285,9 @@ div[id*="adetailer_ad_version"].ad-version-overlay {
      *          "ADetailer Ultimate · v26.2.0+plus.2 · 63a9dd2" ~ 47 chars).
      * The hash auto-updates on every commit, giving a live signal of
      * which build is installed. */
-    max-width: 360px !important;
+    /* Was 360px; widened to fit the injected "📖 Guide · " prefix (see
+     * javascript/guide-button.js) without clipping the version text. */
+    max-width: 460px !important;
     z-index: 5;
     pointer-events: none;
     margin: 0 !important;
@@ -303,11 +305,49 @@ div[id*="adetailer_ad_version"].ad-version-overlay p {
     text-align: right;
 }
 
-/* In-extension user guide — the read-only, collapsed accordion at the bottom
- * of the ADetailer panel. Keep it compact and easy to scan. */
+/* The "📖 Guide" quick-link injected into the header version overlay
+ * (javascript/guide-button.js). The overlay is pointer-events:none so header
+ * clicks still toggle the accordion; re-enable pointer events on the link only.
+ * The link shares the overlay <p>'s 0.55 opacity, so the accent colour + bold
+ * are what keep it distinguishable from the grey version text (clearly legible
+ * on the dark default theme). */
+div[id*="adetailer_ad_version"].ad-version-overlay .ad-guide-open {
+    pointer-events: auto !important;
+    cursor: pointer !important;
+    font-weight: 600 !important;
+    color: #6ea8fe !important;
+    text-decoration: none !important;
+    white-space: nowrap;
+}
+div[id*="adetailer_ad_version"].ad-version-overlay .ad-guide-open:hover {
+    text-decoration: underline !important;
+}
+
+/* In-extension user guide — read-only reference text (the "ADetailer Guide"
+ * top-level tab, plus the small pointer at the bottom of the panel). Compact
+ * and easy to scan. */
 .ad-guide {
     max-width: 900px;
     opacity: 0.92;
+}
+/* Standalone "ADetailer Guide" tab (on_ui_tabs): centre + constrain the column
+ * for readability, and give the collapsible topic sections a little air. */
+.ad-guide-tab {
+    max-width: 940px !important;
+    margin: 0 auto !important;
+}
+.ad-guide-toc {
+    opacity: 0.9;
+}
+.ad-guide-section {
+    margin-top: 6px !important;
+}
+/* Small non-invasive pointer at the bottom of the ADetailer panel that sends
+ * users to the full guide tab. */
+.ad-guide-pointer {
+    margin-top: 12px !important;
+    font-size: 12px !important;
+    opacity: 0.7;
 }
 .ad-guide p,
 .ad-guide li {
