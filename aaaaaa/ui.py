@@ -191,6 +191,7 @@ Everything here is optional — turn ADetailer on, pick a detector, and the defa
 ### Tools at the bottom of the tab
 - **Detection preview** — drop an image to see what the detector would find (boxes), without generating. **Combine all tabs** overlays every tab's detector at once.
 - **Run ADetailer on an image** — drop a finished image and run the full detail pass on it, without regenerating. Optional **Save result to outputs** writes to a dedicated `ADetailer-Inpaint` folder; click the result to enlarge it.
+- **Batch a whole folder** *(new)* — paste a folder path in the same tool to detail every image inside it in one go; each result is always saved to the `ADetailer-Inpaint` folder. A folder path takes priority over a single dropped image.
 
 ### Presets & sharing
 - **Preset library** — save / load / rename a whole tab's settings by name.
@@ -756,9 +757,111 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         def _detect(image, combine, *flat):
             return _run(image, combine, False, False, *flat)
 
-        def _apply(image, save, *flat):
-            # ad_apply_output is a gr.Gallery, so wrap the single result image in
-            # a list (None -> clears the gallery on error / nothing detected).
+        # Cap how many result thumbnails we hand back to the gallery: a huge
+        # folder would otherwise base64 hundreds of full-res images into the
+        # browser and freeze the tab. Every result is still written to disk.
+        _batch_gallery_cap = 30
+
+        def _run_folder(folder, *flat):
+            """Batch: run the full detect+inpaint pass on EVERY image in
+            `folder`, always saving each result to the ADetailer-Inpaint outputs
+            folder (pointing at a folder implies you want the files written).
+            Reuses the single-image _run per file and is fully guarded, so one
+            unreadable file never aborts the batch. Returns (gallery, status)."""
+            from pathlib import Path as _Path
+
+            try:
+                base = _Path(folder)
+                is_dir = base.is_dir()
+            except Exception:  # noqa: BLE001
+                return None, f"⚠️ Invalid folder path: {folder}"
+            if not is_dir:
+                return None, f"⚠️ Folder not found: {folder}"
+
+            exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+            try:
+                files = sorted(
+                    f
+                    for f in base.iterdir()
+                    if f.is_file() and f.suffix.lower() in exts
+                )
+            except Exception as e:  # noqa: BLE001
+                return None, f"⚠️ Couldn't read the folder: {e}"
+            if not files:
+                return None, "ℹ️ No images found in that folder."
+
+            from PIL import Image as _PILImage
+
+            def _gc():
+                # Reclaim VRAM between images so a long batch doesn't fragment
+                # the card (helps on tight GPUs). Guarded: a no-op on any WebUI
+                # that doesn't expose modules.devices.torch_gc.
+                try:
+                    from modules import devices
+
+                    devices.torch_gc()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            gallery = []
+            saved = 0
+            unchanged = 0
+            not_saved = 0
+            failed = 0
+            for f in files:
+                try:
+                    with _PILImage.open(f) as _im:
+                        im = _im.convert("RGB")
+                    # save=True always in batch (see docstring); _run's inpaint
+                    # branch is itself guarded end-to-end and never raises.
+                    img, st = _run(im, False, True, True, *flat)
+                    if img is None:
+                        failed += 1
+                        continue
+                    st = st if isinstance(st, str) else ""
+                    # run_detailer_on_image reports "ℹ️ …unchanged" when nothing
+                    # was detected (not written); "✅ … (couldn't save …)" when it
+                    # detailed the image but the disk write failed; a plain "✅ …"
+                    # when it was detailed AND written. Categorise by that so the
+                    # summary is honest about what actually hit disk.
+                    if st.startswith("ℹ️"):
+                        unchanged += 1
+                    elif "couldn't save" in st:
+                        not_saved += 1
+                    else:
+                        saved += 1
+                    if len(gallery) < _batch_gallery_cap:
+                        gallery.append(img)
+                except Exception:  # noqa: BLE001 — skip a bad file, keep going
+                    failed += 1
+                finally:
+                    _gc()
+
+            # "ADetailer-Inpaint" mirrors AD_APPLY_SUBDIR in scripts/!adetailer.py
+            # (that file isn't importable here — its name starts with "!").
+            have = saved + unchanged + not_saved
+            status = (
+                f"✅ Batch done — {len(files)} image(s): {saved} detailed and "
+                "saved to the 'ADetailer-Inpaint' folder"
+            )
+            if unchanged:
+                status += f", {unchanged} left unchanged (nothing detected)"
+            if not_saved:
+                status += f", {not_saved} detailed but not saved (see console)"
+            if failed:
+                status += f", {failed} skipped (unreadable)"
+            if have > len(gallery):
+                status += f" — showing the first {len(gallery)} in the gallery"
+            status += "."
+            return (gallery or None), status
+
+        def _apply(image, folder, save, *flat):
+            # ad_apply_output is a gr.Gallery, so results are ALWAYS a list
+            # (None -> clears the gallery on error / nothing detected). A folder
+            # path takes priority over the single dropped image.
+            folder = (folder or "").strip().strip('"').strip("'")
+            if folder:
+                return _run_folder(folder, *flat)
             img, status = _run(image, False, True, save, *flat)
             return ([img] if img is not None else None), status
 
@@ -793,7 +896,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         )
         w.ad_apply_btn.click(
             fn=apply_fn,
-            inputs=[w.ad_apply_input, w.ad_apply_save, *tail],
+            inputs=[w.ad_apply_input, w.ad_apply_folder, w.ad_apply_save, *tail],
             outputs=[w.ad_apply_output, w.ad_apply_status],
             queue=True,
         )
@@ -1804,7 +1907,8 @@ def one_ui_group(
                     "detector, detailer checkpoint, prompt, LoRAs, text encoder "
                     "and VAE — without regenerating the base image. Handy for "
                     "trying different detailer setups on a finished picture "
-                    "(requested in #4).",
+                    "(requested in #4). Or paste a folder path below to batch-"
+                    "process every image inside it, saving each result.",
                     elem_classes=["ad-preview-hint"],
                 )
                 with gr.Row():
@@ -1829,6 +1933,21 @@ def one_ui_group(
                         preview=True,
                         show_download_button=True,
                         elem_id=eid("ad_apply_output"),
+                    )
+                with gr.Row():
+                    # Batch mode: point this at a folder of finished images and
+                    # the Run button below details EVERY image in it, saving each
+                    # result. A folder path here wins over the single image above.
+                    # Listener-free input (no .change) and it reuses the existing
+                    # Run button, so it adds no event — index-safe.
+                    w.ad_apply_folder = gr.Textbox(
+                        label="Or batch a whole folder (optional)",
+                        placeholder="Paste a folder path to detail every image inside it",
+                        info="Runs on every image in this folder and always saves each result to the ADetailer-Inpaint outputs folder. Leave empty to use the single image above; if both are set, the folder wins.",
+                        lines=1,
+                        max_lines=1,
+                        interactive=True,
+                        elem_id=eid("ad_apply_folder"),
                     )
                 with gr.Row():
                     w.ad_apply_btn = gr.Button(
