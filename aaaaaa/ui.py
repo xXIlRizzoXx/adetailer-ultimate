@@ -1978,6 +1978,22 @@ def inpainting(  # noqa: PLR0915
                 elem_id=eid("ad_denoising_strength"),
             )
 
+        with gr.Row():
+            w.ad_dynamic_denoise_power = gr.Slider(
+                label="Dynamic denoise by area" + suffix(n),
+                info=(
+                    "Scales this tab's denoise by the detected region's size — "
+                    "smaller regions get more denoise. 0 = use the global "
+                    "Settings value (off unless set there); 2-4 is a good range."
+                ),
+                minimum=0.0,
+                maximum=8.0,
+                step=0.1,
+                value=sv("ad_dynamic_denoise_power", 0.0),
+                visible=True,
+                elem_id=eid("ad_dynamic_denoise_power"),
+            )
+
         with gr.Row(elem_classes=["ad-2col-row"]):
             with gr.Column(variant="compact"):
                 w.ad_inpaint_only_masked = gr.Checkbox(

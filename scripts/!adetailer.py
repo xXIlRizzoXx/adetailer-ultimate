@@ -1156,9 +1156,17 @@ class AfterDetailerScript(scripts.Script):
 
     @staticmethod
     def get_dynamic_denoise_strength(
-        denoise_strength: float, bbox: Sequence[Any], image_size: tuple[int, int]
+        denoise_strength: float,
+        bbox: Sequence[Any],
+        image_size: tuple[int, int],
+        args: ADetailerArgs | None = None,
     ):
-        denoise_power = opts.data.get("ad_dynamic_denoise_power", 0)
+        # Per-tab value wins when set (> 0); 0 falls back to the global
+        # Settings value, so users who only set the global option are
+        # unaffected and existing behavior is preserved.
+        denoise_power = getattr(args, "ad_dynamic_denoise_power", 0) or 0
+        if denoise_power == 0:
+            denoise_power = opts.data.get("ad_dynamic_denoise_power", 0)
         if denoise_power == 0:
             return denoise_strength
 
@@ -1277,7 +1285,7 @@ class AfterDetailerScript(scripts.Script):
         p2.seed = self.get_each_tab_seed(seed, j)
         p2.subseed = self.get_each_tab_seed(subseed, j)
         p2.denoising_strength = self.get_dynamic_denoise_strength(
-            p2.denoising_strength, pred.bboxes[j], pp.image.size
+            p2.denoising_strength, pred.bboxes[j], pp.image.size, args
         )
 
         p2.cached_c = [None, None]

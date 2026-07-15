@@ -82,6 +82,7 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
     ad_mask_merge_invert: Literal["None", "Merge", "Merge and Invert"] = "None"
     ad_mask_blur: NonNegativeInt = 4
     ad_denoising_strength: confloat(ge=0.0, le=1.0) = 0.4
+    ad_dynamic_denoise_power: confloat(ge=0.0, le=8.0) = 0.0
     ad_inpaint_only_masked: bool = True
     ad_inpaint_only_masked_padding: NonNegativeInt = 32
     ad_use_inpaint_width_height: bool = False
@@ -168,6 +169,7 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
         ppop("ADetailer x offset", cond=0)
         ppop("ADetailer y offset", cond=0)
         ppop("ADetailer mask merge invert", cond="None")
+        ppop("ADetailer dynamic denoise power", cond=0.0)
         ppop("ADetailer inpaint only masked", ["ADetailer inpaint padding"])
         ppop(
             "ADetailer use inpaint width height",
@@ -277,6 +279,7 @@ _all_args = [
     ("ad_mask_merge_invert", "ADetailer mask merge invert"),
     ("ad_mask_blur", "ADetailer mask blur"),
     ("ad_denoising_strength", "ADetailer denoising strength"),
+    ("ad_dynamic_denoise_power", "ADetailer dynamic denoise power"),
     ("ad_inpaint_only_masked", "ADetailer inpaint only masked"),
     ("ad_inpaint_only_masked_padding", "ADetailer inpaint padding"),
     ("ad_use_inpaint_width_height", "ADetailer use inpaint width height"),
