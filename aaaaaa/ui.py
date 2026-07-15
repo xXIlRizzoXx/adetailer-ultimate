@@ -1845,6 +1845,20 @@ def detection(
                 visible=True,
                 elem_id=eid("ad_confidence"),
             )
+            w.ad_detection_resolution = gr.Slider(
+                label="Detection resolution (0 = default)" + suffix(n),
+                info=(
+                    "Detector inference resolution. 0 keeps the default (640); "
+                    "higher (e.g. 1024) finds smaller or more distant parts but "
+                    "uses more VRAM and time."
+                ),
+                minimum=0,
+                maximum=1536,
+                step=64,
+                value=sv("ad_detection_resolution", 0),
+                visible=True,
+                elem_id=eid("ad_detection_resolution"),
+            )
             w.ad_mask_filter_method = gr.Radio(
                 choices=["Area", "Confidence"],
                 value=sv("ad_mask_filter_method", "Area"),

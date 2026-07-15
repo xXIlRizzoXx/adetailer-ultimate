@@ -1,6 +1,6 @@
 # Changelog
 
-## v26.3.0+plus.7.beta.1 — 2026-07-15 (BETA · Auto class-guard + Dynamic denoise in the tab)
+## v26.3.0+plus.7.beta.1 — 2026-07-15 (BETA · Auto class-guard + per-tab dynamic denoise + HD detection)
 
 > **Beta / pre-release.** New opt-in features. `main` stays stable at **v26.3.0+plus.6**.
 
@@ -8,6 +8,7 @@
 - Works in **normal** and **sequential-class** modes, and with include or exclude/NOT class filtering. Your **manual per-class prompts (`ad_class_prompts`) always win** — a class you tuned by hand is left exactly as you wrote it, and auto-guard is skipped for it. Silent **no-op** (never a crash) on mediapipe / YOLO-World / class-less models, or on any per-mask misalignment.
 - Index-safe: the checkbox and slider are plain persisted inputs (one uniform per-field listener each, like every other ADetailer field) — no new event wiring, host output-gallery "send to" buttons untouched. Off by default and fully backward-compatible: presets and PNG info from v26.3.0+plus.6 and earlier load unchanged with the new fields at their defaults.
 - **Dynamic denoise by area is now a per-tab slider.** The area-based denoise scaling (smaller detected region → stronger denoise) already existed as a single global Setting; it now also has its own **"Dynamic denoise by area"** slider in each ADetailer tab's Inpainting section, so you can set it per detector/model. Default **0 = use the global Settings value** (so nothing changes for anyone already using the global option); set it above 0 (2–4 is a good range) to override for that tab. Per-tab value wins when set, otherwise it falls back to the global option. Persisted per tab and shown in PNG-info only when non-zero.
+- **New: HD detection — per-tab detector resolution.** A new **"Detection resolution"** slider in each tab's Detection section runs the YOLO detector at a higher inference resolution (e.g. 1024 instead of the default 640), so **small or distant faces/parts are detected better**. Default **0 = keep the default (640)**; higher values find more but use more VRAM and time (capped at 1536 in the UI). Detected boxes are rescaled to the original image internally, so nothing downstream changes. Applies to the generation pass and to **Run ADetailer on an image**; the quick **Detection preview stays at the default resolution** in this build (the generation pass is what uses your setting). Off by default and backward-compatible.
 
 ## v26.3.0+plus.6 — 2026-07-13 (Run ADetailer on an image — no re-generation)
 

@@ -72,6 +72,7 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
     ad_apply_on_hires_only: bool = False
     ad_use_bbox_mask: bool = False
     ad_confidence: confloat(ge=0.0, le=1.0) = 0.3
+    ad_detection_resolution: conint(ge=0, le=2048) = 0
     ad_mask_filter_method: Literal["Area", "Confidence"] = "Area"
     ad_mask_k: NonNegativeInt = 0
     ad_mask_min_ratio: confloat(ge=0.0, le=1.0) = 0.0
@@ -170,6 +171,7 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
         ppop("ADetailer y offset", cond=0)
         ppop("ADetailer mask merge invert", cond="None")
         ppop("ADetailer dynamic denoise power", cond=0.0)
+        ppop("ADetailer detection resolution", cond=0)
         ppop("ADetailer inpaint only masked", ["ADetailer inpaint padding"])
         ppop(
             "ADetailer use inpaint width height",
@@ -269,6 +271,7 @@ _all_args = [
     ("ad_apply_on_hires_only", "ADetailer apply on hires only"),
     ("ad_use_bbox_mask", "ADetailer use bbox mask"),
     ("ad_confidence", "ADetailer confidence"),
+    ("ad_detection_resolution", "ADetailer detection resolution"),
     ("ad_mask_filter_method", "ADetailer method to decide top k masks"),
     ("ad_mask_k", "ADetailer mask only top k"),
     ("ad_mask_min_ratio", "ADetailer mask min ratio"),

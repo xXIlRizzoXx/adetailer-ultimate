@@ -29,6 +29,7 @@ def ultralytics_predict(
     classes: str = "",
     exclude_classes: str = "",
     use_bbox_mask: bool = False,
+    imgsz: int = 0,
 ) -> PredictOutput[float]:
     from ultralytics import YOLO
 
@@ -37,14 +38,25 @@ def ultralytics_predict(
     requested = parse_csv(classes)
     excluded = parse_csv(exclude_classes)
 
+    # Higher detector inference resolution (e.g. 1024) finds smaller / distant
+    # parts than the Ultralytics default of 640. 0 keeps the library default.
+    # Detected boxes are rescaled back to the original image space internally,
+    # so nothing downstream changes. imgsz is a universally-supported predict
+    # kwarg; the multiclass branch additionally drops it on TypeError alongside
+    # `classes=` for very old Ultralytics.
     if is_world_model(model_path):
         # YOLO-World open-vocab path (unchanged behavior).
         if requested:
             model.set_classes(requested)
-        pred = model(image, conf=confidence, device=device)
+        world_kw: dict = {"conf": confidence, "device": device}
+        if imgsz:
+            world_kw["imgsz"] = imgsz
+        pred = model(image, **world_kw)
     else:
         # Multiclass YOLO: include-by-id at inference time, exclude post-hoc.
         kw: dict = {"conf": confidence, "device": device}
+        if imgsz:
+            kw["imgsz"] = imgsz
         if requested:
             ids = resolve_class_ids(str(model_path), requested)
             if ids:
@@ -52,8 +64,10 @@ def ultralytics_predict(
         try:
             pred = model(image, **kw)
         except TypeError:
-            # Older ultralytics may not accept the `classes=` kwarg — fall back.
+            # Older ultralytics may not accept the `classes=` / `imgsz=` kwargs
+            # — drop them and fall back so detection still runs.
             kw.pop("classes", None)
+            kw.pop("imgsz", None)
             pred = model(image, **kw)
 
         if (

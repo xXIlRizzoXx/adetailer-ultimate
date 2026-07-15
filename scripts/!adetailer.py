@@ -1509,6 +1509,7 @@ class AfterDetailerScript(scripts.Script):
                         else ""
                     ),
                     use_bbox_mask=args.ad_use_bbox_mask,
+                    imgsz=args.ad_detection_resolution,
                 )
 
         if pred.preview is None:
