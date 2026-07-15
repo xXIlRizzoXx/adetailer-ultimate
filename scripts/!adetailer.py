@@ -556,6 +556,13 @@ class AfterDetailerScript(scripts.Script):
         # tags themselves. See `_extract_lora_triggers` for the convention.
         extra_triggers = _extract_lora_triggers(extra_loras) if include_triggers else []
         for n in range(len(prompts)):
+            # A bare [SKIP] segment is a control token, not a prompt: leave it
+            # exactly "[SKIP]" so the per-mask skip gate still matches it. Without
+            # this, an "append" / LoRA-merge / strip step would turn it into
+            # "[SKIP], <append>", defeating the skip and leaking a literal token.
+            if re.match(r"^\s*\[SKIP\]\s*$", prompts[n]):
+                prompts[n] = "[SKIP]"
+                continue
             if not prompts[n]:
                 prompts[n] = blank_replacement
             elif "[PROMPT]" in prompts[n]:
@@ -1073,6 +1080,16 @@ class AfterDetailerScript(scripts.Script):
         try:
             from types import SimpleNamespace
 
+            # This standalone path bypasses the WebUI's state.begin() (which
+            # clears these), so a stale interrupt/skip flag left over from a
+            # previously-cancelled generation would make _postprocess_image_inner
+            # no-op every image ("nothing detected"). Clear them for this run.
+            try:
+                state.interrupted = False
+                state.skipped = False
+            except Exception:  # noqa: BLE001
+                pass
+
             image = ensure_pil_image(image, "RGB")
             w, h = image.size
             # The detailer inpaints at p.width/p.height whenever the user hasn't
@@ -1323,7 +1340,12 @@ class AfterDetailerScript(scripts.Script):
                 p2.prompt = "[SKIP]"
                 return
             p2.prompt = new_pos
-            p2.negative_prompt = _resolve_inline_class_prompt(p2.negative_prompt, cls)
+            new_neg = _resolve_inline_class_prompt(p2.negative_prompt, cls)
+            # [SKIP] is a positive-prompt-only control token; a stray one from a
+            # negative inline block is meaningless — drop it so it never leaks
+            # into negative conditioning.
+            new_neg = re.sub(r"\[SKIP\]", "", new_neg, flags=re.IGNORECASE)
+            p2.negative_prompt = re.sub(r"\s{2,}", " ", new_neg).strip().strip(",").strip()
         except Exception:  # noqa: BLE001
             return
 

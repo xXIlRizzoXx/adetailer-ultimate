@@ -1893,7 +1893,7 @@ def one_ui_group(
                 label="Class-guard emphasis" + suffix(n),
                 info=(
                     "Weight applied to the class name added to the positive "
-                    "prompt, e.g. 1.2 gives (face:1.2). 1.0 = no emphasis. "
+                    "prompt, e.g. 1.2 gives (face:1.20). 1.0 = no emphasis. "
                     "Only used when Auto class-guard is on."
                 ),
                 minimum=0.5,
