@@ -323,6 +323,36 @@ div[id*="adetailer_ad_version"].ad-version-overlay .ad-guide-open:hover {
     text-decoration: underline !important;
 }
 
+/* Green "active tabs" pill in the accordion header (javascript/tab-count-pill.js),
+ * à la ControlNet Integrated's unit counter. Injected into the header
+ * `.label-wrap` so it shows whether the accordion is open or collapsed. */
+.ad-tab-count-pill {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    margin-left: 8px !important;
+    padding: 0 6px !important;
+    border-radius: 9px !important;
+    background: #2e7d32 !important;   /* green */
+    color: #fff !important;
+    font-size: 11px !important;
+    font-weight: 700 !important;
+    line-height: 18px !important;
+    vertical-align: middle;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25) inset;
+    pointer-events: none;             /* purely informational */
+    flex: 0 0 auto;
+}
+/* Hidden state (count 0). Two classes out-specify the base rule above, so it
+ * wins without an !important race; JS toggles this class rather than inline
+ * display, and a class change is an attribute mutation the childList observer
+ * ignores (so hiding never re-triggers the observer). */
+.ad-tab-count-pill.ad-pill-hidden {
+    display: none !important;
+}
+
 /* In-extension user guide — read-only reference text (the "ADetailer Guide"
  * top-level tab, plus the small pointer at the bottom of the panel). Compact
  * and easy to scan. */
