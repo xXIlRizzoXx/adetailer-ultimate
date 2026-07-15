@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -124,3 +125,73 @@ def resolve_class_ids(model_path: str, requested: list[str]) -> list[int]:
         if token in names:
             out.append(names.index(token))
     return out
+
+
+def _strip_weight(token: str) -> str:
+    """Reduce an attention-weighted token like '(face:1.20)' to 'face'."""
+    t = token.strip()
+    m = re.fullmatch(r"\(\s*(.*?)\s*:\s*[0-9.]+\s*\)", t)
+    if m:
+        return m.group(1).strip()
+    if len(t) >= 2 and t[0] == "(" and t[-1] == ")":
+        return t[1:-1].strip()
+    return t
+
+
+def _has_token(prompt: str, tok: str) -> bool:
+    """True if ``tok`` appears as a whole comma-separated token in ``prompt``,
+    case-insensitive and ignoring any surrounding attention-weight wrapper."""
+    if not prompt or not tok:
+        return False
+    target = tok.strip().casefold()
+    return any(_strip_weight(part).casefold() == target for part in prompt.split(","))
+
+
+def _sanitize_token(name: str) -> str:
+    """Strip characters that would break prompt / attention-weight syntax
+    ('(', ')', ':', ',') so a class label can never inject a malformed token."""
+    return (
+        name.replace("(", "")
+        .replace(")", "")
+        .replace(":", "")
+        .replace(",", "")
+        .strip()
+    )
+
+
+def build_class_guard(
+    detected: str, full_list: list[str], weight: float
+) -> tuple[str, str]:
+    """Build the (positive_token, negative_tokens) pair for the Auto class-guard.
+
+    positive: the detected class name — bare at weight 1.0, else '(name:weight)'.
+    negative: every OTHER class of the model, comma-joined ('' for a
+              single-class model).
+    All tokens are sanitized of prompt-syntax characters. Returns ('', '') when
+    ``detected`` is empty or is not one of ``full_list`` (e.g. a numeric-id
+    fallback), so the caller degrades to a no-op.
+    """
+    if not detected or not full_list:
+        return "", ""
+    if detected.casefold() not in {c.casefold() for c in full_list}:
+        return "", ""
+    try:
+        w = float(weight)
+    except (TypeError, ValueError):
+        w = 1.0
+    safe = _sanitize_token(detected)
+    if not safe:
+        return "", ""
+    if abs(w - 1.0) < 1e-3:
+        pos = safe
+    else:
+        w = max(0.5, min(2.0, w))
+        pos = f"({safe}:{w:.2f})"
+    others = [
+        s
+        for c in full_list
+        if c.casefold() != detected.casefold()
+        for s in (_sanitize_token(c),)
+        if s
+    ]
+    return pos, ", ".join(others)

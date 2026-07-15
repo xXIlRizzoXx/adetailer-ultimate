@@ -1,5 +1,13 @@
 # Changelog
 
+## v26.3.0+plus.7.beta.1 — 2026-07-15 (BETA · Auto class-guard)
+
+> **Beta / pre-release.** New opt-in feature. `main` stays stable at **v26.3.0+plus.6**.
+
+- **New: Auto class-guard (opt-in checkbox, off by default).** For each detected region, it prepends the region's own detected class name to that region's **positive** prompt and appends **every other class of the current detector model** to that region's **negative** prompt — so a correctly-detected part is not re-generated as a different class (e.g. one anatomical class coming back as another on a multi-class model). It derives the "other classes" automatically from the model's class list (the `.pt`, or the `<model>.names.json` / `<model>.json` sidecar), so it adapts to any model with no manual typing. Optional **"Class-guard emphasis"** slider (0.5–2.0, default 1.0) weights the class name added to the positive, e.g. 1.2 → `(face:1.2)`; at 1.0 it stays a bare token so prompts and PNG-info remain clean.
+- Works in **normal** and **sequential-class** modes, and with include or exclude/NOT class filtering. Your **manual per-class prompts (`ad_class_prompts`) always win** — a class you tuned by hand is left exactly as you wrote it, and auto-guard is skipped for it. Silent **no-op** (never a crash) on mediapipe / YOLO-World / class-less models, or on any per-mask misalignment.
+- Index-safe: the checkbox and slider are plain persisted inputs (one uniform per-field listener each, like every other ADetailer field) — no new event wiring, host output-gallery "send to" buttons untouched. Off by default and fully backward-compatible: presets and PNG info from v26.3.0+plus.6 and earlier load unchanged with the new fields at their defaults.
+
 ## v26.3.0+plus.6 — 2026-07-13 (Run ADetailer on an image — no re-generation)
 
 **New: run the full ADetailer detect + inpaint pass on an image you already have — without regenerating it.** The bottom of each ADetailer tab now has **two clearly-named sibling sub-tools**:

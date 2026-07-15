@@ -204,6 +204,8 @@ def sort_bboxes(
     idx = sorted(range(items), key=lambda i: key(pred.bboxes[i]))
     pred.bboxes = [pred.bboxes[i] for i in idx]
     pred.masks = [pred.masks[i] for i in idx]
+    if pred.class_names:
+        pred.class_names = [pred.class_names[i] for i in idx]
     return pred
 
 
@@ -226,6 +228,8 @@ def filter_by_ratio(
     pred.bboxes = [pred.bboxes[i] for i in idx]
     pred.masks = [pred.masks[i] for i in idx]
     pred.confidences = [pred.confidences[i] for i in idx]
+    if pred.class_names:
+        pred.class_names = [pred.class_names[i] for i in idx]
     return pred
 
 
@@ -238,6 +242,8 @@ def filter_k_largest(pred: PredictOutput[T], k: int = 0) -> PredictOutput[T]:
     pred.bboxes = [pred.bboxes[i] for i in idx]
     pred.masks = [pred.masks[i] for i in idx]
     pred.confidences = [pred.confidences[i] for i in idx]
+    if pred.class_names:
+        pred.class_names = [pred.class_names[i] for i in idx]
     return pred
 
 
@@ -249,6 +255,8 @@ def filter_k_most_confident(pred: PredictOutput[T], k: int = 0) -> PredictOutput
     pred.bboxes = [pred.bboxes[i] for i in idx]
     pred.masks = [pred.masks[i] for i in idx]
     pred.confidences = [pred.confidences[i] for i in idx]
+    if pred.class_names:
+        pred.class_names = [pred.class_names[i] for i in idx]
     return pred
 
 

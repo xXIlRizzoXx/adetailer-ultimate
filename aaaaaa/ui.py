@@ -1561,6 +1561,36 @@ def one_ui_group(
             )
 
         with gr.Row(variant="compact", elem_classes=["ad-2up-row"]):
+            w.ad_class_guard = gr.Checkbox(
+                label="Auto class-guard" + suffix(n),
+                info=(
+                    "For each detected region, adds its class name to the "
+                    "positive prompt and every other class of the current "
+                    "detector model to the negative prompt, so a correct "
+                    "detection is not regenerated as a different class. Your "
+                    "per-class prompts override it. No effect on mediapipe "
+                    "models or models without a class list."
+                ),
+                value=sv("ad_class_guard", False),
+                visible=True,
+                elem_id=eid("ad_class_guard"),
+            )
+            w.ad_class_guard_weight = gr.Slider(
+                label="Class-guard emphasis" + suffix(n),
+                info=(
+                    "Weight applied to the class name added to the positive "
+                    "prompt, e.g. 1.2 gives (face:1.2). 1.0 = no emphasis. "
+                    "Only used when Auto class-guard is on."
+                ),
+                minimum=0.5,
+                maximum=2.0,
+                step=0.05,
+                value=sv("ad_class_guard_weight", 1.0),
+                visible=True,
+                elem_id=eid("ad_class_guard_weight"),
+            )
+
+        with gr.Row(variant="compact", elem_classes=["ad-2up-row"]):
             w.ad_use_main_loras = gr.Checkbox(
                 label="Use LoRAs from main prompt" + suffix(n),
                 value=sv("ad_use_main_loras", False),

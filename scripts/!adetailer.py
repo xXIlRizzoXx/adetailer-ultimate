@@ -49,7 +49,12 @@ from adetailer.args import (
     InpaintBBoxMatchMode,
     SkipImg2ImgOrig,
 )
-from adetailer.classes import parse_csv
+from adetailer.classes import (
+    _has_token,
+    build_class_guard,
+    get_model_class_names,
+    parse_csv,
+)
 from adetailer.common import PredictOutput, ensure_pil_image, safe_mkdir
 from adetailer.mask import (
     filter_by_ratio,
@@ -1217,6 +1222,54 @@ class AfterDetailerScript(scripts.Script):
 
         return optimal_resolution
 
+    def _apply_auto_class_guard(
+        self, p2, args: ADetailerArgs, pred: PredictOutput, j: int, steps: int
+    ) -> None:
+        """Auto class-guard for mask ``j``.
+
+        For the class the detector found on this mask, prepend that class name
+        to the positive prompt and append every *other* class of the current
+        detector model to the negative prompt, so a correctly-detected region
+        is not regenerated as a different class.
+
+        Opt-in via ``ad_class_guard``. A manual ``ad_class_prompts`` entry for
+        the detected class always wins (auto is suppressed for that class). The
+        whole thing degrades to a silent no-op — never a crash — for
+        mediapipe / class-less models, any per-mask misalignment, or on any
+        WebUI where the class-name lookup fails (universal-WebUI compat).
+        """
+        if not getattr(args, "ad_class_guard", False):
+            return
+        try:
+            names_full = get_model_class_names(str(self.get_ad_model(args.ad_model)))
+            if not names_full:
+                return
+            cn = pred.class_names
+            if not cn or len(cn) != steps or j >= len(cn):
+                return
+            detected = cn[j]
+            if detected in _parse_class_prompts(args.ad_class_prompts):
+                return  # manual per-class prompt wins
+
+            pos, neg = build_class_guard(
+                detected, names_full, getattr(args, "ad_class_guard_weight", 1.0)
+            )
+            if pos and not _has_token(p2.prompt, detected):
+                p2.prompt = f"{pos}, {p2.prompt}" if p2.prompt.strip() else pos
+            if neg:
+                add = [
+                    t for t in neg.split(", ") if not _has_token(p2.negative_prompt, t)
+                ]
+                if add:
+                    joined = ", ".join(add)
+                    p2.negative_prompt = (
+                        f"{p2.negative_prompt}, {joined}"
+                        if p2.negative_prompt.strip()
+                        else joined
+                    )
+        except Exception:
+            return
+
     def fix_p2(  # noqa: PLR0913
         self, p, p2, pp: PPImage, args: ADetailerArgs, pred: PredictOutput, j: int
     ):
@@ -1494,6 +1547,8 @@ class AfterDetailerScript(scripts.Script):
 
             if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
                 continue
+
+            self._apply_auto_class_guard(p2, args, pred, j, steps)
 
             self.fix_p2(p, p2, pp, args, pred, j)
 

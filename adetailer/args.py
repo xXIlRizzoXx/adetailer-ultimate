@@ -65,6 +65,8 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
     ad_prompt_append: str = ""
     ad_negative_prompt_append: str = ""
     ad_class_prompts: str = ""
+    ad_class_guard: bool = False
+    ad_class_guard_weight: confloat(ge=0.5, le=2.0) = 1.0
     ad_use_main_loras: bool = False
     ad_use_lora_triggers: bool = False
     ad_apply_on_hires_only: bool = False
@@ -146,6 +148,10 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
         ppop("ADetailer classes exclude")
         ppop("ADetailer model classes excluded")
         ppop("ADetailer classes sequential")
+        ppop(
+            "ADetailer class guard",
+            ["ADetailer class guard", "ADetailer class guard weight"],
+        )
         ppop("ADetailer prompt")
         ppop("ADetailer negative prompt")
         ppop("ADetailer prompt append")
@@ -254,6 +260,8 @@ _all_args = [
     ("ad_prompt_append", "ADetailer prompt append"),
     ("ad_negative_prompt_append", "ADetailer negative prompt append"),
     ("ad_class_prompts", "ADetailer class prompts"),
+    ("ad_class_guard", "ADetailer class guard"),
+    ("ad_class_guard_weight", "ADetailer class guard weight"),
     ("ad_use_main_loras", "ADetailer use main loras"),
     ("ad_use_lora_triggers", "ADetailer use lora triggers"),
     ("ad_apply_on_hires_only", "ADetailer apply on hires only"),
