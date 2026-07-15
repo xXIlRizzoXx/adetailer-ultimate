@@ -1952,7 +1952,7 @@ def one_ui_group(
                         show_download_button=True,
                         elem_id=eid("ad_apply_output"),
                     )
-                with gr.Row():
+                with gr.Row(elem_classes=["ad-apply-folder-row"]):
                     # Batch mode: point this at a folder of finished images and
                     # the Run button below details EVERY image in it, saving each
                     # result. A folder path here wins over the single image above.

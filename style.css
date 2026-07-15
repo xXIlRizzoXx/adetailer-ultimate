@@ -153,6 +153,14 @@ div.block.ad-preview-status {
     margin-bottom: 10px !important;
 }
 
+/* Detach the optional "batch a whole folder" box from the Input/Result image
+ * row above it and the Run button below, so it reads as its own sub-section
+ * instead of being glued to the toolbar icons (user-reported 2026-07-15). */
+.ad-apply-folder-row {
+    margin-top: 14px !important;
+    margin-bottom: 10px !important;
+}
+
 /* Preset preview block: shows the selected preset's content live.
  * Slightly indented, smaller font, no border — should feel like a
  * helper hint, not a UI panel. */
