@@ -1608,6 +1608,20 @@ def one_ui_group(
                 elem_id=eid("ad_use_lora_triggers"),
             )
 
+        with gr.Row():
+            w.ad_strip_loras = gr.Checkbox(
+                label="Strip LoRAs from the detailer prompt" + suffix(n),
+                info=(
+                    "Removes <lora:...> tags from the prompt sent to the "
+                    "detailer, so LoRAs in the main prompt don't bleed onto the "
+                    "detailed region. Runs last, so it wins over Use LoRAs from "
+                    "main prompt when both are on."
+                ),
+                value=sv("ad_strip_loras", False),
+                visible=True,
+                elem_id=eid("ad_strip_loras"),
+            )
+
         # Hires-only toggle on its own row below the LoRA checkboxes — keeps
         # related top-level prompt/pipeline toggles in the same visual area
         # of the tab without needing an accordion expansion. Hidden in

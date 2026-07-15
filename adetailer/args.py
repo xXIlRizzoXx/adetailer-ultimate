@@ -69,6 +69,7 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
     ad_class_guard_weight: confloat(ge=0.5, le=2.0) = 1.0
     ad_use_main_loras: bool = False
     ad_use_lora_triggers: bool = False
+    ad_strip_loras: bool = False
     ad_apply_on_hires_only: bool = False
     ad_use_bbox_mask: bool = False
     ad_confidence: confloat(ge=0.0, le=1.0) = 0.3
@@ -159,6 +160,7 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
         ppop("ADetailer prompt append")
         ppop("ADetailer negative prompt append")
         ppop("ADetailer use main loras")
+        ppop("ADetailer strip loras")
         p.pop("ADetailer tab enable", None)  # always pop
         ppop(
             "ADetailer mask only top k",
@@ -268,6 +270,7 @@ _all_args = [
     ("ad_class_guard_weight", "ADetailer class guard weight"),
     ("ad_use_main_loras", "ADetailer use main loras"),
     ("ad_use_lora_triggers", "ADetailer use lora triggers"),
+    ("ad_strip_loras", "ADetailer strip loras"),
     ("ad_apply_on_hires_only", "ADetailer apply on hires only"),
     ("ad_use_bbox_mask", "ADetailer use bbox mask"),
     ("ad_confidence", "ADetailer confidence"),

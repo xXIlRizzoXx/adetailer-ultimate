@@ -282,6 +282,20 @@ def _append_lora_triggers(prompt: str, triggers: list[str]) -> str:
     return f"{base}, {tail}" if base else tail
 
 
+def _strip_lora_tags(prompt: str) -> str:
+    """Remove every `<lora:...>` / `<lyco:...>` tag from `prompt` and tidy up
+    the separators the removal leaves behind (empty comma slots, double spaces),
+    so a stripped prompt reads cleanly. Returns `prompt` unchanged if empty or
+    tag-free.
+    """
+    if not prompt or "<" not in prompt:
+        return prompt
+    out = _LORA_TAG_RE.sub("", prompt)
+    out = re.sub(r"\s{2,}", " ", out)  # collapse gaps from inline removals
+    parts = [seg.strip() for seg in out.split(",")]
+    return ", ".join(seg for seg in parts if seg)
+
+
 class AfterDetailerScript(scripts.Script):
     def __init__(self):
         super().__init__()
@@ -487,6 +501,7 @@ class AfterDetailerScript(scripts.Script):
         append: str = "",
         include_loras_from: str = "",
         include_triggers: bool = False,
+        strip_loras: bool = False,
     ) -> list[str]:
         prompts = re.split(r"\s*\[SEP\]\s*", ad_prompt)
         blank_replacement = self.prompt_blank_replacement(all_prompts, i, default)
@@ -524,6 +539,12 @@ class AfterDetailerScript(scripts.Script):
             # against the current prompt body are skipped (case-insensitive).
             if extra_triggers:
                 prompts[n] = _append_lora_triggers(prompts[n], extra_triggers)
+
+            # Strip LoRAs LAST so it wins over ad_use_main_loras when both are
+            # set: the detailer pass gets a prompt free of <lora:...> tags, so
+            # the main prompt's LoRAs don't bleed onto the detailed region.
+            if strip_loras:
+                prompts[n] = _strip_lora_tags(prompts[n])
         return prompts
 
     def get_prompt(self, p, args: ADetailerArgs) -> tuple[list[str], list[str]]:
@@ -551,6 +572,7 @@ class AfterDetailerScript(scripts.Script):
             include_triggers=bool(
                 args.ad_use_main_loras and args.ad_use_lora_triggers
             ),
+            strip_loras=args.ad_strip_loras,
         )
         # Triggers only make sense on the positive prompt — leaving the
         # negative pipeline unchanged keeps the negative prompt the exact
@@ -562,6 +584,7 @@ class AfterDetailerScript(scripts.Script):
             default=p.negative_prompt,
             replacements=prompt_sr,
             append=args.ad_negative_prompt_append,
+            strip_loras=args.ad_strip_loras,
         )
 
         return prompt, negative_prompt
