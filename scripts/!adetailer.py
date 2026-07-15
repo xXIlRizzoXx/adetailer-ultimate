@@ -222,6 +222,49 @@ def _parse_class_prompts(text: str) -> dict[str, tuple[str, str]]:
     return result
 
 
+_INLINE_CLASS_RE = re.compile(
+    r"\[CLASS=([^\]]+)\](.*?)\[/CLASS\]", re.IGNORECASE | re.DOTALL
+)
+
+
+def _resolve_inline_class_prompt(text: str, cls: str | None) -> str:
+    """Resolve inline ``[CLASS=name]...[/CLASS]`` blocks for a region of class
+    ``cls``.
+
+    A block whose name matches ``cls`` (case-insensitive; the tag may list
+    several comma-separated names, e.g. ``[CLASS=face,eyes]``) has its content
+    kept inline; a block for a different class is removed. Text OUTSIDE any block
+    is left untouched, so the intended pattern is a normal base prompt plus a few
+    class-specific blocks. When ``cls`` is None (class-less model) every block is
+    kept — we can't filter. A prompt with no ``[CLASS=`` tag is returned
+    unchanged (fast path), so the feature is inert unless the user opts in by
+    typing the tags.
+    """
+    if not text:
+        return text
+    low = text.lower()
+    if "[class=" not in low:
+        return text
+    # Defensive: the lazy regex is O(n^2) on many UNCLOSED tags. No realistic
+    # prompt has 100+ class blocks, so bail (unchanged) on a malformed paste
+    # rather than burn CPU once per mask per image.
+    if low.count("[class=") > 100:
+        return text
+    cls_cf = (cls or "").strip().casefold()
+
+    def _sub(m: "re.Match[str]") -> str:
+        names = {n.strip().casefold() for n in m.group(1).split(",") if n.strip()}
+        return m.group(2) if (not cls_cf or cls_cf in names) else ""
+
+    out = _INLINE_CLASS_RE.sub(_sub, text)
+    # Strip any orphan / malformed CLASS tags so they never leak into the prompt.
+    out = re.sub(r"\[/?CLASS(=[^\]]*)?\]", "", out, flags=re.IGNORECASE)
+    # Tidy separators left behind by removed blocks.
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"(,\s*){2,}", ", ", out)
+    return out.strip().strip(",").strip()
+
+
 def _should_skip_for_hires_only(p, args) -> bool:
     """Return True when the per-tab `ad_apply_on_hires_only` toggle is on and
     the current postprocess call should be skipped.
@@ -1253,6 +1296,37 @@ class AfterDetailerScript(scripts.Script):
 
         return optimal_resolution
 
+    def _apply_inline_class_prompts(
+        self, p2, pred: PredictOutput, j: int, steps: int
+    ) -> None:
+        """Resolve inline ``[CLASS=name]...[/CLASS]`` blocks in mask ``j``'s
+        prompt against the class the detector found on that mask.
+
+        Matching blocks are kept, blocks for other classes are dropped, and text
+        outside any block is untouched. Works in both normal and sequential
+        modes (the per-mask class comes straight from ``pred.class_names``), and
+        is a guarded no-op — never a crash. A prompt with no ``[CLASS=`` tag is
+        returned unchanged, so this only affects users who type the tags.
+        """
+        try:
+            cn = getattr(pred, "class_names", None)
+            cls = cn[j] if (cn and len(cn) == steps and j < len(cn)) else None
+            had_inline = isinstance(p2.prompt, str) and "[class=" in p2.prompt.lower()
+            new_pos = _resolve_inline_class_prompt(p2.prompt, cls)
+            # A [SKIP] token surviving inline resolution — e.g. from a matching
+            # `[CLASS=hand] [SKIP] [/CLASS]` block — means "skip this region"
+            # even when base text is present. Normalise to a bare [SKIP] so the
+            # loop's [SKIP] gate catches it and no literal token leaks into the
+            # real SD prompt. Gated on `had_inline` so a normal prompt that just
+            # happens to contain [SKIP] mid-text is left exactly as before.
+            if had_inline and re.search(r"\[SKIP\]", new_pos, re.IGNORECASE):
+                p2.prompt = "[SKIP]"
+                return
+            p2.prompt = new_pos
+            p2.negative_prompt = _resolve_inline_class_prompt(p2.negative_prompt, cls)
+        except Exception:  # noqa: BLE001
+            return
+
     def _apply_auto_class_guard(
         self, p2, args: ADetailerArgs, pred: PredictOutput, j: int, steps: int
     ) -> None:
@@ -1586,6 +1660,11 @@ class AfterDetailerScript(scripts.Script):
             p2.image_mask = masks[j]
             p2.init_images[0] = ensure_pil_image(p2.init_images[0], "RGB")
             self.i2i_prompts_replace(p2, ad_prompts, ad_negatives, j)
+
+            # Resolve inline [CLASS=name]…[/CLASS] blocks against this mask's
+            # detected class BEFORE the [SKIP] check, so `[CLASS=hand] [SKIP]
+            # [/CLASS]` skips only hand regions.
+            self._apply_inline_class_prompts(p2, pred, j, steps)
 
             if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
                 continue
