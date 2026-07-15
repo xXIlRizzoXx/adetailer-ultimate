@@ -304,7 +304,7 @@ A **Run detection preview** button. Drop or paste an image into the Input box an
 
 **Before clicking the button, pick a model in the tab's `ADetailer detector` dropdown.** The preview reuses the tab's currently-selected detector — there is no separate detector picker inside the accordion. If you haven't chosen one yet (the dropdown is still on the `None` placeholder), the button has nothing to run against.
 
-Useful for tuning confidence threshold + mask preprocessing without burning a full generation each time.
+Useful for tuning confidence threshold + mask preprocessing without burning a full generation each time. The single-tab preview also honours the tab's **Detection resolution** (HD detection), so raising it shows the extra small/distant detections the real pass would find. (The **Combine all tabs** overlay stays at the default resolution.)
 
 **Combine all tabs.** Next to the Run button is a **🔁 Combine all tabs** checkbox. With it off, the preview runs only the current tab's detector (the detector's own rich plot, with class names + confidence). With it **on**, the button runs **every configured tab's detector** on the dropped image and overlays all results on one image at once — each tab's regions tinted in its own colour following the real segmentation shape (or the bounding box for box-only models), labelled `tab#:class confidence`. The status line summarises per tab, e.g. `3 detection(s) across 2 tab(s) — Tab1: 2 | Tab2: 1`. Handy for seeing at a glance what your whole multi-tab setup will catch on a given image before committing to a full generation. (No event listener is added for this — the checkbox is read by the existing preview button — so it stays compatible with the host WebUI's gallery wiring.)
 

@@ -189,7 +189,7 @@ Everything here is optional — turn ADetailer on, pick a detector, and the defa
 - **Detailer checkpoint / VAE / text encoder / sampler / steps / CFG / CLIP skip** — use different settings only for the detail pass. Off = inherit from the main generation. (Text encoder override is Forge / Forge Neo only.)
 
 ### Tools at the bottom of the tab
-- **Detection preview** — drop an image to see what the detector would find (boxes), without generating. **Combine all tabs** overlays every tab's detector at once.
+- **Detection preview** — drop an image to see what the detector would find (boxes), without generating. The single-tab preview honours this tab's **Detection resolution**, so it reflects what the real pass will detect. **Combine all tabs** overlays every tab's detector at once (that combined view stays at the default resolution).
 - **Run ADetailer on an image** — drop a finished image and run the full detail pass on it, without regenerating. Optional **Save result to outputs** writes to a dedicated `ADetailer-Inpaint` folder; click the result to enlarge it.
 - **Batch a whole folder** *(new)* — paste a folder path in the same tool to detail every image inside it in one go; each result is always saved to the `ADetailer-Inpaint` folder. A folder path takes priority over a single dropped image.
 
@@ -560,8 +560,12 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         (0, 210, 210),
     ]
 
-    def _predict(image, model_name, classes_csv, exclude_csv, exclude_mode, confidence):
-        """Run one detector. Returns (PredictOutput | None, error_str | None)."""
+    def _predict(
+        image, model_name, classes_csv, exclude_csv, exclude_mode, confidence, imgsz=0
+    ):
+        """Run one detector. Returns (PredictOutput | None, error_str | None).
+        `imgsz` (0 = default 640) is the optional HD detection resolution; it
+        only affects ultralytics models — mediapipe ignores it."""
         if not model_name or model_name == "None":
             return None, "no model"
         try:
@@ -599,6 +603,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     device="",
                     classes=classes_csv or "",
                     exclude_classes=(exclude_csv if exclude_mode and exclude_csv else ""),
+                    imgsz=int(imgsz or 0),
                 )
             return pred, None
         except Exception as e:  # noqa: BLE001 — surface to the UI
@@ -643,8 +648,20 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 ]
                 if not model_name or model_name == "None":
                     return None, "⚠️ Pick a detector model first."
+                # HD preview: honour THIS tab's "Detection resolution" so the
+                # single-tab preview reflects what the real pass will detect.
+                # Combine-all-tabs stays at the default 640 — it only has the 5
+                # detector fields per tab, not each tab's full args. 0 = default.
+                imgsz = 0
+                try:
+                    _full = flat[num_models * 5 :]
+                    _i = list(ALL_ARGS.attrs).index("ad_detection_resolution")
+                    imgsz = int(_full[_i] or 0)
+                except Exception:  # noqa: BLE001
+                    imgsz = 0
                 pred, err = _predict(
-                    image, model_name, classes_csv, exclude_csv, exclude_mode, confidence
+                    image, model_name, classes_csv, exclude_csv, exclude_mode,
+                    confidence, imgsz,
                 )
                 if err:
                     return None, f"⚠️ Preview failed: {err}"
