@@ -115,6 +115,7 @@ Fixes that don't add new widgets — they keep the extension loading and running
 - 🟢 Action buttons (Copy / Paste / preset Load / Save / Rename / Delete / Reset / detection-preview) get rounded 8px corners and `white-space: nowrap` so all heights stay uniform when labels wrap.
 - 🟢 A version-badge overlay pinned to the top-right of the accordion header. Auto-hides when the accordion collapses.
 - 🟢 Top of every tab: `Enable this tab` + `Copy settings` + `Paste settings` row as direct top-level widgets (no nested clipboard accordion).
+- 🟢 Built-in **"📖 Guide — what each option does"** accordion at the bottom of the panel (collapsed by default): a plain-language reference for every option, grouped by section, right inside the extension. Read-only static markdown (`_build_guide_text` / `.ad-guide`) — no event listeners, so it's index-safe. Kept in English as reference text (like the technical vocabulary), so it is not a translation key.
 
 ### Localisation (10 languages via [Language Diffusion](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion))
 

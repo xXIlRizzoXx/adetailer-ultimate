@@ -294,3 +294,27 @@ div[id*="adetailer_ad_version"].ad-version-overlay p {
     white-space: nowrap;
     text-align: right;
 }
+
+/* In-extension user guide — the read-only, collapsed accordion at the bottom
+ * of the ADetailer panel. Keep it compact and easy to scan. */
+.ad-guide {
+    max-width: 900px;
+    opacity: 0.92;
+}
+.ad-guide p,
+.ad-guide li {
+    font-size: 12.5px !important;
+    line-height: 1.5 !important;
+}
+.ad-guide h3 {
+    margin: 0.8em 0 0.3em !important;
+    font-size: 13.5px !important;
+    opacity: 0.85;
+}
+.ad-guide ul {
+    margin: 0.2em 0 0.6em !important;
+    padding-left: 1.2em !important;
+}
+.ad-guide code {
+    font-size: 0.92em !important;
+}

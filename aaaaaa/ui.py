@@ -144,6 +144,68 @@ def _build_overlay_text() -> str:
     return base
 
 
+# In-extension user guide. Rendered read-only inside a collapsed accordion at
+# the bottom of the ADetailer panel (see `adui`). Deliberately English-only
+# reference text — like the technical vocabulary, it is not a translation key,
+# so the markdown formatting here does NOT fall under the single-plain-block
+# i18n rule. Keep it in sync with README.md when features change.
+_GUIDE_MD = """\
+Everything here is optional — turn ADetailer on, pick a detector, and the defaults already work. Expand a section to see what each control does. Items marked **(new)** are additions of this fork.
+
+### Getting started
+- **Enable ADetailer** (checkbox on the header) turns it on for this generation.
+- **ADetailer detector** — the detector that finds what to fix (face, hand, a segmentation or MediaPipe model…). "None" disables that tab.
+- Each numbered **tab** (1st, 2nd, …) is an independent detector + settings, run in order. Add more tabs in `Settings → ADetailer`.
+
+### Detection
+- **Detection model confidence threshold** — how sure the detector must be. Lower finds more (and more false) boxes.
+- **Detection resolution** *(new)* — run the detector at a higher resolution (e.g. 1024) to catch small or distant parts. `0` = default (640); higher = better detection but more VRAM and time.
+- **ADetailer detector CLASSES** — for multi-class models, choose which parts to detail. Empty = all of them.
+- **Exclude selected (NOT)** — invert the choice: detail everything EXCEPT the selected classes.
+- **Process classes sequentially** — one detect+inpaint pass per selected class, in the order you clicked them. Required for per-class prompts.
+- **Method to filter / Mask only the top k** — keep only the k biggest or most-confident detections; `0` keeps all.
+
+### Mask preprocessing
+- **Use bbox as mask (segmentation models)** — inpaint the rectangle instead of the tight segmentation shape (more blending room). No effect on box-only detectors.
+- **Mask erosion (-) / dilation (+)** — shrink or grow the detected mask.
+- **Mask x / y offset** — nudge the mask left/right or up/down.
+
+### Prompts
+- **Prompt / Negative prompt** — text for the detail pass. Leave blank to reuse the main prompt.
+- **Prompt append / Negative prompt append** — tack a few words onto the end without retyping the whole prompt.
+- **Per-class prompts** — a different prompt (and optional negative) per class. One line each: `classname: positive | negative`. Works only with **Process classes sequentially** on and 2+ classes selected (include mode).
+- **Auto class-guard** *(new)* — for each detected region, adds its own class name to the positive and every OTHER class of the model to the negative, so a detected part isn't re-drawn as a different one. Your per-class prompts always override it. **Class-guard emphasis** weights the added class name.
+- **Use LoRAs from main prompt** (+ triggers) — copy the LoRA tags from the main prompt into the detail pass.
+- **Strip LoRAs from the detailer prompt** *(new)* — remove all `<lora:...>` / `<lyco:...>` tags from the detail prompt so the main prompt's LoRAs don't bleed onto the region. Wins over **Use LoRAs from main prompt** when both are on.
+
+### Inpainting
+- **Inpaint denoising strength** — how much the region changes. Lower keeps the original shape; higher redraws more. ~0.3–0.5 is typical, and low values help keep a detected class looking like itself.
+- **Dynamic denoise by area** *(new)* — automatically gives smaller detected regions more denoise. `0` = use the global Settings value; 2–4 is a good range.
+- **Inpaint mask blur** — soften the mask edge for smoother blending.
+- **Inpaint only masked** (+ padding) — regenerate just the region at full detail (recommended), with some surrounding context.
+- **Separate inpaint width/height** or **scale** — set the working resolution of the region.
+
+### Per-pass overrides (optional)
+- **Detailer checkpoint / VAE / text encoder / sampler / steps / CFG / CLIP skip** — use different settings only for the detail pass. Off = inherit from the main generation. (Text encoder override is Forge / Forge Neo only.)
+
+### Tools at the bottom of the tab
+- **Detection preview** — drop an image to see what the detector would find (boxes), without generating. **Combine all tabs** overlays every tab's detector at once.
+- **Run ADetailer on an image** — drop a finished image and run the full detail pass on it, without regenerating. Optional **Save result to outputs** writes to a dedicated `ADetailer-Inpaint` folder; click the result to enlarge it.
+
+### Presets & sharing
+- **Preset library** — save / load / rename a whole tab's settings by name.
+- **Copy settings / Paste settings** — clone one tab's settings into another.
+- **Remember last-used settings between restarts** (`Settings → ADetailer`) — restore your last setup after a restart.
+- **Reset ADetailer settings** (`Settings → ADetailer`) — restore factory defaults.
+
+**Tip for "the wrong thing gets regenerated":** keep denoise low and turn on **Auto class-guard** (or write per-class prompts in sequential mode) so each detected class stays itself.
+"""
+
+
+def _build_guide_text() -> str:
+    return _GUIDE_MD
+
+
 def _format_preset_preview(name: str | None):
     """Build a compact markdown summary of a preset's contents for the
     live preview area below the preset dropdown.
@@ -452,6 +514,16 @@ def adui(
         # Cross-tab Detection-preview wiring (also a post-loop "second pass"):
         # lets each tab's "Combine all tabs" checkbox run every tab's detector.
         _wire_detection_previews(all_widgets, webui_info, num_models, script)
+
+        # In-extension user guide — a read-only, collapsed accordion at the
+        # bottom of the panel. Static content only (no event listeners), so it
+        # cannot shift the host gallery's fn_index — index-safe by construction.
+        with gr.Accordion(
+            "📖 Guide — what each option does",
+            open=False,
+            elem_id=eid("ad_guide_accordion"),
+        ):
+            gr.Markdown(_build_guide_text(), elem_classes=["ad-guide"])
 
     # components: [bool, bool, dict, dict, ...]
     components = [ad_enable, ad_skip_img2img, *states]
