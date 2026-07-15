@@ -15,6 +15,16 @@ def parse_csv(csv: str) -> list[str]:
     return [c.strip() for c in (csv or "").split(",") if c.strip()]
 
 
+# The multi-class MediaPipe "face features" pseudo-detector. Its class list is
+# the single source of truth shared by: the CLASSES dropdown, the Auto
+# class-guard (build_class_guard), per-class prompts, and the detector itself
+# (adetailer/mediapipe.py imports these). Lives here in the stdlib-only leaf
+# module so mediapipe.py / args.py / ui.py can import it without a cycle.
+# Order = dropdown order = sequential-pass order; keep STABLE (preset/PNG-info).
+MEDIAPIPE_FACE_FEATURES_MODEL = "mediapipe_face_features"
+FACE_FEATURE_CLASSES = ["eyes", "mouth", "nose", "eyebrows", "face"]
+
+
 def _names_from_json(data: Any) -> list[str]:
     """Try to extract a class-names list from a parsed JSON blob.
 
@@ -82,7 +92,18 @@ def get_model_class_names(model_path: str) -> list[str]:
               civitai_helper metadata) don't match the format and are ignored.
       2. model.names from a transient YOLO() load.
       3. [] if unknown (YOLO-World, MediaPipe, missing file, or load failure).
+
+    Special case: the "mediapipe_face_features" pseudo-detector has a fixed,
+    code-defined class list (facial parts). It is matched FIRST, before the
+    .pt-path checks below (a bare mediapipe name has no .pt on disk), so the
+    CLASSES dropdown, Auto class-guard and per-class prompts all light up.
     """
+    if (
+        model_path == MEDIAPIPE_FACE_FEATURES_MODEL
+        or Path(model_path).name == MEDIAPIPE_FACE_FEATURES_MODEL
+    ):
+        return list(FACE_FEATURE_CLASSES)
+
     p = Path(model_path)
     if is_world_model(p) or not p.exists() or p.suffix != ".pt":
         return []

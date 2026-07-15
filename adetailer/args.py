@@ -29,6 +29,8 @@ except ImportError:
         validator,
     )
 
+from adetailer.classes import MEDIAPIPE_FACE_FEATURES_MODEL  # noqa: E402
+
 
 @dataclass
 class SkipImg2ImgOrig:
@@ -249,6 +251,12 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
 
     def is_mediapipe(self) -> bool:
         return self.ad_model.lower().startswith("mediapipe")
+
+    def is_mediapipe_features(self) -> bool:
+        # The one MediaPipe detector that IS class-based (facial parts), so it
+        # opts into the class filter / sequential / per-class-prompt machinery
+        # that the other (class-less) mediapipe models stay out of.
+        return self.ad_model == MEDIAPIPE_FACE_FEATURES_MODEL
 
     def need_skip(self) -> bool:
         return self.ad_model == "None" or self.ad_tab_enable is False

@@ -114,6 +114,7 @@ def get_models(
             "mediapipe_face_short": "mediapipe_face_short",
             "mediapipe_face_mesh": "mediapipe_face_mesh",
             "mediapipe_face_mesh_eyes_only": "mediapipe_face_mesh_eyes_only",
+            "mediapipe_face_features": "mediapipe_face_features",
         }
     )
 

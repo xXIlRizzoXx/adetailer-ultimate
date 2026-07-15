@@ -12,7 +12,7 @@ import gradio as gr
 from aaaaaa.conditional import InputAccordion
 from adetailer import ADETAILER, __version__
 from adetailer.args import ALL_ARGS, MASK_MERGE_INVERT
-from adetailer.classes import get_model_class_names
+from adetailer.classes import MEDIAPIPE_FACE_FEATURES_MODEL, get_model_class_names
 from adetailer.persistence import load_state, save_tab_state
 from adetailer.presets import (
     delete_preset,
@@ -358,7 +358,14 @@ def on_ad_model_update(
       class-filter state when the detector matches.
     - MediaPipe / None: dropdown shown but empty.
     """
-    if not model or model == "None" or model.lower().startswith("mediapipe"):
+    if (
+        not model
+        or model == "None"
+        or (
+            model.lower().startswith("mediapipe")
+            and model != MEDIAPIPE_FACE_FEATURES_MODEL
+        )
+    ):
         return (
             gr.update(visible=False, value=""),
             gr.update(visible=True, choices=[], value=[]),
@@ -560,7 +567,16 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             if model_name.lower().startswith("mediapipe"):
                 from adetailer.mediapipe import mediapipe_predict
 
-                return mediapipe_predict(model_name, image, float(confidence)), None
+                return (
+                    mediapipe_predict(
+                        model_name,
+                        image,
+                        float(confidence),
+                        classes=classes_csv or "",
+                        exclude_classes=(exclude_csv if exclude_mode and exclude_csv else ""),
+                    ),
+                    None,
+                )
             from adetailer.ultralytics import ultralytics_predict
 
             path = model_mapping.get(model_name, "")
@@ -1453,7 +1469,10 @@ def one_ui_group(
                 _wanted_classes
                 and _saved_model
                 and _saved_model != "None"
-                and not _saved_model.lower().startswith("mediapipe")
+                and (
+                    not _saved_model.lower().startswith("mediapipe")
+                    or _saved_model == MEDIAPIPE_FACE_FEATURES_MODEL
+                )
                 and "-world" not in _saved_model
             ):
                 _dd_choices: list[str] = list(_wanted_classes)

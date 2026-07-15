@@ -1,6 +1,6 @@
 # Changelog
 
-## v26.3.0+plus.7.beta.1 — 2026-07-15 (BETA · Auto class-guard + per-tab dynamic denoise + HD detection + strip LoRAs + in-tab guide)
+## v26.3.0+plus.7.beta.1 — 2026-07-15 (BETA · plus.7 feature round)
 
 > **Beta / pre-release.** New opt-in features. `main` stays stable at **v26.3.0+plus.6**.
 
@@ -11,6 +11,7 @@
 - **New: HD detection — per-tab detector resolution.** A new **"Detection resolution"** slider in each tab's Detection section runs the YOLO detector at a higher inference resolution (e.g. 1024 instead of the default 640), so **small or distant faces/parts are detected better**. Default **0 = keep the default (640)**; higher values find more but use more VRAM and time (capped at 1536 in the UI). Detected boxes are rescaled to the original image internally, so nothing downstream changes. Applies to the generation pass and to **Run ADetailer on an image**; the quick **Detection preview stays at the default resolution** in this build (the generation pass is what uses your setting). Off by default and backward-compatible.
 - **New: "Strip LoRAs from the detailer prompt" (opt-in checkbox).** By default the detailer pass inherits the full main prompt — LoRAs included — so a LoRA in the main prompt bleeds onto every detailed region. Tick this per-tab checkbox to remove every `<lora:...>` / `<lyco:...>` tag from the prompt sent to the detailer (leftover commas/spacing are tidied), so the detailer focuses on what you're detailing without the main prompt's LoRAs pulling it around (upstream request #805). Runs last, so it **wins over "Use LoRAs from main prompt"** if both are on. Off by default; no effect on prompts without LoRA tags.
 - **New: built-in guide inside the extension.** A collapsed **"📖 Guide — what each option does"** accordion at the bottom of the ADetailer panel explains every option in plain language, grouped by section (Detection, Prompts, Inpainting, overrides, the bottom tools, presets), right where you use them — no need to open GitHub. Read-only and English (reference text); adds no event listeners, so it's index-safe and can't affect anything else.
+- **New: MediaPipe "face features" detector — detail individual facial parts.** A new detector **`mediapipe_face_features`** treats the face as a **multi-class** model whose classes are **eyes, mouth, nose, eyebrows, face**. Because it's class-based, it reuses the existing **CLASSES filter** — pick **all** (leave empty), **some**, or **just one** — plus include/exclude (NOT) mode, **Process classes sequentially** (a separate pass + prompt per part), **per-class prompts**, and **Auto class-guard** (each part guards itself against the others), with landmark-precise masks (not rectangles). Version-safe against older MediaPipe builds (a `FACEMESH_NOSE` fallback so nose still works), degrades to "nothing detected" on any failure. The existing `mediapipe_face_mesh_eyes_only` is unchanged. Index-safe: reuses the class dropdown, adds no new listeners.
 
 ## v26.3.0+plus.6 — 2026-07-13 (Run ADetailer on an image — no re-generation)
 

@@ -1383,7 +1383,7 @@ class AfterDetailerScript(scripts.Script):
         """
         if (
             not args.ad_classes_sequential
-            or args.is_mediapipe()
+            or (args.is_mediapipe() and not args.is_mediapipe_features())
             or args.ad_model_classes_exclude
         ):
             return False
@@ -1425,7 +1425,7 @@ class AfterDetailerScript(scripts.Script):
         # mutated in place by the inner inpaint).
         if (
             args.ad_classes_sequential
-            and not args.is_mediapipe()
+            and (not args.is_mediapipe() or args.is_mediapipe_features())
             and not args.ad_model_classes_exclude
         ):
             classes = parse_csv(args.ad_model_classes)
@@ -1515,7 +1515,17 @@ class AfterDetailerScript(scripts.Script):
         is_mediapipe = args.is_mediapipe()
 
         if is_mediapipe:
-            pred = mediapipe_predict(args.ad_model, pp.image, args.ad_confidence)
+            pred = mediapipe_predict(
+                args.ad_model,
+                pp.image,
+                args.ad_confidence,
+                classes=args.ad_model_classes,
+                exclude_classes=(
+                    args.ad_model_classes_excluded
+                    if args.ad_model_classes_exclude
+                    else ""
+                ),
+            )
 
         else:
             ad_model = self.get_ad_model(args.ad_model)
