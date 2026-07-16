@@ -2007,6 +2007,18 @@ def on_ui_settings():
     )
 
     shared.opts.add_option(
+        "ad_show_guide_tab",
+        shared.OptionInfo(
+            default=False,
+            label="Show the ADetailer Guide tab (top tab bar)",
+            component=gr.Checkbox,
+            section=section,
+        )
+        .info("Adds a '📖 ADetailer Guide' tab next to Settings with the full option reference")
+        .needs_reload_ui(),
+    )
+
+    shared.opts.add_option(
         "ad_extra_models_dir",
         shared.OptionInfo(
             default="",
@@ -2350,6 +2362,11 @@ def on_ui_tabs():
     and never blocks the extension from loading. Universal: `on_ui_tabs` is a
     core callback on A1111 / Forge / Forge Neo / reForge."""
     try:
+        # Opt-in: off by default. Toggle via Settings -> ADetailer -> "Show the
+        # ADetailer Guide tab" (needs a UI reload to apply, since tabs are built
+        # once at startup).
+        if not shared.opts.data.get("ad_show_guide_tab", False):
+            return []
         from aaaaaa.ui import build_guide_blocks
 
         return [(build_guide_blocks(), "ADetailer Guide", "adetailer_guide")]

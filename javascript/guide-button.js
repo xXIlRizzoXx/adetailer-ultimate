@@ -69,6 +69,12 @@
     }
 
     function injectGuideLinks() {
+        // The guide tab is opt-in (Settings -> ADetailer, off by default). Only
+        // show the header quick-link when the tab actually exists, so it's never
+        // a dead link.
+        if (!document.getElementById("tab_adetailer_guide")) {
+            return;
+        }
         // One overlay per ADetailer accordion instance (txt2img + img2img).
         const paras = document.querySelectorAll(
             'div[id*="adetailer_ad_version"].ad-version-overlay p'

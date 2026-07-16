@@ -626,13 +626,16 @@ def adui(
         # lets each tab's "Combine all tabs" checkbox run every tab's detector.
         _wire_detection_previews(all_widgets, webui_info, num_models, script)
 
-        # The full user guide now lives in its own top-level "ADetailer Guide"
-        # tab (registered via on_ui_tabs). Leave a small, non-invasive pointer
-        # here. Static markdown only (no event listeners) → index-safe. Kept as a
-        # single plain-text line (no inline markdown) so it stays translatable.
+        # The full user guide lives in its own top-level "ADetailer Guide" tab
+        # (opt-in, off by default — see the on_ui_tabs gate + the
+        # ad_show_guide_tab setting). Leave a small, non-invasive pointer that is
+        # accurate whether the tab is on or off. Static markdown only (no event
+        # listeners) → index-safe. Single plain-text line (no inline markdown) so
+        # it stays translatable.
         gr.Markdown(
-            "📖 Full guide with a table of contents: open the ADetailer Guide "
-            "tab at the top of the page.",
+            "📖 A full guide to every option is available as its own top tab — "
+            "turn on \"Show the ADetailer Guide tab\" in Settings → ADetailer to "
+            "display it.",
             elem_classes=["ad-guide-pointer"],
         )
 
