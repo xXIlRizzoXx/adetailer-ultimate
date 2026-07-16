@@ -96,6 +96,23 @@ from modules.shared import cmd_opts, opts, state
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
+# Raise PIL's decompression-bomb ceiling so the "Run ADetailer on an image",
+# batch-folder and detection-preview tools accept large upscales. Gradio's Image
+# component PIL.open()s the dropped file BEFORE our code runs, and Forge Neo
+# leaves PIL's ~179 MP default in place, so a big drop raises a
+# DecompressionBombError and the detector never even sees the image. Only ever
+# RAISE the ceiling (never lower it, and never override a host that already
+# disabled the check with None), keeping a generous finite cap so a genuinely
+# absurd image is still refused. Reported during testing (a 216 MP upscale).
+try:
+    if (
+        Image.MAX_IMAGE_PIXELS is not None
+        and Image.MAX_IMAGE_PIXELS < 1_000_000_000
+    ):
+        Image.MAX_IMAGE_PIXELS = 1_000_000_000
+except Exception:  # noqa: BLE001
+    pass
+
 PARAMS_TXT = "params.txt"
 
 # Sub-folder (relative to the resolved ADetailer output directory) where every
