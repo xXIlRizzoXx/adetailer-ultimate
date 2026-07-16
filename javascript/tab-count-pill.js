@@ -33,29 +33,25 @@
         return n;
     }
 
-    // Find (or create) this accordion's pill inside its header (`.label-wrap`),
-    // so it stays visible whether the accordion is expanded or collapsed.
+    // Find (or create) this accordion's pill in its header, so it stays visible
+    // whether the accordion is expanded or collapsed. Returns null for elements
+    // that carry the accordion id fragment but are NOT the real accordion root
+    // (e.g. the hidden InputAccordion checkbox block) — they have no direct
+    // `.label-wrap` header — so no spurious/duplicate pills are created.
     function ensurePill(accordion) {
-        let pill = accordion.querySelector(".ad-tab-count-pill");
+        const header = accordion.querySelector(":scope > .label-wrap");
+        if (!header) return null;
+        let pill = header.querySelector(".ad-tab-count-pill");
         if (pill) return pill;
-        // Prefer the accordion's OWN direct-child header so we never land in a
-        // nested accordion's `.label-wrap` (Preset I/O, Detection, Guide…). Fall
-        // back to the first `.label-wrap` (which still precedes the content), or
-        // the accordion root as a last resort.
-        const header =
-            accordion.querySelector(":scope > .label-wrap") ||
-            accordion.querySelector(".label-wrap") ||
-            accordion;
         pill = document.createElement("span");
         pill.className = "ad-tab-count-pill";
         pill.setAttribute("aria-hidden", "true");
-        // Sit right after the "ADetailer" label, before the chevron icon.
-        const icon = header.querySelector(".icon");
-        if (icon) {
-            header.insertBefore(pill, icon);
-        } else {
-            header.appendChild(pill);
-        }
+        // Match ControlNet Integrated: put the badge INSIDE the title span,
+        // right after the "ADetailer" text (hugging the title on the left), not
+        // as a far-right sibling before the chevron. The first direct-child
+        // <span> of the label-wrap is the title (the chevron is `.icon`).
+        const titleSpan = header.querySelector(":scope > span");
+        (titleSpan || header).appendChild(pill);
         return pill;
     }
 

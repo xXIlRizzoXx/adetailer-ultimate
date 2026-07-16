@@ -1397,7 +1397,9 @@ def one_ui_group(
     with gr.Row(variant="compact"):
         w.ad_tab_enable = gr.Checkbox(
             label=f"Enable this tab ({ordinal(n + 1)})",
-            value=sv("ad_tab_enable", True),
+            # Default: only the 1st tab is enabled; extra tabs start OFF (they
+            # have no detector yet). Saved/last-used state still wins via sv().
+            value=sv("ad_tab_enable", n == 0),
             visible=True,
             elem_id=eid("ad_tab_enable"),
         )
