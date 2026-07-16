@@ -3,6 +3,7 @@ from __future__ import annotations
 import platform
 import re
 import sys
+import time
 import traceback
 from collections.abc import Sequence
 from copy import copy
@@ -41,6 +42,7 @@ from adetailer import (
     ultralytics_predict,
 )
 from adetailer.args import (
+    ALL_ARGS,
     BBOX_SORTBY,
     BUILTIN_SCRIPT,
     INPAINT_BBOX_MATCH_MODES,
@@ -354,6 +356,200 @@ def _strip_lora_tags(prompt: str) -> str:
     out = re.sub(r"\s{2,}", " ", out)  # collapse gaps from inline removals
     parts = [seg.strip() for seg in out.split(",")]
     return ", ".join(seg for seg in parts if seg)
+
+
+# ── Verbose diagnostic log (opt-in via Settings → ADetailer) ────────────────
+# When "Verbose diagnostic log" is on, every ADetailer pass prints an ordered
+# block to the console: all per-tab settings (grouped), what was detected
+# (class / confidence / mask size), the fully-resolved prompt for each region,
+# and timings + VRAM. Output goes STRAIGHT to stdout (not the module's rich
+# `print`) because the lines contain [..] tokens rich would parse as markup.
+_V_LINE = "─" * 66
+
+
+def _ad_verbose() -> bool:
+    try:
+        return bool(shared.opts.data.get("ad_verbose_log", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _vprint(text: str) -> None:
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _vfmt(val: object) -> str:
+    """Compact one-line rendering of a setting value for the log."""
+    if isinstance(val, str):
+        s = val.replace("\n", "\\n")
+        return f"'{s[:400]}…'" if len(s) > 400 else f"'{s}'"
+    if isinstance(val, float):
+        return f"{val:g}"
+    return str(val)
+
+
+def _vram_str() -> str:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            used = torch.cuda.memory_allocated() / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            return f"{used:.1f}/{total:.1f} GB"
+    except Exception:  # noqa: BLE001
+        pass
+    return "n/a"
+
+
+# Group the ~60 per-tab settings under readable headers for the dump. Any
+# ALL_ARGS attr not listed here is still printed under "Other", so a
+# newly-added field is never silently dropped from the log.
+_VERBOSE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Detection", ("ad_model", "ad_model_classes", "ad_model_classes_exclude",
+                   "ad_model_classes_excluded", "ad_classes_sequential",
+                   "ad_tab_enable", "ad_confidence", "ad_detection_resolution")),
+    ("Prompts", ("ad_prompt", "ad_negative_prompt", "ad_prompt_append",
+                 "ad_negative_prompt_append", "ad_class_prompts", "ad_class_guard",
+                 "ad_class_guard_weight", "ad_use_main_loras", "ad_use_lora_triggers",
+                 "ad_strip_loras")),
+    ("Mask", ("ad_use_bbox_mask", "ad_mask_filter_method", "ad_mask_k",
+              "ad_mask_min_ratio", "ad_mask_max_ratio", "ad_x_offset", "ad_y_offset",
+              "ad_dilate_erode", "ad_mask_merge_invert", "ad_mask_blur")),
+    ("Inpainting", ("ad_denoising_strength", "ad_dynamic_denoise_power",
+                    "ad_inpaint_only_masked", "ad_inpaint_only_masked_padding",
+                    "ad_use_inpaint_width_height", "ad_inpaint_width",
+                    "ad_inpaint_height", "ad_use_resolution_scale",
+                    "ad_resolution_scale", "ad_use_steps", "ad_steps",
+                    "ad_use_cfg_scale", "ad_cfg_scale", "ad_use_sampler", "ad_sampler",
+                    "ad_scheduler", "ad_use_noise_multiplier", "ad_noise_multiplier",
+                    "ad_use_clip_skip", "ad_clip_skip", "ad_restore_face")),
+    ("Model overrides", ("ad_use_checkpoint", "ad_checkpoint", "ad_use_vae", "ad_vae",
+                         "ad_use_text_encoder", "ad_text_encoder")),
+    ("ControlNet", ("ad_controlnet_model", "ad_controlnet_module",
+                    "ad_controlnet_weight", "ad_controlnet_guidance_start",
+                    "ad_controlnet_guidance_end")),
+    ("Overrides", ("ad_apply_on_hires_only",)),
+)
+
+
+def _verbose_gen_header(p, arg_list) -> None:
+    """Once per generation: size / seed / checkpoint / active-tab count + the
+    global Settings → ADetailer options."""
+    if not _ad_verbose():
+        return
+    try:
+        active = sum(1 for a in arg_list if not a.need_skip())
+        try:
+            ckpt = shared.sd_model.sd_checkpoint_info.model_name
+        except Exception:  # noqa: BLE001
+            ckpt = "?"
+        lines = [
+            "",
+            f"[-] ADetailer verbose ═{_V_LINE}",
+            f"      checkpoint={ckpt} | size={getattr(p, 'width', '?')}x"
+            f"{getattr(p, 'height', '?')} | seed={getattr(p, 'seed', '?')} | "
+            f"active tabs={active}",
+        ]
+        glob = []
+        try:
+            for k, info in shared.opts.data_labels.items():
+                sec = getattr(info, "section", None)
+                if sec and sec[0] == "ADetailer" and k != "ad_verbose_log":
+                    glob.append(
+                        (k, shared.opts.data.get(k, getattr(info, "default", None)))
+                    )
+        except Exception:  # noqa: BLE001
+            glob = []
+        if glob:
+            lines.append("      global settings (Settings → ADetailer):")
+            lines.extend(f"        {k} = {_vfmt(v)}" for k, v in glob)
+        _vprint("\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _verbose_pass_header(args: ADetailerArgs, n: int, i: int) -> None:
+    """Before detection: this tab's every setting, grouped by section."""
+    if not _ad_verbose():
+        return
+    try:
+        names = dict(ALL_ARGS)
+        shown: set[str] = set()
+        lines = [f"[-] ADetailer ── tab {n + 1} · image {i + 1} {_V_LINE[:34]}"]
+        for title, attrs in _VERBOSE_SECTIONS:
+            rows = []
+            for attr in attrs:
+                if not hasattr(args, attr):
+                    continue
+                shown.add(attr)
+                label = names.get(attr, attr).replace("ADetailer ", "")
+                rows.append(f"        {label} = {_vfmt(getattr(args, attr))}")
+            if rows:
+                lines.append(f"    [{title}]")
+                lines.extend(rows)
+        extra = [
+            f"        {name.replace('ADetailer ', '')} = {_vfmt(getattr(args, attr))}"
+            for attr, name in ALL_ARGS
+            if attr not in shown and hasattr(args, attr)
+        ]
+        if extra:
+            lines.append("    [Other]")
+            lines.extend(extra)
+        _vprint("\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _verbose_detection(pred, masks, det_ms: float) -> None:
+    if not _ad_verbose():
+        return
+    try:
+        count = len(masks)
+        classes = getattr(pred, "class_names", None) or []
+        confs = getattr(pred, "confidences", None) or []
+        _vprint(f"    [Detection result] {count} region(s) in {det_ms:.0f} ms")
+        for j in range(count):
+            cls = classes[j] if j < len(classes) else "-"
+            conf = f"{float(confs[j]):.2f}" if j < len(confs) else "-"
+            try:
+                bb = masks[j].getbbox()
+                dims = f"{bb[2] - bb[0]}x{bb[3] - bb[1]}px @({bb[0]},{bb[1]})" if bb else "empty"
+            except Exception:  # noqa: BLE001
+                dims = "?"
+            _vprint(f"        [{j + 1}] class={cls} conf={conf} mask={dims}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _verbose_pass_result(
+    regions: list, det_ms: float, inpaint_ms: float, total_ms: float
+) -> None:
+    if not _ad_verbose():
+        return
+    try:
+        for r in regions:
+            j = r.get("j", 0)
+            if r.get("skipped"):
+                _vprint(f"        [{j + 1}] SKIPPED ([SKIP] token)")
+                continue
+            _vprint(
+                f"        [{j + 1}] inpaint {r.get('inp_ms', 0):.0f} ms · "
+                f"denoise={_vfmt(r.get('denoise'))} · "
+                f"size={r.get('w', '?')}x{r.get('h', '?')}"
+            )
+            _vprint(f"            prompt: {_vfmt(r.get('pos', ''))}")
+            _vprint(f"            negative: {_vfmt(r.get('neg', ''))}")
+        _vprint(
+            f"    [Timing] detection {det_ms:.0f} ms · inpaint {inpaint_ms:.0f} ms · "
+            f"total {total_ms / 1000:.2f} s · VRAM {_vram_str()}"
+        )
+        _vprint(f"[-] ADetailer ══{_V_LINE}")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class AfterDetailerScript(scripts.Script):
@@ -1639,6 +1835,11 @@ class AfterDetailerScript(scripts.Script):
 
         is_mediapipe = args.is_mediapipe()
 
+        _v = _ad_verbose()
+        _t_pass = time.perf_counter()
+        _verbose_pass_header(args, n, i)
+        _t_det = time.perf_counter()
+
         if is_mediapipe:
             pred = mediapipe_predict(
                 args.ad_model,
@@ -1670,13 +1871,17 @@ class AfterDetailerScript(scripts.Script):
                     imgsz=args.ad_detection_resolution,
                 )
 
+        _det_ms = (time.perf_counter() - _t_det) * 1000
+
         if pred.preview is None:
+            _verbose_detection(pred, [], _det_ms)
             print(
                 f"[-] ADetailer: nothing detected on image {i + 1} with {ordinal(n + 1)} settings."
             )
             return False
 
         masks = self.pred_preprocessing(p, pred, args)
+        _verbose_detection(pred, masks, _det_ms)
         shared.state.assign_current_image(pred.preview)
 
         # Save the mask preview. In a sequential-class run each pass saves
@@ -1706,6 +1911,8 @@ class AfterDetailerScript(scripts.Script):
         if is_mediapipe:
             print(f"mediapipe: {steps} detected.")
 
+        _regions: list = []
+        _inpaint_ms = 0.0
         p2 = copy(i2i)
         for j in range(steps):
             p2.image_mask = masks[j]
@@ -1718,11 +1925,24 @@ class AfterDetailerScript(scripts.Script):
             self._apply_inline_class_prompts(p2, pred, j, steps)
 
             if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
+                if _v:
+                    _regions.append({"j": j, "skipped": True})
                 continue
 
             self._apply_auto_class_guard(p2, args, pred, j, steps)
 
             self.fix_p2(p, p2, pp, args, pred, j)
+
+            if _v:
+                _reg = {
+                    "j": j,
+                    "pos": p2.prompt,
+                    "neg": p2.negative_prompt,
+                    "denoise": getattr(p2, "denoising_strength", None),
+                    "w": getattr(p2, "width", "?"),
+                    "h": getattr(p2, "height", "?"),
+                }
+                _t_inp = time.perf_counter()
 
             try:
                 processed = process_images(p2)
@@ -1733,6 +1953,11 @@ class AfterDetailerScript(scripts.Script):
             finally:
                 p2.close()
 
+            if _v:
+                _reg["inp_ms"] = (time.perf_counter() - _t_inp) * 1000
+                _inpaint_ms += _reg["inp_ms"]
+                _regions.append(_reg)
+
             if not processed.images:
                 processed = None
                 break
@@ -1740,6 +1965,14 @@ class AfterDetailerScript(scripts.Script):
             self.compare_prompt(p.extra_generation_params, processed, n=n)
             p2 = copy(i2i)
             p2.init_images = [processed.images[0]]
+
+        if _v:
+            _verbose_pass_result(
+                _regions,
+                _det_ms,
+                _inpaint_ms,
+                (time.perf_counter() - _t_pass) * 1000,
+            )
 
         if processed is not None:
             pp.image = processed.images[0]
@@ -1765,6 +1998,7 @@ class AfterDetailerScript(scripts.Script):
         init_image = copy(pp.image)
         arg_list = self.get_args(p, *args_)
         params_txt_content = self.read_params_txt()
+        _verbose_gen_header(p, arg_list)
 
         if need_call_postprocess(p):
             dummy = Processed(p, [], p.seed, "")
@@ -2045,6 +2279,20 @@ def on_ui_settings():
         )
         .info("Adds a '📖 ADetailer Guide' tab next to Settings with the full option reference")
         .needs_reload_ui(),
+    )
+
+    shared.opts.add_option(
+        "ad_verbose_log",
+        shared.OptionInfo(
+            default=False,
+            label="Verbose diagnostic log",
+            component=gr.Checkbox,
+            section=section,
+        ).info(
+            "Prints an ordered block to the console for every pass: all per-tab "
+            "settings, what was detected (class / confidence / mask size), the "
+            "resolved prompt for each region, and timings + VRAM. Off by default"
+        ),
     )
 
     shared.opts.add_option(
