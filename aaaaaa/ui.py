@@ -59,6 +59,29 @@ union = list(chain.from_iterable(cn_module_choices.values()))
 cn_module_choices["union"] = union
 
 
+def _apply_exif_orientation(im):
+    """Rotate a user-supplied image to upright per its EXIF orientation tag.
+
+    Phone/camera photos store the sensor orientation as a tag (274) instead of
+    rotating the pixels; a detector fed the un-rotated pixels sees a sideways
+    face and misses it (or finds garbage). This mirrors Gradio's own upload
+    guard exactly — it only acts when the tag says "rotated" and
+    ``exif_transpose`` clears the tag, so it is a strict no-op on images Gradio
+    (or anyone else) already transposed and can never double-rotate. Guarded:
+    returns the image unchanged on anything unexpected (e.g. a numpy array)."""
+    try:
+        from PIL import Image as _PImg
+        from PIL import ImageOps
+
+        if not isinstance(im, _PImg.Image):
+            return im
+        if im.getexif().get(274, 1) != 1:
+            return ImageOps.exif_transpose(im)
+    except Exception:  # noqa: BLE001
+        pass
+    return im
+
+
 class Widgets(SimpleNamespace):
     def tolist(self):
         return [getattr(self, attr) for attr in ALL_ARGS.attrs]
@@ -719,6 +742,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         def _run(image, combine, run_inpaint, save, *flat):
             if image is None:
                 return None, "⚠️ Drop an image into the Input box first."
+            image = _apply_exif_orientation(image)
             per_tab = [flat[i * 5 : (i + 1) * 5] for i in range(num_models)]
 
             # "Also run ADetailer": run the FULL detect+inpaint pass on the
@@ -934,7 +958,10 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             for f in files:
                 try:
                     with _PILImage.open(f) as _im:
-                        im = _im.convert("RGB")
+                        # Opened straight from disk (not via Gradio), so honour
+                        # the EXIF orientation ourselves or a rotated photo won't
+                        # be detected.
+                        im = _apply_exif_orientation(_im).convert("RGB")
                     # save=True always in batch (see docstring); _run's inpaint
                     # branch is itself guarded end-to-end and never raises.
                     img, st = _run(im, False, True, True, *flat)
