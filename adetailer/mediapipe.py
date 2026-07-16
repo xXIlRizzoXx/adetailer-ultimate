@@ -145,6 +145,16 @@ def _ensure_model(name: str, url: str, min_bytes: int = 1024) -> str | None:
 _LANDMARKER_CACHE: dict[tuple[float, int], object] = {}
 
 
+def _discard_model(path: str) -> None:
+    """Delete a cached model asset that failed to load (corrupt / truncated but
+    over the size floor) so the NEXT run re-downloads it, instead of returning the
+    same broken file forever until the user manually clears the folder."""
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _get_face_landmarker(confidence: float, max_faces: int):
     key = (round(float(confidence), 3), int(max_faces))
     if key in _LANDMARKER_CACHE:
@@ -168,6 +178,7 @@ def _get_face_landmarker(confidence: float, max_faces: int):
             )
         )
     except Exception:  # noqa: BLE001
+        _discard_model(path)  # corrupt asset -> re-download next time
         return None
     _LANDMARKER_CACHE[key] = landmarker
     return landmarker
@@ -199,6 +210,7 @@ def _get_face_detector(confidence: float):
             )
         )
     except Exception:  # noqa: BLE001
+        _discard_model(path)  # corrupt asset -> re-download next time
         return None
     _DETECTOR_CACHE[key] = detector
     return detector

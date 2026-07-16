@@ -1357,12 +1357,24 @@ class AfterDetailerScript(scripts.Script):
                 p2.prompt = "[SKIP]"
                 return
             p2.prompt = new_pos
-            new_neg = _resolve_inline_class_prompt(p2.negative_prompt, cls)
-            # [SKIP] is a positive-prompt-only control token; a stray one from a
-            # negative inline block is meaningless — drop it so it never leaks
-            # into negative conditioning.
-            new_neg = re.sub(r"\[SKIP\]", "", new_neg, flags=re.IGNORECASE)
-            p2.negative_prompt = re.sub(r"\s{2,}", " ", new_neg).strip().strip(",").strip()
+            # The negative supports the same inline blocks, but only touch it when
+            # it actually contains a tag — otherwise leave it byte-identical
+            # (mirrors the positive's `had_inline` gate). The whitespace/comma tidy
+            # below must NOT rewrite everyone's negative on every pass, or old
+            # seeds stop reproducing bit-for-bit.
+            neg = p2.negative_prompt
+            had_inline_neg = isinstance(neg, str) and (
+                "[class=" in neg.lower() or "[skip]" in neg.lower()
+            )
+            if had_inline_neg:
+                new_neg = _resolve_inline_class_prompt(neg, cls)
+                # [SKIP] is a positive-prompt-only control token; a stray one from
+                # a negative inline block is meaningless — drop it so it never
+                # leaks into negative conditioning.
+                new_neg = re.sub(r"\[SKIP\]", "", new_neg, flags=re.IGNORECASE)
+                p2.negative_prompt = (
+                    re.sub(r"\s{2,}", " ", new_neg).strip().strip(",").strip()
+                )
         except Exception:  # noqa: BLE001
             return
 

@@ -94,7 +94,7 @@ def test_class_filter_exclude_person(sample_image: Image.Image):
 def test_parse_csv():
     assert parse_csv("") == []
     assert parse_csv("face") == ["face"]
-    assert parse_csv("face, penis ,pussy") == ["face", "penis", "pussy"]
+    assert parse_csv("face, hand ,eye") == ["face", "hand", "eye"]
     assert parse_csv(",,,") == []
 
 

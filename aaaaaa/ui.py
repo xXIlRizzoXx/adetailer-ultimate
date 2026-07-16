@@ -966,7 +966,19 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             unchanged = 0
             not_saved = 0
             failed = 0
+            interrupted = False
             for f in files:
+                # Honour the WebUI Interrupt/Skip button between files. Each image's
+                # run_detailer_on_image clears these flags at its start, so a click
+                # during one image survives to this top-of-loop check for the next.
+                try:
+                    from modules import shared as _sh
+
+                    if _sh.state.interrupted or _sh.state.skipped:
+                        interrupted = True
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     with _PILImage.open(f) as _im:
                         # Opened straight from disk (not via Gradio), so honour
@@ -1042,8 +1054,10 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 if same_folder
                 else "saved to the 'ADetailer-Inpaint' folder"
             )
+            head = "⏹️ Batch interrupted" if interrupted else "✅ Batch done"
+            scope = f"{have}/{len(files)}" if interrupted else f"{len(files)}"
             status = (
-                f"✅ Batch done — {len(files)} image(s): {saved} detailed and "
+                f"{head} — {scope} image(s): {saved} detailed and "
                 f"{dest_txt}"
             )
             if unchanged:
@@ -1892,8 +1906,8 @@ def one_ui_group(
 
         # NOTE: deliberately NOT queue=False here. With queue=False each
         # selection fires an independent, unordered request; selecting two
-        # classes quickly (face then pussy) could let the earlier "face"
-        # response land last and overwrite "face,pussy", silently dropping the
+        # classes quickly (face then hand) could let the earlier "face"
+        # response land last and overwrite "face,hand", silently dropping the
         # 2nd class. Going through the queue serialises the syncs so the final
         # value wins. We do NOT add a `.input` handler — adding a Gradio event
         # handler shifts dependency indices and breaks Forge's gallery JS
@@ -1991,8 +2005,9 @@ def one_ui_group(
                     "positive prompt and every other class of the current "
                     "detector model to the negative prompt, so a correct "
                     "detection is not regenerated as a different class. Your "
-                    "per-class prompts override it. No effect on mediapipe "
-                    "models or models without a class list."
+                    "per-class prompts override it. Works with any class-based "
+                    "detector including mediapipe face-features; no effect on "
+                    "class-less detectors (the other mediapipe face-box models)."
                 ),
                 value=sv("ad_class_guard", False),
                 visible=True,
