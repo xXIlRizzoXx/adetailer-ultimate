@@ -805,7 +805,8 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             # just the bbox square) so the analysed part is shown in full;
             # box-only models fall back to a filled rectangle. Readable labels
             # (tab# + class name + confidence on a filled background) go on top.
-            from PIL import Image as _PILImage, ImageDraw, ImageFont
+            from PIL import Image as _PILImage
+            from PIL import ImageDraw, ImageFont
 
             targets = [
                 i for i in range(num_models) if per_tab[i][0] and per_tab[i][0] != "None"
@@ -909,13 +910,19 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         # browser and freeze the tab. Every result is still written to disk.
         _batch_gallery_cap = 30
 
-        def _run_folder(folder, *flat):
+        def _run_folder(folder, same_folder, *flat):
             """Batch: run the full detect+inpaint pass on EVERY image in
-            `folder`, always saving each result to the ADetailer-Inpaint outputs
-            folder (pointing at a folder implies you want the files written).
-            Reuses the single-image _run per file and is fully guarded, so one
-            unreadable file never aborts the batch. Returns (gallery, status)."""
+            `folder`. Each result is saved to the ADetailer-Inpaint outputs folder,
+            or — when ``same_folder`` is on — beside its source file as
+            ``<name>-ad`` (a new file; originals are kept, existing ``-ad`` inputs
+            skipped). Reuses the single-image _run per file and is fully guarded,
+            so one unreadable file never aborts the batch. Returns (gallery,
+            status)."""
+            import re as _re
             from pathlib import Path as _Path
+
+            # Recognise this tool's own outputs: "<name>-ad" or "<name>-ad-<n>".
+            _AD_OUT_RE = _re.compile(r"-ad(?:-\d+)?$", _re.IGNORECASE)
 
             try:
                 base = _Path(folder)
@@ -930,7 +937,11 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 files = sorted(
                     f
                     for f in base.iterdir()
-                    if f.is_file() and f.suffix.lower() in exts
+                    if f.is_file()
+                    and f.suffix.lower() in exts
+                    # In same-folder mode our own outputs land here as name-ad /
+                    # name-ad-N; skip them so a re-run doesn't reprocess them.
+                    and not (same_folder and _AD_OUT_RE.search(f.stem))
                 )
             except Exception as e:  # noqa: BLE001
                 return None, f"⚠️ Couldn't read the folder: {e}"
@@ -962,8 +973,44 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                         # the EXIF orientation ourselves or a rotated photo won't
                         # be detected.
                         im = _apply_exif_orientation(_im).convert("RGB")
-                    # save=True always in batch (see docstring); _run's inpaint
-                    # branch is itself guarded end-to-end and never raises.
+                    if same_folder:
+                        # Detail WITHOUT the built-in ADetailer-Inpaint save
+                        # (save=False), then write the result beside the source as
+                        # <name>-ad.<ext> — originals are kept.
+                        img, st = _run(im, False, True, False, *flat)
+                        if img is None:
+                            failed += 1
+                            continue
+                        st = st if isinstance(st, str) else ""
+                        if st.startswith("ℹ️"):  # nothing detected -> not written
+                            unchanged += 1
+                        else:
+                            # NEVER overwrite an existing file — an original in
+                            # this folder may already be named "<x>-ad", and prior
+                            # runs leave their own outputs. Find the first free
+                            # "<name>-ad[-N]" slot so no existing file is clobbered.
+                            dst = f.with_name(f"{f.stem}-ad{f.suffix}")
+                            _n = 1
+                            while dst.exists() and _n <= 9999:
+                                dst = f.with_name(f"{f.stem}-ad-{_n}{f.suffix}")
+                                _n += 1
+                            if dst.exists():
+                                not_saved += 1  # gave up finding a free name
+                            else:
+                                try:
+                                    if f.suffix.lower() in {".jpg", ".jpeg"}:
+                                        img.save(dst, quality=95, subsampling=0)
+                                    else:
+                                        img.save(dst)
+                                    saved += 1
+                                except Exception:  # noqa: BLE001 — keep the result
+                                    not_saved += 1
+                        if len(gallery) < _batch_gallery_cap:
+                            gallery.append(img)
+                        continue
+                    # Default: save=True -> run_detailer_on_image writes to the
+                    # ADetailer-Inpaint folder; its inpaint branch is itself
+                    # guarded end-to-end and never raises.
                     img, st = _run(im, False, True, True, *flat)
                     if img is None:
                         failed += 1
@@ -990,9 +1037,14 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             # "ADetailer-Inpaint" mirrors AD_APPLY_SUBDIR in scripts/!adetailer.py
             # (that file isn't importable here — its name starts with "!").
             have = saved + unchanged + not_saved
+            dest_txt = (
+                "beside each source file as name-ad"
+                if same_folder
+                else "saved to the 'ADetailer-Inpaint' folder"
+            )
             status = (
                 f"✅ Batch done — {len(files)} image(s): {saved} detailed and "
-                "saved to the 'ADetailer-Inpaint' folder"
+                f"{dest_txt}"
             )
             if unchanged:
                 status += f", {unchanged} left unchanged (nothing detected)"
@@ -1005,13 +1057,13 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             status += "."
             return (gallery or None), status
 
-        def _apply(image, folder, save, *flat):
+        def _apply(image, folder, same_folder, save, *flat):
             # ad_apply_output is a gr.Gallery, so results are ALWAYS a list
             # (None -> clears the gallery on error / nothing detected). A folder
             # path takes priority over the single dropped image.
             folder = (folder or "").strip().strip('"').strip("'")
             if folder:
-                return _run_folder(folder, *flat)
+                return _run_folder(folder, same_folder, *flat)
             img, status = _run(image, False, True, save, *flat)
             return ([img] if img is not None else None), status
 
@@ -1046,7 +1098,13 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         )
         w.ad_apply_btn.click(
             fn=apply_fn,
-            inputs=[w.ad_apply_input, w.ad_apply_folder, w.ad_apply_save, *tail],
+            inputs=[
+                w.ad_apply_input,
+                w.ad_apply_folder,
+                w.ad_apply_same_folder,
+                w.ad_apply_save,
+                *tail,
+            ],
             outputs=[w.ad_apply_output, w.ad_apply_status],
             queue=True,
         )
@@ -2114,11 +2172,21 @@ def one_ui_group(
                     w.ad_apply_folder = gr.Textbox(
                         label="Or batch a whole folder (optional)",
                         placeholder="Paste a folder path to detail every image inside it",
-                        info="Runs on every image in this folder and always saves each result to the ADetailer-Inpaint outputs folder. Leave empty to use the single image above; if both are set, the folder wins.",
+                        info="Runs on every image in this folder and saves each result to the ADetailer-Inpaint outputs folder (or beside each source, see below). Leave empty to use the single image above; if both are set, the folder wins.",
                         lines=1,
                         max_lines=1,
                         interactive=True,
                         elem_id=eid("ad_apply_folder"),
+                    )
+                    # Batch-only save destination toggle: write each result NEXT TO
+                    # its source file as name-ad instead of the ADetailer-Inpaint
+                    # folder. Listener-free input (no .change), read by the same Run
+                    # button — index-safe, adds no ALL_ARGS field.
+                    w.ad_apply_same_folder = gr.Checkbox(
+                        label="📁 Save results in the source folder instead",
+                        value=False,
+                        info="Batch only: write each result beside its source file as name-ad (a new file), instead of the ADetailer-Inpaint folder. Existing files are NEVER overwritten — if the name is taken it uses name-ad-1, name-ad-2, and so on — so your originals are always kept. Files already ending in -ad are skipped, so re-runs don't reprocess earlier results.",
+                        elem_id=eid("ad_apply_same_folder"),
                     )
                 with gr.Row():
                     w.ad_apply_btn = gr.Button(
