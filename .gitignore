@@ -3,6 +3,9 @@
 /user_state.json
 # Per-user named preset library — stored by adetailer.presets.
 /user_presets.json
+# MediaPipe "tasks" model assets, downloaded on first use by adetailer.mediapipe.
+# Cached in the install dir so they survive extension updates; never in the repo.
+/adetailer/_mediapipe_models/
 
 # Dev-only artifacts (preview UI, Claude harness config) — not shipped with the extension
 /preview.py
