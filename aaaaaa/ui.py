@@ -1723,7 +1723,7 @@ def one_ui_group(
                 _dd_choices: list[str] = list(
                     dict.fromkeys([*(_full_classes or []), *_wanted_classes])
                 )
-                _dd_value: list[str] = list(_wanted_classes)
+                _dd_value: list[str] = list(dict.fromkeys(_wanted_classes))
             else:
                 _dd_choices = []
                 _dd_value = []
