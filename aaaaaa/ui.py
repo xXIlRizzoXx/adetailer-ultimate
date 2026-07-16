@@ -1676,14 +1676,18 @@ def one_ui_group(
             # across restarts. Only does work when a class filter was actually
             # saved (face-only users pay nothing). Index-safe: this only changes
             # an existing widget's initial values — no event listener is added.
-            # We deliberately do NOT load the detector model here to fetch its
-            # full class list: that would load a YOLO model DURING UI BUILD
-            # (slow startup + needless risk, and a suspect for flaky model state
-            # at boot). Instead we seed choices == value == the saved tokens, so
-            # the selection is always visible and valid with zero startup cost.
-            # The full class list repopulates the instant the user (re)selects
-            # the detector, via on_ad_model_update. Index-safe: only an existing
-            # widget's initial values change, no event listener is added.
+            # Seed the dropdown's FULL class list at build via
+            # get_model_class_names so EVERY class is selectable immediately at
+            # startup. Previously we seeded choices == value == the saved tokens
+            # only, so a restored tab showed just the classes you'd already
+            # picked and you couldn't add more without re-toggling the detector
+            # (reported 2026-07-16). get_model_class_names reads the
+            # `.names.json`/`.json` sidecar first (fast, no .pt load) and is
+            # lru_cached; the (rarer) .pt fallback only happens for a sidecar-
+            # less model, and this whole path runs solely for tabs that actually
+            # restored a class filter — so startup cost stays bounded. Index-
+            # safe: only an existing widget's initial values change, no event
+            # listener is added.
             _saved_exclude = bool(sv("ad_model_classes_exclude", False))
             _saved_classes_csv = (
                 sv("ad_model_classes_excluded", "")
@@ -1703,7 +1707,22 @@ def one_ui_group(
                 )
                 and "-world" not in _saved_model
             ):
-                _dd_choices: list[str] = list(_wanted_classes)
+                try:
+                    if _saved_model == MEDIAPIPE_FACE_FEATURES_MODEL:
+                        _full_classes = get_model_class_names(_saved_model)
+                    else:
+                        _mpath = webui_info.model_mapping.get(_saved_model, "")
+                        _full_classes = (
+                            get_model_class_names(_mpath) if _mpath else []
+                        )
+                except Exception:  # noqa: BLE001
+                    _full_classes = []
+                # Full list first; append any saved token not in it so the value
+                # stays a subset of the choices (Gradio requirement). Falls back
+                # to the saved tokens only if the full list couldn't be read.
+                _dd_choices: list[str] = list(
+                    dict.fromkeys([*(_full_classes or []), *_wanted_classes])
+                )
                 _dd_value: list[str] = list(_wanted_classes)
             else:
                 _dd_choices = []
