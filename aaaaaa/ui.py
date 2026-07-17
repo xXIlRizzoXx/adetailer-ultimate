@@ -1814,11 +1814,23 @@ def one_ui_group(
                 info="Select a model to use for detection.",
             )
 
+        # For a RESTORED YOLO-World detector, on_ad_model_update has NOT run yet
+        # (it fires on ad_model.change, not at initial render), so its world
+        # branch — which makes this free-text box visible — never executed.
+        # Mirror it here: when the saved detector is YOLO-World the box must be
+        # VISIBLE at startup. Two reasons: (1) the user actually sees their
+        # restored open-vocabulary classes instead of a blank; (2) the
+        # client-side class mirror (javascript/class-sync.js) treats a HIDDEN
+        # ad_model_classes as a normal detector's backing field and would sync
+        # the empty dropdown over it, wiping the saved world classes. A visible
+        # box makes the JS visibility guard correctly leave it untouched — a
+        # robust signal that does not depend on reading transient dropdown state.
+        _is_world_saved = bool(_saved_model) and "-world" in _saved_model
         with gr.Row():
             w.ad_model_classes = gr.Textbox(
                 label="ADetailer detector CLASSES (YOLO-World)" + suffix(n),
                 value=sv("ad_model_classes", ""),
-                visible=False,
+                visible=_is_world_saved,
                 elem_id=eid("ad_model_classes"),
             )
             # Restore the saved class filter into the VISIBLE dropdown on load.
