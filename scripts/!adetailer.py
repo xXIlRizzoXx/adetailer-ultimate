@@ -3,6 +3,7 @@ from __future__ import annotations
 import platform
 import re
 import sys
+import textwrap
 import time
 import traceback
 from collections.abc import Sequence
@@ -392,6 +393,23 @@ def _vfmt(val: object) -> str:
     return str(val)
 
 
+def _vwrap(label: str, parts: list[str], indent: int = 8) -> list[str]:
+    """Render `parts` as one flowing 'a=1 | b=2 | …' line under `label`, wrapped
+    at a readable width instead of one setting per line."""
+    if not parts:
+        return []
+    pad = " " * indent
+    body = textwrap.fill(
+        " | ".join(parts),
+        width=150,
+        initial_indent=pad,
+        subsequent_indent=pad,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    return [label, body]
+
+
 def _vram_str() -> str:
     try:
         import torch
@@ -454,19 +472,25 @@ def _verbose_gen_header(p, arg_list) -> None:
             f"{getattr(p, 'height', '?')} | seed={getattr(p, 'seed', '?')} | "
             f"active tabs={active}",
         ]
+        # Skip our own toggle and the three Settings-page UI elements (a divider,
+        # a help blurb and the reset button) — they are not real settings and the
+        # help blurb is a long HTML blob that would swamp the log.
+        skip = {
+            "ad_verbose_log",
+            "ad_reset_divider",
+            "ad_reset_info",
+            "ad_reset_button",
+        }
         glob = []
         try:
             for k, info in shared.opts.data_labels.items():
                 sec = getattr(info, "section", None)
-                if sec and sec[0] == "ADetailer" and k != "ad_verbose_log":
-                    glob.append(
-                        (k, shared.opts.data.get(k, getattr(info, "default", None)))
-                    )
+                if sec and sec[0] == "ADetailer" and k not in skip:
+                    v = shared.opts.data.get(k, getattr(info, "default", None))
+                    glob.append(f"{k}={_vfmt(v)}")
         except Exception:  # noqa: BLE001
             glob = []
-        if glob:
-            lines.append("      global settings (Settings → ADetailer):")
-            lines.extend(f"        {k} = {_vfmt(v)}" for k, v in glob)
+        lines.extend(_vwrap("      global settings (Settings → ADetailer):", glob))
         _vprint("\n".join(lines))
     except Exception:  # noqa: BLE001
         pass
@@ -481,24 +505,20 @@ def _verbose_pass_header(args: ADetailerArgs, n: int, i: int) -> None:
         shown: set[str] = set()
         lines = [f"[-] ADetailer ── tab {n + 1} · image {i + 1} {_V_LINE[:34]}"]
         for title, attrs in _VERBOSE_SECTIONS:
-            rows = []
+            parts = []
             for attr in attrs:
                 if not hasattr(args, attr):
                     continue
                 shown.add(attr)
                 label = names.get(attr, attr).replace("ADetailer ", "")
-                rows.append(f"        {label} = {_vfmt(getattr(args, attr))}")
-            if rows:
-                lines.append(f"    [{title}]")
-                lines.extend(rows)
+                parts.append(f"{label}={_vfmt(getattr(args, attr))}")
+            lines.extend(_vwrap(f"    [{title}]", parts))
         extra = [
-            f"        {name.replace('ADetailer ', '')} = {_vfmt(getattr(args, attr))}"
+            f"{name.replace('ADetailer ', '')}={_vfmt(getattr(args, attr))}"
             for attr, name in ALL_ARGS
             if attr not in shown and hasattr(args, attr)
         ]
-        if extra:
-            lines.append("    [Other]")
-            lines.extend(extra)
+        lines.extend(_vwrap("    [Other]", extra))
         _vprint("\n".join(lines))
     except Exception:  # noqa: BLE001
         pass
