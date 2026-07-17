@@ -1830,22 +1830,24 @@ def one_ui_group(
             # filter was saved. Worse, the first interaction could then sync the
             # empty dropdown back over the restored textbox, silently wiping the
             # user's classes. Fix: pre-seed `choices`/`value` here from the saved
-            # model + saved selection so the filter is visible AND preserved
-            # across restarts. Only does work when a class filter was actually
-            # saved (face-only users pay nothing). Index-safe: this only changes
-            # an existing widget's initial values — no event listener is added.
+            # model (+ any saved selection) so the class list is visible AND the
+            # filter is preserved across restarts.
             # Seed the dropdown's FULL class list at build via
             # get_model_class_names so EVERY class is selectable immediately at
-            # startup. Previously we seeded choices == value == the saved tokens
-            # only, so a restored tab showed just the classes you'd already
-            # picked and you couldn't add more without re-toggling the detector
-            # (reported 2026-07-16). get_model_class_names reads the
-            # `.names.json`/`.json` sidecar first (fast, no .pt load) and is
-            # lru_cached; the (rarer) .pt fallback only happens for a sidecar-
-            # less model, and this whole path runs solely for tabs that actually
-            # restored a class filter — so startup cost stays bounded. Index-
-            # safe: only an existing widget's initial values change, no event
-            # listener is added.
+            # startup — even when NO class filter was saved. Previously this ran
+            # only for tabs that had restored a filter, so a tab whose detector
+            # was already a multiclass model (e.g. it was the last-used detector)
+            # but with no classes picked showed an EMPTY dropdown: you had to
+            # switch detector and switch back to make the classes appear
+            # (reported 2026-07-17). Now it seeds whenever the saved detector is a
+            # class-based model (any multiclass YOLO or mediapipe_face_features),
+            # so the classes show straight away with the saved selection (if any)
+            # pre-applied. get_model_class_names reads the `.names.json`/`.json`
+            # sidecar first (fast, no .pt load) and is lru_cached; the (rarer) .pt
+            # fallback only happens for a sidecar-less model, and this runs once
+            # per tab for its own saved detector — so startup cost stays bounded.
+            # Index-safe: only an existing widget's initial values change, no
+            # event listener is added.
             _saved_exclude = bool(sv("ad_model_classes_exclude", False))
             _saved_classes_csv = (
                 sv("ad_model_classes_excluded", "")
@@ -1856,8 +1858,7 @@ def one_ui_group(
                 c.strip() for c in (_saved_classes_csv or "").split(",") if c.strip()
             ]
             if (
-                _wanted_classes
-                and _saved_model
+                _saved_model
                 and _saved_model != "None"
                 and (
                     not _saved_model.lower().startswith("mediapipe")

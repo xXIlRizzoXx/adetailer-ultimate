@@ -240,6 +240,16 @@ div.block.ad-preview-status {
     margin-top: 6px !important;
 }
 
+/* The Auto class-guard / Class-guard emphasis two-up row sits directly
+ * under the last prompt textbox (ad_class_prompts). The prompt-row rule
+ * above only spaces prompt-row-to-prompt-row and ad-2up-row only has a
+ * margin BELOW, so this transition had no gap and the emphasis slider
+ * touched the textbox above it (reported 2026-07-17). Give just this
+ * transition the same 6px; other ad-2up-row uses are untouched. */
+.ad-prompt-row + .ad-2up-row {
+    margin-top: 6px !important;
+}
+
 /* ---------- Reset-settings button (Settings → ADetailer) ----------
  * Stop variant gives the red accent automatically. We just add a top
  * margin (the OptionHTML helper text above sits flush otherwise) and
