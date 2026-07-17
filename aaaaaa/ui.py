@@ -1234,20 +1234,30 @@ def _wire_presets(
 ) -> None:
     """Wire each tab's preset Load/Save/Delete/Rename/Reset buttons.
 
-    Layout reminder — each entry of `all_presets` is the 8-tuple returned
+    Layout reminder — each entry of `all_presets` is the 9-tuple returned
     from one_ui_group: (dropdown, load_btn, rename_btn, delete_btn,
-    name_box, save_btn, reset_btn, status_md).
+    name_box, save_btn, reset_btn, status_md, reset_all_cb).
 
     Saving / deleting / renaming from any tab refreshes ALL tabs'
     dropdown choices. Load applies a saved preset to THIS tab's widgets
-    (including the UI-only classes dropdown). Reset resets THIS tab's
-    widgets to their pydantic defaults AND clears the preset+clipboard
-    state for a fresh start.
+    (including the UI-only classes dropdown). Reset rolls widgets back to
+    their pydantic defaults AND clears the preset+clipboard state for a
+    fresh start — for this tab alone, or for every tab when that tab's
+    "Reset every tab" checkbox is ticked.
     """
     from adetailer.args import ADetailerArgs
 
     attrs = list(ALL_ARGS.attrs)
     all_dropdowns = [p[0] for p in all_presets]
+    # Cross-tab refs for the "Reset every tab" scope. Reset is the only handler
+    # that can reach outside its own tab, so these are built once here and used
+    # as its static output list; per-tab wiring below still uses the narrow refs.
+    all_name_boxes = [p[4] for p in all_presets]
+    all_status_mds = [p[7] for p in all_presets]
+    all_classes_dds = [_w.ad_model_classes_dropdown for _w in all_widgets]
+    all_widget_refs = [
+        getattr(all_widgets[i], a) for i in range(num_models) for a in attrs
+    ]
 
     # Pydantic field defaults — used by the Reset handler to roll widgets
     # back to a pristine state. Falls back to None for any attr that
@@ -1283,6 +1293,7 @@ def _wire_presets(
             save_btn,
             reset_btn,
             status_md,
+            reset_all_cb,
         ) = all_presets[idx]
         widget_refs = [getattr(all_widgets[idx], a) for a in attrs]
 
@@ -1416,50 +1427,76 @@ def _wire_presets(
             queue=False,
         )
 
-        # RESET: roll THIS tab back to a pristine state.
+        # RESET: roll a tab back to a pristine state. Per target tab:
         # - All ALL_ARGS widgets (detector, classes, prompts, denoise,
         #   padding, sampler, ControlNet, ...) -> pydantic defaults
         # - UI-only classes multi-select dropdown -> empty
-        # - Preset library on this tab: dropdown back to (none), name box
-        #   emptied, status cleared
-        # - Global clipboard wiped: state -> (-1, []), every paste button
-        #   on every tab returns to "📥 Paste settings" disabled
-        # Other tabs' widgets are NOT touched.
-        def _make_reset():
-            def _reset():
-                widget_updates = [
-                    gr.update(value=_defaults.get(a))
-                    if a in _defaults
-                    else gr.update()
-                    for a in attrs
+        # - Preset library: dropdown back to (none), name box emptied, status set
+        # The global clipboard is wiped either way: state -> (-1, []), and every
+        # paste button on every tab returns to "📥 Paste settings" disabled.
+        #
+        # Scope comes from this tab's "Reset every tab" checkbox: unticked resets
+        # only this tab (unchanged behaviour), ticked resets all of them. Gradio
+        # output lists are static, so the outputs always span every tab and
+        # non-target tabs simply receive gr.update() no-ops. Still ONE .click per
+        # tab, exactly as before → index-safe.
+        def _make_reset(idx: int):
+            def _reset(reset_all: bool):
+                targets = set(range(num_models)) if reset_all else {idx}
+                note = (
+                    "\U0001F195 All tabs reset to defaults."
+                    if reset_all
+                    else "\U0001F195 Tab reset to defaults."
+                )
+                status_updates = [
+                    note if i in targets else gr.update() for i in range(num_models)
+                ]
+                dd_updates = [
+                    gr.update(value=PRESET_NONE) if i in targets else gr.update()
+                    for i in range(num_models)
+                ]
+                name_updates = [
+                    "" if i in targets else gr.update() for i in range(num_models)
                 ]
                 paste_updates = [
                     gr.update(value="\U0001F4E5 Paste settings", interactive=False)
                     for _ in range(num_models)
                 ]
+                # Flattened tab-major to match all_widget_refs exactly.
+                widget_updates = [
+                    gr.update(value=_defaults.get(a))
+                    if (i in targets and a in _defaults)
+                    else gr.update()
+                    for i in range(num_models)
+                    for a in attrs
+                ]
+                classes_updates = [
+                    gr.update(value=[]) if i in targets else gr.update()
+                    for i in range(num_models)
+                ]
                 return [
-                    "\U0001F195 Tab reset to defaults.",  # status_md
-                    gr.update(value=PRESET_NONE),         # this tab's preset dropdown
-                    "",                                    # name_box
-                    (-1, []),                              # clipboard_state (global)
-                    *paste_updates,                        # every paste button (global)
-                    *widget_updates,                       # every ALL_ARGS widget
-                    gr.update(value=[]),                   # classes multiselect dropdown
+                    *status_updates,
+                    *dd_updates,
+                    *name_updates,
+                    (-1, []),  # clipboard_state (global)
+                    *paste_updates,
+                    *widget_updates,
+                    *classes_updates,
                 ]
 
             return _reset
 
         reset_btn.click(
-            fn=_make_reset(),
-            inputs=None,
+            fn=_make_reset(idx),
+            inputs=[reset_all_cb],
             outputs=[
-                status_md,
-                dropdown,
-                name_box,
+                *all_status_mds,
+                *all_dropdowns,
+                *all_name_boxes,
                 clipboard_state,
                 *all_paste_btns,
-                *widget_refs,
-                dst_classes_dd,
+                *all_widget_refs,
+                *all_classes_dds,
             ],
             queue=False,
         )
@@ -1614,6 +1651,28 @@ def one_ui_group(
             scale=0,
             min_width=90,
         )
+        # Scope switch for the Reset button next to it: off = this tab only
+        # (the long-standing behaviour), on = every ADetailer tab at once
+        # (requested 2026-07-17 — a single control to reset the whole panel).
+        # A checkbox rather than a second button on purpose: a button would be
+        # a new Gradio event listener, and those shift dependency indices and
+        # break Forge's gallery JS (learned the hard way 2026-06-04). A plain
+        # component with no listener of its own is index-safe; _wire_presets
+        # just reads it as an extra input to the existing .click.
+        preset_reset_all = gr.Checkbox(
+            label="Reset every tab",
+            value=False,
+            scale=0,
+            min_width=140,
+            elem_id=eid("ad_preset_reset_all"),
+        )
+        # Transient scope switch, not a setting: keep the host WebUI's
+        # ui-config.json from freezing it on across restarts (it tracks
+        # labelled components by label). Plain attribute set → index-safe.
+        try:
+            preset_reset_all.do_not_save_to_config = True
+        except Exception:  # noqa: BLE001 — never break UI build over a flag
+            pass
 
     # Copy / Paste settings — inter-tab clipboard. Moved here from the top
     # of the tab so it sits directly under the preset name-to-save row,
@@ -1913,6 +1972,15 @@ def one_ui_group(
         # handler shifts dependency indices and breaks Forge's gallery JS
         # (learned the hard way 2026-06-04). Same 2 handlers as before, just
         # without queue=False → index-safe.
+        #
+        # Queueing costs LATENCY, though, and that latency was a real bug
+        # (2026-07-17): while the queue is busy — a batch run, say — this sync
+        # can sit unprocessed for minutes, so a generation started in the
+        # meantime submits the stale hidden value. Empty means "inpaint every
+        # class", so the user silently got classes they never selected.
+        # javascript/class-sync.js now mirrors the dropdown into these hidden
+        # fields client-side, instantly, which removes the race outright; these
+        # two handlers stay as the backstop, computing the identical CSV.
         w.ad_model_classes_dropdown.change(
             _sync_dropdown,
             inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude],
@@ -2302,6 +2370,7 @@ def one_ui_group(
         preset_save_btn,
         preset_reset_btn,
         preset_status,
+        preset_reset_all,
     )
     return w, copy_btn, paste_btn, preset_widgets, state, infotext_fields
 

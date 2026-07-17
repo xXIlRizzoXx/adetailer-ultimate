@@ -1,8 +1,16 @@
 # Changelog
 
-## v26.3.0+plus.7 — 2026-07-16 (plus.7 feature round)
+## v26.3.0+plus.7.1 — 2026-07-17 (plus.7 feature round)
 
 New opt-in features and fixes, all off by default and backward-compatible.
+
+**Added in plus.7.1 (2026-07-17):**
+
+- **New: Verbose diagnostic log (opt-in, off by default).** Turn on **`Settings → ADetailer → Verbose diagnostic log`** and each generation prints a full, ordered dump to the console of everything the extension does — every active tab's complete settings, the detector and class filter in effect, how many regions were detected, and per-pass timing (detection ms, inpaint ms) plus VRAM. Settings are grouped by category and printed **one wrapped line per category**, each value separated by `|`, so the dump stays compact and scannable instead of one setting per line. Off by default (no console noise for anyone who doesn't want it); a pure diagnostic that never changes generation behaviour.
+- **Fix: the CLASSES filter can no longer be ignored when you Generate quickly (or during a batch).** The visible CLASSES multi-select is UI-only; the value the engine reads is kept in a hidden field synced through the WebUI's request queue. While the queue was busy — most easily during a folder batch — that sync could lag, so a generation started in the meantime used the **previous** filter; and an empty filter means "inpaint every class", so you could silently get classes you never selected (e.g. picking two classes yet a third also being detailed). The selection is now mirrored into the hidden field **instantly in the browser**, so what you see selected is always what runs. The previous queue-based sync is kept as a backstop, so behaviour is only ever safer. No setup needed.
+- **New: "Reset every tab" — reset all detector tabs at once.** The per-tab **🆕 Reset** button (which rolls that tab's settings back to defaults) gained a **"Reset every tab"** checkbox next to it: tick it and pressing Reset returns **all** ADetailer tabs to their defaults in one click, instead of just the current one. Left unticked, Reset behaves exactly as before (this tab only). Index-safe: the checkbox adds no new event wiring; it reuses the existing Reset button.
+
+**From plus.7 (2026-07-16):**
 
 - **New: Auto class-guard (opt-in checkbox, off by default).** For each detected region, it prepends the region's own detected class name to that region's **positive** prompt and appends **every other class of the current detector model** to that region's **negative** prompt — so a correctly-detected part is not re-generated as a different class (e.g. one anatomical class coming back as another on a multi-class model). It derives the "other classes" automatically from the model's class list (the `.pt`, or the `<model>.names.json` / `<model>.json` sidecar), so it adapts to any model with no manual typing. Optional **"Class-guard emphasis"** slider (0.5–2.0, default 1.0) weights the class name added to the positive, e.g. 1.2 → `(face:1.20)`; at 1.0 it stays a bare token so prompts and PNG-info remain clean.
 - Works in **normal** and **sequential-class** modes, and with include or exclude/NOT class filtering. Your **manual per-class prompts (`ad_class_prompts`) always win** — a class you tuned by hand is left exactly as you wrote it, and auto-guard is skipped for it. Silent **no-op** (never a crash) on mediapipe / YOLO-World / class-less models, or on any per-mask misalignment.
