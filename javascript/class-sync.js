@@ -83,9 +83,33 @@
         field.dispatchEvent(new Event("input", { bubbles: true }));
     }
 
+    // Positive YOLO-World detection from the sibling detector dropdown's value.
+    // World models carry "-world" in their filename; the dropdown renders that
+    // name into an <input> we can read. This is STARTUP-SAFE, unlike the
+    // visibility guard below which only recognises world mode after
+    // on_ad_model_update has run (a detector change) — that callback does NOT
+    // fire on initial render, so a RESTORED world detector would otherwise reach
+    // syncOne with its (visible-in-world) free-text ad_model_classes box still
+    // hidden and holding the user's saved vocabulary, and an empty dropdown would
+    // wipe it. Reading the model name closes that gap. If the input can't be
+    // read we return false and fall through to the visibility guard (unchanged).
+    function modelIsWorld(dropdownId) {
+        const modelBox = document.getElementById(
+            dropdownId.replace(DD_KEY, "_ad_model")
+        );
+        if (!modelBox) return false;
+        const inp = modelBox.querySelector("input");
+        return !!inp && (inp.value || "").indexOf("-world") >= 0;
+    }
+
     function syncOne(dropdown) {
         const id = dropdown.id;
         if (!id || id.indexOf(DD_KEY) < 0) return;
+
+        // YOLO-World: ad_model_classes is a VISIBLE free-text box the user types
+        // into, NOT a mirror of this dropdown — never write to it. Detected from
+        // the model name so it holds at startup too (see modelIsWorld).
+        if (modelIsWorld(id)) return;
 
         const incId = id.replace(DD_KEY, "_ad_model_classes");
 

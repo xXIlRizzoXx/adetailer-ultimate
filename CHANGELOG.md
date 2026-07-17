@@ -1,8 +1,12 @@
 # Changelog
 
-## v26.3.0+plus.7.1 — 2026-07-17 (plus.7 feature round)
+## v26.3.0+plus.7.2 — 2026-07-17 (plus.7 feature round)
 
 New opt-in features and fixes, all off by default and backward-compatible.
+
+**Fixed in plus.7.2 (2026-07-17):**
+
+- **Fix: a saved YOLO-World class list is no longer wiped at startup.** The instant browser-side CLASSES sync added in plus.7.1 (`javascript/class-sync.js`) relied on a field's visibility to tell YOLO-World's free-text class box apart from a normal detector's hidden field — but that visibility is only set up after you change detector, not on the first page load. So a tab that restarted with a YOLO-World detector already selected could have its saved open-vocabulary classes (e.g. `person,cat`) silently cleared, making the detector fall back to the default COCO classes. The sync now recognises YOLO-World directly from the detector name, so it never touches the free-text box — at startup or any other time. Only affects YOLO-World users; ordinary YOLO / MediaPipe detectors are unchanged.
 
 **Added in plus.7.1 (2026-07-17):**
 
