@@ -1,5 +1,11 @@
 # Changelog
 
+## v26.3.0+plus.7.3.beta.1 — 2026-07-18 (beta · pick which detections to inpaint)
+
+Beta for testing (issue #5). Off by default, backward-compatible.
+
+- **New: "Inpaint only these detections" — keep just the ones you pick.** Each ADetailer tab's Detection section gained a small text field: type the detection numbers you want to inpaint (e.g. `1,3,5`, or a range like `1-3`); leave it blank to inpaint every detection as before. To see the numbers, run the **Detection preview** — each detected box is now labelled with its number (`#1`, `#2`, …). Use it as a two-step flow: preview to see the numbers, type the ones you want, then Generate — it also works in the **Run ADetailer on an image** tool, where the "pause" is simply the gap between previewing and running. The numbers follow the raw detector order, so they only line up when the detector, confidence and detection resolution are the same between the preview and the run (that's why it's most reliable in the two-step preview→run flow and in the standalone tool). Note: a true mid-generation pause isn't possible in the WebUI, so this is the practical equivalent. Index-safe: one new per-tab field wired like every other, plus a pure runtime filter and preview numbering — no new event handlers.
+
 ## v26.3.0+plus.7.2 — 2026-07-17 (plus.7 feature round)
 
 New opt-in features and fixes, all off by default and backward-compatible.

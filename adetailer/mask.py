@@ -233,6 +233,73 @@ def filter_by_ratio(
     return pred
 
 
+def parse_indices(spec: str, n: int) -> list[int] | None:
+    """Parse a 1-based selection string into sorted, de-duped 0-based indices
+    within ``[0, n)``.
+
+    Accepts comma- (or semicolon-) separated single numbers and inclusive
+    ranges, e.g. ``"1,3,5"`` or ``"1-3,5"``. Whitespace is ignored; tokens that
+    aren't a positive int or an ``a-b`` range are skipped; indices outside
+    ``[1, n]`` are dropped. Returns ``None`` when the string contains no usable
+    number at all — the caller treats that (and a blank string) as "keep all".
+    An in-range parse that resolves to nothing (e.g. only out-of-range numbers)
+    returns an empty list, i.e. "keep none".
+    """
+    seen: set[int] = set()
+    order: list[int] = []
+    found_any = False
+    for tok in spec.replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok[1:]:  # inclusive range like "2-4" (a leading "-" is not a range)
+            a, _, b = tok.partition("-")
+            try:
+                lo, hi = int(a), int(b)
+            except ValueError:
+                continue
+            found_any = True
+            if lo > hi:
+                lo, hi = hi, lo
+            values: range | tuple[int, ...] = range(lo, hi + 1)
+        else:
+            try:
+                v = int(tok)
+            except ValueError:
+                continue
+            found_any = True
+            values = (v,)
+        for one in values:
+            i = one - 1  # 1-based -> 0-based
+            if 0 <= i < n and i not in seen:
+                seen.add(i)
+                order.append(i)
+    if not found_any:
+        return None
+    return sorted(order)
+
+
+def filter_by_indices(pred: PredictOutput[T], spec: str) -> PredictOutput[T]:
+    """Keep only the detections whose 1-based number appears in ``spec``.
+
+    The numbers refer to the RAW detector order (the order shown by the numbered
+    Detection preview), so this must run BEFORE any ratio/top-k/sort step. A
+    blank or unparseable spec is a no-op (all detections kept).
+    """
+    if not spec or not spec.strip() or not pred.bboxes:
+        return pred
+    keep = parse_indices(spec, len(pred.bboxes))
+    if keep is None:  # nothing parseable -> keep all
+        return pred
+    pred.bboxes = [pred.bboxes[i] for i in keep]
+    pred.masks = [pred.masks[i] for i in keep]
+    if pred.confidences:
+        pred.confidences = [pred.confidences[i] for i in keep]
+    if pred.class_names:
+        pred.class_names = [pred.class_names[i] for i in keep]
+    return pred
+
+
 def filter_k_largest(pred: PredictOutput[T], k: int = 0) -> PredictOutput[T]:
     if not pred.bboxes or k == 0:
         return pred

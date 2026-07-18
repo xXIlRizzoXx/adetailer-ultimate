@@ -667,6 +667,47 @@ def adui(
     return components, infotext_fields
 
 
+def _draw_detection_numbers(img, bboxes):
+    """Overlay a bold 1-based ordinal (#1, #2, …) on each detection box, in RAW
+    detector order — the same order the ``ad_inpaint_indices`` filter uses — so a
+    user can read a number off the single-tab Detection preview and type it to
+    keep only that region. Cosmetic and fully guarded: any failure (bad font,
+    bad box) returns the image unchanged rather than breaking the preview."""
+    try:
+        from PIL import ImageDraw, ImageFont
+
+        out = img.convert("RGB")
+        draw = ImageDraw.Draw(out)
+        fsize = max(15, out.height // 40)
+        font = None
+        for _fname in ("arialbd.ttf", "arial.ttf", "DejaVuSans-Bold.ttf"):
+            try:
+                font = ImageFont.truetype(_fname, fsize)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        if font is None:
+            try:
+                font = ImageFont.load_default(size=fsize)  # Pillow >= 10.1
+            except Exception:  # noqa: BLE001
+                font = ImageFont.load_default()
+        for j, box in enumerate(bboxes):
+            try:
+                x1, y1 = int(box[0]), int(box[1])
+            except Exception:  # noqa: BLE001
+                continue
+            label = f"#{j + 1}"
+            tb = draw.textbbox((0, 0), label, font=font)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            lx, ly = x1 + 2, y1 + 2  # just inside the box's top-left corner
+            # Solid dark chip + bright number so it reads over any preview colour.
+            draw.rectangle([lx, ly, lx + tw + 8, ly + th + 7], fill=(0, 0, 0))
+            draw.text((lx + 4, ly + 3), label, fill=(255, 255, 0), font=font)
+        return out
+    except Exception:  # noqa: BLE001
+        return img
+
+
 def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
     """Wire every tab's Detection-preview button AFTER all tabs exist, so the
     per-tab "Combine all tabs" checkbox can run EVERY configured tab's detector
@@ -798,7 +839,12 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 n = len(pred.bboxes) if pred and pred.bboxes else 0
                 if (pred is None or pred.preview is None) and n == 0:
                     return None, "ℹ️ No detections."
-                return pred.preview, f"✅ {n} detection(s)."
+                _preview = pred.preview
+                if _preview is not None and pred and pred.bboxes:
+                    # Number each box (#1, #2, …) so the user can pick which to
+                    # inpaint via the "Inpaint only these detections" field.
+                    _preview = _draw_detection_numbers(_preview, pred.bboxes)
+                return _preview, f"✅ {n} detection(s)."
 
             # Combined: overlay every configured tab's detections on one
             # canvas. For SEGMENTATION models we tint the real mask SHAPE (not
@@ -886,7 +932,12 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     draw.rectangle([x1, y1, x2, y2], outline=color, width=line_w)
                     cls = names[j] if j < len(names) else f"T{i + 1}"
                     c = confs[j] if j < len(confs) else None
-                    label = f"{i + 1}:{cls}" + (f" {c:.2f}" if c is not None else "")
+                    # "#<det> <tab>:<class> <conf>" — the leading #N is this tab's
+                    # 1-based detection number (what the ad_inpaint_indices field
+                    # for this tab expects); tabs are also colour-coded.
+                    label = f"#{j + 1} {i + 1}:{cls}" + (
+                        f" {c:.2f}" if c is not None else ""
+                    )
                     tb = draw.textbbox((0, 0), label, font=font)
                     tw, th = tb[2] - tb[0], tb[3] - tb[1]
                     ly = y1 - th - 7 if (y1 - th - 7) >= 0 else y1 + 2
@@ -2455,6 +2506,15 @@ def detection(
                 value=sv("ad_mask_max_ratio", 1.0),
                 visible=True,
                 elem_id=eid("ad_mask_max_ratio"),
+            )
+            w.ad_inpaint_indices = gr.Textbox(
+                label="Inpaint only these detections, e.g. 1,3,5 (blank = all)"
+                + suffix(n),
+                info="The numbers are the ones shown on the Detection preview boxes. Two-step flow: run the Detection preview to see the numbers, type the ones you want to keep here (single numbers or ranges like 1-3), then generate. Blank inpaints every detection. The numbers only line up if the detector, confidence and detection resolution are the same between the preview and the run.",
+                value=sv("ad_inpaint_indices", ""),
+                placeholder="1,3,5",
+                visible=True,
+                elem_id=eid("ad_inpaint_indices"),
             )
 
 

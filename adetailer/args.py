@@ -117,6 +117,7 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
     ad_controlnet_weight: confloat(ge=0.0, le=1.0) = 1.0
     ad_controlnet_guidance_start: confloat(ge=0.0, le=1.0) = 0.0
     ad_controlnet_guidance_end: confloat(ge=0.0, le=1.0) = 1.0
+    ad_inpaint_indices: str = ""
     is_api: bool = True
 
     @validator("is_api", pre=True)
@@ -171,6 +172,7 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
         )
         ppop("ADetailer mask min ratio", cond=0.0)
         ppop("ADetailer mask max ratio", cond=1.0)
+        ppop("ADetailer inpaint indices")
         ppop("ADetailer x offset", cond=0)
         ppop("ADetailer y offset", cond=0)
         ppop("ADetailer mask merge invert", cond="None")
@@ -324,6 +326,7 @@ _all_args = [
     ("ad_controlnet_weight", "ADetailer ControlNet weight"),
     ("ad_controlnet_guidance_start", "ADetailer ControlNet guidance start"),
     ("ad_controlnet_guidance_end", "ADetailer ControlNet guidance end"),
+    ("ad_inpaint_indices", "ADetailer inpaint indices"),
 ]
 
 _args = [Arg(*args) for args in _all_args]

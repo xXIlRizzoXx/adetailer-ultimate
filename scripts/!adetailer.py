@@ -60,6 +60,7 @@ from adetailer.classes import (
 )
 from adetailer.common import PredictOutput, ensure_pil_image, safe_mkdir
 from adetailer.mask import (
+    filter_by_indices,
     filter_by_ratio,
     filter_k_by,
     has_intersection,
@@ -429,7 +430,8 @@ def _vram_str() -> str:
 _VERBOSE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Detection", ("ad_model", "ad_model_classes", "ad_model_classes_exclude",
                    "ad_model_classes_excluded", "ad_classes_sequential",
-                   "ad_tab_enable", "ad_confidence", "ad_detection_resolution")),
+                   "ad_tab_enable", "ad_confidence", "ad_detection_resolution",
+                   "ad_inpaint_indices")),
     ("Prompts", ("ad_prompt", "ad_negative_prompt", "ad_prompt_append",
                  "ad_negative_prompt_append", "ad_class_prompts", "ad_class_guard",
                  "ad_class_guard_weight", "ad_use_main_loras", "ad_use_lora_triggers",
@@ -1254,6 +1256,10 @@ class AfterDetailerScript(scripts.Script):
         return sort_bboxes(pred, sortby_idx)
 
     def pred_preprocessing(self, p, pred: PredictOutput, args: ADetailerArgs):
+        # Hand-picked detection numbers (e.g. "1,3,5") first, on the RAW detector
+        # order — so the number the user reads on the numbered Detection preview
+        # maps to the same detection here. No-op when the field is blank.
+        pred = filter_by_indices(pred, args.ad_inpaint_indices)
         pred = filter_by_ratio(
             pred, low=args.ad_mask_min_ratio, high=args.ad_mask_max_ratio
         )
