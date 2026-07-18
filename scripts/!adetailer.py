@@ -1259,7 +1259,20 @@ class AfterDetailerScript(scripts.Script):
         # Hand-picked detection numbers (e.g. "1,3,5") first, on the RAW detector
         # order — so the number the user reads on the numbered Detection preview
         # maps to the same detection here. No-op when the field is blank.
+        _n_before = len(pred.bboxes)
         pred = filter_by_indices(pred, args.ad_inpaint_indices)
+        # Debuggability: a non-blank filter that keeps NOTHING (e.g. the numbers
+        # are out of range because this run detected fewer regions than the
+        # preview) otherwise looks exactly like "nothing detected". Say so.
+        if args.ad_inpaint_indices.strip() and _n_before and not pred.bboxes:
+            # Route through sys.stdout, not the rich-shadowed print: the user's
+            # value is echoed and could contain "[..]" that rich would treat as
+            # markup.
+            sys.stdout.write(
+                f"[-] ADetailer: 'inpaint indices' "
+                f"{args.ad_inpaint_indices!r} matched none of the {_n_before} "
+                f"detection(s) this pass — nothing inpainted.\n"
+            )
         pred = filter_by_ratio(
             pred, low=args.ad_mask_min_ratio, high=args.ad_mask_max_ratio
         )
@@ -1802,6 +1815,14 @@ class AfterDetailerScript(scripts.Script):
                     update: dict[str, Any] = {
                         "ad_model_classes": cls,
                         "ad_classes_sequential": False,
+                        # The hand-picked "inpaint indices" number the FULL
+                        # multi-class detection shown on the preview; each
+                        # sequential pass re-detects a SINGLE class with its own
+                        # 1-based order, so those numbers wouldn't map. Drop the
+                        # filter here so sequential mode inpaints every detection
+                        # of each class (the index filter is a non-sequential
+                        # feature).
+                        "ad_inpaint_indices": "",
                     }
                     # Apply per-class prompt overrides if any. Empty strings
                     # leave the tab's default intact for that field.

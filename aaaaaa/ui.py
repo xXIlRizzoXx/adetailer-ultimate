@@ -2510,7 +2510,7 @@ def detection(
             w.ad_inpaint_indices = gr.Textbox(
                 label="Inpaint only these detections, e.g. 1,3,5 (blank = all)"
                 + suffix(n),
-                info="The numbers are the ones shown on the Detection preview boxes. Two-step flow: run the Detection preview to see the numbers, type the ones you want to keep here (single numbers or ranges like 1-3), then generate. Blank inpaints every detection. The numbers only line up if the detector, confidence and detection resolution are the same between the preview and the run.",
+                info="The numbers are the ones shown on the Detection preview boxes. Two-step flow: run the Detection preview to see the numbers, type the ones you want to keep here (single numbers or ranges like 1-3), then generate. Blank inpaints every detection. The numbers only line up if the detector, confidence and detection resolution are the same between the preview and the run. Ignored in Process classes sequentially mode (each class is detailed in full there).",
                 value=sv("ad_inpaint_indices", ""),
                 placeholder="1,3,5",
                 visible=True,
