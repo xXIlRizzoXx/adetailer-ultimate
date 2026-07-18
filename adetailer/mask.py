@@ -109,7 +109,7 @@ def mask_preprocess(
     x_offset: int = 0,
     y_offset: int = 0,
     merge_invert: int | MergeInvert | str = MergeInvert.NONE,
-) -> list[Image.Image]:
+) -> tuple[list[Image.Image], list[list[int]]]:
     """
     The mask_preprocess function takes a list of masks and preprocesses them.
     It dilates and erodes the masks, and offsets them by x_offset and y_offset.
@@ -127,20 +127,34 @@ def mask_preprocess(
 
     Returns
     -------
-        list[Image.Image]
-            A list of processed masks
+        tuple[list[Image.Image], list[list[int]]]
+            The processed masks, and — parallel to them — the SOURCE index groups
+            each output mask came from (into the input `masks`). Normally a
+            singleton `[i]`; erosion can drop an all-black mask (that source index
+            disappears) and Merge / Merge-and-Invert collapse the survivors into
+            one mask whose group lists every merged source index. The caller uses
+            the groups to keep its bbox / confidence / class_names arrays aligned
+            with the processed masks.
     """
     if not masks:
-        return []
+        return [], []
+
+    groups = [[i] for i in range(len(masks))]
 
     if x_offset != 0 or y_offset != 0:
         masks = [offset(m, x_offset, y_offset) for m in masks]
 
     if kernel != 0:
         masks = [dilate_erode(m, kernel) for m in masks]
-        masks = [m for m in masks if not is_all_black(m)]
+        kept = [k for k, m in enumerate(masks) if not is_all_black(m)]
+        masks = [masks[k] for k in kept]
+        groups = [groups[k] for k in kept]
 
-    return mask_merge_invert(masks, mode=merge_invert)
+    merged = mask_merge_invert(masks, mode=merge_invert)
+    if len(merged) != len(masks):
+        # Merge / Merge-and-Invert collapsed every surviving mask into one.
+        groups = [[i for g in groups for i in g]] if merged else []
+    return merged, groups
 
 
 # Bbox sorting
@@ -204,6 +218,8 @@ def sort_bboxes(
     idx = sorted(range(items), key=lambda i: key(pred.bboxes[i]))
     pred.bboxes = [pred.bboxes[i] for i in idx]
     pred.masks = [pred.masks[i] for i in idx]
+    if pred.confidences:
+        pred.confidences = [pred.confidences[i] for i in idx]
     if pred.class_names:
         pred.class_names = [pred.class_names[i] for i in idx]
     return pred

@@ -1278,7 +1278,7 @@ class AfterDetailerScript(scripts.Script):
         )
         pred = filter_k_by(pred, k=args.ad_mask_k, by=args.ad_mask_filter_method)
         pred = self.sort_bboxes(pred)
-        masks = mask_preprocess(
+        masks, groups = mask_preprocess(
             pred.masks,
             kernel=args.ad_dilate_erode,
             x_offset=args.ad_x_offset,
@@ -1288,8 +1288,43 @@ class AfterDetailerScript(scripts.Script):
 
         if is_img2img_inpaint(p) and not is_inpaint_only_masked(p):
             image_mask = self.get_image_mask(p)
-            masks = self.inpaint_mask_filter(image_mask, masks)
+            keep = self.inpaint_mask_filter(image_mask, masks)
+            masks = [masks[k] for k in keep]
+            groups = [groups[k] for k in keep]
+
+        # Keep pred (bboxes / confidences / class_names) aligned with the FINAL
+        # mask list. Erosion drops all-black masks, Merge collapses them, and the
+        # img2img-inpaint intersection filter drops non-overlapping ones — each
+        # shifts the count, but fix_p2 (dynamic denoise / resolution scale), auto
+        # class-guard and inline [CLASS=] prompts all index pred by the SAME j as
+        # masks[j]. No-op in the common case (one singleton group per mask).
+        if len(groups) != len(pred.bboxes) or any(len(g) != 1 for g in groups):
+            self._reindex_pred(pred, masks, groups)
         return masks
+
+    @staticmethod
+    def _reindex_pred(pred, masks, groups) -> None:
+        """Rebuild pred's per-detection arrays so index j lines up with masks[j]
+        after masks were dropped/merged. A one-source group keeps that detection;
+        a merged group (>1 source) becomes a single entry — the UNION bbox, the
+        max confidence, and the first class name."""
+
+        def _union(boxes):
+            return [
+                min(b[0] for b in boxes),
+                min(b[1] for b in boxes),
+                max(b[2] for b in boxes),
+                max(b[3] for b in boxes),
+            ]
+
+        if pred.confidences:
+            pred.confidences = [
+                max(pred.confidences[i] for i in g) for g in groups
+            ]
+        if pred.class_names:
+            pred.class_names = [pred.class_names[g[0]] for g in groups]
+        pred.bboxes = [_union([pred.bboxes[i] for i in g]) for g in groups]
+        pred.masks = masks
 
     @staticmethod
     def i2i_prompts_replace(
@@ -1471,10 +1506,15 @@ class AfterDetailerScript(scripts.Script):
     @staticmethod
     def inpaint_mask_filter(
         img2img_mask: Image.Image, ad_mask: list[Image.Image]
-    ) -> list[Image.Image]:
+    ) -> list[int]:
+        # Return the INDICES of ad_mask entries that intersect the img2img
+        # inpaint mask (not the masks themselves), so the caller can drop the
+        # same entries from pred's parallel arrays and stay aligned.
         if ad_mask and img2img_mask.size != ad_mask[0].size:
             img2img_mask = img2img_mask.resize(ad_mask[0].size, resample=Image.LANCZOS)
-        return [mask for mask in ad_mask if has_intersection(img2img_mask, mask)]
+        return [
+            i for i, mask in enumerate(ad_mask) if has_intersection(img2img_mask, mask)
+        ]
 
     @staticmethod
     def get_image_mask(p) -> Image.Image:
