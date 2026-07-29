@@ -12,6 +12,10 @@
 /preview.pyi
 /.claude/
 
+# Local dev notes / reports — kept out of the repo even when private (global workflow rule)
+NOTES.md
+ANALISI-*.md
+
 # Created by https://www.toptal.com/developers/gitignore/api/python,visualstudiocode
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,visualstudiocode
 
