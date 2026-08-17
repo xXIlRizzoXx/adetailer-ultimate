@@ -155,10 +155,52 @@ def _discard_model(path: str) -> None:
         pass
 
 
+@lru_cache(maxsize=1)
+def _tasks_api_aborts() -> bool:
+    """True when the installed MediaPipe's `tasks` API is known to ABORT the whole
+    process on this platform instead of raising a catchable error.
+
+    MediaPipe 1.0.1 (2026-08-14) rebuilt the tasks API on a raw ctypes bridge into
+    the native library. On macOS-arm64 that bridge aborts while CREATING a
+    FaceDetector / FaceLandmarker, which takes the entire WebUI down with it: a
+    native abort is not a Python exception, so the `except Exception` around
+    create_from_options below cannot catch it. Evidence: this fork's CI
+    (macos-latest, Python 3.10-3.14) was green on mediapipe 1.0.0 and aborts on
+    1.0.1 inside FaceDetector.create_from_options, while the identical call on
+    Windows + mediapipe 1.0.1 + Python 3.13 completes normally.
+
+    Deliberately narrow — macOS only, mediapipe >= 1.0.1 only. On every other
+    platform, and on the 0.10.x line install.py pins, this returns False and the
+    detectors behave exactly as before.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        from importlib.metadata import version
+
+        installed = version("mediapipe")
+        parts = installed.split(".")[:3]
+        current = tuple(int("".join(c for c in p if c.isdigit()) or 0) for p in parts)
+    except Exception:  # noqa: BLE001
+        return False
+    if current < (1, 0, 1):
+        return False
+    print(
+        f"[-] ADetailer: MediaPipe {installed} aborts the process on macOS when"
+        " creating a face detector, so the MediaPipe detectors are disabled to"
+        " keep the WebUI alive. Install a supported build with:"
+        ' pip install "mediapipe<1.0"',
+        file=sys.stderr,
+    )
+    return True
+
+
 def _get_face_landmarker(confidence: float, max_faces: int):
     key = (round(float(confidence), 3), int(max_faces))
     if key in _LANDMARKER_CACHE:
         return _LANDMARKER_CACHE[key]
+    if _tasks_api_aborts():
+        return None
     try:
         from mediapipe.tasks.python import BaseOptions, vision
     except Exception:  # noqa: BLE001
@@ -194,6 +236,8 @@ def _get_face_detector(confidence: float):
     key = round(float(confidence), 3)
     if key in _DETECTOR_CACHE:
         return _DETECTOR_CACHE[key]
+    if _tasks_api_aborts():
+        return None
     try:
         from mediapipe.tasks.python import BaseOptions, vision
     except Exception:  # noqa: BLE001

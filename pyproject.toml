@@ -17,7 +17,9 @@ classifiers = [
 ]
 dependencies = [
   "huggingface-hub",
-  "mediapipe>=0.10.13",
+  # <1.0 on purpose — see install.py for the reason (1.0 is a rewrite, 1.0.1
+  # aborts the process on macOS). Keeps CI testing the version users get.
+  "mediapipe>=0.10.13,<1.0",
   "pydantic<3",
   "rich>=13",
   "ultralytics>=8.2",

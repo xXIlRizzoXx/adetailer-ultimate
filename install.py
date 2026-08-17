@@ -67,7 +67,12 @@ def install():
     deps = [
         # requirements
         ("ultralytics", "8.3.75", None),
-        ("mediapipe", "0.10.13", None),
+        # Ceiling on purpose: mediapipe 1.0 is a ground-up rewrite whose top-level
+        # module exposes only Image / ImageFormat / tasks, and 1.0.1 aborts the
+        # whole process on macOS while creating a face detector (see
+        # adetailer/mediapipe.py::_tasks_api_aborts). The 0.10.x line is the one
+        # this extension is tested against, so keep users on it.
+        ("mediapipe", "0.10.13", "0.10.99"),
         ("rich", "13.0.0", None),
     ]
 
