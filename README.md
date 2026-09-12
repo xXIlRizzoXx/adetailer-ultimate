@@ -16,7 +16,7 @@
 
 ## First local beta — v26.3.0+plus.7.5.beta.1
 
-**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. Automated regression checks and detection with real models have passed; complete generation and UI workflows in AUTOMATIC1111 and Forge Neo are still being checked.
+**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. All 156 automated checks passed. Browser tests in AUTOMATIC1111 also passed generation, Send to img2img, preset restoration, standalone detailing, folder interruption/restart and queueing behind a folder run. Advanced cross-architecture workflows in Forge Neo still need verification.
 
 - Shifted masks are clipped at image edges; YOLO segmentation masks remove inference padding before resizing, keeping regions aligned on rectangular images.
 - Very large detection-number ranges are limited to the detections that actually exist, avoiding long stalls.
@@ -392,7 +392,7 @@ Separately, the **Run ADetailer on an image** tool's optional **💾 Save result
 
 At the bottom of `Settings → ADetailer` there is a red `🔄 Reset ADetailer settings to defaults` button. Clicking it walks the WebUI options registry and restores every entry registered under the `ADetailer` section (every toggle visible on this page — max tabs, save paths, manual mode, remember-last, etc.) to the default value the extension declared in its source. The change is written to `config.json` and the page reloads automatically so every widget re-reads its now-default value.
 
-A `confirm()` prompt gates the action — clicking Cancel does nothing. Per-tab widget state stored in `user_state.json` is **not** touched; only the global Settings options are reset. If you also want to clear per-tab cached values, toggle `Remember last-used settings` off, save once, and toggle it back on.
+A `confirm()` prompt gates the action — clicking Cancel does nothing. Per-tab widget state stored in `user_state.json` is **not** touched; only the global Settings options are reset. To replace remembered tab values with defaults, use **Reset** in the ADetailer panel (optionally with **Reset every tab**), then run Generate with **Remember last-used settings** enabled. Turning that option off and on does not erase saved tab values.
 
 ## Class Pass Order
 

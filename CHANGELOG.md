@@ -15,7 +15,7 @@ First beta of the plus.7.5 reliability update, prepared locally. It is not a sta
 - Add focused regression coverage, MediaPipe face-features and platform-guard tests, and a Windows unit-test job. Trigger checks for all Python changes and dependency configuration, including pushes to main. Mark model-download tests separately and bound test-image HTTP requests.
 - Align Copy/Reset tooltips with their actual behavior and clarify the preferred class-name sidecar file and the MediaPipe face-features class filter.
 
-Automated regression tests and detector tests with real models have passed. Preliminary tests using the installed AUTOMATIC1111 and Forge Neo runtimes, with isolated settings, also passed generation with ADetailer, manual mode plus Skip img2img, preset import/copy and standalone detailing. Browser verification through Stability Matrix remains in progress; these results do not yet constitute a stable release.
+All 156 automated regression and real-detector tests passed. Preliminary tests using the installed AUTOMATIC1111 and Forge Neo runtimes, with isolated settings, also passed generation with ADetailer, manual mode plus Skip img2img, preset import/copy and standalone detailing. Browser tests in AUTOMATIC1111 passed generation, Send to img2img, Copy/Paste/Reset/Load with excluded classes, standalone detailing, gallery enlargement and folder interruption followed by a successful restart. A generation submitted during the folder run waited in the host queue. Source images and existing results were preserved. Advanced Forge Neo cross-architecture checks remain pending; these results do not yet constitute a stable release.
 
 ## v26.3.0+plus.7.4 — 2026-09-07 (MediaPipe 1.0 safety pin)
 

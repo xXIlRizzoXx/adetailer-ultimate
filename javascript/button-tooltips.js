@@ -40,7 +40,7 @@
         adetailer_ad_preset_save:
             "Save the current tab's full widget state as a named preset using the name in the textbox to the left.",
         adetailer_ad_preset_reset:
-            "Reset this tab's widgets and preset selection to defaults. The clipboard and saved presets are kept.",
+            "Reset this tab's widgets and preset selection to defaults, and clear the shared clipboard. Saved presets are kept.",
 
         // Preset library export / import
         adetailer_ad_preset_export_btn:
