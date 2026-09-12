@@ -26,7 +26,7 @@
     const TOOLTIPS = {
         // Top-of-tab clipboard
         adetailer_ad_copy_settings:
-            "Copy this tab's processing settings to the clipboard. Detector, class filter and per-tab enable are excluded so each tab can target a different region.",
+            "Copy all of this tab's settings to the clipboard, including its detector, class filter and enabled state.",
         adetailer_ad_paste_settings:
             "Paste the clipboard's settings into this tab. Only enabled after a Copy has been done on a different tab.",
 
@@ -40,7 +40,7 @@
         adetailer_ad_preset_save:
             "Save the current tab's full widget state as a named preset using the name in the textbox to the left.",
         adetailer_ad_preset_reset:
-            "Reset this tab's widgets to the pydantic defaults. Preset selection and clipboard state are not touched.",
+            "Reset this tab's widgets and preset selection to defaults. The clipboard and saved presets are kept.",
 
         // Preset library export / import
         adetailer_ad_preset_export_btn:

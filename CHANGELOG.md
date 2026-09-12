@@ -1,5 +1,22 @@
 # Changelog
 
+## v26.3.0+plus.7.5.beta.1 — first local beta, unreleased, 2026-09-12
+
+First beta of the plus.7.5 reliability update, prepared locally. It is not a stable release and has not been published on GitHub. Testing in AUTOMATIC1111 and Forge Neo is still in progress.
+
+- Clip shifted masks at image edges instead of wrapping them onto the opposite edge; keep detection metadata aligned when an offset removes a mask completely.
+- Remove YOLO segmentation letterbox padding before resizing masks to the original image, fixing misplaced masks on rectangular images.
+- Bound detection-index ranges before expanding them, so an accidentally enormous range cannot stall the detailer.
+- Serialize per-tab settings and preset writes within the WebUI process. Report preset write failures instead of claiming success; tolerate unreadable text encoding at startup.
+- Restore class filters and their controls together when loading or pasting a tab, including excluded classes and YOLO-World text.
+- Accept both Gradio 3 temporary-file objects and Gradio 4 file paths when importing preset JSON. Report unreadable uploads without breaking the panel.
+- Apply manual mode before the temporary Skip img2img pass changes image dimensions; keep the base Forge encoder/VAE when a preset's replacement module is missing, while accepting exact paths already present in Forge's module registry.
+- Run standalone images and folders under the host's shared generation lock and job lifecycle. Preserve cancellation between masks and images, and allow a new batch after an earlier cancellation.
+- Add focused regression coverage, MediaPipe face-features and platform-guard tests, and a Windows unit-test job. Trigger checks for all Python changes and dependency configuration, including pushes to main. Mark model-download tests separately and bound test-image HTTP requests.
+- Align Copy/Reset tooltips with their actual behavior and clarify the preferred class-name sidecar file and the MediaPipe face-features class filter.
+
+Automated regression tests and detector tests with real models have passed. Preliminary tests using the installed AUTOMATIC1111 and Forge Neo runtimes, with isolated settings, also passed generation with ADetailer, manual mode plus Skip img2img, preset import/copy and standalone detailing. Browser verification through Stability Matrix remains in progress; these results do not yet constitute a stable release.
+
 ## v26.3.0+plus.7.4 — 2026-09-07 (MediaPipe 1.0 safety pin)
 
 A dependency fix only — no feature or UI change, and nothing to reconfigure.

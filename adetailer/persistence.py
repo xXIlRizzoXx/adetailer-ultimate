@@ -27,11 +27,15 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 # extension_root = parent of the `adetailer/` package this file lives in.
 _EXT_ROOT = Path(__file__).resolve().parent.parent
 _STATE_FILE = _EXT_ROOT / "user_state.json"
+# Generate dispatches one unqueued callback per tab. Protect the entire
+# read/modify/replace transaction so those callbacks cannot drop each other.
+_STATE_LOCK = RLock()
 
 
 def _enabled() -> bool:
@@ -54,7 +58,7 @@ def _load_raw() -> dict[str, Any]:
         data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             return data
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, UnicodeError, OSError):
         pass
     return {}
 
@@ -115,15 +119,16 @@ def save_tab_state(
     """
     if not _enabled():
         return
-    try:
-        current = _load_raw()
-        cleaned = {k: v for k, v in state.items() if k != "is_api"}
-        current[_state_key(mode, tab_index)] = cleaned
+    with _STATE_LOCK:
+        try:
+            current = _load_raw()
+            cleaned = {k: v for k, v in state.items() if k != "is_api"}
+            current[_state_key(mode, tab_index)] = cleaned
 
-        tmp = _STATE_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(current, indent=2, default=str), encoding="utf-8")
-        os.replace(tmp, _STATE_FILE)
-    except OSError:
-        # Disk full / permission denied / network drive flaked / ... — we
-        # don't want a save failure to break the user's generation.
-        pass
+            tmp = _STATE_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(current, indent=2, default=str), encoding="utf-8")
+            os.replace(tmp, _STATE_FILE)
+        except OSError:
+            # Disk full / permission denied / network drive flaked / ... — we
+            # don't want a save failure to break the user's generation.
+            pass

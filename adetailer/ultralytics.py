@@ -225,5 +225,17 @@ def mask_to_pil(masks: torch.Tensor, shape: tuple[int, int]) -> list[Image.Image
         (W, H) of the original image
     """
     masks = masks.float()
-    n = masks.shape[0]
+    n, mask_height, mask_width = masks.shape
+    width, height = shape
+    # Standard Ultralytics segmentation returns masks in letterboxed inference
+    # coordinates, while boxes are already in original-image coordinates.
+    # Remove the centered padding before resizing (same rounding as scale_masks)
+    # so a rectangular image's mask stays aligned with the detected subject.
+    gain = min(mask_height / height, mask_width / width)
+    pad_x = (mask_width - round(width * gain)) / 2
+    pad_y = (mask_height - round(height * gain)) / 2
+    left, top = round(pad_x - 0.1), round(pad_y - 0.1)
+    right = mask_width - round(pad_x + 0.1)
+    bottom = mask_height - round(pad_y + 0.1)
+    masks = masks[:, top:bottom, left:right]
     return [to_pil_image(masks[i], mode="L").resize(shape) for i in range(n)]

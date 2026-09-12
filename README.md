@@ -4,7 +4,7 @@
 >
 > **About this fork** — a soft-fork of [Bing-su/adetailer](https://github.com/Bing-su/adetailer) that adds workflow features on top of upstream ADetailer. Everything upstream still works the same way; the additions are opt-in widgets layered on top of the existing UI. See the [NEW IN THIS FORK](#new-in-this-fork) section below for the complete list of additions, each compared side-by-side with upstream behavior.
 >
-> The implementation was authored by **Claude** (Anthropic's coding assistant) at the request of the repository owner, who is not a Python developer. The class-filtering pattern is borrowed from [wkpark/uddetailer](https://github.com/wkpark/uddetailer); the preset library is conceptually inspired by uddetailer too. All credit for the original ADetailer goes to **Bing-su**; this fork extends that work — it does not replace it.
+> The initial fork implementation was authored by **Claude** (Anthropic's coding assistant) at the request of the repository owner, who is not a Python developer. The current reliability review was developed with **OpenAI Codex**. The class-filtering pattern is borrowed from [wkpark/uddetailer](https://github.com/wkpark/uddetailer); the preset library is conceptually inspired by uddetailer too. All credit for the original ADetailer goes to **Bing-su**; this fork extends that work — it does not replace it.
 >
 > This fork is distributed under the same AGPL-3.0 license as the upstream. See `LICENSE.md` for the full text; Bing-su's copyright notices are intact.
 >
@@ -14,13 +14,27 @@
 
 ---
 
+## First local beta — v26.3.0+plus.7.5.beta.1
+
+**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. Automated regression checks and detection with real models have passed; complete generation and UI workflows in AUTOMATIC1111 and Forge Neo are still being checked.
+
+- Shifted masks are clipped at image edges; YOLO segmentation masks remove inference padding before resizing, keeping regions aligned on rectangular images.
+- Very large detection-number ranges are limited to the detections that actually exist, avoiding long stalls.
+- Concurrent settings and preset saves preserve other tabs' changes. Failed preset writes are reported, and preset import accepts uploads from both Gradio 3 and Gradio 4.
+- Loading a preset or pasting a tab restores the full configuration, including detector, per-tab enable and class controls. Excluded classes and YOLO-World text are restored together with their visible selection.
+- Manual mode preserves normal generation even with Skip img2img checked. Missing Forge encoder/VAE choices retain the corresponding base module.
+- Standalone images, folder runs and detection previews share the WebUI generation lock. Folder cancellation is preserved between images, and a new run can start after cancellation.
+- Windows unit checks and regression coverage have been expanded. Tests that download detector models are marked separately.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
+
 ## NEW IN THIS FORK
 
 Every row below is an addition this fork makes on top of upstream [Bing-su/adetailer](https://github.com/Bing-su/adetailer). The **Upstream** column describes how the official extension behaves today; the **This fork** column describes what the same workflow looks like here. Anything not listed below works identically to upstream.
 
 > **Status legend** (first column of every table):
 > - 🟢 **Tested** — implemented in the codebase and verified hands-on by the repo owner.
-> - 🟡 **Under testing** — implemented and shipped, but the repo owner has not finished hands-on verification yet. Should work; issue reports are welcome.
+> - 🟡 **Under testing** — implemented, but the repo owner has not finished hands-on verification yet. Unreleased changes are explicitly identified above.
 > - 🔴 **Not yet implemented** — on the roadmap, no code in `main` yet. See the [Roadmap](#roadmap-not-yet-implemented) sub-section.
 
 ### Per-tab features — visible in **both** the txt2img and img2img ADetailer accordions
@@ -65,7 +79,7 @@ Features registered through `adui()` with mode-agnostic visibility — every wid
 
 | Status | Feature | Upstream Bing-su | This fork |
 | :---: | --- | --- | --- |
-| 🟢 | Copy / Paste between tabs | Each tab is configured by hand; there is no built-in way to clone a tab's settings into another. | Clipboard model. Per-tab `Copy settings` button stashes the tab's processing settings into a shared state; every other tab's `Paste settings` button enables and re-labels to `Paste settings from Nth tab here`. The clipboard is sticky — paste into multiple tabs in sequence, or overwrite by Copying from a different tab. Detector / class filter / per-tab enable are deliberately excluded from the snapshot. |
+| 🟢 | Copy / Paste between tabs | Each tab is configured by hand; there is no built-in way to clone a tab's settings into another. | Clipboard model. Per-tab `Copy settings` captures the full tab configuration, including detector, class filter and per-tab enable. The clipboard is sticky — paste into multiple tabs in sequence, or overwrite by copying from a different tab. In the local plus.7.5.beta.1 review, pasted class choices and their backing values are restored together; that follow-up fix remains under testing. |
 | 🟢 | Named preset library | `Settings → ADetailer` lets you set drop-in defaults (one shared default). There is no per-tab named-preset facility. | Per-tab dropdown + Load / Save / Delete / Rename / Reset row. Each preset is a full widget-state snapshot. Stored in `<extension_root>/user_presets.json` with atomic writes; gitignored. A reserved `(none)` entry at the top of every dropdown lets you clear the active-preset label without touching widget values. Implemented in `adetailer/presets.py`. |
 | 🟢 | Reset tab to defaults (with "Reset every tab" scope) | No per-tab reset — clearing a tab means re-editing every widget by hand. | The preset row's **🆕 Reset** button rolls the tab's widgets back to their pydantic defaults, clears its preset selection/name, and wipes the copy/paste clipboard. A **"Reset every tab"** checkbox beside it switches the scope: unticked resets this tab only (default); ticked resets **all** ADetailer tabs at once. Index-safe — the checkbox has no listener of its own and reuses the existing Reset `.click`. |
 | 🟢 | Preset live preview (`[SEP]` / `[PROMPT]` aware) | Selecting a preset from the dropdown gives no hint of its contents until you commit by clicking Load. | A markdown preview block under the preset dropdown updates on every `preset_dropdown.change` event with the preset's detector, classes, prompts, sequential flag, and class-specific prompt summary. `[SEP]` and `[PROMPT]` tokens are wrapped in backticks and a footnote reminds the user they'll be expanded at generation time. Formatter `_format_preset_preview`. |
@@ -110,6 +124,7 @@ Fixes that don't add new widgets — they keep the extension loading and running
 | 🟢 | AUTOMATIC1111 load — Forge-only `OptionDiv` / `OptionHTML` | The Settings "Reset ADetailer settings" area uses Forge-only `OptionDiv` / `OptionHTML` classes; a hard `from modules.options import OptionDiv` crashed the whole extension at load on vanilla A1111, which doesn't ship them (#2). | Guarded import + `getattr(shared, "OptionHTML", None)`; on A1111 the extension loads and only the small cosmetic divider/help above the Reset button is skipped (the button + every feature still work). plus.4.1. |
 | 🟢 | AUTOMATIC1111 install — NumPy | Installing the extension's deps (ultralytics / mediapipe) on a NumPy-1.x WebUI could drag NumPy up to 2.x, breaking the whole install with a binary-incompatibility crash (skimage / gradio) (#2). | `install.py` adds a `numpy<2` constraint on NumPy-1.x hosts so the resolver keeps the host's NumPy. plus.5. |
 | 🟢 | AUTOMATIC1111 preset "Export" button — Gradio 3 | The preset-library Export button uses `gr.DownloadButton`, which only exists in Gradio 4 (Forge); A1111's Gradio 3 lacks it, crashing the ADetailer tab at build (#2). | Falls back to a plain `gr.Button` on Gradio 3 so the tab builds; export just isn't a one-click download there (Import still works). plus.5. |
+| 🟡 | Preset import on Gradio 3 and Gradio 4 | No named preset-library import. | The fork's import callback now accepts both the temporary-file object supplied by Gradio 3 and the path supplied by Gradio 4. Unreadable uploads produce a status message. Included in the unreleased local plus.7.5.beta.1 review. |
 | 🟢 | ControlNet backend import | A broken / drifted Forge `lib_controlnet` could raise a non-`ImportError` at import and take the whole extension down at load. | The Forge-vs-A1111 ControlNet dispatcher now degrades on **any** import error to the standard backend instead of crashing. plus.5. |
 | 🟢 | "ADetailer VAE" override on Forge Neo | Forge Neo deprecated `sd_vae` (VAE + text encoders unified into `forge_additional_modules`), so the per-model VAE override was silently a no-op there. | Routed through `forge_additional_modules` on Forge; A1111 / classic keep using `sd_vae`. plus.5. |
 | 🟢 | Attribute / signature-drift guards | Version drift across WebUIs (`shared.sd_model.is_sdxl`, `checkpoint_tiles(use_short=…)`, `create_infotext(...)`, and the `img2img` / `huggingface_hub` (offline) / `modules.safe` imports) could raise on some builds. | Each is wrapped in a `getattr` / `try-except` fallback so the extension degrades gracefully rather than crashing. plus.5. |
@@ -206,11 +221,11 @@ When a multiclass YOLO detection or segmentation model is selected — that is, 
 
 The multi-select is UI-only; its value is mirrored into the hidden `ad_model_classes` / `ad_model_classes_excluded` fields the engine reads. That mirror now happens **instantly in the browser** (`javascript/class-sync.js`), so what you see selected is always what runs — even if you Generate immediately after picking classes, or while a folder batch is keeping the request queue busy. (Previously the sync went through the queue and could lag, so a generation started in the meantime used the previous filter — and an empty filter means "inpaint every class". The queue sync is kept as a backstop.) YOLO-World detectors are recognised by name and left untouched, so their free-text class box is never overwritten by the mirror.
 
-For YOLO-World models the original text-based interface is preserved (open-vocabulary class names are not known up-front). For MediaPipe models the dropdown stays hidden (those models are not class-based).
+For YOLO-World models the original text-based interface is preserved (open-vocabulary class names are not known up-front). MediaPipe face features exposes eyes, mouth, nose, eyebrows and face; the other MediaPipe detectors do not offer a class filter.
 
 #### Custom class names via sidecar JSON
 
-If your `.pt` model does not embed class names in `model.names`, or you want to override them, drop a `.json` file with the same basename next to the `.pt` in `models/adetailer/`. The JSON may be a list, a `{"names": [...]}` object, or a `{"0": "face", "1": "hand", …}` map. Example:
+If your `.pt` model does not embed class names in `model.names`, or you want to override them, add a `<model>.names.json` file next to `<model>.pt` in `models/adetailer/`. This dedicated filename is preferred because it does not collide with launcher or model-manager metadata. The older `<model>.json` filename is also supported as a fallback. The JSON may be a list, a `{"names": [...]}` object, or a `{"0": "face", "1": "hand", …}` map. Example:
 
 ```json
 ["face", "hand", "eye"]
@@ -265,7 +280,7 @@ The flow:
 3. Click **Paste settings** in any target tab to apply the stashed values. The source tab's own Paste button stays disabled (you can't paste a tab's settings back into itself).
 4. The clipboard stays sticky — paste into multiple tabs in sequence, or do another Copy from a different tab to overwrite it.
 
-The detector model and the class filter selection are **deliberately not part of the copy** so that each tab can target a different region or model while sharing all downstream processing. The "Enable this tab" checkbox of the destination tab is also left alone.
+The snapshot includes the detector model, class selection and "Enable this tab" checkbox as well as the processing settings. Pasting replaces those values in the destination tab. In the local plus.7.5.beta.1 review, the visible class choices are restored in the same response as the included/excluded values, so a detector change does not erase the copied filter.
 
 ## Preset Library
 
@@ -275,15 +290,17 @@ Each tab gets a dropdown + Load / Save / Delete / Rename row. A preset is a name
 - **Load** — pick a name from the dropdown and hit **Load preset**. All widgets in the current tab snap to the preset's values, including the class dropdown for the detector model in use.
 - **Rename** — pick a preset, type the new name into the textbox, hit **Rename preset**. The on-disk file is updated atomically.
 - **Delete** — pick a preset, hit **Delete preset**. The selection clears.
-- **Reset** — hit **Reset preset** to clear the dropdown label to `(none)`. This is a label-only operation: widget values are not touched. Useful when you want to break the association with the currently displayed preset without changing what's on screen.
+- **Reset** — restore the tab's default settings and clear its preset selection and clipboard. Tick **Reset every tab** to apply the reset to every detector tab. To clear only the preset label while keeping settings, choose `(none)` from the dropdown instead.
 
-Presets live in `<extension_root>/user_presets.json` and are also git-ignored. Corrupted JSON or permission errors are swallowed — the worst case is presets stop appearing in the dropdown, never a broken generation.
+Presets live in `<extension_root>/user_presets.json` and are git-ignored. An unreadable library does not break UI startup. In the local plus.7.5.beta.1 review, simultaneous writes are serialized, and Save / Delete / Rename / Import report when a change could not be written. A failed atomic replacement leaves the previous library intact.
+
+Preset JSON import accepts Gradio 3 uploads on AUTOMATIC1111 and Gradio 4 uploads on Forge / Forge Neo. Loading a preset restores the detector, class choices and saved include/exclude or YOLO-World text together.
 
 A reserved `(none)` entry sits at the top of every dropdown so you always have an explicit way to clear the selection.
 
 ## Persistent Last-Used Settings
 
-When `Settings → ADetailer → Remember last used settings` is on (default), every Generate click stashes each tab's widget state to `<extension_root>/user_state.json`. The file is rewritten atomically (`.tmp` + `os.replace`), so a crash mid-write can't corrupt it.
+When `Settings → ADetailer → Remember last used settings` is on (default), every Generate click stashes each tab's widget state to `<extension_root>/user_state.json`. The file is rewritten atomically (`.tmp` + `os.replace`). In the local plus.7.5.beta.1 review, simultaneous tab saves within one WebUI process are also serialized, so they cannot overwrite each other's updates.
 
 On the next WebUI start the values are restored as the tab's initial state. Like presets, errors are silent — if the file goes missing or unreadable, tabs come up at their static defaults.
 
@@ -330,9 +347,11 @@ This makes it fast to try different detailer checkpoints or LoRAs on a finished 
 
 The whole pass is guarded end-to-end: any failure degrades to a status message, never a crash. Very large drops are capped to a sane working resolution to avoid a CUDA out-of-memory (with "inpaint only masked" — the default — the final image still stays full-resolution; only the per-region regeneration is capped). Index-safe: the second button and its checkbox add no persistence listeners and don't disturb the host WebUI's gallery send-to buttons.
 
+In the local plus.7.5.beta.1 review, this tool and detection previews wait for the WebUI's current generation to finish before using its shared processing resources. A whole folder is one job: Skip / Interrupt remains active between masks and files, and a fresh job clears the previous cancellation once at startup.
+
 ## Manual Mode
 
-`Settings → ADetailer → Manual mode` is a global toggle. When on, ADetailer's `postprocess_image` short-circuits — no detection, no inpainting — even if the accordion is enabled and tabs are configured. All widget values stay intact. Flip it back off and the next generation runs ADetailer as usual.
+`Settings → ADetailer → Manual mode` is a global toggle. When on, automatic ADetailer processing is bypassed even if the accordion is enabled and tabs are configured. In the local plus.7.5.beta.1 review, that bypass happens before Skip img2img can replace the normal generation's dimensions, sampler or steps. All widget values stay intact. The separate **Run ADetailer on an image** tool remains available; turn manual mode off to resume automatic detailing on subsequent generations.
 
 The use case is iteration on prompt / sampler / seed without recomputing the ADetailer pass between every txt2img run.
 

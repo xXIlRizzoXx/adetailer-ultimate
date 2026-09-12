@@ -18,10 +18,13 @@ import json
 import os
 import re
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 _EXT_ROOT = Path(__file__).resolve().parent.parent
 _PRESETS_FILE = _EXT_ROOT / "user_presets.json"
+# Preset actions are unqueued and can arrive from different tabs/sessions.
+_PRESETS_LOCK = RLock()
 
 # Reasonable preset name = printable, no path separators or quotes. Doesn't
 # need to be airtight; this is just to keep the JSON keys + dropdown labels
@@ -36,18 +39,24 @@ def _load_raw() -> dict[str, Any]:
         data = json.loads(_PRESETS_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             return data
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, UnicodeError, OSError):
         pass
     return {}
 
 
-def _write_raw(presets: dict[str, Any]) -> None:
+def _write_raw(presets: dict[str, Any]) -> bool:
+    """Atomically write the library; callers hold _PRESETS_LOCK.
+
+    A failed write must be reported to callers instead of acknowledging a
+    save, import, rename, or deletion that never reached disk.
+    """
     try:
         tmp = _PRESETS_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(presets, indent=2, default=str), encoding="utf-8")
         os.replace(tmp, _PRESETS_FILE)
     except OSError:
-        pass
+        return False
+    return True
 
 
 def load_presets() -> dict[str, dict[str, Any]]:
@@ -78,10 +87,10 @@ def save_preset(name: str, state: dict[str, Any]) -> bool:
     name = (name or "").strip()
     if not is_valid_name(name):
         return False
-    presets = _load_raw()
-    presets[name] = {k: v for k, v in state.items() if k != "is_api"}
-    _write_raw(presets)
-    return True
+    with _PRESETS_LOCK:
+        presets = _load_raw()
+        presets[name] = {k: v for k, v in state.items() if k != "is_api"}
+        return _write_raw(presets)
 
 
 def delete_preset(name: str) -> bool:
@@ -89,12 +98,12 @@ def delete_preset(name: str) -> bool:
     name = (name or "").strip()
     if not name:
         return False
-    presets = _load_raw()
-    if name not in presets:
-        return False
-    presets.pop(name, None)
-    _write_raw(presets)
-    return True
+    with _PRESETS_LOCK:
+        presets = _load_raw()
+        if name not in presets:
+            return False
+        presets.pop(name, None)
+        return _write_raw(presets)
 
 
 def get_preset(name: str) -> dict[str, Any]:
@@ -133,6 +142,9 @@ def import_presets_json(payload: str, *, overwrite: bool = False) -> tuple[int, 
           when ``overwrite=True``).
         - ``skipped``  — list of names skipped (conflicts when
           ``overwrite=False``, plus any names that fail `is_valid_name`).
+
+    If the library cannot be written, added and replaced are both zero and
+    the incoming valid names are reported as skipped.
     """
     try:
         incoming = json.loads(payload)
@@ -141,30 +153,34 @@ def import_presets_json(payload: str, *, overwrite: bool = False) -> tuple[int, 
     if not isinstance(incoming, dict):
         return 0, 0, []
 
-    current = _load_raw()
-    added = 0
-    replaced = 0
-    skipped: list[str] = []
-    for name, value in incoming.items():
-        if not isinstance(name, str) or not isinstance(value, dict):
-            continue
-        clean_name = name.strip()
-        if not is_valid_name(clean_name):
-            skipped.append(name)
-            continue
-        if clean_name in current:
-            if overwrite:
-                current[clean_name] = {k: v for k, v in value.items() if k != "is_api"}
-                replaced += 1
-            else:
-                skipped.append(clean_name)
-            continue
-        current[clean_name] = {k: v for k, v in value.items() if k != "is_api"}
-        added += 1
+    with _PRESETS_LOCK:
+        current = _load_raw()
+        added = 0
+        replaced = 0
+        skipped: list[str] = []
+        changed: list[str] = []
+        for name, value in incoming.items():
+            if not isinstance(name, str) or not isinstance(value, dict):
+                continue
+            clean_name = name.strip()
+            if not is_valid_name(clean_name):
+                skipped.append(name)
+                continue
+            if clean_name in current:
+                if overwrite:
+                    current[clean_name] = {k: v for k, v in value.items() if k != "is_api"}
+                    changed.append(clean_name)
+                    replaced += 1
+                else:
+                    skipped.append(clean_name)
+                continue
+            current[clean_name] = {k: v for k, v in value.items() if k != "is_api"}
+            changed.append(clean_name)
+            added += 1
 
-    if added or replaced:
-        _write_raw(current)
-    return added, replaced, skipped
+        if (added or replaced) and not _write_raw(current):
+            return 0, 0, [*skipped, *changed]
+        return added, replaced, skipped
 
 
 def rename_preset(old_name: str, new_name: str) -> tuple[bool, str]:
@@ -181,11 +197,13 @@ def rename_preset(old_name: str, new_name: str) -> tuple[bool, str]:
         return False, f"invalid name '{new_name}'"
     if new_name == old_name:
         return True, "no change"
-    presets = _load_raw()
-    if old_name not in presets:
-        return False, f"preset '{old_name}' not found"
-    if new_name in presets:
-        return False, f"'{new_name}' already exists"
-    presets[new_name] = presets.pop(old_name)
-    _write_raw(presets)
-    return True, "ok"
+    with _PRESETS_LOCK:
+        presets = _load_raw()
+        if old_name not in presets:
+            return False, f"preset '{old_name}' not found"
+        if new_name in presets:
+            return False, f"'{new_name}' already exists"
+        presets[new_name] = presets.pop(old_name)
+        if not _write_raw(presets):
+            return False, "could not write preset file"
+        return True, "ok"

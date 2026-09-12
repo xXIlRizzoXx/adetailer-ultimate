@@ -1367,15 +1367,10 @@ class AfterDetailerScript(scripts.Script):
         try:
             from types import SimpleNamespace
 
-            # This standalone path bypasses the WebUI's state.begin() (which
-            # clears these), so a stale interrupt/skip flag left over from a
-            # previously-cancelled generation would make _postprocess_image_inner
-            # no-op every image ("nothing detected"). Clear them for this run.
-            try:
-                state.interrupted = False
-                state.skipped = False
-            except Exception:  # noqa: BLE001
-                pass
+            # The standalone UI action owns the host queue lock and begins/ends
+            # the job once, including for a whole folder. Never clear its
+            # cancellation flags here: a request arriving between files must
+            # remain visible to this pass and the folder loop.
 
             image = ensure_pil_image(image, "RGB")
             w, h = image.size
@@ -1742,6 +1737,14 @@ class AfterDetailerScript(scripts.Script):
         if getattr(p, "_ad_disabled", False):
             return
 
+        # Bypass before Skip img2img replaces the host's settings with a
+        # throwaway 128px / one-step pass. Manual mode must preserve the
+        # normal generation, including when Skip img2img remains checked.
+        if opts.data.get("ad_manual_mode", False):
+            p._ad_disabled = True
+            print("[-] ADetailer: manual mode is ON, skipping auto-run.")
+            return
+
         if is_img2img_inpaint(p) and is_all_black(self.get_image_mask(p)):
             p._ad_disabled = True
             msg = (
@@ -2002,6 +2005,11 @@ class AfterDetailerScript(scripts.Script):
         _inpaint_ms = 0.0
         p2 = copy(i2i)
         for j in range(steps):
+            # The host resets Skip when process_images starts another batch.
+            # Stop before that happens so the outer sequential pass can still
+            # observe cancellation and roll back, and a folder run can stop.
+            if state.interrupted or state.skipped:
+                break
             p2.image_mask = masks[j]
             p2.init_images[0] = ensure_pil_image(p2.init_images[0], "RGB")
             self.i2i_prompts_replace(p2, ad_prompts, ad_negatives, j)
@@ -2207,14 +2215,14 @@ def _forge_wanted_modules(args: ADetailerArgs) -> "list | None":
         if name in module_list:
             return module_list[name]
         for _n, _pth in module_list.items():
-            if _n == name or Path(str(_pth)).name == name:
+            if _n == name or str(_pth) == name or Path(str(_pth)).name == name:
                 return _pth
         print(
             f"[-] ADetailer: text-encoder/VAE '{name}' not found in Forge's "
             f"module list; the detailer step keeps the base module for that slot.",
             file=sys.stderr,
         )
-        return name
+        return None
 
     def _is_te(path: str) -> bool:
         p = str(path).replace("\\", "/").lower()
@@ -2227,17 +2235,19 @@ def _forge_wanted_modules(args: ADetailerArgs) -> "list | None":
     result = list(base)
 
     if want_te:
-        result = [m for m in result if not _is_te(str(m))]
         # "None (...)" drops the TE with no replacement; a real name is added.
-        if not str(te_choice).startswith("None"):
+        if str(te_choice).startswith("None"):
+            result = [m for m in result if not _is_te(str(m))]
+        else:
             resolved = _resolve(te_choice)
             if resolved:
+                result = [m for m in result if not _is_te(str(m))]
                 result.append(resolved)
 
     if want_vae:
-        result = [m for m in result if not _is_vae(str(m))]
         resolved = _resolve(args.ad_vae)
         if resolved:
+            result = [m for m in result if not _is_vae(str(m))]
             result.append(resolved)
 
     if sorted(map(str, result)) == sorted(map(str, base)):
@@ -2544,12 +2554,12 @@ def on_ui_settings():
     _OptionHTML = getattr(shared, "OptionHTML", None)
     if _OptionHTML is not None:
         reset_help = _OptionHTML(
-            "<b>Reset ADetailer settings</b> — restores every option on this "
+            "Reset ADetailer settings — restores every option on this "
             "page (max tabs, save paths, bbox sort, manual mode, remember-last, "
             "etc.) to the value declared in the extension's source. Per-tab "
-            "widget values stashed in <code>user_state.json</code> are <i>not</i> "
-            "touched; clear them by toggling 'Remember last-used settings' off, "
-            "saving once, and toggling it back on."
+            "widget values saved in user_state.json are kept. To reset them, "
+            "use Reset in the ADetailer panel; with Remember last-used settings "
+            "enabled, the defaults are saved on the next Generate click."
         )
         reset_help.section = section
         shared.opts.add_option("ad_reset_info", reset_help)

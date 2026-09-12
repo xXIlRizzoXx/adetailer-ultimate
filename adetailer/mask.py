@@ -84,7 +84,11 @@ def offset(img: Image.Image, x: int = 0, y: int = 0) -> Image.Image:
         PIL.Image.Image
             A new image that is offset by x and y
     """
-    return ImageChops.offset(img, x, -y)
+    # Mask regions that leave the canvas must disappear, not wrap around onto
+    # unrelated pixels at the opposite edge (ImageChops.offset is circular).
+    shifted = Image.new(img.mode, img.size, 0)
+    shifted.paste(img, (x, -y))
+    return shifted
 
 
 def is_all_black(img: Image.Image | np.ndarray) -> bool:
@@ -146,6 +150,10 @@ def mask_preprocess(
 
     if kernel != 0:
         masks = [dilate_erode(m, kernel) for m in masks]
+
+    if kernel != 0 or x_offset != 0 or y_offset != 0:
+        # An offset can now move a region completely outside the image, just
+        # as erosion can remove it. Drop its metadata together with its mask.
         kept = [k for k, m in enumerate(masks) if not is_all_black(m)]
         masks = [masks[k] for k in kept]
         groups = [groups[k] for k in kept]
@@ -277,7 +285,9 @@ def parse_indices(spec: str, n: int) -> list[int] | None:
             found_any = True
             if lo > hi:
                 lo, hi = hi, lo
-            values: range | tuple[int, ...] = range(lo, hi + 1)
+            # Only existing detections can match. Clip BEFORE iterating so a
+            # pasted range such as "1-999999999999" cannot stall generation.
+            values: range | tuple[int, ...] = range(max(1, lo), min(n, hi) + 1)
         else:
             try:
                 v = int(tok)

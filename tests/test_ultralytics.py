@@ -8,6 +8,7 @@ from adetailer.classes import _names_from_json, parse_csv, resolve_class_ids
 from adetailer.ultralytics import mask_to_pil, ultralytics_predict
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "model_name",
     [
@@ -34,6 +35,7 @@ def test_ultralytics_hf_models(sample_image: Image.Image, model_name: str):
     assert len(result.bboxes) == len(result.masks) == len(result.confidences)
 
 
+@pytest.mark.integration
 def test_yolo_world_default(sample_image: Image.Image):
     model_path = hf_hub_download("Bingsu/yolo-world-mirror", "yolov8x-worldv2.pt")
     result = ultralytics_predict(model_path, sample_image)
@@ -44,6 +46,7 @@ def test_yolo_world_default(sample_image: Image.Image):
     assert len(result.bboxes) == len(result.masks) == len(result.confidences)
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "klass",
     [
@@ -65,6 +68,7 @@ def test_yolo_world(sample_image2: Image.Image, klass: str):
     assert len(result.bboxes) == len(result.masks) == len(result.confidences)
 
 
+@pytest.mark.integration
 def test_class_filter_include_person(sample_image: Image.Image):
     """Single-class model: filtering on its only class is a no-op vs unfiltered."""
     model_path = hf_hub_download("Bingsu/adetailer", "person_yolov8n-seg.pt")
@@ -74,6 +78,7 @@ def test_class_filter_include_person(sample_image: Image.Image):
     assert len(filtered.masks) == len(full.masks)
 
 
+@pytest.mark.integration
 def test_class_filter_include_unknown_falls_back(sample_image: Image.Image):
     """Unknown class names are dropped; if no valid id remains, falls back to no filter."""
     model_path = hf_hub_download("Bingsu/adetailer", "person_yolov8n-seg.pt")
@@ -82,6 +87,7 @@ def test_class_filter_include_unknown_falls_back(sample_image: Image.Image):
     assert len(filtered.bboxes) == len(full.bboxes)
 
 
+@pytest.mark.integration
 def test_class_filter_exclude_person(sample_image: Image.Image):
     """Excluding the only class the model produces should yield zero detections."""
     model_path = hf_hub_download("Bingsu/adetailer", "person_yolov8n-seg.pt")
@@ -141,6 +147,7 @@ class TestNamesFromJson:
         assert _names_from_json("face") == []
 
 
+@pytest.mark.integration
 def test_resolve_class_ids_with_known_model():
     """resolve_class_ids should accept names AND numeric strings."""
     model_path = hf_hub_download("Bingsu/adetailer", "person_yolov8n-seg.pt")
@@ -150,6 +157,35 @@ def test_resolve_class_ids_with_known_model():
 
 
 class TestMaskToPil:
+    @pytest.mark.parametrize(
+        ("content_size", "padding", "output_size"),
+        [
+            ((8, 6), (0, 0, 1, 1), (16, 12)),  # landscape
+            ((6, 8), (1, 1, 0, 0), (12, 16)),  # portrait
+            ((8, 5), (0, 0, 1, 2), (16, 10)),  # odd vertical padding
+            ((5, 8), (1, 2, 0, 0), (10, 16)),  # odd horizontal padding
+            ((8, 8), (0, 0, 0, 0), (16, 16)),  # square, no padding
+            ((8, 6), (0, 0, 0, 0), (16, 12)),  # rectangular, no padding
+            ((8, 6), (0, 0, 0, 0), (8, 6)),  # native-resolution mask
+        ],
+    )
+    def test_mask_to_pil_preserves_regions_after_letterbox(
+        self, content_size, padding, output_size
+    ):
+        width, height = content_size
+        original = torch.zeros((2, height, width), dtype=torch.float32)
+        original[0, :2, :3] = 1
+        original[1, -2:, -3:] = 1
+        letterboxed = torch.nn.functional.pad(original, padding)
+
+        results = mask_to_pil(letterboxed, output_size)
+
+        assert len(results) == 2
+        for content, result in zip(original, results):
+            expected = Image.fromarray((content.numpy() * 255).astype(np.uint8))
+            expected = expected.resize(output_size)
+            np.testing.assert_array_equal(np.array(result), np.array(expected))
+
     def test_mask_to_pil_float32(self):
         mask = torch.tensor([[[0.0, 1.0], [0.0, 1.0]]], dtype=torch.float32)
         imgs = mask_to_pil(mask, shape=(2, 2))

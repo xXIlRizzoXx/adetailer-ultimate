@@ -1,9 +1,16 @@
 name: Test
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "**.py"
+      - "pyproject.toml"
+      - ".github/workflows/test.yml"
   pull_request:
     paths:
-      - "adetailer/**.py"
+      - "**.py"
+      - "pyproject.toml"
       - ".github/workflows/test.yml"
   workflow_call:
   workflow_dispatch:
@@ -11,6 +18,17 @@ on:
     - cron: "0 0 * * 0"
 
 jobs:
+  unit-windows:
+    name: Unit tests on Windows / Python 3.12
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Run tests without detector downloads
+        run: uv run --all-extras pytest -v -m "not integration"
+
   test:
     name: Test on python ${{ matrix.python-version }}
     runs-on: macos-latest

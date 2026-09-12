@@ -1,0 +1,191 @@
+"""Standalone action lifecycle with synthetic host state; no WebUI/GPU needed."""
+
+from __future__ import annotations
+
+import ast
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Event, Lock
+from types import ModuleType, SimpleNamespace
+
+import pytest
+from PIL import Image
+
+from aaaaaa.jobs import wrap_adetailer_detection, wrap_adetailer_job
+
+_UI_PATH = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+
+
+class _ObservedLock:
+    def __init__(self):
+        self.lock = Lock()
+        self.attempted = Event()
+
+    def __enter__(self):
+        self.attempted.set()
+        self.lock.acquire()
+
+    def __exit__(self, *_exc):
+        self.lock.release()
+
+
+@pytest.fixture
+def host(monkeypatch):
+    lock = _ObservedLock()
+    events = []
+
+    class State:
+        skipped = True
+        interrupted = True
+        stopping_generation = True
+        job = "previous job"
+        job_count = 9
+
+        def begin(self, job):
+            assert lock.lock.locked()
+            events.append("begin")
+            self.skipped = self.interrupted = self.stopping_generation = False
+            self.job = job
+            self.job_count = -1
+
+        def end(self):
+            assert lock.lock.locked()
+            events.append("end")
+            self.job = ""
+            self.job_count = 0
+
+    state = State()
+    modules = ModuleType("modules")
+    shared = ModuleType("modules.shared")
+    shared.state = state
+    queue = ModuleType("modules.call_queue")
+    queue.queue_lock = lock
+    modules.shared = shared
+    modules.devices = SimpleNamespace(torch_gc=lambda: None)
+    monkeypatch.setitem(sys.modules, "modules", modules)
+    monkeypatch.setitem(sys.modules, "modules.shared", shared)
+    monkeypatch.setitem(sys.modules, "modules.call_queue", queue)
+    return SimpleNamespace(state=state, lock=lock, events=events)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_action_waits_for_host_lock_before_touching_state_and_cleans_up(host, fails):
+    def action():
+        assert not host.state.interrupted
+        assert not host.state.skipped
+        host.events.append("action")
+        host.state.interrupted = host.state.skipped = True
+        if fails:
+            msg = "simulated callback failure"
+            raise RuntimeError(msg)
+        return ["result"], "original status"
+
+    host.lock.lock.acquire()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(wrap_adetailer_job(action))
+        try:
+            assert host.lock.attempted.wait(timeout=2)
+            assert host.events == []
+            assert host.state.interrupted
+            assert host.state.job == "previous job"
+        finally:
+            host.lock.lock.release()
+
+        if fails:
+            with pytest.raises(RuntimeError, match="simulated callback failure"):
+                future.result(timeout=2)
+        else:
+            assert future.result(timeout=2) == (["result"], "original status")
+
+    assert host.events == ["begin", "action", "end"]
+    assert not host.lock.lock.locked()
+    assert not host.state.interrupted
+    assert not host.state.skipped
+    assert not host.state.stopping_generation
+    assert (host.state.job, host.state.job_count) == ("", 0)
+
+
+def test_detector_serializes_without_resetting_generation_state(host):
+    def detect():
+        assert host.lock.lock.locked()
+        return "preview", "status"
+
+    assert wrap_adetailer_detection(detect)() == ("preview", "status")
+    assert host.events == []
+    assert host.state.interrupted
+    assert host.state.skipped
+    assert host.state.job == "previous job"
+
+
+def _wired_apply(monkeypatch, script):
+    """Execute the actual callback wiring, omitting only WebUI import side effects."""
+    args_module = ModuleType("adetailer.args")
+    args_module.ADetailerArgs = SimpleNamespace
+    monkeypatch.setitem(sys.modules, "adetailer.args", args_module)
+    tree = ast.parse(_UI_PATH.read_text(encoding="utf-8"))
+    body = ast.parse("from __future__ import annotations").body
+    body.extend(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_wire_detection_previews"
+    )
+    namespace = {
+        "ALL_ARGS": SimpleNamespace(attrs=("ad_model",)),
+        "_apply_exif_orientation": lambda image: image,
+        "wrap_adetailer_job": wrap_adetailer_job,
+        "wrap_adetailer_detection": wrap_adetailer_detection,
+    }
+    module = ast.Module(body=body, type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(_UI_PATH), "exec"), namespace)
+
+    class Widget:
+        def __init__(self):
+            self.ad_preview_btn = SimpleNamespace(click=lambda **_kwargs: None)
+            self.ad_apply_btn = SimpleNamespace(click=self.capture)
+            self.callback = None
+
+        def __getattr__(self, name):
+            return name
+
+        def tolist(self):
+            return ["model component"]
+
+        def capture(self, **kwargs):
+            self.callback = kwargs["fn"]
+
+    widget = Widget()
+    namespace["_wire_detection_previews"](
+        [widget], SimpleNamespace(model_mapping={}), 1, script
+    )
+    return widget.callback
+
+
+@pytest.mark.parametrize("cancel_after_first", [False, True])
+def test_wired_folder_restarts_after_cancel_and_preserves_new_interrupt(
+    host, monkeypatch, tmp_path, cancel_after_first
+):
+    for name in ("a.png", "b.png"):
+        Image.new("RGB", (8, 8), "white").save(tmp_path / name)
+    calls = []
+
+    def detail(image, _args, save):
+        assert not host.state.interrupted
+        assert not host.state.skipped
+        assert save
+        calls.append(image)
+        if cancel_after_first:
+            host.state.interrupted = True
+        return image, "✅ ADetailer pass complete."
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    gallery, status = callback(
+        None, str(tmp_path), False, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert len(calls) == (1 if cancel_after_first else 2)
+    assert len(gallery) == len(calls)
+    assert ("Batch interrupted" if cancel_after_first else "Batch done") in status
+    assert host.events == ["begin", "end"]
+    assert not host.state.interrupted

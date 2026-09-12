@@ -27,11 +27,16 @@ dependencies = [
 dynamic = ["version"]
 
 [project.urls]
-repository = "https://github.com/Bing-su/adetailer"
+repository = "https://github.com/xXIlRizzoXx/adetailer-ultimate"
 
 [project.optional-dependencies]
 dev = ["devtools"]
 test = ["pytest", "hypothesis"]
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: runs real detectors and may download models or sample images",
+]
 
 [build-system]
 requires = ["hatchling"]

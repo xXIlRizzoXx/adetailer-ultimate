@@ -10,6 +10,7 @@ from typing import Any
 import gradio as gr
 
 from aaaaaa.conditional import InputAccordion
+from aaaaaa.jobs import wrap_adetailer_detection, wrap_adetailer_job
 from adetailer import ADETAILER, __version__
 from adetailer.args import ALL_ARGS, MASK_MERGE_INVERT
 from adetailer.classes import MEDIAPIPE_FACE_FEATURES_MODEL, get_model_class_names
@@ -20,6 +21,7 @@ from adetailer.presets import (
     get_preset,
     get_preset_names,
     import_presets_json,
+    is_valid_name,
     rename_preset,
     save_preset,
 )
@@ -471,6 +473,10 @@ def on_ad_model_update(
     model: str,
     current_selection: list | None = None,
     model_mapping: dict[str, str] | None = None,
+    *,
+    current_include: str | None = None,
+    current_exclude: bool = False,
+    current_excluded: str | None = None,
 ):
     """Return updates for (textbox, dropdown, exclude-checkbox, excluded-textbox).
 
@@ -478,11 +484,13 @@ def on_ad_model_update(
     predictable across model changes. They're populated with the model's
     class names when applicable, empty otherwise.
 
-    - YOLO-World: ALSO shows the free-text textbox (open-vocabulary).
+    - YOLO-World: ALSO shows the free-text textbox (open-vocabulary),
+      preserving values restored by presets or PNG infotext.
     - Other multiclass YOLO: dropdown populated from model.names. Any
       current selections that are still valid in the new model are
       preserved — this is what lets Copy/Paste between tabs keep the
-      class-filter state when the detector matches.
+      class-filter state when the detector matches. Include/exclude mode
+      and its backing CSV are preserved on programmatic detector changes.
     - MediaPipe / None: dropdown shown but empty.
     """
     if (
@@ -504,31 +512,105 @@ def on_ad_model_update(
         return (
             gr.update(
                 visible=True,
-                value="",
+                value=current_include or "",
                 placeholder="Comma separated class names to detect, ex: 'person,cat'. default: COCO 80 classes",
             ),
             gr.update(visible=True, choices=[], value=[]),
-            gr.update(visible=True, value=False),
-            gr.update(value=""),
+            gr.update(visible=True, value=current_exclude),
+            gr.update(value=current_excluded or ""),
         )
 
     mapping = model_mapping or {}
-    path = mapping.get(model, "")
+    path = (
+        model if model == MEDIAPIPE_FACE_FEATURES_MODEL else mapping.get(model, "")
+    )
     names = get_model_class_names(path) if path else []
-    # Preserve selections that still exist in the new model's class list.
-    preserved = [s for s in (current_selection or []) if s in names]
+    # Presets/PNG infotext update the backing fields directly; the old UI-only
+    # dropdown may still describe a different detector. Read the active CSV
+    # when supplied, using the selection only for older callers.
+    csv = current_excluded if current_exclude else current_include
+    requested = (
+        [s.strip() for s in csv.split(",") if s.strip()]
+        if csv is not None
+        else (current_selection or [])
+    )
+    # Preserve requested values if metadata could not be read; silently
+    # erasing the filter would mean "detect every class".
+    preserved = [s for s in requested if not names or s in names]
     # Also feed the preserved classes into the hidden backing textbox.
-    # Programmatic dropdown updates don't fire `.change`, so without this the
+    # Keep the backing field in the same response as the dropdown so it
+    # does not have to wait for a subsequent `.change` callback. Without this the
     # textbox would stay empty even though the dropdown shows the preserved
     # tokens (e.g. after Copy/Paste or re-selecting the same model), desyncing
-    # the filter. Checkbox is reset to include-mode here, so the value goes to
-    # ad_model_classes (not ad_model_classes_excluded).
+    # the filter. Respect the current NOT toggle when choosing its CSV field.
+    csv = ",".join(preserved)
     return (
-        gr.update(visible=False, value=",".join(preserved)),
-        gr.update(visible=True, choices=names, value=preserved),
-        gr.update(visible=True, value=False),
-        gr.update(value=""),
+        gr.update(visible=False, value="" if current_exclude else csv),
+        gr.update(
+            visible=True, choices=list(dict.fromkeys([*names, *preserved])), value=preserved
+        ),
+        gr.update(visible=True, value=current_exclude),
+        gr.update(value=csv if current_exclude else ""),
     )
+
+
+def _restored_tab_updates(
+    state: dict[str, Any], attrs: list[str], model_mapping: dict[str, str] | None = None
+) -> list:
+    """Restore a snapshot together with its detector's class UI.
+
+    The visible class selection and its choices travel alongside
+    the saved values in the same Load/Paste/Reset response.
+    """
+    updates = {
+        attr: gr.update(value=state[attr]) if attr in state else gr.update()
+        for attr in attrs
+    }
+    dropdown_update = gr.update()
+    if "ad_model" in state:
+        model = state.get("ad_model") or "None"
+        world = "-world" in model
+        exclude = bool(state.get("ad_model_classes_exclude", False))
+        csv = state.get(
+            "ad_model_classes_excluded" if exclude else "ad_model_classes", ""
+        ) or ""
+        selected = list(dict.fromkeys(c.strip() for c in csv.split(",") if c.strip()))
+        path = (
+            model
+            if model == MEDIAPIPE_FACE_FEATURES_MODEL
+            else (model_mapping or {}).get(model, "")
+        )
+        names = get_model_class_names(path) if path and not world else []
+        if world or model == "None" or (
+            model.lower().startswith("mediapipe")
+            and model != MEDIAPIPE_FACE_FEATURES_MODEL
+        ):
+            selected = []
+            names = []
+        dropdown_update = gr.update(
+            choices=list(dict.fromkeys([*names, *selected])),
+            value=selected,
+            visible=True,
+        )
+        # Preserve unknown saved tokens if a model's metadata is unavailable;
+        # silently erasing them would turn a narrow filter into "all classes".
+        updates["ad_model_classes"] = gr.update(
+            value=state.get("ad_model_classes", ""), visible=world
+        )
+        updates["ad_model_classes_exclude"] = gr.update(value=exclude, visible=True)
+        updates["ad_model_classes_excluded"] = gr.update(
+            value=state.get("ad_model_classes_excluded", "")
+        )
+    return [*(updates[attr] for attr in attrs), dropdown_update]
+
+
+def _sync_class_dropdown(selected: list[str] | None, exclude: bool, model: str):
+    # World classes live in a separate free-text field. Loading/resetting its
+    # empty fixed-class dropdown must never erase that open vocabulary.
+    if model and "-world" in model:
+        return gr.update(), gr.update()
+    csv = ",".join(selected or [])
+    return ("" if exclude else csv), (csv if exclude else "")
 
 
 def on_cn_model_update(cn_model_name: str):
@@ -575,11 +657,10 @@ def adui(
         # Version "about" badge — CSS pulls it out of normal flow and overlays
         # it onto the accordion header. Lives inside the accordion content so
         # it's automatically hidden when the accordion is collapsed.
-        # Format (since 2026-05-16): brand prefix + locked __version__ +
-        # current git short-hash. The hash gives a live, auto-updating
-        # indicator of "which commit is installed" — refreshes every time
-        # adui() rebuilds the panel after a `git pull`. Locked __version__
-        # is left alone per the no-auto-bump rule.
+        # Format: brand prefix + __version__ + current git short-hash.
+        # Increment the plus revision with each improvement round. The hash
+        # identifies the installed commit and
+        # refreshes whenever adui() rebuilds the panel after a `git pull`.
         gr.Markdown(
             _build_overlay_text(),
             elem_id=eid("ad_version"),
@@ -636,7 +717,8 @@ def adui(
         # update their labels when ANY tab does a copy, so this can't be done
         # inside one_ui_group.
         _wire_copy_paste(
-            all_widgets, all_copy_btns, all_paste_btns, clipboard_state, num_models
+            all_widgets, all_copy_btns, all_paste_btns, clipboard_state, num_models,
+            model_mapping=webui_info.model_mapping,
         )
         _wire_presets(
             all_widgets,
@@ -644,6 +726,7 @@ def adui(
             all_paste_btns,
             clipboard_state,
             num_models,
+            model_mapping=webui_info.model_mapping,
         )
         # Cross-tab Detection-preview wiring (also a post-loop "second pass"):
         # lets each tab's "Combine all tabs" checkbox run every tab's detector.
@@ -1019,9 +1102,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             failed = 0
             interrupted = False
             for f in files:
-                # Honour the WebUI Interrupt/Skip button between files. Each image's
-                # run_detailer_on_image clears these flags at its start, so a click
-                # during one image survives to this top-of-loop check for the next.
+                # The whole folder runs as one host job. Its wrapper clears
+                # stale flags once before entering this loop; an Interrupt/Skip
+                # during any image remains visible to the next iteration.
                 try:
                     from modules import shared as _sh
 
@@ -1156,13 +1239,13 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         # ADetailer's listener count (which already scales 1-15x with the "max
         # models" slider). The checkboxes stay listener-free.
         w.ad_preview_btn.click(
-            fn=detect_fn,
+            fn=wrap_adetailer_detection(detect_fn),
             inputs=[w.ad_preview_input, w.ad_preview_all_tabs, *tail],
             outputs=[w.ad_preview_output, w.ad_preview_status],
             queue=True,
         )
         w.ad_apply_btn.click(
-            fn=apply_fn,
+            fn=wrap_adetailer_job(apply_fn),
             inputs=[
                 w.ad_apply_input,
                 w.ad_apply_folder,
@@ -1196,6 +1279,7 @@ def _wire_copy_paste(
     all_paste_btns: list[gr.Button],
     clipboard_state: gr.State,
     num_models: int,
+    model_mapping: dict[str, str] | None = None,
 ) -> None:
     attrs = _copyable_attrs()
 
@@ -1239,12 +1323,8 @@ def _wire_copy_paste(
     # Wire each Paste button: read clipboard_state and apply to this tab's
     # widgets. No-op if clipboard is empty or paste is on the source tab.
     # The UI-only ad_model_classes_dropdown isn't part of ALL_ARGS, so we
-    # explicitly compute its new value from the pasted ad_model_classes CSV
-    # and append it to the outputs.
-    try:
-        _classes_attr_idx = attrs.index("ad_model_classes")
-    except ValueError:
-        _classes_attr_idx = -1
+    # restore its detector-specific choices and include/exclude selection
+    # explicitly and append it to the outputs.
 
     for dst_idx in range(num_models):
         dst_widget_refs = [getattr(all_widgets[dst_idx], a) for a in attrs]
@@ -1259,12 +1339,7 @@ def _wire_copy_paste(
                     or len(values) != n_attrs
                 ):
                     return [gr.update() for _ in range(n_attrs)] + [gr.update()]
-                # Parse the pasted CSV into a multi-select value list for
-                # the class dropdown. on_ad_model_update will filter any
-                # entries that aren't valid for the destination's detector.
-                csv = values[_classes_attr_idx] if _classes_attr_idx >= 0 else ""
-                selected = [c.strip() for c in (csv or "").split(",") if c.strip()]
-                return list(values) + [gr.update(value=selected)]
+                return _restored_tab_updates(dict(zip(attrs, values)), attrs, model_mapping)
 
             return _paste_fn
 
@@ -1282,6 +1357,7 @@ def _wire_presets(
     all_paste_btns: list[gr.Button],
     clipboard_state: gr.State,
     num_models: int,
+    model_mapping: dict[str, str] | None = None,
 ) -> None:
     """Wire each tab's preset Load/Save/Delete/Rename/Reset buttons.
 
@@ -1365,17 +1441,9 @@ def _wire_presets(
                         *(gr.update() for _ in range(n_attrs)),
                         gr.update(),
                     ]
-                widget_updates = [
-                    gr.update(value=preset[a]) if a in preset else gr.update()
-                    for a in attrs
-                ]
-                # Parse the saved CSV into the multi-select dropdown.
-                csv = preset.get("ad_model_classes", "") or ""
-                selected_classes = [c.strip() for c in csv.split(",") if c.strip()]
                 return [
                     f"✅ Loaded '{selected}'.",
-                    *widget_updates,
-                    gr.update(value=selected_classes),
+                    *_restored_tab_updates(preset, attrs, model_mapping),
                 ]
 
             return _load
@@ -1394,11 +1462,16 @@ def _wire_presets(
                 name = (name or "").strip()
                 if not name:
                     return ["⚠️ Enter a preset name first.", *_refresh_dropdowns_update()]
+                if not is_valid_name(name):
+                    return [
+                        f"⚠️ Invalid preset name '{name}'.",
+                        *_refresh_dropdowns_update(),
+                    ]
                 state_dict = {a: v for a, v in zip(attrs, values)}
                 ok = save_preset(name, state_dict)
                 if not ok:
                     return [
-                        f"⚠️ Invalid preset name '{name}'.",
+                        f"⚠️ Could not save preset '{name}'. Check disk space and folder permissions.",
                         *_refresh_dropdowns_update(),
                     ]
                 return [
@@ -1424,7 +1497,7 @@ def _wire_presets(
                 ok = delete_preset(selected)
                 if not ok:
                     return [
-                        f"⚠️ Preset '{selected}' not found.",
+                        f"⚠️ Could not delete preset '{selected}'. It may be missing or the preset file is not writable.",
                         *_refresh_dropdowns_update(),
                     ]
                 return [
@@ -1513,16 +1586,15 @@ def _wire_presets(
                     gr.update(value="\U0001F4E5 Paste settings", interactive=False)
                     for _ in range(num_models)
                 ]
+                restored_defaults = _restored_tab_updates(_defaults, attrs, model_mapping)
                 # Flattened tab-major to match all_widget_refs exactly.
                 widget_updates = [
-                    gr.update(value=_defaults.get(a))
-                    if (i in targets and a in _defaults)
-                    else gr.update()
+                    update if i in targets else gr.update()
                     for i in range(num_models)
-                    for a in attrs
+                    for update in restored_defaults[:-1]
                 ]
                 classes_updates = [
-                    gr.update(value=[]) if i in targets else gr.update()
+                    restored_defaults[-1] if i in targets else gr.update()
                     for i in range(num_models)
                 ]
                 return [
@@ -1796,15 +1868,16 @@ def one_ui_group(
     def _do_export_status() -> str:
         return f"✅ Exported **{len(get_preset_names())}** preset(s)."
 
-    def _do_import(uploaded_path: str | None, overwrite: bool) -> tuple[Any, str]:
-        """Upload handler. `uploaded_path` is the local filesystem path of
-        the file the user dropped on the UploadButton."""
+    def _do_import(uploaded_path: Any, overwrite: bool) -> tuple[Any, str]:
+        """Accept Gradio 4 paths and Gradio 3 temporary-file wrappers."""
         if not uploaded_path:
             return gr.update(), "_no file received._"
+        if not isinstance(uploaded_path, (str, Path)):
+            uploaded_path = getattr(uploaded_path, "name", uploaded_path)
         try:
             with open(uploaded_path, "r", encoding="utf-8") as f:
                 payload = f.read()
-        except OSError as e:
+        except (OSError, UnicodeError, TypeError) as e:
             return gr.update(), f"_could not read file: {e}_"
         added, replaced, skipped = import_presets_json(
             payload, overwrite=overwrite
@@ -1816,7 +1889,7 @@ def one_ui_group(
             parts.append(f"\U0001F501 **{replaced}** replaced")
         if skipped:
             parts.append(
-                f"⏭ **{len(skipped)}** skipped (already present; tick 'Overwrite' to replace)"
+                f"⏭ **{len(skipped)}** not imported (name conflict, invalid name, or file not writable)"
             )
         if not parts:
             msg = "_no presets imported (file empty, invalid, or all names skipped)._"
@@ -2008,12 +2081,22 @@ def one_ui_group(
                 elem_id=eid("ad_model_classes_excluded"),
             )
 
-        _on_ad_model_update = partial(
-            on_ad_model_update, model_mapping=webui_info.model_mapping
-        )
+        def _on_ad_model_update(model, selected, include, exclude, excluded):
+            return on_ad_model_update(
+                model, selected, webui_info.model_mapping,
+                current_include=include, current_exclude=exclude,
+                current_excluded=excluded,
+            )
+
+        # .change also covers PNG infotext/Send-to and preset updates. Include
+        # the backing CSVs so those restored values cannot be replaced by an
+        # old dropdown selection or a forced switch out of NOT mode.
         w.ad_model.change(
             _on_ad_model_update,
-            inputs=[w.ad_model, w.ad_model_classes_dropdown],
+            inputs=[
+                w.ad_model, w.ad_model_classes_dropdown, w.ad_model_classes,
+                w.ad_model_classes_exclude, w.ad_model_classes_excluded,
+            ],
             outputs=[
                 w.ad_model_classes,
                 w.ad_model_classes_dropdown,
@@ -2022,10 +2105,6 @@ def one_ui_group(
             ],
             queue=False,
         )
-
-        def _sync_dropdown(selected: list[str] | None, exclude: bool):
-            csv = ",".join(selected or [])
-            return ("" if exclude else csv), (csv if exclude else "")
 
         # NOTE: deliberately NOT queue=False here. With queue=False each
         # selection fires an independent, unordered request; selecting two
@@ -2046,13 +2125,13 @@ def one_ui_group(
         # fields client-side, instantly, which removes the race outright; these
         # two handlers stay as the backstop, computing the identical CSV.
         w.ad_model_classes_dropdown.change(
-            _sync_dropdown,
-            inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude],
+            _sync_class_dropdown,
+            inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude, w.ad_model],
             outputs=[w.ad_model_classes, w.ad_model_classes_excluded],
         )
         w.ad_model_classes_exclude.change(
-            _sync_dropdown,
-            inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude],
+            _sync_class_dropdown,
+            inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude, w.ad_model],
             outputs=[w.ad_model_classes, w.ad_model_classes_excluded],
         )
 

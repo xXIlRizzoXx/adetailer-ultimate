@@ -4,8 +4,12 @@ from PIL import Image
 
 
 def get_image(url: str) -> Image.Image:
-    resp = requests.get(url, stream=True, headers={"User-Agent": "Mozilla/5.0"})
-    return Image.open(resp.raw)
+    with requests.get(
+        url, stream=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=(10, 60)
+    ) as resp:
+        resp.raise_for_status()
+        with Image.open(resp.raw) as image:
+            return image.copy()
 
 
 @pytest.fixture(scope="session")
