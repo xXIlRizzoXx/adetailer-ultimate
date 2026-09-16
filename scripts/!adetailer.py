@@ -1857,8 +1857,17 @@ class AfterDetailerScript(scripts.Script):
                 was_skipped = False
 
                 is_processed = False
+                cls_processed = False
                 for idx, cls in enumerate(classes):
-                    if state.interrupted or state.skipped:
+                    # A1111's "stop after the current image" only sets
+                    # stopping_generation: the next class pass would get no
+                    # images from the host, so roll back now instead of
+                    # keeping the classes done so far as a complete result.
+                    if (
+                        state.interrupted
+                        or state.skipped
+                        or getattr(state, "stopping_generation", False)
+                    ):
                         was_skipped = True
                         break
                     update: dict[str, Any] = {
@@ -1912,8 +1921,18 @@ class AfterDetailerScript(scripts.Script):
 
                 # Late-skip catch: the last class's inpaint loop may have
                 # set state.skipped after returning. Treat that the same
-                # as breaking mid-loop.
-                if was_skipped or state.interrupted or state.skipped:
+                # as breaking mid-loop. A stop request only counts when it
+                # cut the last class short; a last class that finished is
+                # kept.
+                if (
+                    was_skipped
+                    or state.interrupted
+                    or state.skipped
+                    or (
+                        getattr(state, "stopping_generation", False)
+                        and not cls_processed
+                    )
+                ):
                     pp.image = initial_image
                     print(
                         f"[-] ADetailer: sequential class pass on tab "
@@ -2002,7 +2021,8 @@ class AfterDetailerScript(scripts.Script):
 
         steps = len(masks)
         processed = None
-        state.job_count += steps
+        # A standalone job starts at the host's "not counted yet" value (-1).
+        state.job_count = max(state.job_count, 0) + steps
 
         if is_mediapipe:
             print(f"mediapipe: {steps} detected.")
@@ -2056,6 +2076,15 @@ class AfterDetailerScript(scripts.Script):
                 msg = f"[-] ADetailer: 'NansException' occurred with {ordinal(n + 1)} settings.\n{e}"
                 print(msg, file=sys.stderr)
                 continue
+            except Exception as e:
+                # Forge Neo returns no latent when a cancel lands before the
+                # first sampling step and then fails on it. The user cancelled,
+                # so discard the pass instead of reporting a failure.
+                if not (state.interrupted or state.skipped):
+                    raise
+                print(f"[-] ADetailer: region cancelled ({e})", file=sys.stderr)
+                processed = None
+                break
             finally:
                 p2.close()
 

@@ -21,6 +21,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from adetailer.json_file import read_json_object, set_aside
+
 _EXT_ROOT = Path(__file__).resolve().parent.parent
 _PRESETS_FILE = _EXT_ROOT / "user_presets.json"
 # Preset actions are unqueued and can arrive from different tabs/sessions.
@@ -32,16 +34,37 @@ _PRESETS_LOCK = RLock()
 _VALID_NAME = re.compile(r"^[\w\- .,()\[\]+!?@#&]{1,80}$")
 
 
+def _read_raw() -> tuple[dict[str, Any] | None, bool]:
+    return read_json_object(_PRESETS_FILE)
+
+
 def _load_raw() -> dict[str, Any]:
-    if not _PRESETS_FILE.is_file():
-        return {}
-    try:
-        data = json.loads(_PRESETS_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except (json.JSONDecodeError, UnicodeError, OSError):
-        pass
-    return {}
+    data, _damaged = _read_raw()
+    return {} if data is None else data
+
+
+# Set when a save had to set an unreadable library aside; shown once by the UI.
+_recovery_note = ""
+
+
+def take_recovery_note() -> str:
+    """Return, once, the message about a library that was set aside."""
+    global _recovery_note
+    note, _recovery_note = _recovery_note, ""
+    return note
+
+
+def _replace_library(presets: dict[str, Any], damaged: bool) -> bool:
+    """Write the library; a damaged file is kept under a new name first."""
+    global _recovery_note
+    if damaged:
+        backup = set_aside(_PRESETS_FILE)
+        if backup is None:
+            return False
+        _recovery_note = (
+            f"The old preset file could not be read and was kept as {backup.name}."
+        )
+    return _write_raw(presets)
 
 
 def _write_raw(presets: dict[str, Any]) -> bool:
@@ -88,9 +111,12 @@ def save_preset(name: str, state: dict[str, Any]) -> bool:
     if not is_valid_name(name):
         return False
     with _PRESETS_LOCK:
-        presets = _load_raw()
+        presets, damaged = _read_raw()
+        if presets is None and not damaged:
+            return False  # unreadable right now: leave the file alone
+        presets = presets or {}
         presets[name] = {k: v for k, v in state.items() if k != "is_api"}
-        return _write_raw(presets)
+        return _replace_library(presets, damaged)
 
 
 def delete_preset(name: str) -> bool:
@@ -154,7 +180,9 @@ def import_presets_json(payload: str, *, overwrite: bool = False) -> tuple[int, 
         return 0, 0, []
 
     with _PRESETS_LOCK:
-        current = _load_raw()
+        current, damaged = _read_raw()
+        unavailable = current is None and not damaged
+        current = current or {}
         added = 0
         replaced = 0
         skipped: list[str] = []
@@ -178,7 +206,9 @@ def import_presets_json(payload: str, *, overwrite: bool = False) -> tuple[int, 
             changed.append(clean_name)
             added += 1
 
-        if (added or replaced) and not _write_raw(current):
+        if (added or replaced) and (
+            unavailable or not _replace_library(current, damaged)
+        ):
             return 0, 0, [*skipped, *changed]
         return added, replaced, skipped
 

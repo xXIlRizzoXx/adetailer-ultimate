@@ -30,6 +30,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from adetailer.json_file import read_json_object, set_aside
+
 # extension_root = parent of the `adetailer/` package this file lives in.
 _EXT_ROOT = Path(__file__).resolve().parent.parent
 _STATE_FILE = _EXT_ROOT / "user_state.json"
@@ -51,16 +53,13 @@ def _enabled() -> bool:
     return bool(opts.data.get("ad_remember_last_settings", True))
 
 
+def _read_raw() -> tuple[dict[str, Any] | None, bool]:
+    return read_json_object(_STATE_FILE)
+
+
 def _load_raw() -> dict[str, Any]:
-    if not _STATE_FILE.is_file():
-        return {}
-    try:
-        data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except (json.JSONDecodeError, UnicodeError, OSError):
-        pass
-    return {}
+    data, _damaged = _read_raw()
+    return {} if data is None else data
 
 
 def _state_key(mode: str, tab_index: int) -> str:
@@ -121,7 +120,13 @@ def save_tab_state(
         return
     with _STATE_LOCK:
         try:
-            current = _load_raw()
+            current, damaged = _read_raw()
+            if current is None:
+                # Unreadable right now: skip this save. Damaged: keep the old
+                # file under a new name rather than overwrite every other tab.
+                if not damaged or set_aside(_STATE_FILE) is None:
+                    return
+                current = {}
             cleaned = {k: v for k, v in state.items() if k != "is_api"}
             current[_state_key(mode, tab_index)] = cleaned
 

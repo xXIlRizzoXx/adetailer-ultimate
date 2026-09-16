@@ -19,7 +19,10 @@ def wrap_adetailer_job(func):
         from modules.call_queue import queue_lock
 
         with queue_lock:
-            shared.state.begin(job="ADetailer")
+            try:
+                shared.state.begin(job="ADetailer")
+            except TypeError:  # a host whose begin() takes no job label
+                shared.state.begin()
             try:
                 return func(*args, **kwargs)
             finally:

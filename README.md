@@ -4,7 +4,7 @@
 >
 > **About this fork** — a soft-fork of [Bing-su/adetailer](https://github.com/Bing-su/adetailer) that adds workflow features on top of upstream ADetailer. Everything upstream still works the same way; the additions are opt-in widgets layered on top of the existing UI. See the [NEW IN THIS FORK](#new-in-this-fork) section below for the complete list of additions, each compared side-by-side with upstream behavior.
 >
-> The initial fork implementation was authored by **Claude** (Anthropic's coding assistant) at the request of the repository owner, who is not a Python developer. The current reliability review was developed with **OpenAI Codex**. The class-filtering pattern is borrowed from [wkpark/uddetailer](https://github.com/wkpark/uddetailer); the preset library is conceptually inspired by uddetailer too. All credit for the original ADetailer goes to **Bing-su**; this fork extends that work — it does not replace it.
+> The initial fork implementation was authored by **Claude** (Anthropic's coding assistant) at the request of the repository owner, who is not a Python developer. The plus.7.5 reliability update was started with **OpenAI Codex** and reviewed and completed with **Claude**. The class-filtering pattern is borrowed from [wkpark/uddetailer](https://github.com/wkpark/uddetailer); the preset library is conceptually inspired by uddetailer too. All credit for the original ADetailer goes to **Bing-su**; this fork extends that work — it does not replace it.
 >
 > This fork is distributed under the same AGPL-3.0 license as the upstream. See `LICENSE.md` for the full text; Bing-su's copyright notices are intact.
 >
@@ -16,15 +16,16 @@
 
 ## First local beta — v26.3.0+plus.7.5.beta.1
 
-**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. All 141 offline regression tests pass, including fixes made after an independent review; the 27 real-detector tests passed in the earlier run. Browser tests in AUTOMATIC1111, run before those review fixes, also passed generation, Send to img2img, preset restoration, standalone detailing, folder interruption/restart and queueing behind a folder run. Advanced cross-architecture workflows in Forge Neo still need verification.
+**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. All 175 offline regression tests pass, including fixes made after two independent reviews; the 27 real-detector tests passed in the earlier run. Browser tests in AUTOMATIC1111, run before those review fixes, passed generation, Send to img2img, preset restoration, standalone detailing, folder interruption/restart and queueing behind a folder run. Advanced cross-architecture workflows in Forge Neo still need verification.
 
 - Shifted masks are clipped at image edges; YOLO segmentation masks remove inference padding before resizing, keeping regions aligned on rectangular images.
 - Very large detection-number ranges are limited to the detections that actually exist, avoiding long stalls.
 - Concurrent settings and preset saves preserve other tabs' changes. Failed preset writes are reported, and preset import accepts uploads from both Gradio 3 and Gradio 4.
-- Loading a preset or pasting a tab restores the full configuration, including detector, per-tab enable and class controls. Excluded classes and YOLO-World text are restored together with their visible selection.
+- Loading a preset or pasting a tab restores the full configuration, including detector, per-tab enable and class controls. Excluded classes and YOLO-World text are restored together with their visible selection. Pasting generation parameters (PNG Info, Send to txt2img/img2img) restores a tab's class filter and its visible selection too, even when the detector does not change.
+- If `user_presets.json` or `user_state.json` can no longer be read (for example after being re-saved in another text encoding), the next save keeps the old file under a new name, `…unreadable-<date>.json`, instead of overwriting it. A byte-order mark at the start of either file is accepted.
 - Manual mode preserves normal generation even with Skip img2img checked. Missing Forge encoder/VAE choices retain the corresponding base module.
 - Standalone images, folder runs and detection previews share the WebUI generation lock. Interrupt stops a folder run before the next file — including AUTOMATIC1111's default "stop after the current image" — and a new run can start after cancellation.
-- An Interrupt or Skip that cuts a region short now always discards that pass — including on the last or only region — instead of keeping a half-finished region. Skip stops ADetailer for the rest of the current batch. A folder run lists cancelled files separately.
+- An Interrupt or Skip that cuts a region short now always discards that pass — including on the last or only region — instead of keeping a half-finished region. Skip stops ADetailer for the rest of the current batch. A folder run lists cancelled files separately, and on Forge Neo a very early Interrupt is reported as cancelled rather than as an error.
 - Windows unit checks and regression coverage have been expanded. Tests that download detector models are marked separately.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
@@ -266,9 +267,9 @@ So with all three toggles on, a face→hands sequential tab gives you, in `adeta
 
 **Skip / Interrupt mid-sequential rolls back the tab:**
 
-If you press **Skip** or **Interrupt** while a sequential pass is running — for instance, after seeing class 1 (face) succeed but class 2 (hand) produce a bad result — the entire tab is rolled back. `pp.image` is restored to the pre-sequential state and the final image saved by the WebUI is the untouched original. The terminal logs `[-] ADetailer: sequential class pass on tab N was skipped — rolled back to the pre-sequential image.` so you can confirm what happened. (If `Save intermediate steps` is on, the step files written for the classes that *did* complete before the skip remain in `adetailer-steps/` — they document what ran; only the final gallery image is rolled back.)
+If you press **Skip** or **Interrupt** while a sequential pass is running (with AUTOMATIC1111's default "stop after the current image" Interrupt, whenever the stop cuts the tab short) — for instance, after seeing class 1 (face) succeed but class 2 (hand) produce a bad result — the entire tab is rolled back. `pp.image` is restored to the pre-sequential state and the final image saved by the WebUI is the untouched original. The terminal logs `[-] ADetailer: sequential class pass on tab N was skipped — rolled back to the pre-sequential image.` so you can confirm what happened. (If `Save intermediate steps` is on, the step files written for the classes that *did* complete before the skip remain in `adetailer-steps/` — they document what ran; only the final gallery image is rolled back.)
 
-The rollback only applies to the sequential code path. Pressing Skip during a single-class tab or with `Process classes sequentially` off behaves as before (the inpaint stops where it is, partial result kept).
+The rollback only applies to the sequential code path. With a single class or with `Process classes sequentially` off, an Interrupt or Skip that cuts a region short discards that tab's pass (since plus.7.5.beta.1; earlier releases could keep a half-finished region).
 
 ## Copy Settings Between Tabs
 

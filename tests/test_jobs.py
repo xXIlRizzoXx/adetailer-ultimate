@@ -106,6 +106,17 @@ def test_action_waits_for_host_lock_before_touching_state_and_cleans_up(host, fa
     assert (host.state.job, host.state.job_count) == ("", 0)
 
 
+def test_action_runs_on_a_host_whose_begin_takes_no_job_label(host, monkeypatch):
+    def begin_without_label(self):
+        host.events.append("begin")
+        self.skipped = self.interrupted = self.stopping_generation = False
+
+    monkeypatch.setattr(type(host.state), "begin", begin_without_label)
+    assert wrap_adetailer_job(lambda: "done")() == "done"
+    assert host.events == ["begin", "end"]
+    assert not host.lock.lock.locked()
+
+
 def test_detector_serializes_without_resetting_generation_state(host):
     def detect():
         assert host.lock.lock.locked()

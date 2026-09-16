@@ -24,6 +24,7 @@ from adetailer.presets import (
     is_valid_name,
     rename_preset,
     save_preset,
+    take_recovery_note,
 )
 from controlnet_ext import controlnet_exists, controlnet_type, get_cn_models
 
@@ -602,6 +603,58 @@ def _restored_tab_updates(
             value=state.get("ad_model_classes_excluded", "")
         )
     return [*(updates[attr] for attr in attrs), dropdown_update]
+
+
+_CLASS_FILTER_DEFAULTS = {
+    "ad_model_classes": "",
+    "ad_model_classes_exclude": False,
+    "ad_model_classes_excluded": "",
+}
+
+
+def _class_filter_infotext_fields(
+    w: Widgets, n: int, model_mapping: dict[str, str] | None = None
+) -> list[tuple[Any, Any]]:
+    """Paste handlers for tab `n`'s class filter, including its selection.
+
+    Infotext leaves out class-filter keys that hold their defaults, and the
+    WebUI keeps a field unchanged when its key is missing, so a pasted image
+    could inherit the tab's previous filter. When the tab's detector is in
+    the infotext, a missing key means its default. The UI-only selection is
+    pasted from the same values: the detector may not change, and then
+    nothing else would update it.
+    """
+    names = dict(ALL_ARGS)
+    model_key = names["ad_model"] + suffix(n)
+
+    def read(params: dict[str, Any]) -> dict[str, Any] | None:
+        if model_key not in params:
+            return None
+        state = {"ad_model": str(params[model_key])}
+        for attr, default in _CLASS_FILTER_DEFAULTS.items():
+            value = params.get(names[attr] + suffix(n), default)
+            if attr == "ad_model_classes_exclude":
+                value = str(value).strip().lower() == "true"
+            state[attr] = value
+        return state
+
+    def field(attr: str):
+        def paste(params: dict[str, Any]):
+            state = read(params)
+            return None if state is None else state[attr]
+
+        return paste
+
+    def selection(params: dict[str, Any]):
+        state = read(params)
+        if state is None:
+            return None
+        return _restored_tab_updates(state, [], model_mapping)[-1]
+
+    return [
+        *((getattr(w, attr), field(attr)) for attr in _CLASS_FILTER_DEFAULTS),
+        (w.ad_model_classes_dropdown, selection),
+    ]
 
 
 def _sync_class_dropdown(selected: list[str] | None, exclude: bool, model: str):
@@ -1489,8 +1542,9 @@ def _wire_presets(
                         f"⚠️ Could not save preset '{name}'. Check disk space and folder permissions.",
                         *_refresh_dropdowns_update(),
                     ]
+                note = take_recovery_note()
                 return [
-                    f"✅ Saved preset '{name}'.",
+                    f"✅ Saved preset '{name}'." + (f" ⚠️ {note}" if note else ""),
                     *_refresh_dropdowns_update(selected=name),
                 ]
 
@@ -1916,6 +1970,9 @@ def one_ui_group(
             msg = "_no presets imported (file empty, invalid, or all names skipped)._"
         else:
             msg = " · ".join(parts)
+        note = take_recovery_note()
+        if note:
+            msg += f" · ⚠️ {note}"
         names = [PRESET_NONE] + get_preset_names()
         return gr.update(choices=names), msg
 
@@ -2523,7 +2580,14 @@ def one_ui_group(
         queue=False,
     )
 
-    infotext_fields = [(getattr(w, attr), name + suffix(n)) for attr, name in ALL_ARGS]
+    infotext_fields = [
+        (getattr(w, attr), name + suffix(n))
+        for attr, name in ALL_ARGS
+        if attr not in _CLASS_FILTER_DEFAULTS
+    ]
+    infotext_fields.extend(
+        _class_filter_infotext_fields(w, n, webui_info.model_mapping)
+    )
 
     preset_widgets = (
         preset_dropdown,

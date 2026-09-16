@@ -26,11 +26,15 @@ def callbacks():
     names = {
         "ordinal", "_copyable_attrs", "_wire_copy_paste", "_wire_presets",
         "_restored_tab_updates", "_sync_class_dropdown", "on_ad_model_update",
-        "_do_import",
+        "_do_import", "suffix", "_class_filter_infotext_fields",
     }
     functions = [
         node for node in ast.walk(source)
-        if isinstance(node, ast.FunctionDef) and node.name in names
+        if (isinstance(node, ast.FunctionDef) and node.name in names)
+        or (
+            isinstance(node, ast.Assign)
+            and any(getattr(t, "id", "") == "_CLASS_FILTER_DEFAULTS" for t in node.targets)
+        )
     ]
     module = ast.Module(
         body=[source.body[0], *functions], type_ignores=[]
@@ -48,6 +52,7 @@ def callbacks():
             MEDIAPIPE_FACE_FEATURES_MODEL: ["eyes", "mouth", "nose"],
         }.get(path, []),
         "get_preset_names": lambda: ["saved"],
+        "take_recovery_note": lambda: "",
     }
     exec(compile(module, str(path), "exec"), namespace)
     return namespace
@@ -227,3 +232,71 @@ def test_import_accepts_gradio_3_and_4_upload_values(callbacks, tmp_path, upload
     assert received == [(payload, True)]
     assert choices["choices"] == ["(none)", "saved"]
     assert "added" in status
+
+
+def _paste(fields, params):
+    """AUTOMATIC1111's paste loop for callable infotext keys."""
+    out = {}
+    for component, key in fields:
+        value = key(params)
+        out[component] = value
+    return out
+
+
+@pytest.mark.parametrize(
+    ("tab", "params", "expected"),
+    [
+        # NOT mode image pasted onto the same detector: nothing else would
+        # update the visible selection, so the paste must.
+        (
+            0,
+            {"ADetailer model": "faces.pt", "ADetailer classes exclude": "True",
+             "ADetailer model classes excluded": "hand"},
+            ("", True, "hand", ["hand"], ["face", "hand"]),
+        ),
+        # Include-mode image: its missing exclude key means include mode.
+        (
+            0,
+            {"ADetailer model": "faces.pt", "ADetailer model classes": "face"},
+            ("face", False, "", ["face"], ["face", "hand"]),
+        ),
+        # No class filter at all: every field goes back to its default.
+        (
+            1,
+            {"ADetailer model 2nd": "animals.pt"},
+            ("", False, "", [], ["cat", "dog"]),
+        ),
+        # World vocabulary lives in the free-text field, never the selection.
+        (
+            0,
+            {"ADetailer model": "custom-world.pt",
+             "ADetailer model classes": "red hat,glasses"},
+            ("red hat,glasses", False, "", [], []),
+        ),
+    ],
+)
+def test_png_info_paste_restores_class_filter_and_selection(
+    callbacks, tab, params, expected
+):
+    w = widgets()
+    fields = callbacks["_class_filter_infotext_fields"](
+        w, tab, {"faces.pt": "faces.pt", "animals.pt": "animals.pt"}
+    )
+    assert [c for c, _ in fields] == [
+        w.ad_model_classes, w.ad_model_classes_exclude,
+        w.ad_model_classes_excluded, w.ad_model_classes_dropdown,
+    ]
+    pasted = _paste(fields, params)
+    include, exclude, excluded, selected, choices = expected
+    assert pasted[w.ad_model_classes] == include
+    assert pasted[w.ad_model_classes_exclude] is exclude
+    assert pasted[w.ad_model_classes_excluded] == excluded
+    assert pasted[w.ad_model_classes_dropdown]["value"] == selected
+    assert pasted[w.ad_model_classes_dropdown]["choices"] == choices
+
+
+def test_png_info_without_this_tab_leaves_its_class_filter_alone(callbacks):
+    w = widgets()
+    fields = callbacks["_class_filter_infotext_fields"](w, 1, {})
+    pasted = _paste(fields, {"ADetailer model": "faces.pt"})
+    assert set(pasted.values()) == {None}

@@ -383,3 +383,132 @@ def test_cancel_with_nan_on_the_last_region_discards_the_pass(cancel_flag):
     assert len(calls) == 2
     assert processed is False
     assert pp.image.tobytes() == before.tobytes()
+
+
+def _detailer(state, process_images, n_masks, **host_globals):
+    before = Image.new("RGB", (8, 8), "white")
+    pred = SimpleNamespace(preview=before)
+    runtime = _load_runtime(
+        state=state, shared=SimpleNamespace(state=state),
+        re=re, time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda image, _mode: image,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+        **host_globals,
+    )
+    script = runtime.AfterDetailerScript()
+    pp = SimpleNamespace(image=before)
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[pp.image], prompt="face", close=lambda: None
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [before] * n_masks
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.fix_p2 = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    class Args(SimpleNamespace):
+        def copy(self, update):
+            return Args(**{**vars(self), **update})
+
+    def run(classes="", sequential=False):
+        args = Args(
+            ad_classes_sequential=sequential, ad_model_classes=classes,
+            ad_model_classes_exclude=False, ad_class_prompts="",
+            ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+            ad_detection_resolution=0, is_mediapipe=lambda: False,
+        )
+        return script._postprocess_image_inner(
+            SimpleNamespace(extra_generation_params={}), pp, args
+        )
+
+    return run, pp, before
+
+
+@pytest.mark.parametrize(
+    ("stop_at", "n_calls", "kept"),
+    [(1, 2, False), (2, 2, False), (3, 4, False), (4, 4, True)],
+    ids=[
+        "first-class-first-region", "first-class-last-region",
+        "last-class-first-region", "last-class-last-region",
+    ],
+)
+def test_sequential_pass_honours_stop_after_current_image(stop_at, n_calls, kept):
+    # AUTOMATIC1111's default Interrupt only sets stopping_generation. The host
+    # finishes the region in progress, then returns no images for any later
+    # region. A sequential tab cut short must roll back instead of keeping the
+    # classes done so far as a complete result; one that finished is kept.
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, stopping_generation=False,
+        job_count=0, assign_current_image=lambda _image: None,
+    )
+    result = Image.new("RGB", (8, 8), "red")
+    calls = []
+
+    def process_images(_p):
+        calls.append(_p)
+        if state.stopping_generation:
+            return SimpleNamespace(images=[])
+        if len(calls) == stop_at:
+            state.stopping_generation = True
+        return SimpleNamespace(images=[result])
+
+    run, pp, before = _detailer(state, process_images, n_masks=2)
+    processed = run(classes="face,hand", sequential=True)
+
+    assert len(calls) == n_calls
+    assert processed is kept
+    expected = result if kept else before
+    assert pp.image.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("cancel_flag", ["skipped", "interrupted", None])
+def test_host_error_after_a_cancel_counts_as_the_cancel(cancel_flag):
+    # Forge Neo hands back no latent when a cancel lands before the first
+    # sampling step, and then fails on it. That is the user's cancel, not a
+    # failure; any other error must still reach the caller.
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+
+    def process_images(_p):
+        if cancel_flag:
+            setattr(state, cancel_flag, True)
+        msg = "unsupported operand type(s) for *: 'NoneType' and 'Tensor'"
+        raise TypeError(msg)
+
+    run, pp, before = _detailer(state, process_images, n_masks=2)
+    if cancel_flag is None:
+        with pytest.raises(TypeError):
+            run()
+        return
+    assert run() is False
+    assert pp.image.tobytes() == before.tobytes()
+
+
+@pytest.mark.parametrize(("start", "expected"), [(-1, 2), (0, 2), (3, 5)])
+def test_region_count_is_added_to_the_host_job_count(start, expected):
+    # A standalone job begins at the host's "not counted yet" value, -1.
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=start,
+        assign_current_image=lambda _image: None,
+    )
+    result = Image.new("RGB", (8, 8), "red")
+    run, _pp, _before = _detailer(
+        state, lambda _p: SimpleNamespace(images=[result]), n_masks=2
+    )
+    assert run() is True
+    assert state.job_count == expected
