@@ -61,6 +61,8 @@ def _replace_library(presets: dict[str, Any], damaged: bool) -> bool:
         backup = set_aside(_PRESETS_FILE)
         if backup is None:
             return False
+        # Set before writing: even if the write fails, the old library now
+        # lives under the new name and the user should hear where.
         _recovery_note = (
             f"The old preset file could not be read and was kept as {backup.name}."
         )

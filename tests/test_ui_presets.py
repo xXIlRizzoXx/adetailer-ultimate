@@ -1,9 +1,10 @@
 """Callback-level regressions; these do not start a live Gradio/WebUI server."""
 
 import ast
+import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -27,6 +28,7 @@ def callbacks():
         "ordinal", "_copyable_attrs", "_wire_copy_paste", "_wire_presets",
         "_restored_tab_updates", "_sync_class_dropdown", "on_ad_model_update",
         "_do_import", "suffix", "_class_filter_infotext_fields",
+        "_skipped_infotext_keys",
     }
     functions = [
         node for node in ast.walk(source)
@@ -300,3 +302,39 @@ def test_png_info_without_this_tab_leaves_its_class_filter_alone(callbacks):
     fields = callbacks["_class_filter_infotext_fields"](w, 1, {})
     pasted = _paste(fields, {"ADetailer model": "faces.pt"})
     assert set(pasted.values()) == {None}
+
+
+def test_png_info_paste_leaves_fields_the_user_disregards(callbacks, monkeypatch):
+    # "Disregard fields from pasted infotext" removes keys before the paste
+    # handlers run; those fields must stay as they are, not reset to defaults.
+    modules = ModuleType("modules")
+    modules.shared = SimpleNamespace(
+        opts=SimpleNamespace(infotext_skip_pasting=["ADetailer classes exclude"])
+    )
+    monkeypatch.setitem(sys.modules, "modules", modules)
+    w = widgets()
+    fields = callbacks["_class_filter_infotext_fields"](w, 0, {"faces.pt": "faces.pt"})
+    pasted = _paste(
+        fields, {"ADetailer model": "faces.pt", "ADetailer model classes": "face"}
+    )
+    assert pasted[w.ad_model_classes] == "face"
+    assert pasted[w.ad_model_classes_exclude] is None
+    assert pasted[w.ad_model_classes_excluded] == ""
+    assert pasted[w.ad_model_classes_dropdown] is None
+
+
+def test_each_tab_registers_the_class_filter_paste_handlers():
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    group = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "one_ui_group"
+    )
+    calls = {
+        node.func.id
+        for node in ast.walk(group)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_class_filter_infotext_fields" in calls
+    source = ast.get_source_segment(path.read_text(encoding="utf-8"), group)
+    assert "if attr not in _CLASS_FILTER_DEFAULTS" in source

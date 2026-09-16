@@ -3,7 +3,7 @@ from threading import Event
 
 import pytest
 
-from adetailer import presets
+from adetailer import json_file, presets
 
 
 @pytest.fixture
@@ -158,3 +158,33 @@ def test_library_that_cannot_be_read_right_now_is_not_replaced(
             assert (added, replaced, skipped) == (0, 0, ["new"])
     assert preset_file.read_bytes() == original
     assert not list(preset_file.parent.glob("user_presets.unreadable-*"))
+
+
+def test_deeply_nested_library_is_damaged_not_fatal(preset_file):
+    preset_file.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+    assert presets.load_presets() == {}
+    assert presets.save_preset("new", {"ad_prompt": "new"})
+    assert len(list(preset_file.parent.glob("user_presets.unreadable-*.json"))) == 1
+
+
+def test_backup_made_in_the_same_second_is_never_overwritten(preset_file, monkeypatch):
+    monkeypatch.setattr(json_file.time, "strftime", lambda _fmt: "20260916-120000")
+    earlier = preset_file.parent / "user_presets.unreadable-20260916-120000.json"
+    earlier.write_bytes(b"earlier backup")
+    preset_file.write_bytes(DAMAGED_LIBRARIES["trailing-comma"])
+
+    assert presets.save_preset("new", {"ad_prompt": "new"})
+    assert earlier.read_bytes() == b"earlier backup"
+    second = preset_file.parent / "user_presets.unreadable-20260916-120000-2.json"
+    assert second.read_bytes() == DAMAGED_LIBRARIES["trailing-comma"]
+
+
+def test_library_whose_status_cannot_be_checked_does_not_break_the_ui(
+    preset_file, monkeypatch
+):
+    def denied(*_args, **_kwargs):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(type(preset_file), "is_file", denied)
+    assert presets.load_presets() == {}
+    assert not presets.save_preset("new", {"ad_prompt": "new"})

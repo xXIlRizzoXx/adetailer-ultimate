@@ -2082,7 +2082,11 @@ class AfterDetailerScript(scripts.Script):
                 # so discard the pass instead of reporting a failure.
                 if not (state.interrupted or state.skipped):
                     raise
-                print(f"[-] ADetailer: region cancelled ({e})", file=sys.stderr)
+                # Type name only: rich would parse "[...]" in the message.
+                print(
+                    f"[-] ADetailer: region cancelled ({type(e).__name__}).",
+                    file=sys.stderr,
+                )
                 processed = None
                 break
             finally:

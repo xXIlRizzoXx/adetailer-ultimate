@@ -612,6 +612,20 @@ _CLASS_FILTER_DEFAULTS = {
 }
 
 
+def _skipped_infotext_keys() -> set[str]:
+    """Keys the user asked the WebUI to disregard when pasting infotext.
+
+    The WebUI drops them before paste handlers run, so a missing key can
+    also mean "leave this field alone".
+    """
+    try:
+        from modules import shared
+
+        return set(getattr(shared.opts, "infotext_skip_pasting", None) or [])
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _class_filter_infotext_fields(
     w: Widgets, n: int, model_mapping: dict[str, str] | None = None
 ) -> list[tuple[Any, Any]]:
@@ -630,9 +644,14 @@ def _class_filter_infotext_fields(
     def read(params: dict[str, Any]) -> dict[str, Any] | None:
         if model_key not in params:
             return None
+        skipped = _skipped_infotext_keys()
         state = {"ad_model": str(params[model_key])}
         for attr, default in _CLASS_FILTER_DEFAULTS.items():
-            value = params.get(names[attr] + suffix(n), default)
+            key = names[attr] + suffix(n)
+            if key in skipped:
+                state[attr] = None  # leave the field as it is
+                continue
+            value = params.get(key, default)
             if attr == "ad_model_classes_exclude":
                 value = str(value).strip().lower() == "true"
             state[attr] = value
@@ -647,7 +666,7 @@ def _class_filter_infotext_fields(
 
     def selection(params: dict[str, Any]):
         state = read(params)
-        if state is None:
+        if state is None or None in state.values():
             return None
         return _restored_tab_updates(state, [], model_mapping)[-1]
 
@@ -1537,12 +1556,13 @@ def _wire_presets(
                     ]
                 state_dict = {a: v for a, v in zip(attrs, values)}
                 ok = save_preset(name, state_dict)
+                note = take_recovery_note()
                 if not ok:
                     return [
-                        f"⚠️ Could not save preset '{name}'. Check disk space and folder permissions.",
+                        f"⚠️ Could not save preset '{name}'. Check disk space and folder permissions."
+                        + (f" {note}" if note else ""),
                         *_refresh_dropdowns_update(),
                     ]
-                note = take_recovery_note()
                 return [
                     f"✅ Saved preset '{name}'." + (f" ⚠️ {note}" if note else ""),
                     *_refresh_dropdowns_update(selected=name),

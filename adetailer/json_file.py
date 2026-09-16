@@ -22,15 +22,19 @@ def read_json_object(path: Path) -> tuple[dict[str, Any] | None, bool]:
     holds anything other than an object, is damaged: ``(None, True)``. A file
     that exists but cannot be read right now gives ``(None, False)``.
     """
-    if not path.is_file():
-        return {}, False
     try:
+        if not path.is_file():
+            return {}, False
         # utf-8-sig also accepts the byte-order mark some Windows editors add.
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (UnicodeError, json.JSONDecodeError):
+        text = path.read_text(encoding="utf-8-sig")
+    except ValueError:  # UnicodeDecodeError
         return None, True
     except OSError:
         return None, False
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return None, True
     if not isinstance(data, dict):
         return None, True
     return data, False
@@ -42,17 +46,28 @@ def set_aside(path: Path) -> Path | None:
     Returns the new path, or None if the file could not be renamed.
     """
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = path.with_name(f"{path.stem}.unreadable-{stamp}{path.suffix}")
-    n = 1
-    while backup.exists():
-        n += 1
-        backup = path.with_name(f"{path.stem}.unreadable-{stamp}-{n}{path.suffix}")
-    try:
-        os.replace(path, backup)
-    except OSError:
-        return None
-    print(
-        f"[ADetailer] {path.name} could not be read; kept it as {backup.name}.",
-        file=sys.stderr,
-    )
-    return backup
+    for n in range(1, 1000):
+        tail = "" if n == 1 else f"-{n}"
+        backup = path.with_name(f"{path.stem}.unreadable-{stamp}{tail}{path.suffix}")
+        # Claim the name first: os.replace would silently overwrite a backup
+        # another WebUI process made in the same second.
+        try:
+            os.close(os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            continue
+        except OSError:
+            return None
+        try:
+            os.replace(path, backup)
+        except OSError:
+            try:
+                os.unlink(backup)
+            except OSError:
+                pass
+            return None
+        print(
+            f"[ADetailer] {path.name} could not be read; kept it as {backup.name}.",
+            file=sys.stderr,
+        )
+        return backup
+    return None

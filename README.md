@@ -16,7 +16,7 @@
 
 ## First local beta — v26.3.0+plus.7.5.beta.1
 
-**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. All 175 offline regression tests pass, including fixes made after two independent reviews; the 27 real-detector tests passed in the earlier run. Browser tests in AUTOMATIC1111, run before those review fixes, passed generation, Send to img2img, preset restoration, standalone detailing, folder interruption/restart and queueing behind a folder run. Advanced cross-architecture workflows in Forge Neo still need verification.
+**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. All 180 offline regression tests pass, including fixes made after two independent reviews; the 27 real-detector tests passed in the earlier run. Browser tests in AUTOMATIC1111, run before those review fixes, passed generation, Send to img2img, preset restoration, standalone detailing, folder interruption/restart and queueing behind a folder run. Advanced cross-architecture workflows in Forge Neo still need verification.
 
 - Shifted masks are clipped at image edges; YOLO segmentation masks remove inference padding before resizing, keeping regions aligned on rectangular images.
 - Very large detection-number ranges are limited to the detections that actually exist, avoiding long stalls.
