@@ -1098,6 +1098,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             gallery = []
             saved = 0
             unchanged = 0
+            cancelled = 0
             not_saved = 0
             failed = 0
             interrupted = False
@@ -1108,9 +1109,10 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 try:
                     from modules import shared as _sh
 
-                    # AUTOMATIC1111's Interrupt only sets stopping_generation
-                    # ("stop after the current image") once job_count > 1, which
-                    # a folder run always reaches. Honour it between files.
+                    # AUTOMATIC1111's Interrupt sets only stopping_generation
+                    # ("stop after the current image") when job_count > 1 and its
+                    # default "interrupt after current" option is on. Honour it
+                    # between files as well.
                     if (
                         _sh.state.interrupted
                         or _sh.state.skipped
@@ -1135,7 +1137,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                             failed += 1
                             continue
                         st = st if isinstance(st, str) else ""
-                        if st.startswith("ℹ️"):  # nothing detected -> not written
+                        if st.startswith("ℹ️ Cancelled"):  # cancelled -> not written
+                            cancelled += 1
+                        elif st.startswith("ℹ️"):  # nothing detected -> not written
                             unchanged += 1
                         else:
                             # NEVER overwrite an existing file — an original in
@@ -1174,7 +1178,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     # detailed the image but the disk write failed; a plain "✅ …"
                     # when it was detailed AND written. Categorise by that so the
                     # summary is honest about what actually hit disk.
-                    if st.startswith("ℹ️"):
+                    if st.startswith("ℹ️ Cancelled"):
+                        cancelled += 1
+                    elif st.startswith("ℹ️"):
                         unchanged += 1
                     elif "couldn't save" in st:
                         not_saved += 1
@@ -1189,7 +1195,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
 
             # "ADetailer-Inpaint" mirrors AD_APPLY_SUBDIR in scripts/!adetailer.py
             # (that file isn't importable here — its name starts with "!").
-            have = saved + unchanged + not_saved
+            have = saved + unchanged + not_saved + cancelled
             dest_txt = (
                 "beside each source file as name-ad"
                 if same_folder
@@ -1203,6 +1209,8 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             )
             if unchanged:
                 status += f", {unchanged} left unchanged (nothing detected)"
+            if cancelled:
+                status += f", {cancelled} cancelled (left unchanged)"
             if not_saved:
                 status += f", {not_saved} detailed but not saved (see console)"
             if failed:

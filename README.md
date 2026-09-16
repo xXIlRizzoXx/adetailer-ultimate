@@ -16,7 +16,7 @@
 
 ## First local beta — v26.3.0+plus.7.5.beta.1
 
-**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. All 133 offline regression tests pass, including three fixes made after an independent review; the 27 real-detector tests passed in the earlier run. Browser tests in AUTOMATIC1111 also passed generation, Send to img2img, preset restoration, standalone detailing, folder interruption/restart and queueing behind a folder run. Advanced cross-architecture workflows in Forge Neo still need verification.
+**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. All 141 offline regression tests pass, including fixes made after an independent review; the 27 real-detector tests passed in the earlier run. Browser tests in AUTOMATIC1111, run before those review fixes, also passed generation, Send to img2img, preset restoration, standalone detailing, folder interruption/restart and queueing behind a folder run. Advanced cross-architecture workflows in Forge Neo still need verification.
 
 - Shifted masks are clipped at image edges; YOLO segmentation masks remove inference padding before resizing, keeping regions aligned on rectangular images.
 - Very large detection-number ranges are limited to the detections that actually exist, avoiding long stalls.
@@ -24,8 +24,7 @@
 - Loading a preset or pasting a tab restores the full configuration, including detector, per-tab enable and class controls. Excluded classes and YOLO-World text are restored together with their visible selection.
 - Manual mode preserves normal generation even with Skip img2img checked. Missing Forge encoder/VAE choices retain the corresponding base module.
 - Standalone images, folder runs and detection previews share the WebUI generation lock. Interrupt stops a folder run before the next file — including AUTOMATIC1111's default "stop after the current image" — and a new run can start after cancellation.
-- Interrupt or Skip while a region is being inpainted now always discards that pass — including the last or only region — instead of keeping a half-finished region. Skip stops ADetailer for the rest of the current batch.
-- **Reset every tab** now resets every tab on Forge, Forge Neo and reForge too (before, only the first tab was reset there).
+- An Interrupt or Skip that cuts a region short now always discards that pass — including on the last or only region — instead of keeping a half-finished region. Skip stops ADetailer for the rest of the current batch. A folder run lists cancelled files separately.
 - Windows unit checks and regression coverage have been expanded. Tests that download detector models are marked separately.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.

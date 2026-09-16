@@ -1448,8 +1448,10 @@ class AfterDetailerScript(scripts.Script):
             pp = SimpleNamespace(image=image)
             processed = self._postprocess_image_inner(p, pp, args)
             if not processed:
-                if getattr(state, "interrupted", False) or getattr(
-                    state, "skipped", False
+                if (
+                    getattr(state, "interrupted", False)
+                    or getattr(state, "skipped", False)
+                    or getattr(state, "stopping_generation", False)
                 ):
                     return image, "ℹ️ Cancelled — image unchanged."
                 return image, "ℹ️ Nothing detected — image unchanged."
@@ -2084,6 +2086,12 @@ class AfterDetailerScript(scripts.Script):
                 _inpaint_ms,
                 (time.perf_counter() - _t_pass) * 1000,
             )
+
+        if processed is not None and (state.interrupted or state.skipped):
+            # A cancel can still slip past the per-region checks: a region that
+            # raised NansException `continue`s over them, and if it was the last
+            # one the loop simply ends. The cancelled pass must not be kept.
+            processed = None
 
         if processed is not None:
             pp.image = processed.images[0]

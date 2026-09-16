@@ -203,8 +203,9 @@ def test_wired_folder_stops_before_next_file_when_host_requests_stop(
     calls = []
 
     def detail(image, _args, save):
-        assert not host.state.stopping_generation
-        calls.append(image)
+        # Record, don't assert: an exception here would be swallowed by the
+        # folder loop as "unreadable" and hide a missing stop check.
+        calls.append(host.state.stopping_generation)
         host.state.stopping_generation = True
         return image, "✅ ADetailer pass complete."
 
@@ -215,7 +216,37 @@ def test_wired_folder_stops_before_next_file_when_host_requests_stop(
         "face.pt", "", "", False, 0.3, "face.pt",
     )
 
-    assert len(calls) == 1
+    assert calls == [False]
     assert "Batch interrupted" in status
+    assert "unreadable" not in status
     assert host.events == ["begin", "end"]
     assert not host.state.stopping_generation
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_lists_cancelled_files_separately(
+    host, monkeypatch, tmp_path, same_folder
+):
+    # A file whose pass was cancelled did have detections: the summary must not
+    # call it "nothing detected", and it must not be written anywhere.
+    for name in ("a.png", "b.png"):
+        Image.new("RGB", (8, 8), "white").save(tmp_path / name)
+    calls = []
+
+    def detail(image, _args, save):
+        calls.append(save)
+        host.state.interrupted = True
+        return image, "ℹ️ Cancelled — image unchanged."
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    _gallery, status = callback(
+        None, str(tmp_path), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert calls == [not same_folder]
+    assert "Batch interrupted" in status
+    assert "1 cancelled" in status
+    assert "nothing detected" not in status
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["a.png", "b.png"]
