@@ -24,7 +24,7 @@
 - Loading a preset or pasting a tab restores the full configuration, including detector, per-tab enable and class controls. Excluded classes and YOLO-World text are restored together with their visible selection.
 - Manual mode preserves normal generation even with Skip img2img checked. Missing Forge encoder/VAE choices retain the corresponding base module.
 - Standalone images, folder runs and detection previews share the WebUI generation lock. Interrupt stops a folder run before the next file — including AUTOMATIC1111's default "stop after the current image" — and a new run can start after cancellation.
-- Interrupting or skipping while a region is being inpainted discards that pass instead of keeping a half-finished region.
+- Interrupt or Skip while a region is being inpainted now always discards that pass — including the last or only region — instead of keeping a half-finished region. Skip stops ADetailer for the rest of the current batch.
 - **Reset every tab** now resets every tab on Forge, Forge Neo and reForge too (before, only the first tab was reset there).
 - Windows unit checks and regression coverage have been expanded. Tests that download detector models are marked separately.
 

@@ -1448,6 +1448,10 @@ class AfterDetailerScript(scripts.Script):
             pp = SimpleNamespace(image=image)
             processed = self._postprocess_image_inner(p, pp, args)
             if not processed:
+                if getattr(state, "interrupted", False) or getattr(
+                    state, "skipped", False
+                ):
+                    return image, "ℹ️ Cancelled — image unchanged."
                 return image, "ℹ️ Nothing detected — image unchanged."
             status = "✅ ADetailer pass complete."
             if save:
@@ -2057,6 +2061,13 @@ class AfterDetailerScript(scripts.Script):
                 _reg["inp_ms"] = (time.perf_counter() - _t_inp) * 1000
                 _inpaint_ms += _reg["inp_ms"]
                 _regions.append(_reg)
+
+            if state.interrupted or state.skipped:
+                # Cancelled while THIS region was being inpainted: the host still
+                # returns its half-denoised latent. Discard the pass here too, or
+                # the last (or only) region would slip past the check above.
+                processed = None
+                break
 
             if not processed.images:
                 processed = None

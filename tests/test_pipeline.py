@@ -232,11 +232,18 @@ def test_sequential_cancel_stops_next_mask_before_host_can_clear_skip(cancel_fla
 
 
 @pytest.mark.parametrize("cancel_flag", ["skipped", "interrupted"])
-def test_cancel_in_ordinary_flow_discards_the_half_finished_pass(cancel_flag):
-    # One tab, two detections, not sequential. The user cancels while the first
-    # mask is being inpainted: the host still hands back that half-denoised
-    # image. It must not reach the final picture (nor a standalone/folder save);
-    # the pass is discarded, as it was before the per-mask cancel check existed.
+@pytest.mark.parametrize(
+    ("n_masks", "cancel_at"),
+    [(1, 0), (2, 0), (2, 1)],
+    ids=["only-region", "first-of-two", "last-of-two"],
+)
+def test_cancel_in_ordinary_flow_discards_the_half_finished_pass(
+    cancel_flag, n_masks, cancel_at
+):
+    # One tab, not sequential. The user cancels while a region is being
+    # inpainted: the host still hands back its half-denoised image. That must
+    # not reach the final picture (nor a standalone/folder save) whichever
+    # region was cancelled, including the last or only one.
     state = SimpleNamespace(
         interrupted=False, skipped=False, job_count=0,
         assign_current_image=lambda _image: None,
@@ -249,7 +256,8 @@ def test_cancel_in_ordinary_flow_discards_the_half_finished_pass(cancel_flag):
     def process_images(_p):
         state.skipped = False
         calls.append(_p)
-        setattr(state, cancel_flag, True)  # cancelled during this mask
+        if len(calls) - 1 == cancel_at:
+            setattr(state, cancel_flag, True)  # cancelled during this region
         return SimpleNamespace(images=[partial_result])
 
     pred = SimpleNamespace(preview=before)
@@ -274,7 +282,7 @@ def test_cancel_in_ordinary_flow_discards_the_half_finished_pass(cancel_flag):
     )
     script.get_prompt = lambda *_args: (["face"], [""])
     script.get_ad_model = lambda _name: "model.pt"
-    script.pred_preprocessing = lambda *_args: [before, before]
+    script.pred_preprocessing = lambda *_args: [before] * n_masks
     script.save_image = lambda *_args, **_kwargs: None
     script.i2i_prompts_replace = lambda *_args: None
     script._apply_inline_class_prompts = lambda *_args: None
@@ -297,7 +305,7 @@ def test_cancel_in_ordinary_flow_discards_the_half_finished_pass(cancel_flag):
         SimpleNamespace(extra_generation_params={}), pp, args
     )
 
-    assert len(calls) == 1
+    assert len(calls) == cancel_at + 1
     assert processed is False
     assert pp.image.tobytes() == before.tobytes()
     assert getattr(state, cancel_flag)
