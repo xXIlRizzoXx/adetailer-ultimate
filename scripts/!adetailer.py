@@ -2009,6 +2009,11 @@ class AfterDetailerScript(scripts.Script):
             # Stop before that happens so the outer sequential pass can still
             # observe cancellation and roll back, and a folder run can stop.
             if state.interrupted or state.skipped:
+                # `processed` may still hold the half-denoised output of the
+                # mask that was just cancelled. Discard the pass, exactly as the
+                # host-returned-no-images path below does, so it never reaches
+                # the final image or a standalone/folder save.
+                processed = None
                 break
             p2.image_mask = masks[j]
             p2.init_images[0] = ensure_pil_image(p2.init_images[0], "RGB")

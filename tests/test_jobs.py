@@ -189,3 +189,33 @@ def test_wired_folder_restarts_after_cancel_and_preserves_new_interrupt(
     assert ("Batch interrupted" if cancel_after_first else "Batch done") in status
     assert host.events == ["begin", "end"]
     assert not host.state.interrupted
+
+
+def test_wired_folder_stops_before_next_file_when_host_requests_stop(
+    host, monkeypatch, tmp_path
+):
+    # AUTOMATIC1111's Interrupt button calls stop_generating() instead of
+    # interrupt() once job_count > 1 (its default "interrupt after current"
+    # option). That sets only stopping_generation. The folder must finish the
+    # current file and stop, not run every remaining file for nothing.
+    for name in ("a.png", "b.png", "c.png"):
+        Image.new("RGB", (8, 8), "white").save(tmp_path / name)
+    calls = []
+
+    def detail(image, _args, save):
+        assert not host.state.stopping_generation
+        calls.append(image)
+        host.state.stopping_generation = True
+        return image, "✅ ADetailer pass complete."
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    _gallery, status = callback(
+        None, str(tmp_path), False, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert len(calls) == 1
+    assert "Batch interrupted" in status
+    assert host.events == ["begin", "end"]
+    assert not host.state.stopping_generation

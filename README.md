@@ -16,14 +16,16 @@
 
 ## First local beta — v26.3.0+plus.7.5.beta.1
 
-**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. All 156 automated checks passed. Browser tests in AUTOMATIC1111 also passed generation, Send to img2img, preset restoration, standalone detailing, folder interruption/restart and queueing behind a folder run. Advanced cross-architecture workflows in Forge Neo still need verification.
+**Beta 1, unreleased, under testing (2026-09-12).** This is the first local beta of the plus.7.5 update, not a stable release. It has not been published on GitHub. All 133 offline regression tests pass, including three fixes made after an independent review; the 27 real-detector tests passed in the earlier run. Browser tests in AUTOMATIC1111 also passed generation, Send to img2img, preset restoration, standalone detailing, folder interruption/restart and queueing behind a folder run. Advanced cross-architecture workflows in Forge Neo still need verification.
 
 - Shifted masks are clipped at image edges; YOLO segmentation masks remove inference padding before resizing, keeping regions aligned on rectangular images.
 - Very large detection-number ranges are limited to the detections that actually exist, avoiding long stalls.
 - Concurrent settings and preset saves preserve other tabs' changes. Failed preset writes are reported, and preset import accepts uploads from both Gradio 3 and Gradio 4.
 - Loading a preset or pasting a tab restores the full configuration, including detector, per-tab enable and class controls. Excluded classes and YOLO-World text are restored together with their visible selection.
 - Manual mode preserves normal generation even with Skip img2img checked. Missing Forge encoder/VAE choices retain the corresponding base module.
-- Standalone images, folder runs and detection previews share the WebUI generation lock. Folder cancellation is preserved between images, and a new run can start after cancellation.
+- Standalone images, folder runs and detection previews share the WebUI generation lock. Interrupt stops a folder run before the next file — including AUTOMATIC1111's default "stop after the current image" — and a new run can start after cancellation.
+- Interrupting or skipping while a region is being inpainted discards that pass instead of keeping a half-finished region.
+- **Reset every tab** now resets every tab on Forge, Forge Neo and reForge too (before, only the first tab was reset there).
 - Windows unit checks and regression coverage have been expanded. Tests that download detector models are marked separately.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.

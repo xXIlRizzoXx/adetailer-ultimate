@@ -1108,7 +1108,14 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 try:
                     from modules import shared as _sh
 
-                    if _sh.state.interrupted or _sh.state.skipped:
+                    # AUTOMATIC1111's Interrupt only sets stopping_generation
+                    # ("stop after the current image") once job_count > 1, which
+                    # a folder run always reaches. Honour it between files.
+                    if (
+                        _sh.state.interrupted
+                        or _sh.state.skipped
+                        or getattr(_sh.state, "stopping_generation", False)
+                    ):
                         interrupted = True
                         break
                 except Exception:  # noqa: BLE001
@@ -1586,17 +1593,23 @@ def _wire_presets(
                     gr.update(value="\U0001F4E5 Paste settings", interactive=False)
                     for _ in range(num_models)
                 ]
-                restored_defaults = _restored_tab_updates(_defaults, attrs, model_mapping)
-                # Flattened tab-major to match all_widget_refs exactly.
-                widget_updates = [
-                    update if i in targets else gr.update()
-                    for i in range(num_models)
-                    for update in restored_defaults[:-1]
-                ]
-                classes_updates = [
-                    restored_defaults[-1] if i in targets else gr.update()
-                    for i in range(num_models)
-                ]
+                # Flattened tab-major to match all_widget_refs exactly. Build the
+                # restored updates separately for EACH target tab: Gradio 4 pops
+                # "value" out of an update dict in place while post-processing
+                # it, so one set of dicts shared by several tabs reaches every
+                # tab after the first without a value and leaves it unchanged.
+                widget_updates = []
+                classes_updates = []
+                for i in range(num_models):
+                    if i in targets:
+                        restored = _restored_tab_updates(
+                            _defaults, attrs, model_mapping
+                        )
+                        widget_updates.extend(restored[:-1])
+                        classes_updates.append(restored[-1])
+                    else:
+                        widget_updates.extend(gr.update() for _ in attrs)
+                        classes_updates.append(gr.update())
                 return [
                     *status_updates,
                     *dd_updates,

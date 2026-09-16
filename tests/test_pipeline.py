@@ -229,3 +229,75 @@ def test_sequential_cancel_stops_next_mask_before_host_can_clear_skip(cancel_fla
     assert processed is False
     assert pp.image.tobytes() == before.tobytes()
     assert getattr(state, cancel_flag)
+
+
+@pytest.mark.parametrize("cancel_flag", ["skipped", "interrupted"])
+def test_cancel_in_ordinary_flow_discards_the_half_finished_pass(cancel_flag):
+    # One tab, two detections, not sequential. The user cancels while the first
+    # mask is being inpainted: the host still hands back that half-denoised
+    # image. It must not reach the final picture (nor a standalone/folder save);
+    # the pass is discarded, as it was before the per-mask cancel check existed.
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    before = Image.new("RGB", (8, 8), "white")
+    partial_result = Image.new("RGB", (8, 8), "red")
+    pp = SimpleNamespace(image=before)
+    calls = []
+
+    def process_images(_p):
+        state.skipped = False
+        calls.append(_p)
+        setattr(state, cancel_flag, True)  # cancelled during this mask
+        return SimpleNamespace(images=[partial_result])
+
+    pred = SimpleNamespace(preview=before)
+    runtime = _load_runtime(
+        state=state, shared=SimpleNamespace(state=state),
+        re=re, time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda image, _mode: image,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[pp.image], prompt="face", close=lambda: None
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [before, before]
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.fix_p2 = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    class Args(SimpleNamespace):
+        def copy(self, update):
+            return Args(**{**vars(self), **update})
+
+    args = Args(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+    )
+
+    processed = script._postprocess_image_inner(
+        SimpleNamespace(extra_generation_params={}), pp, args
+    )
+
+    assert len(calls) == 1
+    assert processed is False
+    assert pp.image.tobytes() == before.tobytes()
+    assert getattr(state, cancel_flag)

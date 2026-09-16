@@ -136,6 +136,36 @@ def test_reset_hides_previous_world_vocabulary_field(callbacks):
     assert result[-1]["value"] == []
 
 
+def test_reset_every_tab_gives_each_tab_its_own_updates(callbacks):
+    # Gradio 4 pops "value" out of an update dict while post-processing it, in
+    # place. An update object shared by two tabs therefore reaches the second
+    # tab empty, and that tab is silently left unchanged. Every target tab must
+    # receive its own update objects, as it did before plus.7.5.
+    tabs = 3
+    preset_widgets = [tuple(Component() for _ in range(9)) for _ in range(tabs)]
+    callbacks["_wire_presets"](
+        [widgets() for _ in range(tabs)], preset_widgets,
+        [Component() for _ in range(tabs)], Component(), tabs,
+    )
+    result = preset_widgets[0][6].callback(True)
+    count = len(ALL_ARGS.attrs)
+    base = 4 * tabs + 1  # status, preset, name and paste per tab + clipboard
+    per_tab = [result[base + t * count: base + (t + 1) * count] for t in range(tabs)]
+    classes = result[base + tabs * count:]
+    assert len(classes) == tabs
+
+    restored = [*(u for tab in per_tab for u in tab), *classes]
+    assert len({id(u) for u in restored}) == len(restored)
+
+    # Consume the outputs in order the way Gradio 4 does.
+    values = [[u.pop("value", "<missing>") for u in tab] for tab in per_tab]
+    class_values = [c.pop("value", "<missing>") for c in classes]
+    assert values[1] == values[0]
+    assert values[2] == values[0]
+    assert values[0][ALL_ARGS.attrs.index("ad_model")] != "<missing>"
+    assert class_values == [[], [], []]
+
+
 def test_mediapipe_face_feature_selection_has_choices(callbacks):
     result = callbacks["on_ad_model_update"](
         MEDIAPIPE_FACE_FEATURES_MODEL, ["eyes"], {}
