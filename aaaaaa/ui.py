@@ -676,6 +676,40 @@ def _class_filter_infotext_fields(
     ]
 
 
+_TAB_PASTE_ATTRS = ("ad_tab_enable", "ad_inpaint_indices")
+
+
+def _tab_infotext_fields(w: Widgets, n: int) -> list[tuple[Any, Any]]:
+    """Paste handlers for tab `n`'s enable flag and detection numbers.
+
+    Infotext never writes "ADetailer tab enable" (it only lists enabled tabs)
+    and leaves out empty inpaint indices, and the WebUI keeps a field
+    unchanged when its key is missing. Extra tabs start disabled, so a pasted
+    tab stayed off and an old detection-number filter stayed in place. When
+    the tab's detector is in the infotext, the tab was enabled and a missing
+    indices key means empty.
+    """
+    names = dict(ALL_ARGS)
+    model_key = names["ad_model"] + suffix(n)
+
+    def pasted(params: dict[str, Any], attr: str) -> bool:
+        return (
+            model_key in params
+            and str(params[model_key]) != "None"
+            and names[attr] + suffix(n) not in _skipped_infotext_keys()
+        )
+
+    def enable(params: dict[str, Any]):
+        return True if pasted(params, "ad_tab_enable") else None
+
+    def indices(params: dict[str, Any]):
+        if not pasted(params, "ad_inpaint_indices"):
+            return None  # leave the field as it is
+        return str(params.get(names["ad_inpaint_indices"] + suffix(n), ""))
+
+    return [(w.ad_tab_enable, enable), (w.ad_inpaint_indices, indices)]
+
+
 def _sync_class_dropdown(selected: list[str] | None, exclude: bool, model: str):
     # World classes live in a separate free-text field. Loading/resetting its
     # empty fixed-class dropdown must never erase that open vocabulary.
@@ -685,12 +719,16 @@ def _sync_class_dropdown(selected: list[str] | None, exclude: bool, model: str):
     return ("" if exclude else csv), (csv if exclude else "")
 
 
-def on_cn_model_update(cn_model_name: str):
+def on_cn_model_update(cn_model_name: str, current_module: str | None = None):
     cn_model_name = cn_model_name.replace("inpaint_depth", "depth")
     for t in cn_module_choices:
         if t in cn_model_name:
             choices = cn_module_choices[t]
-            return gr.update(visible=True, choices=choices, value=choices[0])
+            # Keep a module that fits the model: Load, Paste and infotext
+            # paste set the model and its module together, and this handler
+            # runs after them.
+            value = current_module if current_module in choices else choices[0]
+            return gr.update(visible=True, choices=choices, value=value)
     return gr.update(visible=False, choices=["None"], value="None")
 
 
@@ -1173,7 +1211,16 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             cancelled = 0
             not_saved = 0
             failed = 0
+            run_failed = 0
+            first_error = ""
             interrupted = False
+            # _run's answers that depend only on the tab's settings, so they
+            # are the same for every file: report them instead of a batch.
+            settings_errors = (
+                "⚠️ ADetailer run isn't available",
+                "⚠️ Couldn't read this tab's settings",
+                "⚠️ Pick a detector",
+            )
             for f in files:
                 # The whole folder runs as one host job. Its wrapper clears
                 # stale flags once before entering this loop; an Interrupt/Skip
@@ -1206,7 +1253,11 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                         # <name>-ad.<ext> — originals are kept.
                         img, st = _run(im, False, True, False, *flat)
                         if img is None:
-                            failed += 1
+                            st = st if isinstance(st, str) else ""
+                            if st.startswith(settings_errors):
+                                return (gallery or None), st
+                            run_failed += 1
+                            first_error = first_error or st
                             continue
                         st = st if isinstance(st, str) else ""
                         if st.startswith("ℹ️ Cancelled"):  # cancelled -> not written
@@ -1242,7 +1293,11 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     # guarded end-to-end and never raises.
                     img, st = _run(im, False, True, True, *flat)
                     if img is None:
-                        failed += 1
+                        st = st if isinstance(st, str) else ""
+                        if st.startswith(settings_errors):
+                            return (gallery or None), st
+                        run_failed += 1
+                        first_error = first_error or st
                         continue
                     st = st if isinstance(st, str) else ""
                     # run_detailer_on_image reports "ℹ️ …unchanged" when nothing
@@ -1273,7 +1328,12 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 if same_folder
                 else "saved to the 'ADetailer-Inpaint' folder"
             )
-            head = "⏹️ Batch interrupted" if interrupted else "✅ Batch done"
+            if interrupted:
+                head = "⏹️ Batch interrupted"
+            elif not have and (run_failed or failed):
+                head = "⚠️ Batch failed"
+            else:
+                head = "✅ Batch done"
             scope = f"{have}/{len(files)}" if interrupted else f"{len(files)}"
             status = (
                 f"{head} — {scope} image(s): {saved} detailed and "
@@ -1285,6 +1345,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 status += f", {cancelled} cancelled (left unchanged)"
             if not_saved:
                 status += f", {not_saved} detailed but not saved (see console)"
+            if run_failed:
+                reason = first_error.removeprefix("⚠️").strip().rstrip(".")
+                status += f", {run_failed} failed ({reason} — see console)"
             if failed:
                 status += f", {failed} skipped (unreadable)"
             if have > len(gallery):
@@ -1680,12 +1743,16 @@ def _wire_presets(
                 # "value" out of an update dict in place while post-processing
                 # it, so one set of dicts shared by several tabs reaches every
                 # tab after the first without a value and leaves it unchanged.
+                # "Enable this tab" follows the build default (only the first
+                # tab on), not the schema default, as on a fresh setup.
                 widget_updates = []
                 classes_updates = []
                 for i in range(num_models):
                     if i in targets:
                         restored = _restored_tab_updates(
-                            _defaults, attrs, model_mapping
+                            {**_defaults, "ad_tab_enable": i == 0},
+                            attrs,
+                            model_mapping,
                         )
                         widget_updates.extend(restored[:-1])
                         classes_updates.append(restored[-1])
@@ -1775,8 +1842,9 @@ def one_ui_group(
             # ships Gradio 3, which lacks it — a hard reference crashed the whole
             # ADetailer tab at build there (#2). Fall back to a plain Button so the
             # tab still loads; preset export just isn't one-click-downloadable on
-            # Gradio 3 (everything else, incl. Import, works). The .click wiring
-            # below is harmless on a Button.
+            # Gradio 3 (everything else, incl. Import, works). A Button would
+            # show a returned path as its label, so the export handlers below
+            # only explain the limit there.
             _DownloadButton = getattr(gr, "DownloadButton", None)
             if _DownloadButton is not None:
                 preset_export_btn = _DownloadButton(
@@ -1946,7 +2014,7 @@ def one_ui_group(
     # download automatically and updates the button's `value` so subsequent
     # clicks re-serve the file. UploadButton: upload event yields the path
     # of the uploaded file via the button's `inputs` value.
-    def _do_export() -> str:
+    def _do_export() -> Any:
         """Click handler for the export DownloadButton. Writes the current
         preset library to a temp file and returns its path so Gradio can
         serve the download. Also updates the status line side-effect-free
@@ -1954,6 +2022,10 @@ def one_ui_group(
         import tempfile
         from pathlib import Path
 
+        if _DownloadButton is None:
+            # Gradio 3 fallback Button: a path would become its label and
+            # nothing would download. Leave the button as it is.
+            return gr.update()
         payload = export_presets_json()
         tmp_dir = Path(tempfile.gettempdir())
         out = tmp_dir / "adetailer-ultimate-presets.json"
@@ -1961,6 +2033,12 @@ def one_ui_group(
         return str(out)
 
     def _do_export_status() -> str:
+        if _DownloadButton is None:
+            return (
+                "⚠️ Export as a download needs Gradio 4 (Forge / Forge Neo). "
+                "On this WebUI, back up user_presets.json from the extension "
+                "folder instead."
+            )
         return f"✅ Exported **{len(get_preset_names())}** preset(s)."
 
     def _do_import(uploaded_path: Any, overwrite: bool) -> tuple[Any, str]:
@@ -1970,7 +2048,9 @@ def one_ui_group(
         if not isinstance(uploaded_path, (str, Path)):
             uploaded_path = getattr(uploaded_path, "name", uploaded_path)
         try:
-            with open(uploaded_path, "r", encoding="utf-8") as f:
+            # utf-8-sig: a byte-order mark is accepted, as for the library
+            # file itself (adetailer/json_file.py).
+            with open(uploaded_path, "r", encoding="utf-8-sig") as f:
                 payload = f.read()
         except (OSError, UnicodeError, TypeError) as e:
             return gr.update(), f"_could not read file: {e}_"
@@ -2603,11 +2683,12 @@ def one_ui_group(
     infotext_fields = [
         (getattr(w, attr), name + suffix(n))
         for attr, name in ALL_ARGS
-        if attr not in _CLASS_FILTER_DEFAULTS
+        if attr not in _CLASS_FILTER_DEFAULTS and attr not in _TAB_PASTE_ATTRS
     ]
     infotext_fields.extend(
         _class_filter_infotext_fields(w, n, webui_info.model_mapping)
     )
+    infotext_fields.extend(_tab_infotext_fields(w, n))
 
     preset_widgets = (
         preset_dropdown,
@@ -3183,7 +3264,7 @@ def controlnet(
 
             w.ad_controlnet_model.change(
                 on_cn_model_update,
-                inputs=w.ad_controlnet_model,
+                inputs=[w.ad_controlnet_model, w.ad_controlnet_module],
                 outputs=w.ad_controlnet_module,
                 queue=False,
             )

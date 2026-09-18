@@ -28,7 +28,8 @@ def callbacks():
         "ordinal", "_copyable_attrs", "_wire_copy_paste", "_wire_presets",
         "_restored_tab_updates", "_sync_class_dropdown", "on_ad_model_update",
         "_do_import", "suffix", "_class_filter_infotext_fields",
-        "_skipped_infotext_keys",
+        "_skipped_infotext_keys", "_tab_infotext_fields", "on_cn_model_update",
+        "_do_export", "_do_export_status",
     }
     functions = [
         node for node in ast.walk(source)
@@ -55,6 +56,11 @@ def callbacks():
         }.get(path, []),
         "get_preset_names": lambda: ["saved"],
         "take_recovery_note": lambda: "",
+        "export_presets_json": lambda: '{"saved": {}}',
+        "cn_module_choices": {
+            "inpaint": ["inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"],
+            "openpose": ["openpose", "openpose_face", "openpose_full"],
+        },
     }
     exec(compile(module, str(path), "exec"), namespace)
     return namespace
@@ -167,10 +173,35 @@ def test_reset_every_tab_gives_each_tab_its_own_updates(callbacks):
     # Consume the outputs in order the way Gradio 4 does.
     values = [[u.pop("value", "<missing>") for u in tab] for tab in per_tab]
     class_values = [c.pop("value", "<missing>") for c in classes]
+    # Every tab gets the same values, except "Enable this tab" (only the
+    # first tab starts enabled, as on a fresh setup).
+    enable = ALL_ARGS.attrs.index("ad_tab_enable")
+    assert [tab.pop(enable) for tab in values] == [True, False, False]
     assert values[1] == values[0]
     assert values[2] == values[0]
     assert values[0][ALL_ARGS.attrs.index("ad_model")] != "<missing>"
     assert class_values == [[], [], []]
+
+
+def test_reset_leaves_extra_tabs_disabled_like_a_fresh_setup(callbacks):
+    # A fresh build starts only the first tab enabled. Reset used the schema
+    # default (enabled) for every tab, so all extra tabs came back ticked.
+    tabs = 3
+    preset_widgets = [tuple(Component() for _ in range(9)) for _ in range(tabs)]
+    callbacks["_wire_presets"](
+        [widgets() for _ in range(tabs)], preset_widgets,
+        [Component() for _ in range(tabs)], Component(), tabs,
+    )
+    count = len(ALL_ARGS.attrs)
+    base = 4 * tabs + 1  # status, preset, name and paste per tab + clipboard
+    enable = ALL_ARGS.attrs.index("ad_tab_enable")
+
+    def enabled(result):
+        return [result[base + t * count + enable].get("value") for t in range(tabs)]
+
+    assert enabled(preset_widgets[0][6].callback(True)) == [True, False, False]
+    # Resetting the second tab alone turns it off and leaves the others.
+    assert enabled(preset_widgets[1][6].callback(False)) == [None, False, None]
 
 
 def test_mediapipe_face_feature_selection_has_choices(callbacks):
@@ -234,6 +265,91 @@ def test_import_accepts_gradio_3_and_4_upload_values(callbacks, tmp_path, upload
     assert received == [(payload, True)]
     assert choices["choices"] == ["(none)", "saved"]
     assert "added" in status
+
+
+def test_import_accepts_a_file_with_a_byte_order_mark(callbacks, tmp_path):
+    # Windows editors and PowerShell 5.1 can save UTF-8 with a byte-order
+    # mark; the library reader accepts it, so Import must too.
+    payload = '{"saved":{"ad_model":"animals.pt"}}'
+    uploaded = tmp_path / "presets.json"
+    uploaded.write_bytes(b"\xef\xbb\xbf" + payload.encode("utf-8"))
+    received = []
+
+    def import_payload(value, *, overwrite):
+        received.append(value)
+        return 1, 0, []
+
+    callbacks["import_presets_json"] = import_payload
+    _choices, status = callbacks["_do_import"](str(uploaded), False)
+    assert received == [payload]
+    assert "added" in status
+
+
+def test_export_on_gradio_3_keeps_the_button_label(callbacks, tmp_path, monkeypatch):
+    # Gradio 3 has no DownloadButton: a returned path became the plain
+    # Button's label and "Exported" was reported although nothing downloaded.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    callbacks["_DownloadButton"] = None
+    assert callbacks["_do_export"]() == {}
+    assert list(tmp_path.iterdir()) == []
+    status = callbacks["_do_export_status"]()
+    assert "Exported" not in status
+    assert "Gradio 4" in status
+
+
+def test_export_on_gradio_4_still_serves_the_file(callbacks, tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    callbacks["_DownloadButton"] = object
+    out = tmp_path / "adetailer-ultimate-presets.json"
+    assert callbacks["_do_export"]() == str(out)
+    assert out.read_text(encoding="utf-8") == '{"saved": {}}'
+    assert "Exported" in callbacks["_do_export_status"]()
+
+
+CN_INPAINT = "control_v11p_sd15_inpaint [ebff9138]"
+
+
+@pytest.mark.parametrize(
+    ("model", "module", "expected"),
+    [
+        # Load / Paste / infotext paste set model and module together; the
+        # model's change handler runs afterwards and must keep the module.
+        (CN_INPAINT, "inpaint_only+lama", "inpaint_only+lama"),
+        # A module that does not fit the new model falls back to the first.
+        ("control_v11p_sd15_openpose [cab727d4]", "inpaint_only+lama", "openpose"),
+        (CN_INPAINT, None, "inpaint_global_harmonious"),
+    ],
+)
+def test_controlnet_model_change_keeps_a_fitting_module(
+    callbacks, model, module, expected
+):
+    update = callbacks["on_cn_model_update"](model, module)
+    assert update["visible"] is True
+    assert update["value"] == expected
+
+
+def test_controlnet_model_none_hides_the_module(callbacks):
+    update = callbacks["on_cn_model_update"]("None", "inpaint_only")
+    assert (update["visible"], update["value"]) == (False, "None")
+
+
+def test_controlnet_model_change_reads_the_current_module():
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "change"
+        and node.args
+        and getattr(node.args[0], "id", "") == "on_cn_model_update"
+    ]
+    assert len(calls) == 1
+    inputs = next(k.value for k in calls[0].keywords if k.arg == "inputs")
+    assert isinstance(inputs, ast.List)
+    assert [e.attr for e in inputs.elts] == [
+        "ad_controlnet_model", "ad_controlnet_module"
+    ]
 
 
 def _paste(fields, params):
@@ -336,5 +452,94 @@ def test_each_tab_registers_the_class_filter_paste_handlers():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert "_class_filter_infotext_fields" in calls
+    assert "_tab_infotext_fields" in calls
     source = ast.get_source_segment(path.read_text(encoding="utf-8"), group)
     assert "if attr not in _CLASS_FILTER_DEFAULTS" in source
+    # Each widget is pasted once: by its callable handler, not its label too.
+    assert "and attr not in _TAB_PASTE_ATTRS" in source
+    attrs = next(
+        node.value for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", "") == "_TAB_PASTE_ATTRS" for t in node.targets)
+    )
+    assert ast.literal_eval(attrs) == ("ad_tab_enable", "ad_inpaint_indices")
+
+
+@pytest.mark.parametrize(
+    ("tab", "params", "expected"),
+    [
+        # Tab 2 is in the image: it was enabled, and no indices means none.
+        (1, {"ADetailer model": "face.pt", "ADetailer model 2nd": "hand.pt"}, (True, "")),
+        (
+            1,
+            {"ADetailer model 2nd": "hand.pt", "ADetailer inpaint indices 2nd": "1,3"},
+            (True, "1,3"),
+        ),
+        (0, {"ADetailer model": "face.pt"}, (True, "")),
+        # Tab 3 is not in the image: leave it as it is.
+        (2, {"ADetailer model": "face.pt", "ADetailer model 2nd": "hand.pt"}, (None, None)),
+        (1, {"ADetailer model": "face.pt"}, (None, None)),
+    ],
+)
+def test_png_info_paste_enables_the_tab_and_clears_old_indices(
+    callbacks, tab, params, expected
+):
+    w = widgets()
+    fields = callbacks["_tab_infotext_fields"](w, tab)
+    assert [c for c, _ in fields] == [w.ad_tab_enable, w.ad_inpaint_indices]
+    pasted = _paste(fields, params)
+    assert (pasted[w.ad_tab_enable], pasted[w.ad_inpaint_indices]) == expected
+
+
+def test_png_info_paste_of_a_two_tab_image_runs_the_second_pass(callbacks):
+    # Real infotext for an image made with two enabled tabs. It never lists
+    # "tab enable" and leaves out empty indices, and the WebUI keeps a field
+    # whose key is missing, so tab 2 (off by default) stayed off and an old
+    # "2" in its indices field stayed in place.
+    from adetailer.args import ADetailerArgs
+
+    params = {
+        **ADetailerArgs(ad_model="face.pt").extra_params(),
+        **ADetailerArgs(ad_model="hand.pt", ad_prompt="detailed hand").extra_params(
+            suffix=" 2nd"
+        ),
+    }
+    params = {k: str(v) for k, v in params.items()}  # parsed from text
+    assert "ADetailer tab enable 2nd" not in params
+    assert "ADetailer inpaint indices 2nd" not in params
+
+    w = widgets()
+    fields = [
+        (getattr(w, attr), name + " 2nd")
+        for attr, name in ALL_ARGS
+        if attr in ("ad_model", "ad_prompt")
+    ]
+    fields.extend(callbacks["_tab_infotext_fields"](w, 1))
+    pasted = _paste(
+        [(c, k if callable(k) else (lambda p, k=k: p.get(k))) for c, k in fields],
+        params,
+    )
+    tab = {"ad_tab_enable": False, "ad_inpaint_indices": "2"}  # before pasting
+    tab.update(
+        (attr, pasted[getattr(w, attr)])
+        for attr in ("ad_model", "ad_prompt", "ad_tab_enable", "ad_inpaint_indices")
+        if pasted[getattr(w, attr)] is not None
+    )
+    args = ADetailerArgs(**tab)
+    assert args.ad_model == "hand.pt"
+    assert not args.need_skip()
+    assert args.ad_inpaint_indices == ""
+
+
+def test_png_info_paste_leaves_tab_fields_the_user_disregards(callbacks, monkeypatch):
+    modules = ModuleType("modules")
+    modules.shared = SimpleNamespace(
+        opts=SimpleNamespace(infotext_skip_pasting=["ADetailer inpaint indices 2nd"])
+    )
+    monkeypatch.setitem(sys.modules, "modules", modules)
+    w = widgets()
+    pasted = _paste(
+        callbacks["_tab_infotext_fields"](w, 1), {"ADetailer model 2nd": "hand.pt"}
+    )
+    assert pasted[w.ad_tab_enable] is True
+    assert pasted[w.ad_inpaint_indices] is None

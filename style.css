@@ -52,7 +52,7 @@ button[id*="adetailer_ad_preset_import_btn"] {
     padding-right: 12px !important;
 }
 
-/* ---------- Section labels — bright white, small uppercase ---------- */
+/* ---------- Section labels — small uppercase, bright white in dark mode ---------- */
 .ad-section-label,
 .ad-section-label p {
     margin: 6px 0 2px 0 !important;
@@ -61,13 +61,19 @@ button[id*="adetailer_ad_preset_import_btn"] {
     font-weight: 600 !important;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: #ffffff !important;
     opacity: 1 !important;
 }
 
-/* ---------- Brighten placeholder text in our textboxes ---------- */
-[id*="adetailer_ad_preset_name"] textarea::placeholder,
-.ad-prompt-row textarea::placeholder {
+/* White only on the dark theme (Gradio 3 and 4 set .dark there): on the light
+ * theme it was white on white, so the theme's own colours apply instead. */
+.dark .ad-section-label,
+.dark .ad-section-label p {
+    color: #ffffff !important;
+}
+
+/* ---------- Brighten placeholder text in our textboxes (dark theme) ---------- */
+.dark [id*="adetailer_ad_preset_name"] textarea::placeholder,
+.dark .ad-prompt-row textarea::placeholder {
     color: rgba(255, 255, 255, 0.78) !important;
     opacity: 1 !important;
 }
@@ -92,6 +98,11 @@ button[id*="adetailer_ad_preset_import_btn"] {
 div.block.ad-preset-preview:has(.md:empty),
 div.block.ad-preset-status:has(.md:empty),
 div.block.ad-preview-status:has(.md:empty) {
+    display: none !important;
+}
+
+/* A preset / IO status hidden by preset-status-fade.js after ~4 s. */
+div.block.ad-preset-status.ad-status-faded {
     display: none !important;
 }
 
@@ -304,6 +315,16 @@ div[id*="adetailer_ad_version"].ad-version-overlay {
     padding: 0 !important;
     border: 0 !important;
     background: transparent !important;
+}
+
+/* Gradio 3 (AUTOMATIC1111) repeats elem_id/elem_classes on the inner .prose
+ * div. Keep that copy in normal flow so the badge is offset only once; offset
+ * twice, it sat above the header (clipped, or over the control above). Gradio
+ * 4's inner div has no id, so this matches nothing there. */
+div.prose[id*="adetailer_ad_version"].ad-version-overlay {
+    position: static !important;
+    top: auto !important;
+    right: auto !important;
 }
 
 div[id*="adetailer_ad_version"].ad-version-overlay p {

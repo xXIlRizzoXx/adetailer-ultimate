@@ -32,6 +32,9 @@ _PRESETS_LOCK = RLock()
 # need to be airtight; this is just to keep the JSON keys + dropdown labels
 # sane.
 _VALID_NAME = re.compile(r"^[\w\- .,()\[\]+!?@#&]{1,80}$")
+# The dropdowns' "no preset selected" entry (PRESET_NONE in aaaaaa/ui.py). A
+# preset with this name could never be loaded, renamed or deleted in the UI.
+_RESERVED_NAME = "(none)"
 
 
 def _read_raw() -> tuple[dict[str, Any] | None, bool]:
@@ -101,7 +104,11 @@ def get_preset_names() -> list[str]:
 
 def is_valid_name(name: str) -> bool:
     """Whether `name` is acceptable as a preset key."""
-    return bool(name) and bool(_VALID_NAME.match(name.strip()))
+    return (
+        bool(name)
+        and bool(_VALID_NAME.match(name.strip()))
+        and name.strip() != _RESERVED_NAME
+    )
 
 
 def save_preset(name: str, state: dict[str, Any]) -> bool:

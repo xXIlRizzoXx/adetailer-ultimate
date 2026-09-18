@@ -80,6 +80,36 @@ def test_import_keeps_conflicts_unless_overwrite_requested(preset_file):
     assert presets.get_preset("original") == {"ad_prompt": "replace me"}
 
 
+def test_dropdown_placeholder_name_is_reserved(preset_file):
+    # "(none)" is the dropdowns' "no preset selected" entry: a preset with that
+    # name could be saved but never loaded, renamed or deleted in the UI.
+    assert not presets.is_valid_name("(none)")
+    assert not presets.is_valid_name(" (none) ")
+    assert not presets.save_preset("(none)", {"ad_prompt": "face"})
+    assert presets.save_preset("faces", {"ad_prompt": "face"})
+    assert presets.rename_preset("faces", "(none)") == (False, "invalid name '(none)'")
+    payload = '{"(none)": {"ad_prompt": "face"}}'
+    assert presets.import_presets_json(payload, overwrite=True) == (0, 0, ["(none)"])
+    assert presets.get_preset_names() == ["faces"]
+    # Parentheses stay allowed in ordinary names.
+    assert presets.is_valid_name("face (close-up)")
+
+
+def test_reserved_name_matches_the_ui_placeholder():
+    import ast
+    from pathlib import Path
+
+    ui = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(ui.read_text(encoding="utf-8"))
+    placeholder = next(
+        node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", "") == "PRESET_NONE" for t in node.targets)
+    )
+    assert placeholder == presets._RESERVED_NAME
+
+
 def test_unreadable_encoding_does_not_break_ui_startup(preset_file):
     preset_file.write_bytes(b"\xff\xfe{\x00}\x00")
     assert presets.load_presets() == {}

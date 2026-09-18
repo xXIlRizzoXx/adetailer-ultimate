@@ -21,16 +21,18 @@
  * millisecond later already carries the correct value.
  *
  * The Python `.change` sync is intentionally LEFT IN PLACE as a backstop: it
- * computes the exact same CSV, so it can only ever confirm what we wrote. If
+ * computes the same CSV from the real values, so it confirms what we wrote. If
  * this script is disabled, or the DOM shape is one we don't recognise, behaviour
  * degrades to exactly what it is today — never worse.
  *
  * SAFETY
  * ------
  * A wrong write would be worse than the bug, so every path bails out rather than
- * guesses: unknown dropdown DOM (no `.wrap-inner`), an unreadable token, or a
- * missing "Exclude selected" checkbox (which decides WHICH hidden field receives
- * the CSV) all mean "don't write" — the server sync then handles it as before.
+ * guesses: unknown dropdown DOM (no `.wrap-inner`), an unreadable token, a token
+ * whose text the WebUI's localization may have replaced (a translated word is
+ * not a class name), or a missing "Exclude selected" checkbox (which decides
+ * WHICH hidden field receives the CSV) all mean "don't write" — the server sync
+ * then handles it as before.
  *
  * Pure client-side DOM: no Gradio components and no Python-side event listeners
  * are added, so fn_index / dependency ordering is untouched — index-safe. Works
@@ -52,6 +54,26 @@
         return box ? box.querySelector("textarea, input") : null;
     }
 
+    // Text the WebUI's localization.js may have written over a token's label:
+    // every translation (window.localization value) whose key is different.
+    // Built once; the dictionary does not change while the page is open.
+    let translatedLabels = null;
+    function isTranslatedLabel(label) {
+        if (translatedLabels === null) {
+            translatedLabels = new Set();
+            const l10n = window.localization;
+            if (l10n && typeof l10n === "object") {
+                for (const key in l10n) {
+                    const value = l10n[key];
+                    if (typeof value === "string" && value.trim() !== key.trim()) {
+                        translatedLabels.add(value.trim());
+                    }
+                }
+            }
+        }
+        return translatedLabels.has(label);
+    }
+
     // Read the selected class names out of a multi-select. Returns null — meaning
     // "I don't understand this DOM, do not write anything" — rather than risking a
     // wrong value. `.wrap-inner` is the multi-select marker on both Gradio 3 and 4;
@@ -69,6 +91,9 @@
             for (let j = 0; j < remove.length; j += 1) remove[j].remove();
             const label = (clone.textContent || "").trim();
             if (!label) return null; // a token we can't read → bail entirely
+            // Possibly a translation, not the real class name: leave the write
+            // to the Python sync, which uses the real value.
+            if (isTranslatedLabel(label)) return null;
             out.push(label);
         }
         return out;

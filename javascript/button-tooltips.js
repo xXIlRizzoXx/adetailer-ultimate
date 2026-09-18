@@ -66,7 +66,12 @@
             const candidates = document.querySelectorAll(
                 `[id*="${idFragment}"]`
             );
+            // The id must END with the fragment plus an optional tab suffix
+            // (_2nd, _3rd, _11th, …): "..._ad_preset_reset" must not also
+            // match the "Reset every tab" checkbox "..._ad_preset_reset_all".
+            const exactId = new RegExp(idFragment + "(_\\d+(st|nd|rd|th))?$");
             for (const el of candidates) {
+                if (!exactId.test(el.id)) continue;
                 // Prefer the inner <button> if the matched element is a
                 // wrapper (cases where Gradio nests the actual click target).
                 const target =
