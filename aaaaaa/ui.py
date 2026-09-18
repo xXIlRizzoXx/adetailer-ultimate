@@ -481,12 +481,13 @@ def on_ad_model_update(
 ):
     """Return updates for (textbox, dropdown, exclude-checkbox, excluded-textbox).
 
-    The dropdown and exclude checkbox stay always visible so the layout is
+    The dropdown and exclude checkbox stay visible so the layout is
     predictable across model changes. They're populated with the model's
     class names when applicable, empty otherwise.
 
     - YOLO-World: ALSO shows the free-text textbox (open-vocabulary),
-      preserving values restored by presets or PNG infotext.
+      preserving values restored by presets or PNG infotext. The exclude
+      checkbox is hidden and off: World always detects the typed classes.
     - Other multiclass YOLO: dropdown populated from model.names. Any
       current selections that are still valid in the new model are
       preserved — this is what lets Copy/Paste between tabs keep the
@@ -517,7 +518,7 @@ def on_ad_model_update(
                 placeholder="Comma separated class names to detect, ex: 'person,cat'. default: COCO 80 classes",
             ),
             gr.update(visible=True, choices=[], value=[]),
-            gr.update(visible=True, value=current_exclude),
+            gr.update(visible=False, value=False),
             gr.update(value=current_excluded or ""),
         )
 
@@ -598,7 +599,10 @@ def _restored_tab_updates(
         updates["ad_model_classes"] = gr.update(
             value=state.get("ad_model_classes", ""), visible=world
         )
-        updates["ad_model_classes_exclude"] = gr.update(value=exclude, visible=True)
+        # YOLO-World has no NOT mode: keep its checkbox hidden and off.
+        updates["ad_model_classes_exclude"] = gr.update(
+            value=exclude and not world, visible=not world
+        )
         updates["ad_model_classes_excluded"] = gr.update(
             value=state.get("ad_model_classes_excluded", "")
         )
@@ -653,7 +657,10 @@ def _class_filter_infotext_fields(
                 continue
             value = params.get(key, default)
             if attr == "ad_model_classes_exclude":
-                value = str(value).strip().lower() == "true"
+                # YOLO-World has no NOT mode: its checkbox stays off.
+                value = str(value).strip().lower() == "true" and (
+                    "-world" not in state["ad_model"]
+                )
             state[attr] = value
         return state
 
@@ -2239,10 +2246,12 @@ def one_ui_group(
             )
 
         with gr.Row(variant="compact", elem_classes=["ad-2up-row"]):
+            # Hidden and off for a saved YOLO-World detector, which has no NOT
+            # mode (mirrors on_ad_model_update's world branch).
             w.ad_model_classes_exclude = gr.Checkbox(
                 label="Exclude selected (NOT)" + suffix(n),
-                value=sv("ad_model_classes_exclude", False),
-                visible=True,
+                value=sv("ad_model_classes_exclude", False) and not _is_world_saved,
+                visible=not _is_world_saved,
                 elem_id=eid("ad_model_classes_exclude"),
             )
             w.ad_classes_sequential = gr.Checkbox(

@@ -543,3 +543,85 @@ def test_png_info_paste_leaves_tab_fields_the_user_disregards(callbacks, monkeyp
     )
     assert pasted[w.ad_tab_enable] is True
     assert pasted[w.ad_inpaint_indices] is None
+
+
+# YOLO-World detects the typed classes and has no NOT mode: its "Exclude
+# selected (NOT)" checkbox must be hidden and off, never a visible promise of
+# an inversion that does not happen. Other detectors keep NOT mode.
+_WORLD_NOT = {
+    "ad_model": "custom-world.pt",
+    "ad_model_classes": "person",
+    "ad_model_classes_exclude": True,
+    "ad_model_classes_excluded": "hand",
+}
+_FIXED_NOT = {
+    "ad_model": "animals.pt",
+    "ad_model_classes": "",
+    "ad_model_classes_exclude": True,
+    "ad_model_classes_excluded": "dog",
+}
+
+
+@pytest.mark.parametrize(
+    ("state", "shown"), [(_WORLD_NOT, False), (_FIXED_NOT, True)]
+)
+def test_detector_change_hides_not_mode_for_yolo_world(callbacks, state, shown):
+    result = callbacks["on_ad_model_update"](
+        state["ad_model"], [], {"animals.pt": "animals.pt"},
+        current_include=state["ad_model_classes"],
+        current_exclude=True,
+        current_excluded=state["ad_model_classes_excluded"],
+    )
+    assert result[2] == {"visible": shown, "value": shown}
+    assert result[3]["value"] == state["ad_model_classes_excluded"]
+    if not shown:
+        assert result[0]["value"] == "person"  # the typed vocabulary is kept
+
+
+@pytest.mark.parametrize(
+    ("state", "shown"), [(_WORLD_NOT, False), (_FIXED_NOT, True)]
+)
+def test_load_and_paste_hide_not_mode_for_yolo_world(callbacks, state, shown):
+    attrs = list(ALL_ARGS.attrs)
+    restored = dict(
+        zip(
+            attrs,
+            callbacks["_restored_tab_updates"](
+                state, attrs, {"animals.pt": "animals.pt"}
+            )[:-1],
+        )
+    )
+    assert restored["ad_model_classes_exclude"] == {"visible": shown, "value": shown}
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"), [("custom-world.pt", False), ("animals.pt", True)]
+)
+def test_png_info_paste_leaves_not_mode_off_for_yolo_world(callbacks, model, expected):
+    w = widgets()
+    fields = callbacks["_class_filter_infotext_fields"](w, 0, {"animals.pt": "animals.pt"})
+    pasted = _paste(
+        fields,
+        {"ADetailer model": model, "ADetailer classes exclude": "True",
+         "ADetailer model classes": "person"},
+    )
+    assert pasted[w.ad_model_classes_exclude] is expected
+
+
+@pytest.mark.parametrize(("world", "shown"), [(True, False), (False, True)])
+def test_saved_yolo_world_tab_starts_with_not_mode_hidden(world, shown):
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    checkbox = next(
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "attr", "") == "ad_model_classes_exclude"
+    )
+    keywords = {k.arg: k.value for k in checkbox.keywords}
+    namespace = {"sv": lambda attr, default: True, "_is_world_saved": world}
+
+    def evaluate(node):
+        return eval(compile(ast.Expression(node), str(path), "eval"), namespace)
+
+    assert evaluate(keywords["visible"]) is shown
+    assert evaluate(keywords["value"]) is shown

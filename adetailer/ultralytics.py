@@ -116,8 +116,16 @@ def ultralytics_predict(
     try:
         _names = get_model_class_names(str(model_path))
         _cids = pred[0].boxes.cls.cpu().numpy().astype(int).tolist()
+        # No names for YOLO-World (or a model whose names could not be looked
+        # up): use the result's own vocabulary, which follows set_classes.
+        _result_names = None if _names else getattr(pred[0], "names", None)
+        if isinstance(_result_names, (list, tuple)):
+            _result_names = dict(enumerate(_result_names))
+        if not isinstance(_result_names, dict):
+            _result_names = {}
         class_names = [
-            _names[c] if 0 <= c < len(_names) else str(c) for c in _cids
+            _names[c] if 0 <= c < len(_names) else str(_result_names.get(c, c))
+            for c in _cids
         ]
     except Exception:  # noqa: BLE001
         class_names = []

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -76,8 +75,59 @@ def _names_from_json(data: Any) -> list[str]:
     return result
 
 
-@lru_cache(maxsize=32)
+def _host_refuses_unpickle() -> bool:
+    """True while the WebUI refuses to unpickle model classes: AUTOMATIC1111's
+    safe-unpickle check (also in classic Forge / reForge) is on and not
+    bypassed. Detection bypasses it; the UI's class lookups do not. False on
+    hosts without the check (Forge Neo) and outside a WebUI."""
+    try:
+        from modules import shared
+
+        return getattr(shared.cmd_opts, "disable_safe_unpickle", True) is False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Class names read successfully, per model path, kept for the session.
+_RESOLVED_NAMES: dict[str, list[str]] = {}
+# Models the host's safe-unpickle check refused outside detection. Remembered
+# so the UI does not repeat the host's error report on every lookup.
+_REFUSED_PATHS: set[str] = set()
+
+
 def get_model_class_names(model_path: str) -> list[str]:
+    """Resolve class names for a YOLO model (see _read_class_names).
+
+    Only names that were found are cached. On AUTOMATIC1111 the UI looks them
+    up with the host's safe-unpickle check on, which refuses a .pt without a
+    sidecar; detection bypasses the check, so its lookup must still read the
+    real names instead of reusing the UI's empty result (which would silently
+    ignore a class filter). Names found once are then reused everywhere.
+    """
+    names = _RESOLVED_NAMES.get(model_path)
+    if names:
+        return names
+    refused = _host_refuses_unpickle()
+    if refused and model_path in _REFUSED_PATHS:
+        return []
+    names = _read_class_names(model_path)
+    if names:
+        _RESOLVED_NAMES[model_path] = names
+    elif refused:
+        _REFUSED_PATHS.add(model_path)
+    return names
+
+
+def _clear_class_name_cache() -> None:
+    _RESOLVED_NAMES.clear()
+    _REFUSED_PATHS.clear()
+
+
+# Keeps the reset hook of the lru_cache this replaced.
+get_model_class_names.cache_clear = _clear_class_name_cache  # type: ignore[attr-defined]
+
+
+def _read_class_names(model_path: str) -> list[str]:
     """Resolve class names for a YOLO model.
 
     Resolution order:
@@ -112,8 +162,11 @@ def get_model_class_names(model_path: str) -> list[str]:
         if not sidecar.is_file():
             continue
         try:
-            data = json.loads(sidecar.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            # Bytes let json detect UTF-8 (with or without a byte-order mark)
+            # and UTF-16/32, as Windows editors and PowerShell write them. An
+            # undecodable file falls through like a malformed one.
+            data = json.loads(sidecar.read_bytes())
+        except (ValueError, OSError):
             data = None
         if data is not None:
             names = _names_from_json(data)

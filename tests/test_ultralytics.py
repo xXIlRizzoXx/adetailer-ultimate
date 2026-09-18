@@ -1,10 +1,18 @@
+import sys
+from types import ModuleType
+
 import numpy as np
 import pytest
 import torch
 from huggingface_hub import hf_hub_download
 from PIL import Image
 
-from adetailer.classes import _names_from_json, parse_csv, resolve_class_ids
+from adetailer.classes import (
+    _names_from_json,
+    get_model_class_names,
+    parse_csv,
+    resolve_class_ids,
+)
 from adetailer.ultralytics import mask_to_pil, ultralytics_predict
 
 
@@ -154,6 +162,83 @@ def test_resolve_class_ids_with_known_model():
     ids = resolve_class_ids(model_path, ["person", "0", "unknown"])
     assert 0 in ids
     assert all(isinstance(i, int) for i in ids)
+
+
+class _FakeBoxes:
+    def __init__(self, cls):
+        n = len(cls)
+        self.xyxy = torch.tensor([[1.0, 1.0, 3.0, 3.0]] * n)
+        self.conf = torch.tensor([0.9] * n)
+        self.cls = torch.tensor(cls)
+
+    def __len__(self):
+        return len(self.cls)
+
+
+class _FakeResult:
+    def __init__(self, names, cls):
+        self.names = names
+        self.boxes = _FakeBoxes(cls)
+        self.masks = None
+
+    def plot(self):
+        return np.zeros((4, 4, 3), np.uint8)
+
+
+def _fake_yolo(monkeypatch, cls, names):
+    """Fake Ultralytics model returning one result with boxes of class ids
+    `cls`. Like YOLO-World, set_classes replaces its vocabulary, which the
+    result reports as `names`."""
+    module = ModuleType("ultralytics")
+
+    class YOLO:
+        def __init__(self, path):
+            self.names = names
+
+        def set_classes(self, classes):
+            self.names = list(classes)
+
+        def __call__(self, image, **kwargs):
+            return [_FakeResult(self.names, cls)]
+
+    module.YOLO = YOLO
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+
+
+@pytest.mark.parametrize(
+    ("classes", "cls", "expected"),
+    [
+        # No typed classes: the model's own vocabulary names the regions.
+        ("", [1.0, 0.0], ["bicycle", "person"]),
+        # Typed classes: the region carries the typed name, so inline
+        # [CLASS=hand] blocks and [SKIP] match it.
+        ("face, hand", [1.0], ["hand"]),
+    ],
+)
+def test_world_regions_are_named_after_their_classes(
+    tmp_path, monkeypatch, classes, cls, expected
+):
+    _fake_yolo(monkeypatch, cls, {0: "person", 1: "bicycle"})
+    model = tmp_path / "yolov8x-worldv2.pt"
+
+    result = ultralytics_predict(str(model), Image.new("RGB", (4, 4)), classes=classes)
+
+    assert result.class_names == expected
+
+
+def test_looked_up_class_names_still_win_over_the_result(tmp_path, monkeypatch):
+    model = tmp_path / "multi.pt"
+    model.write_bytes(b"x")
+    (tmp_path / "multi.names.json").write_text('["face", "hand"]', encoding="utf-8")
+    _fake_yolo(monkeypatch, [1.0, 5.0], {0: "other", 1: "thing"})
+    get_model_class_names.cache_clear()
+    try:
+        result = ultralytics_predict(str(model), Image.new("RGB", (4, 4)))
+    finally:
+        get_model_class_names.cache_clear()
+
+    # An id outside the looked-up names stays numeric, as before.
+    assert result.class_names == ["hand", "5"]
 
 
 class TestMaskToPil:

@@ -162,6 +162,11 @@ def mask_preprocess(
     if len(merged) != len(masks):
         # Merge / Merge-and-Invert collapsed every surviving mask into one.
         groups = [[i for g in groups for i in g]] if merged else []
+    if len(merged) == 1 and is_all_black(merged[0]):
+        # Merge and Invert of detections that fill the whole frame leaves
+        # nothing to inpaint. The host treats a blank mask as "no mask" and
+        # would repaint the entire image, so return no mask at all.
+        return [], []
     return merged, groups
 
 

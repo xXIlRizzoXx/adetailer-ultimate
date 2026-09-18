@@ -114,6 +114,43 @@ def test_offset_drops_all_off_canvas_masks():
     assert mask_preprocess([mask], x_offset=10) == ([], [])
 
 
+def _box_mask(box):
+    mask = Image.new("L", (10, 10), 0)
+    ImageDraw.Draw(mask).rectangle(box, fill=255)
+    return mask
+
+
+@pytest.mark.parametrize(
+    ("boxes", "kernel"),
+    [
+        ([(0, 0, 9, 9)], 4),  # a box clamped to the whole frame
+        ([(0, 0, 9, 9)], 0),
+        ([(1, 1, 8, 8)], 4),  # dilation fills the last pixels
+        ([(0, 0, 4, 9), (5, 0, 9, 9)], 0),  # two halves cover the frame
+    ],
+)
+def test_merge_invert_of_detections_filling_the_frame_inpaints_nothing(
+    boxes, kernel
+):
+    # The inverted mask would be blank, and the host repaints the whole image
+    # for a blank mask instead of nothing.
+    masks = [_box_mask(box) for box in boxes]
+
+    assert mask_preprocess(
+        masks, kernel=kernel, merge_invert="Merge and Invert"
+    ) == ([], [])
+
+
+def test_merge_invert_keeps_the_background_around_detections():
+    masks = [_box_mask((0, 0, 4, 9)), _box_mask((5, 0, 8, 9))]
+
+    processed, groups = mask_preprocess(masks, merge_invert="Merge and Invert")
+
+    assert len(processed) == 1
+    assert processed[0].getbbox() == (9, 0, 10, 10)
+    assert groups == [[0, 1]]
+
+
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
