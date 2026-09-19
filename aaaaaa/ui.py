@@ -266,17 +266,17 @@ Use different settings **only** for the detail pass; each is off (inherits the m
 Two sibling tools live inside each tab's **Detection** section (roughly the middle of the tab, above Mask preprocessing):
 - **Detection preview** — drop an image to see what the detector would find (boxes), without generating. The single-tab preview honours this tab's **Detection resolution**. **Combine all tabs** overlays every tab's detector at once (that combined view stays at the default resolution).
 - **Run ADetailer on an image** — drop a finished image and run the full detect + inpaint pass on it, without regenerating. Optional **Save result to outputs** writes to a dedicated `ADetailer-Inpaint` folder; click the result to enlarge it.
-- **Batch a whole folder (new)** — paste a **folder path** in that same tool to detail every image inside it in one go; each result is always saved to the `ADetailer-Inpaint` folder. A folder path takes priority over a single dropped image.
+- **Batch a whole folder (new)** — paste a **folder path** in that same tool to detail every image inside it in one go; each result is always saved: to the `ADetailer-Inpaint` folder or, with **📁 Save results in the source folder instead** ticked, beside each source image as `name-ad` (a new file — originals are never overwritten; `name-ad-1`, `name-ad-2`… if the name is taken). A folder path takes priority over a single dropped image.
 """,
     ),
     (
         "💾 Presets, copy/paste & saving",
         """
-- **Preset library** — save / load / rename / delete a whole tab's settings by name; **export / import** the library as a file to move it between machines.
+- **Preset library** — save / load / rename / delete a whole tab's settings by name; **export / import** the library as a file to move it between machines (on AUTOMATIC1111, which ships Gradio 3, Export cannot download a file: back up `user_presets.json` from the extension folder instead; Import works everywhere).
 - **Copy settings / Paste settings** — clone one tab's settings into another.
 - **Remember last-used settings between restarts** (`Settings → ADetailer`) — restore your last setup after a restart.
 - **Reset ADetailer settings** (`Settings → ADetailer`) — restore factory defaults.
-- **Where files go** — intermediate step/preview files land in an `adetailer-steps/` sub-folder; the standalone *Run/Batch* results go in a top-level `ADetailer-Inpaint/` folder next to your normal outputs.
+- **Where files go** — intermediate step/preview files land in an `adetailer-steps/` sub-folder; the standalone *Run/Batch* results go in a top-level `ADetailer-Inpaint/` folder next to your normal outputs, unless a folder batch uses *Save results in the source folder instead*, which writes beside each source image.
 """,
     ),
     (
@@ -538,8 +538,17 @@ def on_ad_model_update(
         else (current_selection or [])
     )
     # Preserve requested values if metadata could not be read; silently
-    # erasing the filter would mean "detect every class".
-    preserved = [s for s in requested if not names or s in names]
+    # erasing the filter would mean "detect every class". A name in another
+    # case maps to the model's own name, as in resolve_class_ids (an exact
+    # match wins; a name matching several classes is dropped).
+    folded = [n.casefold() for n in names]
+    preserved = list(
+        dict.fromkeys(
+            s if not names or s in names else names[folded.index(s.casefold())]
+            for s in requested
+            if not names or s in names or folded.count(s.casefold()) == 1
+        )
+    )
     # Also feed the preserved classes into the hidden backing textbox.
     # Keep the backing field in the same response as the dropdown so it
     # does not have to wait for a subsequent `.change` callback. Without this the
@@ -1543,7 +1552,8 @@ def _wire_presets(
     name_box, save_btn, reset_btn, status_md, reset_all_cb).
 
     Saving / deleting / renaming from any tab refreshes ALL tabs'
-    dropdown choices. Load applies a saved preset to THIS tab's widgets
+    dropdown choices; each other tab keeps its selection.
+    Load applies a saved preset to THIS tab's widgets
     (including the UI-only classes dropdown). Reset rolls widgets back to
     their pydantic defaults AND clears the preset+clipboard state for a
     fresh start — for this tab alone, or for every tab when that tab's
@@ -1572,17 +1582,29 @@ def _wire_presets(
         if a in ADetailerArgs.__fields__
     }
 
-    def _refresh_dropdowns_update(selected: str | None = None) -> list:
+    def _refresh_dropdowns_update(
+        current: list,
+        idx: int | None = None,
+        selected: str | None = None,
+        renamed: tuple[str, str] | None = None,
+    ) -> list:
         # PRESET_NONE is always the first entry so the user has a no-op
         # option to switch the dropdown back to "nothing selected".
+        # Every tab gets the new choices but keeps its own selection (`current`,
+        # one value per tab): only the acting tab `idx` takes `selected`, a tab
+        # showing a renamed preset follows its new name, and a preset that no
+        # longer exists falls back to PRESET_NONE.
         names = [PRESET_NONE] + get_preset_names()
-        return [
-            gr.update(
-                choices=names,
-                value=(selected if selected in names else PRESET_NONE),
+        updates = []
+        for i, value in enumerate(current):
+            if renamed and value == renamed[0]:
+                value = renamed[1]
+            if i == idx and selected is not None:
+                value = selected
+            updates.append(
+                gr.update(choices=names, value=(value if value in names else PRESET_NONE))
             )
-            for _ in range(num_models)
-        ]
+        return updates
 
     def _is_none(selected: str | None) -> bool:
         return not selected or selected == PRESET_NONE
@@ -1618,9 +1640,13 @@ def _wire_presets(
                         *(gr.update() for _ in range(n_attrs)),
                         gr.update(),
                     ]
+                # A preset saved by an older version lacks the settings added
+                # since: those take their defaults instead of keeping the tab's
+                # current values. "Enable this tab" is left as it is.
+                filled = {a: v for a, v in _defaults.items() if a != "ad_tab_enable"}
                 return [
                     f"✅ Loaded '{selected}'.",
-                    *_restored_tab_updates(preset, attrs, model_mapping),
+                    *_restored_tab_updates({**filled, **preset}, attrs, model_mapping),
                 ]
 
             return _load
@@ -1633,16 +1659,18 @@ def _wire_presets(
         )
 
         # SAVE: capture current widget values and write a new preset. Refresh
-        # every tab's dropdown so the preset becomes selectable everywhere.
+        # every tab's dropdown so the preset becomes selectable everywhere; the
+        # other tabs keep their selection (every dropdown is also an input).
         def _make_save(idx: int):
             def _save(name: str, *values):
+                values, current = values[: len(attrs)], values[len(attrs) :]
                 name = (name or "").strip()
                 if not name:
-                    return ["⚠️ Enter a preset name first.", *_refresh_dropdowns_update()]
+                    return ["⚠️ Enter a preset name first.", *_refresh_dropdowns_update(current)]
                 if not is_valid_name(name):
                     return [
                         f"⚠️ Invalid preset name '{name}'.",
-                        *_refresh_dropdowns_update(),
+                        *_refresh_dropdowns_update(current),
                     ]
                 state_dict = {a: v for a, v in zip(attrs, values)}
                 ok = save_preset(name, state_dict)
@@ -1651,81 +1679,83 @@ def _wire_presets(
                     return [
                         f"⚠️ Could not save preset '{name}'. Check disk space and folder permissions."
                         + (f" {note}" if note else ""),
-                        *_refresh_dropdowns_update(),
+                        *_refresh_dropdowns_update(current),
                     ]
                 return [
                     f"✅ Saved preset '{name}'." + (f" ⚠️ {note}" if note else ""),
-                    *_refresh_dropdowns_update(selected=name),
+                    *_refresh_dropdowns_update(current, idx, selected=name),
                 ]
 
             return _save
 
         save_btn.click(
             fn=_make_save(idx),
-            inputs=[name_box, *widget_refs],
+            inputs=[name_box, *widget_refs, *all_dropdowns],
             outputs=[status_md, *all_dropdowns],
             queue=False,
         )
 
-        # DELETE: remove the selected preset; refresh dropdowns.
-        def _make_delete():
-            def _delete(selected: str | None):
+        # DELETE: remove this tab's selected preset; refresh dropdowns.
+        def _make_delete(idx: int):
+            def _delete(*current):
+                selected = current[idx]
                 if _is_none(selected):
-                    return ["⚠️ Pick a preset first.", *_refresh_dropdowns_update()]
+                    return ["⚠️ Pick a preset first.", *_refresh_dropdowns_update(current)]
                 selected = selected.strip()
                 ok = delete_preset(selected)
                 if not ok:
                     return [
                         f"⚠️ Could not delete preset '{selected}'. It may be missing or the preset file is not writable.",
-                        *_refresh_dropdowns_update(),
+                        *_refresh_dropdowns_update(current),
                     ]
                 return [
                     f"\U0001F5D1 Deleted '{selected}'.",
-                    *_refresh_dropdowns_update(),
+                    *_refresh_dropdowns_update(current, idx, selected=PRESET_NONE),
                 ]
 
             return _delete
 
         delete_btn.click(
-            fn=_make_delete(),
-            inputs=dropdown,
+            fn=_make_delete(idx),
+            inputs=all_dropdowns,
             outputs=[status_md, *all_dropdowns],
             queue=False,
         )
 
-        # RENAME: take the currently-selected preset and the value of
+        # RENAME: take this tab's selected preset and the value of
         # the 'Preset name to save' textbox; rename the preset on disk
-        # to the new name and refresh every tab's dropdown so it points
-        # at the renamed entry.
-        def _make_rename():
-            def _rename(selected: str | None, new_name: str):
+        # to the new name and refresh every tab's dropdown so each tab
+        # that showed the old name points at the renamed entry.
+        def _make_rename(idx: int):
+            def _rename(new_name: str, *current):
+                selected = current[idx]
                 if _is_none(selected):
                     return [
                         "⚠️ Pick a preset first.",
-                        *_refresh_dropdowns_update(),
+                        *_refresh_dropdowns_update(current),
                     ]
                 new_name = (new_name or "").strip()
                 if not new_name:
                     return [
                         "⚠️ Enter the new name in the 'Preset name to save' box first.",
-                        *_refresh_dropdowns_update(selected=selected),
+                        *_refresh_dropdowns_update(current),
                     ]
                 ok, msg = rename_preset(selected, new_name)
                 if not ok:
                     return [
                         f"⚠️ Rename failed: {msg}.",
-                        *_refresh_dropdowns_update(selected=selected),
+                        *_refresh_dropdowns_update(current),
                     ]
                 return [
                     f"✏️ Renamed '{selected}' → '{new_name}'.",
-                    *_refresh_dropdowns_update(selected=new_name),
+                    *_refresh_dropdowns_update(current, renamed=(selected, new_name)),
                 ]
 
             return _rename
 
         rename_btn.click(
-            fn=_make_rename(),
-            inputs=[dropdown, name_box],
+            fn=_make_rename(idx),
+            inputs=[name_box, *all_dropdowns],
             outputs=[status_md, *all_dropdowns],
             queue=False,
         )

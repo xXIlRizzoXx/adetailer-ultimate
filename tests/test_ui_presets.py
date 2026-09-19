@@ -822,3 +822,146 @@ def test_saved_yolo_world_tab_starts_without_excluded_classes(world, expected):
     namespace = {"sv": lambda attr, default: "hand", "_is_world_saved": world}
     value = eval(compile(ast.Expression(keywords["value"]), str(path), "eval"), namespace)
     assert value == expected
+
+
+def test_load_resets_settings_an_older_preset_does_not_have(callbacks):
+    # A preset saved by an older version lacks the settings added since. They
+    # kept the tab's current values, so a leftover detection-number filter
+    # ("2") inpainted only that detection after loading the preset.
+    callbacks["get_preset"] = lambda name: {
+        "ad_model": "faces.pt", "ad_prompt": "old preset", "ad_model_classes": "face",
+    }
+    preset_widgets = [tuple(Component() for _ in range(9))]
+    callbacks["_wire_presets"](
+        [widgets()], preset_widgets, [Component()], Component(), 1,
+        {"faces.pt": "faces.pt"},
+    )
+    result = preset_widgets[0][1].callback("saved")[1:]
+    restored = dict(zip(ALL_ARGS.attrs, result[:-1]))
+    assert restored["ad_inpaint_indices"]["value"] == ""
+    assert restored["ad_detection_resolution"]["value"] == 0
+    assert restored["ad_class_guard"]["value"] is False
+    assert restored["ad_confidence"]["value"] == 0.3
+    assert restored["ad_prompt"]["value"] == "old preset"
+    assert restored["ad_model_classes"]["value"] == "face"
+    assert result[-1]["value"] == ["face"]
+    # "Enable this tab" is not in the preset, so it is left as it is.
+    assert "value" not in restored["ad_tab_enable"]
+
+
+@pytest.mark.parametrize("exclude", [False, True])
+def test_detector_change_keeps_a_class_name_in_another_case(callbacks, exclude):
+    # Pasted parameters or a preset may hold "Face" for the model's "face".
+    # The engine matches it, but the detector change that follows a paste or
+    # Load dropped it, so every class was inpainted (in NOT mode, none excluded).
+    result = callbacks["on_ad_model_update"](
+        "faces.pt", ["Face"], {"faces.pt": "faces.pt"},
+        current_include="" if exclude else "Face",
+        current_exclude=exclude,
+        current_excluded="Face" if exclude else "",
+    )
+    assert result[1]["value"] == ["face"]
+    assert result[1]["choices"] == ["face", "hand"]
+    assert result[0]["value"] == ("" if exclude else "face")
+    assert result[3]["value"] == ("face" if exclude else "")
+
+
+def test_detector_change_drops_an_ambiguous_or_unknown_class_name(callbacks):
+    # As in the engine: an exact match wins, a name matching several classes
+    # in another case and a name the model does not have are dropped.
+    result = callbacks["on_ad_model_update"](
+        "faces.pt", [], {"faces.pt": "faces.pt"}, current_include="Face,face,HAND",
+    )
+    assert result[0]["value"] == "face,hand"  # listed once
+    callbacks["get_model_class_names"] = lambda path: ["Face", "face", "hand"]
+    result = callbacks["on_ad_model_update"](
+        "faces.pt", [], {"faces.pt": "faces.pt"},
+        current_include="FACE,Face,cat,HAND",
+    )
+    assert result[0]["value"] == "Face,hand"
+    # Without class names every requested name is kept, as before.
+    callbacks["get_model_class_names"] = lambda path: []
+    result = callbacks["on_ad_model_update"](
+        "faces.pt", [], {"faces.pt": "faces.pt"}, current_include="Face",
+    )
+    assert result[0]["value"] == "Face"
+
+
+def test_preset_save_delete_rename_keep_other_tabs_selection(callbacks):
+    # Save, Delete and Rename refresh every tab's list of presets, but they
+    # also moved every tab's selection to the acting tab's preset (or to
+    # "(none)" on an error), so a Delete in another tab removed the wrong one.
+    disk = {"hands": {}, "eyes": {}}
+
+    def rename(old, new):
+        disk[new] = disk.pop(old)
+        return True, ""
+
+    callbacks.update(
+        get_preset_names=lambda: sorted(disk),
+        is_valid_name=lambda name: "/" not in name,
+        save_preset=lambda name, state: disk.__setitem__(name, state) is None,
+        delete_preset=lambda name: disk.pop(name, None) is not None,
+        rename_preset=rename,
+    )
+    tabs = 3
+    preset_widgets = [tuple(Component() for _ in range(9)) for _ in range(tabs)]
+    callbacks["_wire_presets"](
+        [widgets() for _ in range(tabs)], preset_widgets,
+        [Component() for _ in range(tabs)], Component(), tabs,
+    )
+    dropdowns = [p[0] for p in preset_widgets]
+    for button in (2, 3, 5):  # Rename, Delete, Save read every dropdown
+        assert preset_widgets[0][button].inputs[-tabs:] == dropdowns
+    values = [None] * len(ALL_ARGS.attrs)
+
+    def chosen(result):
+        return [u["value"] for u in result[1:]]
+
+    save = preset_widgets[0][5].callback
+    assert chosen(save("faces", *values, "(none)", "hands", "eyes")) == [
+        "faces", "hands", "eyes",
+    ]
+    assert "faces" in disk
+    for name in ("", "bad/name"):
+        assert chosen(save(name, *values, "eyes", "hands", "(none)")) == [
+            "eyes", "hands", "(none)",
+        ]
+    # Nothing picked in tab 2: no tab changes.
+    delete = preset_widgets[1][3].callback
+    assert chosen(delete("eyes", "(none)", "hands")) == ["eyes", "(none)", "hands"]
+    # Deleting "eyes" in tab 2 clears it there and in tab 1, which showed it.
+    assert chosen(delete("eyes", "eyes", "hands")) == ["(none)", "(none)", "hands"]
+    assert "eyes" not in disk
+    # Every tab that showed the renamed preset follows its new name.
+    rename_cb = preset_widgets[1][2].callback
+    assert chosen(rename_cb("hand", "hands", "hands", "faces")) == [
+        "hand", "hand", "faces",
+    ]
+    assert chosen(rename_cb("", "faces", "hand", "hand")) == ["faces", "hand", "hand"]
+    result = save("faces", *values, "(none)", "hand", "faces")
+    assert len({id(u) for u in result[1:]}) == tabs
+    assert all(u["choices"] == ["(none)", "faces", "hand"] for u in result[1:])
+
+
+def test_guide_describes_source_folder_batches_and_the_export_fallback():
+    # The Guide said folder-batch results always go to ADetailer-Inpaint and
+    # that the library can be exported as a file, which is wrong with "Save
+    # results in the source folder instead" and on AUTOMATIC1111 (Gradio 3).
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    node = next(
+        node for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and getattr(node.target, "id", "") == "_GUIDE_SECTIONS"
+    )
+    sections = dict(ast.literal_eval(node.value))
+    tools = next(body for title, body in sections.items() if "run-on-image" in title)
+    presets = next(body for title, body in sections.items() if "Presets" in title)
+    assert "always saved to the `ADetailer-Inpaint` folder" not in tools
+    assert "Save results in the source folder instead" in tools
+    assert "`name-ad`" in tools
+    where = next(line for line in presets.splitlines() if "Where files go" in line)
+    assert "Save results in the source folder instead" in where
+    library = next(line for line in presets.splitlines() if "Preset library" in line)
+    assert "AUTOMATIC1111" in library and "user_presets.json" in library
