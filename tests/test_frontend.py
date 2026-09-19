@@ -542,10 +542,10 @@ def _glob(pattern: str) -> re.Pattern[str]:
 
 @pytest.mark.parametrize("event", ["push", "pull_request"])
 def test_ci_runs_for_every_non_python_file_the_tests_read(event):
-    # The checks of the stylesheet, the scripts and the README never ran on
-    # a change to those files alone.
+    # The checks of the stylesheet, the scripts, the README and the changelog
+    # never ran on a change to those files alone.
     patterns = [_glob(p) for p in _workflow_paths(event)]
-    files = ["style.css", "README.md"] + [
+    files = ["style.css", "README.md", "CHANGELOG.md"] + [
         f"javascript/{js.name}" for js in sorted((ROOT / "javascript").glob("*.js"))
     ]
     for name in files:

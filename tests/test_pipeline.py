@@ -694,6 +694,60 @@ def test_skip_img2img_keeps_the_users_sampler_and_infotext():
     assert (p.steps, p.sampler_name, p.width, p.height) == (1, "Euler", 128, 128)
 
 
+@pytest.mark.parametrize(
+    ("second_file", "expected"),
+    [
+        # img2img Batch tab, "Resize by": the host sets each file's own size.
+        ({"width": 1216, "height": 832}, (30, "DPM++ 2M", 1216, 832)),
+        # "Append png info": also that file's own steps and sampler.
+        (
+            {"width": 1216, "height": 832, "steps": 40, "sampler_name": "DDIM"},
+            (40, "DDIM", 1216, 832),
+        ),
+        # Batch count, loopback, "Resize to": p keeps the throwaway values.
+        ({}, (30, "DPM++ 2M", 832, 1216)),
+    ],
+)
+def test_skip_img2img_records_each_batch_files_own_settings(second_file, expected):
+    # The host reuses p for every file of the Batch tab; the first file's
+    # size, steps and sampler were recorded for all of them, and the later
+    # files' throwaway pass ran at full size.
+    from adetailer.args import ADetailerArgs, SkipImg2ImgOrig
+
+    runtime = _load_script(
+        methods={"process", "set_skip_img2img", "get_width_height"},
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        SkipImg2ImgOrig=SkipImg2ImgOrig,
+    )
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: True
+    script.get_args = lambda *_args: []
+    script.extra_params = lambda _args: {}
+    p = SimpleNamespace(
+        init_images=[object()], width=832, height=1216, steps=30,
+        sampler_name="DPM++ 2M", extra_generation_params={},
+    )
+    script.process(p, True, True, {})
+
+    p.init_images = [object()]
+    for key, value in second_file.items():
+        setattr(p, key, value)
+    script.process(p, True, True, {})
+
+    steps, sampler, width, height = expected
+    infotext = {
+        "Steps": p.steps,
+        "Sampler": p.sampler_name,
+        "Size": f"{p.width}x{p.height}",
+        **p.extra_generation_params,
+    }
+    assert infotext == {"Steps": steps, "Sampler": sampler, "Size": f"{width}x{height}"}
+    assert (p.steps, p.sampler_name, p.width, p.height) == (1, "Euler", 128, 128)
+    whole = ADetailerArgs(ad_inpaint_only_masked=False)
+    assert script.get_width_height(p, whole) == (width, height)
+
+
 def _standalone_runtime(tmp_path, **host_globals):
     state = SimpleNamespace(
         interrupted=False, skipped=False, stopping_generation=False
@@ -883,6 +937,10 @@ def test_merged_and_inverted_masks_get_the_right_class_prompts(
         # Also for non-Latin text, echoed as ASCII so no console code page
         # can fail to print it.
         ("\u4e8c", [list(_FACE_BOXES[0]), list(_FACE_BOXES[1]), list(_HAND_BOX)], True),
+        # Numbers that match no detection keep none; that warning is ASCII
+        # too, also next to non-Latin text.
+        ("5", [], False),
+        ("\u4e8c 5", [], False),
     ],
 )
 def test_inpaint_indices_accept_preview_labels_and_warn_when_unreadable(
@@ -900,6 +958,7 @@ def test_inpaint_indices_accept_preview_labels_and_warn_when_unreadable(
     assert len(masks) == len(kept)
     out = capsys.readouterr().out
     assert ("has no usable number" in out) is warned
+    assert ("matched none" in out) is (kept == [])
     assert out.isascii()
 
 
@@ -1706,6 +1765,47 @@ def test_a_prompt_of_only_class_blocks_keeps_the_main_prompt(
     assert regions == [face, hand]
 
 
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        # A LoRA the tab prompt names at another weight keeps that weight.
+        ("detailed face <lora:detail:0.3>", "detailed face <lora:detail:0.3> <lora:style:0.8>"),
+        ("detailed face <lora:detail:1.0>", "detailed face <lora:detail:1.0> <lora:style:0.8>"),
+        ("detailed face <lyco:detail:0.3>", "detailed face <lyco:detail:0.3> <lora:style:0.8>"),
+        # Unchanged: another name (the host's lookup is case-sensitive), a
+        # prompt without LoRAs and a blank prompt.
+        (
+            "detailed face <lora:Detail:0.3>",
+            "detailed face <lora:Detail:0.3> <lora:detail:1> <lora:style:0.8>",
+        ),
+        ("detailed face,", "detailed face <lora:detail:1> <lora:style:0.8>"),
+        ("", "portrait <lora:detail:1> <lora:style:0.8>"),
+    ],
+)
+def test_main_prompt_loras_keep_the_weight_the_tab_prompt_gives(prompt, expected):
+    # The main prompt's <lora:detail:1> was added next to the tab's
+    # <lora:detail:0.3>, so the host applied that LoRA twice.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS,
+        functions=_INLINE_PROMPT_FUNCTIONS,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        get_i=lambda _p: 0,
+    )
+    script = runtime.AfterDetailerScript()
+    main = "portrait <lora:detail:1> <lora:style:0.8>"
+    p = SimpleNamespace(
+        prompt=main, all_prompts=[main], negative_prompt="",
+        all_negative_prompts=[""],
+    )
+    args = ADetailerArgs(ad_model="faces.pt", ad_prompt=prompt, ad_use_main_loras=True)
+
+    prompts, _negatives = script.get_prompt(p, args)
+
+    assert prompts == [expected]
+
+
 def test_a_merged_region_whose_only_block_is_skipped_keeps_the_main_prompt():
     # A merged face and hand is not skipped by the hands' [SKIP] block, and
     # the blocks leave it no text of its own.
@@ -2055,11 +2155,39 @@ def test_readme_copy_and_preset_sections_match_the_ui():
         assert stale not in readme
 
 
+def test_readme_describes_the_current_tab_layout():
+    # The README placed the export / import accordion at the bottom and
+    # Copy / Paste at the top of the tab, the other way round.
+    ui_text = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    readme = (_SCRIPT_PATH.parents[1] / "README.md").read_text(encoding="utf-8")
+    order = [
+        ui_text.index(anchor)
+        for anchor in (
+            'eid("ad_tab_enable")', '"Preset library export / import"',
+            'eid("ad_preset_dropdown")', 'eid("ad_copy_settings")',
+        )
+    ]
+    assert order == sorted(order)
+    assert 'label="Overwrite on conflict"' in ui_text
+    row = next(
+        line for line in readme.splitlines()
+        if line.startswith("| 🟢 | Export / Import preset library JSON |")
+    )
+    assert "at the top of every tab" in row
+    assert '"Overwrite on conflict"' in row
+    for stale in ("at the bottom of the preset area", "Overwrite existing on conflict",
+                  "`Enable this tab` + `Copy settings` + `Paste settings` row"):
+        assert stale not in readme
+
+
 # Final debugging pass, round 3: generation pipeline, prompts and docs.
 
 
 def _i2i_script(host=_A1111I2I, methods=(), **host_globals):
     """get_i2i_p with the host's img2img class and the other inputs stubbed."""
+    from aaaaaa.p_method import is_skip_img2img
+
+    host_globals.setdefault("is_skip_img2img", is_skip_img2img)
     runtime = _load_script(
         methods={"get_i2i_p", "get_width_height", *methods},
         StableDiffusionProcessingImg2Img=host,
@@ -2116,6 +2244,42 @@ def test_whole_picture_inpaint_keeps_the_hires_fix_size(
     )
 
     i2i = script.get_i2i_p(p, args, Image.new("RGB", (1024, 1536)))
+
+    assert (i2i.width, i2i.height) == canvas
+
+
+@pytest.mark.parametrize(
+    ("only_masked", "separate", "canvas"),
+    [
+        # Whole picture: the init image's own size, not the sliders' 512x512.
+        (False, False, (832, 1216)),
+        # Unchanged: the crop resolution and a separate size.
+        (True, False, (512, 512)),
+        (False, True, (640, 640)),
+    ],
+)
+def test_whole_picture_inpaint_keeps_the_skip_img2img_image_size(
+    only_masked, separate, canvas
+):
+    # With Skip img2img the host resized the whole 832x1216 init image to the
+    # img2img sliders, so the result came back squashed to 512x512.
+    from adetailer.args import ADetailerArgs
+
+    script = _i2i_script()
+    p = _txt2img_p(
+        _ad_skip_img2img=True,
+        _ad_orig=SimpleNamespace(
+            steps=20, sampler_name="Euler a", width=512, height=512
+        ),
+    )
+    p.width = p.height = 128
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_inpaint_only_masked=only_masked,
+        ad_use_inpaint_width_height=separate, ad_inpaint_width=640,
+        ad_inpaint_height=640,
+    )
+
+    i2i = script.get_i2i_p(p, args, Image.new("RGB", (832, 1216)))
 
     assert (i2i.width, i2i.height) == canvas
 
@@ -2372,6 +2536,58 @@ def test_class_prompt_lines_match_the_class_regardless_of_case(classes, class_pr
     assert passes == ["detailed skin", "five fingers"]
 
 
+@pytest.mark.parametrize(
+    ("classes", "expected"),
+    [
+        # "hands" is not a class of the detector: its pass detected every
+        # class and repainted the faces with the hands' prompt.
+        ("face,hands", [("face", "main")]),
+        ("Face,hand,hands", [("Face", "main"), ("hand", "five fingers")]),
+        # Unchanged: known names, and no known name at all (every class).
+        ("face,hand", [("face", "main"), ("hand", "five fingers")]),
+        ("faces,hands", [("faces", "main"), ("hands", "five fingers")]),
+    ],
+)
+def test_a_sequential_pass_runs_only_for_a_class_the_detector_has(
+    classes, expected, tmp_path
+):
+    from adetailer.args import ADetailerArgs
+    from adetailer.classes import get_model_class_names, resolve_class_ids
+
+    model = tmp_path / "multi.pt"
+    model.write_bytes(b"x")
+    (tmp_path / "multi.names.json").write_bytes(b'["face","hand"]')
+    runtime = _load_runtime(
+        state=SimpleNamespace(interrupted=False, skipped=False),
+        copy=copy, re=re,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        disable_safe_unpickle=nullcontext,
+        get_model_class_names=get_model_class_names,
+        resolve_class_ids=resolve_class_ids,
+    )
+    script = runtime.AfterDetailerScript()
+    script.save_image = lambda *_args, **_kwargs: None
+    script.get_ad_model = lambda _name: model
+    passes = []
+
+    def class_pass(_p, _pp, sub_args, **_kwargs):
+        passes.append((sub_args.ad_model_classes, sub_args.ad_prompt))
+        return True
+
+    script._postprocess_image_inner = class_pass  # each class's own pass
+    args = ADetailerArgs(
+        ad_model="multi.pt", ad_prompt="main", ad_model_classes=classes,
+        ad_classes_sequential=True,
+        ad_class_prompts="hand: five fingers\nhands: five fingers",
+    )
+
+    assert runtime.AfterDetailerScript._postprocess_image_inner(
+        script, SimpleNamespace(), SimpleNamespace(image=Image.new("RGB", (8, 8))), args
+    )
+    assert passes == expected
+
+
 def test_a_class_prompt_line_in_another_case_still_takes_priority_over_the_guard():
     from adetailer.args import ADetailerArgs
 
@@ -2475,3 +2691,11 @@ def test_public_docs_match_the_behaviour_of_this_beta():
     assert "MediaPipe detectors work again" not in readme
     # AUTOMATIC1111 now softens the later regions' mask edge at canvas size.
     assert "its result does not change" not in changelog
+    # That edge is narrower, not wider, on a canvas larger than the image.
+    assert "slightly wider than before" not in changelog
+    # The dictionaries lack the reworded tooltips and help text.
+    l10n = next(
+        line for line in readme.splitlines() if line.startswith("- 🟡 Every UI label")
+    )
+    assert "Copy settings and Reset tooltips" in l10n
+    assert "stay English" in l10n

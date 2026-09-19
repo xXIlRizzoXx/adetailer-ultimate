@@ -57,6 +57,7 @@ from adetailer.classes import (
     build_class_guard,
     get_model_class_names,
     parse_csv,
+    resolve_class_ids,
 )
 from adetailer.common import PredictOutput, ensure_pil_image, safe_mkdir
 from adetailer.mask import (
@@ -191,11 +192,16 @@ def _extract_lora_triggers(tags: list[str]) -> list[str]:
 
 
 def _merge_lora_tags(prompt: str, extras: list[str]) -> str:
-    """Append `extras` to `prompt`, skipping any tag already present."""
+    """Append `extras` to `prompt`, skipping any LoRA already present.
+
+    A LoRA is matched by name, as the host reads it (the text after the first
+    ":", case-sensitive), so one the prompt already names at another weight
+    keeps that weight instead of being applied twice.
+    """
     if not extras:
         return prompt
-    existing = set(_LORA_TAG_RE.findall(prompt or ""))
-    to_add = [t for t in extras if t not in existing]
+    existing = {t[1:-1].split(":")[1] for t in _LORA_TAG_RE.findall(prompt or "")}
+    to_add = [t for t in extras if t[1:-1].split(":")[1] not in existing]
     if not to_add:
         return prompt
     base = (prompt or "").rstrip().rstrip(",").rstrip()
@@ -692,6 +698,38 @@ class AfterDetailerScript(scripts.Script):
         return ad_enabled and not_none
 
     def set_skip_img2img(self, p, *args_) -> None:
+        if getattr(p, "_ad_skip_img2img", False) and hasattr(p, "_ad_orig"):
+            # img2img Batch tab: the host reuses p for every file and, before
+            # each one, may put back that file's own size ("Resize by") or its
+            # PNG Info steps and sampler. Record those and switch p back to
+            # the throwaway pass; values still at the throwaway ones (Batch
+            # count, loopback) keep the recorded settings.
+            if (p.steps, p.sampler_name, p.width, p.height) != (1, "Euler", 128, 128):
+                orig = p._ad_orig
+                resized = (p.width, p.height) != (128, 128)
+                p._ad_orig = SkipImg2ImgOrig(
+                    steps=p.steps if p.steps != 1 else orig.steps,
+                    sampler_name=(
+                        p.sampler_name
+                        if p.sampler_name != "Euler"
+                        else orig.sampler_name
+                    ),
+                    width=p.width if resized else orig.width,
+                    height=p.height if resized else orig.height,
+                )
+                p.steps = 1
+                p.sampler_name = "Euler"
+                p.width = 128
+                p.height = 128
+                p.extra_generation_params.update(
+                    {
+                        "Steps": p._ad_orig.steps,
+                        "Sampler": p._ad_orig.sampler_name,
+                        "Size": f"{p._ad_orig.width}x{p._ad_orig.height}",
+                    }
+                )
+            return
+
         if (
             hasattr(p, "_ad_skip_img2img")
             or not hasattr(p, "init_images")
@@ -849,8 +887,8 @@ class AfterDetailerScript(scripts.Script):
                 prompts[n] = f"{base}, {append_clean}" if base else append_clean
 
             # LoRA auto-inclusion: append LoRAs from the main prompt that
-            # aren't already present in this segment. The order is preserved
-            # and duplicates skipped.
+            # aren't already named in this segment (its own weight wins). The
+            # order is preserved and duplicates skipped.
             if extra_loras:
                 prompts[n] = _merge_lora_tags(prompts[n], extra_loras)
 
@@ -1130,13 +1168,14 @@ class AfterDetailerScript(scripts.Script):
     ) -> StableDiffusionProcessingImg2Img:
         seed, subseed = self.get_seed(p)
         width, height = self.get_width_height(p, args)
-        # Hires fix keeps p.width/height at the first-pass size. With the whole
-        # picture inpainted the host resizes the image to the canvas, so use
-        # the upscaled image's own size or the hires result is lost.
+        # Hires fix keeps p.width/height at the first-pass size, and with Skip
+        # img2img the sliders only set the size of a pass that never ran. With
+        # the whole picture inpainted the host resizes the image to the canvas,
+        # so use the image's own size or it is shrunk (and stretched) to it.
         if (
             not args.ad_inpaint_only_masked
             and not args.ad_use_inpaint_width_height
-            and getattr(p, "enable_hr", False)
+            and (getattr(p, "enable_hr", False) or is_skip_img2img(p))
             and image is not None
         ):
             width = max(64, image.width // 8 * 8)
@@ -1334,11 +1373,12 @@ class AfterDetailerScript(scripts.Script):
         if args.ad_inpaint_indices.strip() and _n_before and not pred.bboxes:
             # Route through sys.stdout, not the rich-shadowed print: the user's
             # value is echoed and could contain "[..]" that rich would treat as
-            # markup.
+            # markup. ASCII only (ascii(), no dash character), so a console
+            # pipe in any legacy code page can print it.
             sys.stdout.write(
                 f"[-] ADetailer: 'inpaint indices' "
-                f"{args.ad_inpaint_indices!r} matched none of the {_n_before} "
-                f"detection(s) this pass — nothing inpainted.\n"
+                f"{args.ad_inpaint_indices!a} matched none of the {_n_before} "
+                f"detection(s) this pass - nothing inpainted.\n"
             )
         elif (
             args.ad_inpaint_indices.strip()
@@ -2073,6 +2113,23 @@ class AfterDetailerScript(scripts.Script):
         ):
             classes = parse_csv(args.ad_model_classes)
             if len(classes) > 1:
+                # A name the detector does not have (from a preset, pasted
+                # parameters or the API) would give a pass with no class
+                # filter, repainting every class with that name's prompt.
+                # Drop it, as the single-pass filter does; when no name is
+                # known, the every-class fallback is kept. Looked up like
+                # detection, past the host's safe-unpickle check.
+                if not args.is_mediapipe():
+                    try:
+                        with disable_safe_unpickle():
+                            _model = str(self.get_ad_model(args.ad_model))
+                            if get_model_class_names(_model):
+                                classes = [
+                                    c for c in classes
+                                    if resolve_class_ids(_model, [c])
+                                ] or classes
+                    except Exception:  # noqa: BLE001
+                        pass
                 # Class-specific prompts: each class can have its own
                 # positive/negative prompt that overrides the tab's default
                 # for that pass only. Format documented in

@@ -10,6 +10,7 @@ on:
       - "javascript/**"
       - "style.css"
       - "README.md"
+      - "CHANGELOG.md"
   pull_request:
     paths:
       - "**.py"
@@ -18,6 +19,7 @@ on:
       - "javascript/**"
       - "style.css"
       - "README.md"
+      - "CHANGELOG.md"
   workflow_call:
   workflow_dispatch:
   schedule:
