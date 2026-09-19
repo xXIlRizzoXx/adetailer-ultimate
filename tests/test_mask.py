@@ -161,6 +161,19 @@ def test_merge_invert_keeps_the_background_around_detections():
         ("-2,0", []),
         ("bad,1-x", None),
         ("", None),
+        # The Detection preview labels boxes "#1", "#2", ...: typing the label,
+        # or separating numbers with spaces, must select those detections
+        # instead of silently keeping every one of them.
+        ("#2", [1]),
+        ("#1,#3", [0, 2]),
+        ("2 3", [1, 2]),
+        ("1, #3", [0, 2]),
+        ("#1-#2", [0, 1]),
+        (" #2 ", [1]),
+        # A spaced range stays a range (not the two numbers 1 and 3).
+        ("1 - 3", [0, 1, 2]),
+        ("1 -3", [0, 1, 2]),
+        ("#", None),
     ],
 )
 def test_parse_indices_preserves_selection_rules(spec, expected):

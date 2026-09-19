@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from enum import IntEnum
 from functools import partial, reduce
 from math import dist
@@ -266,10 +267,12 @@ def parse_indices(spec: str, n: int) -> list[int] | None:
     """Parse a 1-based selection string into sorted, de-duped 0-based indices
     within ``[0, n)``.
 
-    Accepts comma- (or semicolon-) separated single numbers and inclusive
-    ranges, e.g. ``"1,3,5"`` or ``"1-3,5"``. Whitespace is ignored; tokens that
-    aren't a positive int or an ``a-b`` range are skipped; indices outside
-    ``[1, n]`` are dropped. Returns ``None`` when the string contains no usable
+    Accepts comma-, semicolon- or space-separated single numbers and inclusive
+    ranges, e.g. ``"1,3,5"``, ``"1 3 5"`` or ``"1-3,5"``. A ``#`` is ignored, so
+    the labels drawn on the Detection preview (``"#2"``, ``"#1-#3"``) work too.
+    Spaces around a range dash are ignored; tokens that aren't a positive int
+    or an ``a-b`` range are skipped; indices outside ``[1, n]`` are dropped.
+    Returns ``None`` when the string contains no usable
     number at all — the caller treats that (and a blank string) as "keep all".
     An in-range parse that resolves to nothing (e.g. only out-of-range numbers)
     returns an empty list, i.e. "keep none".
@@ -277,7 +280,10 @@ def parse_indices(spec: str, n: int) -> list[int] | None:
     seen: set[int] = set()
     order: list[int] = []
     found_any = False
-    for tok in spec.replace(";", ",").split(","):
+    # Glue "1 - 3" into "1-3" BEFORE splitting on whitespace, so a spaced range
+    # stays a range instead of becoming the two numbers 1 and 3.
+    spec = re.sub(r"\s*-\s*", "-", spec.replace("#", ""))
+    for tok in re.split(r"[,;\s]+", spec):
         tok = tok.strip()
         if not tok:
             continue

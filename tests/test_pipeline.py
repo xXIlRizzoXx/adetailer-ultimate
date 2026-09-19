@@ -787,6 +787,7 @@ def _class_prompt_script():
         filter_by_ratio,
         filter_k_by,
         mask_preprocess,
+        parse_indices,
         sort_bboxes,
     )
 
@@ -803,6 +804,7 @@ def _class_prompt_script():
         filter_by_ratio=filter_by_ratio,
         filter_k_by=filter_k_by,
         mask_preprocess=mask_preprocess,
+        parse_indices=parse_indices,
         sort_bboxes=sort_bboxes,
         is_img2img_inpaint=lambda _p: False,
         is_inpaint_only_masked=lambda _p: True,
@@ -867,6 +869,36 @@ def test_merged_and_inverted_masks_get_the_right_class_prompts(
     script._apply_auto_class_guard(p2, args, pred, 0, len(masks))
 
     assert (p2.prompt, p2.negative_prompt) == (prompt, negative)
+
+
+@pytest.mark.parametrize(
+    ("spec", "kept", "warned"),
+    [
+        # The label drawn on the Detection preview keeps only that detection.
+        ("#2", [list(_FACE_BOXES[1])], False),
+        # No readable number keeps every detection, and the console says so.
+        ("x", [list(_FACE_BOXES[0]), list(_FACE_BOXES[1]), list(_HAND_BOX)], True),
+        # Also for non-Latin text, echoed as ASCII so no console code page
+        # can fail to print it.
+        ("\u4e8c", [list(_FACE_BOXES[0]), list(_FACE_BOXES[1]), list(_HAND_BOX)], True),
+    ],
+)
+def test_inpaint_indices_accept_preview_labels_and_warn_when_unreadable(
+    spec, kept, warned, capsys
+):
+    from adetailer.args import ADetailerArgs
+
+    script = _class_prompt_script()
+    pred = _detections(["face", "face", "hand"])
+    args = ADetailerArgs(ad_model="faces.pt", ad_inpaint_indices=spec)
+
+    masks = script.pred_preprocessing(SimpleNamespace(), pred, args)
+
+    assert pred.bboxes == kept
+    assert len(masks) == len(kept)
+    out = capsys.readouterr().out
+    assert ("has no usable number" in out) is warned
+    assert out.isascii()
 
 
 def test_class_skip_block_does_not_skip_the_inverted_background():

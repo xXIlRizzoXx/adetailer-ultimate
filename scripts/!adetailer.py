@@ -66,6 +66,7 @@ from adetailer.mask import (
     has_intersection,
     is_all_black,
     mask_preprocess,
+    parse_indices,
     sort_bboxes,
 )
 from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
@@ -1312,6 +1313,20 @@ class AfterDetailerScript(scripts.Script):
                 f"[-] ADetailer: 'inpaint indices' "
                 f"{args.ad_inpaint_indices!r} matched none of the {_n_before} "
                 f"detection(s) this pass — nothing inpainted.\n"
+            )
+        elif (
+            args.ad_inpaint_indices.strip()
+            and _n_before
+            and parse_indices(args.ad_inpaint_indices, _n_before) is None
+        ):
+            # A non-blank value with no readable number means "keep all": say
+            # so, or it looks as if the filter had been applied. ascii(), not
+            # repr(): such a value may be non-Latin text that a console pipe
+            # in a legacy code page cannot encode.
+            sys.stdout.write(
+                f"[-] ADetailer: 'inpaint indices' "
+                f"{args.ad_inpaint_indices!a} has no usable number, so every "
+                f"detection is inpainted.\n"
             )
         pred = filter_by_ratio(
             pred, low=args.ad_mask_min_ratio, high=args.ad_mask_max_ratio
