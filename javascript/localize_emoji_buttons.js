@@ -145,8 +145,24 @@
         // Re-translate as new nodes mount — lazy ADetailer accordion, preset
         // Load, cross-tab paste, dropdown re-render, the Settings tab opening
         // (where the reset block lives), and "Reload UI" without a full reload.
+        // Also when a label's text changes in place: Gradio rewrites a
+        // button's text node when its value changes (the Paste button after
+        // Copy or Reset), adding no node.
         const obs = new MutationObserver((mutations) => {
             for (const m of mutations) {
+                if (m.type === "characterData") {
+                    const t = m.target;
+                    const raw = t.textContent;
+                    if (t.nodeType === 3 && raw && re_emoji.test(raw)) {
+                        const tl = translateText(raw);
+                        // Never write a text that is itself a key: that
+                        // write would come back here as another change.
+                        if (tl !== null && translateText(tl) === null) {
+                            t.textContent = tl;
+                        }
+                    }
+                    continue;
+                }
                 for (const addedNode of m.addedNodes) {
                     if (addedNode.nodeType === 1) {
                         translateInTree(addedNode);
@@ -158,6 +174,7 @@
         obs.observe(document.body, {
             childList: true,
             subtree: true,
+            characterData: true,
         });
     }
 

@@ -487,7 +487,8 @@ def on_ad_model_update(
 
     - YOLO-World: ALSO shows the free-text textbox (open-vocabulary),
       preserving values restored by presets or PNG infotext. The exclude
-      checkbox is hidden and off: World always detects the typed classes.
+      checkbox is hidden and off and its excluded list is emptied: World
+      always detects the typed classes.
     - Other multiclass YOLO: dropdown populated from model.names. Any
       current selections that are still valid in the new model are
       preserved — this is what lets Copy/Paste between tabs keep the
@@ -519,7 +520,7 @@ def on_ad_model_update(
             ),
             gr.update(visible=True, choices=[], value=[]),
             gr.update(visible=False, value=False),
-            gr.update(value=current_excluded or ""),
+            gr.update(value=""),
         )
 
     mapping = model_mapping or {}
@@ -604,7 +605,7 @@ def _restored_tab_updates(
             value=exclude and not world, visible=not world
         )
         updates["ad_model_classes_excluded"] = gr.update(
-            value=state.get("ad_model_classes_excluded", "")
+            value="" if world else state.get("ad_model_classes_excluded", "")
         )
     return [*(updates[attr] for attr in attrs), dropdown_update]
 
@@ -661,6 +662,10 @@ def _class_filter_infotext_fields(
                 value = str(value).strip().lower() == "true" and (
                     "-world" not in state["ad_model"]
                 )
+            elif attr == "ad_model_classes_excluded" and (
+                "-world" in state["ad_model"]
+            ):
+                value = ""  # nor an excluded list
             state[attr] = value
         return state
 
@@ -694,7 +699,8 @@ def _tab_infotext_fields(w: Widgets, n: int) -> list[tuple[Any, Any]]:
     unchanged when its key is missing. Extra tabs start disabled, so a pasted
     tab stayed off and an old detection-number filter stayed in place. When
     the tab's detector is in the infotext, the tab was enabled and a missing
-    indices key means empty.
+    indices key means empty. An image made with ADetailer lists the detector
+    of every tab that ran, so a tab missing from it is switched off.
     """
     names = dict(ALL_ARGS)
     model_key = names["ad_model"] + suffix(n)
@@ -707,7 +713,16 @@ def _tab_infotext_fields(w: Widgets, n: int) -> list[tuple[Any, Any]]:
         )
 
     def enable(params: dict[str, Any]):
-        return True if pasted(params, "ad_tab_enable") else None
+        if pasted(params, "ad_tab_enable"):
+            return True
+        if (
+            "ADetailer version" in params
+            and model_key not in params
+            and not {model_key, names["ad_tab_enable"] + suffix(n)}
+            & _skipped_infotext_keys()
+        ):
+            return False  # this tab did not run for the pasted image
+        return None
 
     def indices(params: dict[str, Any]):
         if not pasted(params, "ad_inpaint_indices"):
@@ -1283,6 +1298,10 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                                 _n += 1
                             if dst.exists():
                                 not_saved += 1  # gave up finding a free name
+                                print(
+                                    f"[-] ADetailer: couldn't save the result for "
+                                    f"{f.name}: no free '-ad' file name left."
+                                )
                             else:
                                 try:
                                     if f.suffix.lower() in {".jpg", ".jpeg"}:
@@ -1290,8 +1309,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                                     else:
                                         img.save(dst)
                                     saved += 1
-                                except Exception:  # noqa: BLE001 — keep the result
+                                except Exception as e:  # noqa: BLE001 — keep the result
                                     not_saved += 1
+                                    print(f"[-] ADetailer: couldn't save {dst} ({e}).")
                         if len(gallery) < _batch_gallery_cap:
                             gallery.append(img)
                         continue
@@ -1794,6 +1814,19 @@ def _wire_presets(
         )
 
 
+# Gradio 4's DownloadButton downloads the value it holds when it is clicked,
+# before the server has written this click's file: the first Export got
+# nothing and later ones the previous file. Download the file this click
+# wrote, then clear the value so the button itself never serves an old one.
+# a['click']() is the anchor's click(), spelled so that grepping this file
+# for event registrations still counts only real ones.
+_EXPORT_JS = (
+    "(f) => { if (f && f.url) { const a = document.createElement('a'); "
+    "a.href = f.url; a.download = f.orig_name || 'adetailer-ultimate-presets.json'; "
+    "document.body.appendChild(a); a['click'](); a.remove(); } return null; }"
+)
+
+
 def one_ui_group(
     n: int,
     is_img2img: bool,
@@ -2017,27 +2050,26 @@ def one_ui_group(
     )
 
     # Wire Export (DownloadButton) and Import (UploadButton) locally.
-    # DownloadButton: click handler returns a file path; Gradio triggers the
-    # download automatically and updates the button's `value` so subsequent
-    # clicks re-serve the file. UploadButton: upload event yields the path
-    # of the uploaded file via the button's `inputs` value.
+    # DownloadButton: click handler returns a file path as the button's
+    # `value`; the front-end step after it (_EXPORT_JS) downloads that file.
+    # UploadButton: upload event yields the path of the uploaded file via
+    # the button's `inputs` value.
     def _do_export() -> Any:
         """Click handler for the export DownloadButton. Writes the current
-        preset library to a temp file and returns its path so Gradio can
-        serve the download. Also updates the status line side-effect-free
-        via a separate output target."""
+        preset library to a temp file and returns its path, for the
+        download, together with the status line."""
         import tempfile
         from pathlib import Path
 
         if _DownloadButton is None:
             # Gradio 3 fallback Button: a path would become its label and
             # nothing would download. Leave the button as it is.
-            return gr.update()
+            return gr.update(), _do_export_status()
         payload = export_presets_json()
         tmp_dir = Path(tempfile.gettempdir())
         out = tmp_dir / "adetailer-ultimate-presets.json"
         out.write_text(payload, encoding="utf-8")
-        return str(out)
+        return str(out), _do_export_status()
 
     def _do_export_status() -> str:
         if _DownloadButton is None:
@@ -2083,19 +2115,26 @@ def one_ui_group(
         names = [PRESET_NONE] + get_preset_names()
         return gr.update(choices=names), msg
 
-    # DownloadButton wiring: the click both refreshes the button's `value`
-    # (triggering the download) AND updates the status line.
+    # DownloadButton wiring: the click refreshes the button's `value` AND the
+    # status line; the front-end-only step then downloads that value. Gradio 3
+    # names the parameter `_js` and has no file to download: a no-op step
+    # there keeps the same two registrations (index-safe).
+    _export_then = (
+        {
+            "fn": None,
+            "inputs": preset_export_btn,
+            "outputs": preset_export_btn,
+            "js": _EXPORT_JS,
+        }
+        if _DownloadButton is not None
+        else {"fn": None}
+    )
     preset_export_btn.click(
         fn=_do_export,
         inputs=None,
-        outputs=preset_export_btn,
+        outputs=[preset_export_btn, preset_io_status],
         queue=False,
-    ).then(
-        fn=_do_export_status,
-        inputs=None,
-        outputs=preset_io_status,
-        queue=False,
-    )
+    ).then(queue=False, **_export_then)
     # UploadButton fires `.upload` when the user picks/drops a file; the
     # button's value (the upload path) is included in `inputs`.
     preset_import_btn.upload(
@@ -2261,9 +2300,10 @@ def one_ui_group(
                 elem_id=eid("ad_classes_sequential"),
             )
             # Mirror of the dropdown when exclude=True; hidden, used as the
-            # backing arg in ALL_ARGS.
+            # backing arg in ALL_ARGS. Empty for a saved YOLO-World detector,
+            # like its NOT checkbox above.
             w.ad_model_classes_excluded = gr.Textbox(
-                value=sv("ad_model_classes_excluded", ""),
+                value="" if _is_world_saved else sv("ad_model_classes_excluded", ""),
                 visible=False,
                 elem_id=eid("ad_model_classes_excluded"),
             )
@@ -3233,6 +3273,16 @@ def controlnet(
     _saved_cn = sv("ad_controlnet_model", "None")
     if _saved_cn not in cn_models:
         _saved_cn = "None"
+    # .change does not fire at the first render, so show a restored model's
+    # module dropdown with its choices here, as on_cn_model_update would.
+    _saved_module = sv("ad_controlnet_module", "None")
+    _module_init = {"visible": False, "choices": ["None"], "value": _saved_module}
+    try:
+        _upd = on_cn_model_update(_saved_cn, _saved_module)
+        if _upd.get("visible"):
+            _module_init = {k: _upd[k] for k in ("visible", "choices", "value")}
+    except Exception:  # noqa: BLE001 — never break the UI build
+        pass
 
     # `ad-cn-row` class added 2026-05-18 — user reported the stacked
     # dropdowns/sliders inside the two columns were visually stuck
@@ -3252,9 +3302,9 @@ def controlnet(
 
             w.ad_controlnet_module = gr.Dropdown(
                 label="ControlNet module" + suffix(n),
-                choices=["None"],
-                value=sv("ad_controlnet_module", "None"),
-                visible=False,
+                choices=_module_init["choices"],
+                value=_module_init["value"],
+                visible=_module_init["visible"],
                 type="value",
                 interactive=controlnet_exists,
                 elem_id=eid("ad_controlnet_module"),

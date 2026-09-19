@@ -80,7 +80,15 @@ def _write_raw(presets: dict[str, Any]) -> bool:
     """
     try:
         tmp = _PRESETS_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(presets, indent=2, default=str), encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(presets, indent=2, default=str))
+            # On disk before the rename: after a power cut the library is
+            # then the old or the new one, never a file of zero bytes.
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # best effort: some file systems cannot sync
         os.replace(tmp, _PRESETS_FILE)
     except OSError:
         return False

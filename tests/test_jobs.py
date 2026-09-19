@@ -315,6 +315,49 @@ def test_wired_folder_reports_failed_runs_with_their_reason(
     assert "unreadable" not in status
 
 
+class _Unsavable:
+    def save(self, *_args, **_kwargs):
+        msg = "disk full"
+        raise OSError(msg)
+
+
+@pytest.mark.parametrize("reason", ["save fails", "no free name"])
+def test_wired_same_folder_explains_unsaved_results_in_the_console(
+    host, monkeypatch, tmp_path, capsys, reason
+):
+    # The status says "detailed but not saved (see console)"; the console
+    # must then say why.
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "a.png")
+    result = Image.new("RGB", (8, 8), "black")
+    if reason == "save fails":
+        result = _Unsavable()
+    else:
+        exists = Path.exists
+        monkeypatch.setattr(
+            Path, "exists", lambda self: "-ad" in self.stem or exists(self)
+        )
+
+    def detail(_image, _args, save):
+        return result, "✅ ADetailer pass complete."
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    _gallery, status = callback(
+        None, str(tmp_path), True, False,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert "1 detailed but not saved (see console)" in status
+    console = "".join(capsys.readouterr())
+    if reason == "save fails":
+        assert "a-ad.png" in console
+        assert "disk full" in console
+    else:
+        assert "a.png" in console
+        assert "no free" in console
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["a.png"]
+
+
 def test_wired_folder_still_skips_an_unreadable_file(host, monkeypatch, tmp_path):
     Image.new("RGB", (8, 8), "white").save(tmp_path / "a.png")
     (tmp_path / "b.png").write_bytes(b"not an image")

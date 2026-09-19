@@ -2901,25 +2901,85 @@ def on_ui_tabs():
 
 _INFOTEXT_MODEL_KEY = re.compile(r"ADetailer model( \d+(?:st|nd|rd|th))?")
 
+# The value of each key the infotext leaves out: extra_params drops these at
+# their defaults. Values that only apply when their "use separate ..." toggle
+# is on (steps, sampler, checkpoint, ...) are not listed; the toggle is enough.
+_INFOTEXT_PASTE_DEFAULTS = {
+    "ADetailer classes sequential": "False",
+    "ADetailer prompt": "",
+    "ADetailer negative prompt": "",
+    "ADetailer prompt append": "",
+    "ADetailer negative prompt append": "",
+    "ADetailer class prompts": "",
+    "ADetailer class guard": "False",
+    "ADetailer use main loras": "False",
+    "ADetailer strip loras": "False",
+    "ADetailer detection resolution": "0",
+    "ADetailer mask only top k": "0",
+    "ADetailer mask min ratio": "0.0",
+    "ADetailer mask max ratio": "1.0",
+    "ADetailer x offset": "0",
+    "ADetailer y offset": "0",
+    "ADetailer mask merge invert": "None",
+    "ADetailer dynamic denoise power": "0.0",
+    "ADetailer use inpaint width height": "False",
+    "ADetailer use separate steps": "False",
+    "ADetailer use separate CFG scale": "False",
+    "ADetailer use separate checkpoint": "False",
+    "ADetailer use separate VAE": "False",
+    "ADetailer use separate text encoder": "False",
+    "ADetailer use separate sampler": "False",
+    "ADetailer use separate noise multiplier": "False",
+    "ADetailer use separate CLIP skip": "False",
+    "ADetailer restore face": "False",
+    "ADetailer ControlNet model": "None",
+}
+# Keys that the infotext leaves out at their defaults only while the key on
+# the left is written: the scheduler of a separate sampler, and the settings
+# of a ControlNet model (a missing module there means "None").
+_INFOTEXT_PASTE_DEPENDENT_DEFAULTS = {
+    "ADetailer use separate sampler": {"ADetailer scheduler": "Use same scheduler"},
+    "ADetailer ControlNet model": {
+        "ADetailer ControlNet module": "None",
+        "ADetailer ControlNet weight": "1.0",
+        "ADetailer ControlNet guidance start": "0.0",
+        "ADetailer ControlNet guidance end": "1.0",
+    },
+}
+
 
 def _clear_missing_class_prompts(_infotext: str, params: dict) -> None:
     """``infotext_pasted`` callback (PNG Info, Send to, the paste button).
 
-    Empty class prompts are left out of the infotext, and the WebUI keeps a
-    field unchanged when its key is missing. For every tab whose detector is
-    in the pasted parameters, a missing "ADetailer class prompts" key
-    therefore means empty. Keys listed in "Disregard fields from pasted
-    infotext" are left alone. Not a Gradio event, so index-safe; never raises.
+    The infotext leaves out keys that hold their defaults (empty prompts and
+    class prompts, unticked toggles, ...), and the WebUI keeps a field
+    unchanged when its key is missing. For every tab whose detector is in the
+    pasted parameters, a missing key therefore means its default. Pasted
+    parameters with a detector also switch ADetailer itself on: the infotext
+    never writes "ADetailer enable". Keys listed in "Disregard fields from
+    pasted infotext" are left alone. Not a Gradio event, so index-safe; never
+    raises. The API's infotext field does not run it.
     """
     try:
         skipped = set(getattr(shared.opts, "infotext_skip_pasting", None) or [])
+        detector = False
         for key in list(params):
             match = _INFOTEXT_MODEL_KEY.fullmatch(str(key))
             if not match:
                 continue
-            name = "ADetailer class prompts" + (match.group(1) or "")
-            if name not in params and name not in skipped:
-                params[name] = ""
+            sfx = match.group(1) or ""
+            detector = detector or str(params[key]) != "None"
+            defaults = dict(_INFOTEXT_PASTE_DEFAULTS)
+            for written, extra in _INFOTEXT_PASTE_DEPENDENT_DEFAULTS.items():
+                if written + sfx in params:
+                    defaults.update(extra)
+            for name, default in defaults.items():
+                if name + sfx not in params and name + sfx not in skipped:
+                    params[name + sfx] = default
+        if detector and "ADetailer enable" not in params and (
+            "ADetailer enable" not in skipped
+        ):
+            params["ADetailer enable"] = "True"
     except Exception:  # noqa: BLE001
         return
 

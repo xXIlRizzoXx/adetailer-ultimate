@@ -1021,16 +1021,260 @@ def test_empty_class_prompts_stay_out_of_the_infotext():
 def test_pasting_parameters_clears_class_prompts_they_leave_out(
     params, skipped, added
 ):
-    runtime = _load_script(
-        functions={"_clear_missing_class_prompts"},
-        assigns={"_INFOTEXT_MODEL_KEY"},
-        shared=SimpleNamespace(opts=SimpleNamespace(infotext_skip_pasting=skipped)),
-    )
+    runtime = _paste_callback(skipped)
     pasted = dict(params)
 
     runtime._clear_missing_class_prompts("", pasted)
 
-    assert pasted == {**params, **added}
+    assert {
+        k: v for k, v in pasted.items() if "class prompts" in k or k in params
+    } == {**params, **added}
+
+
+def _paste_callback(skipped=()):
+    return _load_script(
+        functions={"_clear_missing_class_prompts"},
+        assigns={
+            "_INFOTEXT_MODEL_KEY",
+            "_INFOTEXT_PASTE_DEFAULTS",
+            "_INFOTEXT_PASTE_DEPENDENT_DEFAULTS",
+        },
+        shared=SimpleNamespace(
+            opts=SimpleNamespace(infotext_skip_pasting=list(skipped))
+        ),
+    )
+
+
+def _infotext(*tabs):
+    """Parsed parameters of an image made with these tabs, as the WebUI
+    pastes them: every value is text, empty class prompts are left out."""
+    suffix = _ui_suffix()
+    params = {}
+    for n, args in enumerate(tabs):
+        params.update(args.extra_params(suffix=suffix(n)))
+    params = {
+        k: str(v) for k, v in params.items()
+        if not (k.startswith("ADetailer class prompts") and not str(v).strip())
+    }
+    params["ADetailer version"] = "test"
+    return params
+
+
+# Pasted by handlers of their own in aaaaaa/ui.py, not by their key.
+_UI_PASTED = {
+    "ad_model_classes", "ad_model_classes_exclude", "ad_model_classes_excluded",
+    "ad_tab_enable", "ad_inpaint_indices",
+}
+
+
+def _host_paste(params, before, suffix=""):
+    """AUTOMATIC1111's and Forge Neo's paste of the string-keyed fields: a
+    missing key leaves the field as it is, text is converted to its type."""
+    from adetailer.args import ALL_ARGS
+
+    state = dict(before)
+    for attr, name in ALL_ARGS:
+        value = params.get(name + suffix)
+        if attr in _UI_PASTED or value is None:
+            continue
+        kind = type(before[attr])
+        try:
+            if kind is bool and value == "False":
+                state[attr] = False
+            elif kind is int:
+                state[attr] = float(value)
+            else:
+                state[attr] = kind(value)
+        except (TypeError, ValueError):
+            continue  # the WebUI leaves the field as it is
+    return state
+
+
+_CN_INPAINT = "control_v11p_sd15_inpaint [ebff9138]"
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        {},
+        # A separate sampler leaves out "Use same scheduler".
+        {"ad_use_sampler": True, "ad_sampler": "Euler a"},
+        # A ControlNet model leaves out the "None" module and default weights.
+        {"ad_controlnet_model": _CN_INPAINT, "ad_controlnet_module": "None"},
+    ],
+)
+def test_pasted_parameters_reproduce_the_image_tab(image):
+    # The infotext leaves out every key at its default, and the WebUI keeps a
+    # field whose key is missing: a stale prompt, separate steps, offset or
+    # ControlNet setting of the tab used to stay and the next image differed.
+    from adetailer.args import ADetailerArgs
+
+    made = ADetailerArgs(ad_model="face_yolov8n.pt", **image)
+    before = ADetailerArgs(
+        ad_model="hand_yolov8n.pt", ad_prompt="detailed eyes",
+        ad_negative_prompt="blurry", ad_prompt_append="smile",
+        ad_negative_prompt_append="frown", ad_classes_sequential=True,
+        ad_class_guard=True, ad_use_main_loras=True, ad_strip_loras=True,
+        ad_detection_resolution=640, ad_mask_k=2, ad_mask_min_ratio=0.1,
+        ad_mask_max_ratio=0.9, ad_x_offset=10, ad_y_offset=-5,
+        ad_mask_merge_invert="Merge", ad_dynamic_denoise_power=1.5,
+        ad_use_inpaint_width_height=True, ad_use_steps=True, ad_steps=50,
+        ad_use_cfg_scale=True, ad_use_checkpoint=True, ad_checkpoint="other",
+        ad_use_vae=True, ad_vae="vae", ad_use_text_encoder=True,
+        ad_text_encoder="te", ad_use_sampler=True, ad_sampler="Euler",
+        ad_scheduler="Karras", ad_use_noise_multiplier=True,
+        ad_use_clip_skip=True, ad_restore_face=True,
+        ad_controlnet_model="control_v11p_sd15_openpose [cab727d4]",
+        ad_controlnet_module="inpaint_only+lama", ad_controlnet_weight=0.5,
+        ad_controlnet_guidance_start=0.1, ad_controlnet_guidance_end=0.9,
+    ).dict()
+    params = _infotext(made)
+
+    _paste_callback()._clear_missing_class_prompts("", params)
+    after = ADetailerArgs(**_host_paste(params, before))
+
+    assert after.extra_params() == made.extra_params()
+
+
+def test_pasting_keeps_values_that_only_apply_with_their_toggle():
+    from adetailer.args import ADetailerArgs
+
+    params = _infotext(
+        ADetailerArgs(ad_model="face_yolov8n.pt"),
+        ADetailerArgs(
+            ad_model="hand_yolov8n.pt", ad_prompt="hand detail", ad_use_steps=True,
+            ad_steps=50,
+        ),
+    )
+    image = dict(params)
+
+    _paste_callback(["ADetailer x offset"])._clear_missing_class_prompts("", params)
+
+    assert params["ADetailer prompt"] == ""
+    assert params["ADetailer use separate steps"] == "False"
+    assert params["ADetailer ControlNet model"] == "None"
+    assert params["ADetailer x offset 2nd"] == "0"
+    # Unused while their toggle is off: the tab keeps its own values.
+    for name in ("ADetailer steps", "ADetailer sampler", "ADetailer checkpoint",
+                 "ADetailer scheduler", "ADetailer ControlNet module"):
+        assert name not in params
+    assert "ADetailer x offset" not in params  # "Disregard fields ..."
+    assert {k: params[k] for k in image} == image  # pasted values stay
+    assert not any(k.endswith(" 3rd") for k in params)
+
+
+def test_pasting_parameters_without_a_detector_adds_nothing():
+    params = {"Steps": "20", "ADetailer version": "test"}
+
+    _paste_callback()._clear_missing_class_prompts("", params)
+
+    assert params == {"Steps": "20", "ADetailer version": "test"}
+
+
+def test_paste_defaults_cover_every_key_the_infotext_leaves_out():
+    from adetailer.args import ALL_ARGS, ADetailerArgs
+
+    runtime = _paste_callback()
+    defaults = {
+        **runtime._INFOTEXT_PASTE_DEFAULTS,
+        **{
+            name: value
+            for extra in runtime._INFOTEXT_PASTE_DEPENDENT_DEFAULTS.values()
+            for name, value in extra.items()
+        },
+    }
+    attrs = {name: attr for attr, name in ALL_ARGS}
+    args = ADetailerArgs()
+    for name, value in defaults.items():
+        assert str(getattr(args, attrs[name])) == value, name
+
+    # Used only while their toggle (itself filled) is on.
+    dependent = {
+        "ADetailer class guard weight", "ADetailer method to decide top k masks",
+        "ADetailer inpaint padding", "ADetailer inpaint width",
+        "ADetailer inpaint height", "ADetailer steps", "ADetailer CFG scale",
+        "ADetailer checkpoint", "ADetailer VAE", "ADetailer text encoder",
+        "ADetailer sampler", "ADetailer noise multiplier", "ADetailer CLIP skip",
+    }
+    ui_pasted = {dict(ALL_ARGS)[attr] for attr in _UI_PASTED}
+    for made in (
+        ADetailerArgs(ad_model="face_yolov8n.pt"),
+        ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_only_masked=False),
+        ADetailerArgs(ad_model="face_yolov8n.pt", ad_use_sampler=True),
+        ADetailerArgs(ad_model="face_yolov8n.pt", ad_controlnet_model=_CN_INPAINT),
+    ):
+        left_out = set(ALL_ARGS.names) - set(made.extra_params())
+        assert left_out <= set(defaults) | dependent | ui_pasted
+
+
+@pytest.mark.parametrize("suffix", ["", " 2nd"])
+@pytest.mark.parametrize(
+    ("choices", "expected"),
+    [
+        # Forge / Forge Neo list "None" first: the image's preprocessor.
+        (["None", "inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"],
+         "None"),
+        # AUTOMATIC1111 has no "None": the model's default, as when generating.
+        (["inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"],
+         "inpaint_global_harmonious"),
+    ],
+)
+def test_pasted_controlnet_module_none_replaces_a_stale_module(
+    suffix, choices, expected
+):
+    # The infotext leaves out the "None" preprocessor, and the model's change
+    # handler kept the tab's old one because it fits the model.
+    from adetailer.args import ADetailerArgs
+
+    made = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_controlnet_model=_CN_INPAINT,
+        ad_controlnet_module="None",
+    )
+    params = {k: str(v) for k, v in made.extra_params(suffix=suffix).items()}
+    assert "ADetailer ControlNet module" + suffix not in params
+
+    _paste_callback()._clear_missing_class_prompts("", params)
+    # The module field keeps its value when its key is missing.
+    module = params.get("ADetailer ControlNet module" + suffix, "inpaint_only+lama")
+
+    ui_path = _SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(ui_path.read_text(encoding="utf-8"))
+    nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "on_cn_model_update"
+    ]
+    namespace = {
+        "gr": SimpleNamespace(update=lambda **kwargs: kwargs),
+        "cn_module_choices": {"inpaint": choices},
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(ui_path), "exec"), namespace)
+
+    assert namespace["on_cn_model_update"](_CN_INPAINT, module)["value"] == expected
+
+
+@pytest.mark.parametrize(
+    ("params", "skipped", "enabled"),
+    [
+        ({"ADetailer model": "face_yolov8n.pt"}, [], "True"),
+        ({"ADetailer model 2nd": "hand_yolov8n.pt"}, [], "True"),
+        ({"ADetailer model": "face_yolov8n.pt"}, ["ADetailer enable"], None),
+        ({"ADetailer model": "None"}, [], None),
+        ({"ADetailer model classes": "face"}, [], None),
+        ({"Steps": "20"}, [], None),
+        ({"ADetailer model": "face_yolov8n.pt", "ADetailer enable": "False"}, [],
+         "False"),
+    ],
+)
+def test_pasting_parameters_with_a_detector_switches_adetailer_on(
+    params, skipped, enabled
+):
+    # "ADetailer enable" is never written, so PNG Info and Send to switched
+    # the image's tabs on while ADetailer itself stayed off.
+    pasted = dict(params)
+
+    _paste_callback(skipped)._clear_missing_class_prompts("", pasted)
+
+    assert pasted.get("ADetailer enable") == enabled
 
 
 def test_class_prompts_paste_callback_is_registered():

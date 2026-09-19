@@ -6,6 +6,7 @@ DOM shaped like Gradio's output. They are skipped when Node.js is missing.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -36,6 +37,18 @@ def test_white_text_is_limited_to_the_dark_theme():
             assert all(s.startswith(".dark ") for s in selectors), selectors
     labels = [s for s, _ in css_rules() if any("ad-section-label" in x for x in s)]
     assert any(all(x.startswith(".dark ") for x in s) for s in labels)
+
+
+def test_amber_status_text_is_limited_to_the_dark_theme():
+    # On the light theme, amber text on the near-white Detection preview /
+    # Run ADetailer status pill was about 1.6:1, barely readable.
+    amber = re.compile(r"(?<![-\w])color:\s*#fbbf24\b", re.I)
+    found = False
+    for selectors, body in css_rules():
+        if amber.search(body):
+            found = True
+            assert all(s.startswith(".dark ") for s in selectors), selectors
+    assert found  # the dark theme keeps its amber
 
 
 def test_version_badge_inner_copy_stays_in_normal_flow():
@@ -72,6 +85,7 @@ const vm = require("vm");
 class Text {
     constructor(t) { this.nodeType = 3; this.data = t; this.parentElement = null; }
     get textContent() { return this.data; }
+    set textContent(v) { this.data = v; }
     cloneNode() { return new Text(this.data); }
 }
 class El {
@@ -144,6 +158,14 @@ function run(file, body, extraWindow) {
             .find((e) => e.id === id) || null,
         querySelectorAll: all,
         addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); },
+        createTreeWalker: (root) => {
+            const texts = [];
+            const walk = (n) => (n.children || []).forEach((k) => {
+                if (k.nodeType === 3) texts.push(k); else walk(k);
+            });
+            walk(root);
+            return { nextNode: () => texts.shift() || null };
+        },
     };
     const window = Object.assign({
         getComputedStyle: (e) => ({ display: e.style.display }),
@@ -154,7 +176,7 @@ function run(file, body, extraWindow) {
         observe(target, options) { this.target = target; this.options = options; }
     }
     const ctx = {
-        window, document, MutationObserver, console,
+        window, document, MutationObserver, console, NodeFilter: { SHOW_TEXT: 4 },
         Event: class { constructor(t) { this.type = t; } },
         setTimeout: (f) => { timers.push(f); return timers.length; },
         clearTimeout: (id) => { timers[id - 1] = null; },
@@ -295,3 +317,147 @@ def test_repeated_identical_status_is_shown_again(tmp_path):
     assert out["options"]["attributeOldValue"] is True
     # Only the outer block is hidden; Gradio copies the class inside it.
     assert out["watched"] == ["outer"]
+
+
+def _tooltip(fragment: str) -> str:
+    source = (ROOT / "javascript" / "button-tooltips.js").read_text(encoding="utf-8")
+    return re.search(rf'{fragment}:\s*"([^"]*)"', source).group(1)
+
+
+TRANSLATED_TOOLTIPS = r"""
+const P = "script_txt2img_adetailer_";
+const inner = new El("button", {});
+const els = {
+    load: new El("button", { id: P + "ad_preset_load" }),
+    load2: new El("button", { id: P + "ad_preset_load_2nd" }),
+    remove: new El("button", { id: P + "ad_preset_delete" }),
+    exportBtn: new El("div", { id: P + "ad_preset_export_btn" }, [inner]),
+};
+run(SCRIPT, new El("body", {}, Object.values(els)), { localization: CASE });
+const out = {};
+for (const k in els) out[k] = els[k].title;
+out.exportBtn = inner.title;
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+@pytest.mark.parametrize("translated", [True, False])
+def test_tooltips_are_shown_in_the_webui_language(tmp_path, translated):
+    # The WebUI's localizer translates a title only when its node is added,
+    # before this script sets it, so every tooltip stayed English.
+    load = _tooltip("adetailer_ad_preset_load")
+    export = _tooltip("adetailer_ad_preset_export_btn")
+    remove = _tooltip("adetailer_ad_preset_delete")
+    localization = (
+        {load: "LOAD (translated)", export: "EXPORT (translated)", "rtl": True}
+        if translated
+        else {}
+    )
+    scenario = f"const CASE = {json.dumps(localization)};\n" + TRANSLATED_TOOLTIPS
+    titles = run_js(tmp_path, "button-tooltips.js", scenario)
+    assert titles["load"] == ("LOAD (translated)" if translated else load)
+    assert titles["load2"] == titles["load"]
+    assert titles["exportBtn"] == ("EXPORT (translated)" if translated else export)
+    assert titles["remove"] == remove  # no translation: English
+
+
+CHANGED_LABEL = r"""
+const tabs = [new Text("📥 Paste settings"), new Text("📥 Paste settings")];
+const other = new Text("plain");
+const body = new El("body", {}, [
+    ...tabs.map((t) => new El("button", {}, [t])), new El("button", {}, [other])]);
+run(SCRIPT, body, { localization: CASE });
+const obs = observers[observers.length - 1];
+// Gradio (Svelte) rewrites a button's text node in place when its value
+// changes: one characterData record, no added node.
+const change = (t, text) => {
+    t.data = text;
+    obs.cb([{ type: "characterData", target: t, addedNodes: [] }]);
+    return t.data;
+};
+const out = { options: obs.options, swept: tabs.map((t) => t.data) };
+out.copied = change(tabs[1], "📥 Paste from 1st tab");  // runtime text, no key
+out.reset = change(tabs[1], "📥 Paste settings");
+obs.cb([{ type: "characterData", target: tabs[1], addedNodes: [] }]);
+out.again = tabs[1].data;
+out.cycle = change(other, "🔁 A");  // never written: its translation is a key
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_paste_label_stays_translated_after_copy_and_reset(tmp_path):
+    # Copy and Reset set the Paste button's label back to English in place;
+    # only added nodes were translated, so it stayed English.
+    localization = {
+        "📥 Paste settings": "📥 PASTE (translated)",
+        "🔁 A": "🔁 B",
+        "🔁 B": "🔁 A",
+    }
+    scenario = f"const CASE = {json.dumps(localization)};\n" + CHANGED_LABEL
+    out = run_js(tmp_path, "localize_emoji_buttons.js", scenario)
+    assert out["options"]["characterData"] is True
+    assert out["swept"] == ["📥 PASTE (translated)"] * 2
+    assert out["copied"] == "📥 Paste from 1st tab"
+    assert out["reset"] == "📥 PASTE (translated)"
+    assert out["again"] == "📥 PASTE (translated)"
+    assert out["cycle"] == "🔁 A"
+
+
+def _export_js() -> str:
+    tree = ast.parse((ROOT / "aaaaaa" / "ui.py").read_text(encoding="utf-8"))
+    return next(
+        ast.literal_eval(node.value) for node in tree.body
+        if isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "id", "") == "_EXPORT_JS"
+    )
+
+
+EXPORT_STEP = r"""
+const clicked = [];
+globalThis.document = {
+    createElement: () => ({ click() { clicked.push([this.href, this.download]); },
+                            remove() {} }),
+    body: { appendChild() {} },
+};
+// Gradio 4.40's wrapper for a front-end-only step with one output.
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const step = new AsyncFunction("__fn_args", `
+  let result = await (${EXPORT_JS})(...__fn_args);
+  if (typeof result === "undefined") return [];
+  return (true && !Array.isArray(result)) ? [result] : result;`);
+(async () => {
+    const out = {};
+    out.fresh = await step([{ url: "/file=gradio/1a2b/adetailer-ultimate-presets.json",
+                              orig_name: null }]);
+    out.cleared = await step([null]);
+    out.clicked = clicked;
+    console.log(JSON.stringify(out));
+})();
+"""
+
+
+@needs_node
+def test_export_step_downloads_the_new_file_once_and_clears_it(tmp_path):
+    # Gradio 4's DownloadButton only downloads the value it already holds when
+    # clicked: the first Export got nothing and later ones the previous file.
+    driver = tmp_path / "export.js"
+    driver.write_text(
+        f"const EXPORT_JS = {json.dumps(_export_js())};\n" + EXPORT_STEP,
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [NODE, str(driver)], capture_output=True, encoding="utf-8", timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    # One download of the file this click wrote; the value is then cleared,
+    # so the button never serves it again on the next click.
+    assert out["clicked"] == [
+        ["/file=gradio/1a2b/adetailer-ultimate-presets.json",
+         "adetailer-ultimate-presets.json"]
+    ]
+    assert out["fresh"] == [None]
+    assert out["cleared"] == [None]

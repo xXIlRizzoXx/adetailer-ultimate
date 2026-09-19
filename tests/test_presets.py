@@ -218,3 +218,40 @@ def test_library_whose_status_cannot_be_checked_does_not_break_the_ui(
     monkeypatch.setattr(type(preset_file), "is_file", denied)
     assert presets.load_presets() == {}
     assert not presets.save_preset("new", {"ad_prompt": "new"})
+
+
+def test_library_is_on_disk_before_it_replaces_the_old_one(preset_file, monkeypatch):
+    # Closing a file does not put it on disk. After a power cut the renamed
+    # library could hold only zero bytes, and the next save dropped every
+    # preset it had.
+    events = []
+    real_fsync, real_replace = presets.os.fsync, presets.os.replace
+
+    def fsync(fd):
+        events.append(("fsync", presets.os.fstat(fd).st_size))
+        real_fsync(fd)
+
+    def replace(src, dst):
+        events.append(("replace", str(src), str(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(presets.os, "fsync", fsync)
+    monkeypatch.setattr(presets.os, "replace", replace)
+    assert presets.save_preset("face", {"ad_prompt": "x"})
+
+    tmp = preset_file.with_suffix(".json.tmp")
+    assert events == [
+        ("fsync", preset_file.stat().st_size),
+        ("replace", str(tmp), str(preset_file)),
+    ]
+    assert presets.get_preset("face") == {"ad_prompt": "x"}
+
+
+def test_a_file_system_that_cannot_sync_still_saves(preset_file, monkeypatch):
+    def fail_fsync(_fd):
+        raise OSError
+
+    monkeypatch.setattr(presets.os, "fsync", fail_fsync)
+    assert presets.save_preset("face", {"ad_prompt": "x"})
+    assert presets.get_preset("face") == {"ad_prompt": "x"}
+    assert not preset_file.with_suffix(".json.tmp").exists()

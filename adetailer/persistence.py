@@ -131,7 +131,15 @@ def save_tab_state(
             current[_state_key(mode, tab_index)] = cleaned
 
             tmp = _STATE_FILE.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(current, indent=2, default=str), encoding="utf-8")
+            with tmp.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(current, indent=2, default=str))
+                # On disk before the rename: after a power cut the file is
+                # then the old or the new one, never a file of zero bytes.
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass  # best effort: some file systems cannot sync
             os.replace(tmp, _STATE_FILE)
         except OSError:
             # Disk full / permission denied / network drive flaked / ... — we

@@ -129,7 +129,7 @@ div.block.ad-preview-status {
     margin: 0 0 0 10px !important;
     /* Asymmetric horizontal padding: bigger left inset so the text
      * doesn't hug the amber border-left bar. User-reported 2026-05-18
-     * "il testo spostalo leggermente a destra" — bumped left padding
+     * "move the text slightly to the right" — bumped left padding
      * from 12px to 18px (+6px) for breathing room from the border. */
     padding: 6px 12px 6px 18px !important;
     background: rgba(251, 191, 36, 0.08) !important;
@@ -148,12 +148,18 @@ div.block.ad-preview-status {
     font-size: 12px !important;
     line-height: 1.4 !important;
     opacity: 1 !important;
+}
+
+/* Amber text only on the dark theme: on the light theme's near-white pill it
+ * was about 1.6:1, barely readable, so the theme's own text colour applies
+ * there. The amber bar on the left still marks the pill. */
+.dark .ad-preview-status p {
     color: #fbbf24 !important;
 }
 
 /* "Combine all tabs" checkbox sits on the same row as the Run button;
  * detach it a bit so the two aren't glued together (user-requested
- * 2026-06-04 "staccandolo un po' dal tasto"). */
+ * 2026-06-04 "detach it a little from the button"). */
 .ad-preview-combine {
     margin-left: 28px !important;
 }
@@ -226,8 +232,8 @@ div.block.ad-preview-status {
 }
 
 /* General breathing room for the two-up rows in Detection / Mask
- * Preprocessing / Inpainting (user-requested 2026-06-05 "spazia tutto un
- * po"). `ad-2col-row` = rows built from two compact gr.Column; `ad-2up-row`
+ * Preprocessing / Inpainting (user-requested 2026-06-05 "space everything
+ * out a bit"). `ad-2col-row` = rows built from two compact gr.Column; `ad-2up-row`
  * = rows with two widgets placed directly (mask-blur/denoising,
  * sampler/scheduler). Both get a horizontal gap between the two halves plus
  * a little space below; the column variant also gets a vertical gap between

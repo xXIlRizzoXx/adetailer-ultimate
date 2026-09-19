@@ -114,3 +114,39 @@ def test_state_that_cannot_be_read_right_now_is_not_replaced(
         persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
     assert state_file.read_bytes() == original
     assert not list(state_file.parent.glob("user_state.unreadable-*"))
+
+
+def test_state_is_on_disk_before_it_replaces_the_old_one(state_file, monkeypatch):
+    # Every Generate click rewrites this file. Closing it does not put it on
+    # disk: after a power cut every remembered setting could be gone.
+    events = []
+    real_fsync, real_replace = persistence.os.fsync, persistence.os.replace
+
+    def fsync(fd):
+        events.append(("fsync", persistence.os.fstat(fd).st_size))
+        real_fsync(fd)
+
+    def replace(src, dst):
+        events.append(("replace", str(src), str(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(persistence.os, "fsync", fsync)
+    monkeypatch.setattr(persistence.os, "replace", replace)
+    persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
+
+    tmp = state_file.with_suffix(".json.tmp")
+    assert events == [
+        ("fsync", state_file.stat().st_size),
+        ("replace", str(tmp), str(state_file)),
+    ]
+    assert persistence.load_state() == {"0": {"ad_prompt": "face"}}
+
+
+def test_state_saves_where_the_file_system_cannot_sync(state_file, monkeypatch):
+    def fail_fsync(_fd):
+        raise OSError
+
+    monkeypatch.setattr(persistence.os, "fsync", fail_fsync)
+    persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
+    assert persistence.load_state() == {"0": {"ad_prompt": "face"}}
+    assert not state_file.with_suffix(".json.tmp").exists()

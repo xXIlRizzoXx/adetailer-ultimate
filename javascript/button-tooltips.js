@@ -77,7 +77,15 @@
                 const target =
                     el.tagName === "BUTTON" ? el : el.querySelector("button") || el;
                 if (!target.title) {
-                    target.title = tooltipText;
+                    // The WebUI's localizer translates a title only when the
+                    // node is added, before this runs: look it up here, as
+                    // the WebUI's own hints.js does for its tooltips.
+                    const l10n = window.localization;
+                    const translated = l10n && l10n[tooltipText];
+                    target.title =
+                        typeof translated === "string" && translated
+                            ? translated
+                            : tooltipText;
                 }
             }
         }

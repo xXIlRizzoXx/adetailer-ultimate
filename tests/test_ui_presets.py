@@ -290,9 +290,9 @@ def test_export_on_gradio_3_keeps_the_button_label(callbacks, tmp_path, monkeypa
     # Button's label and "Exported" was reported although nothing downloaded.
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     callbacks["_DownloadButton"] = None
-    assert callbacks["_do_export"]() == {}
+    label, status = callbacks["_do_export"]()
+    assert label == {}
     assert list(tmp_path.iterdir()) == []
-    status = callbacks["_do_export_status"]()
     assert "Exported" not in status
     assert "Gradio 4" in status
 
@@ -301,9 +301,55 @@ def test_export_on_gradio_4_still_serves_the_file(callbacks, tmp_path, monkeypat
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     callbacks["_DownloadButton"] = object
     out = tmp_path / "adetailer-ultimate-presets.json"
-    assert callbacks["_do_export"]() == str(out)
+    path, status = callbacks["_do_export"]()
+    assert path == str(out)
     assert out.read_text(encoding="utf-8") == '{"saved": {}}'
-    assert "Exported" in callbacks["_do_export_status"]()
+    assert "Exported" in status
+
+
+@pytest.mark.parametrize("gradio_4", [True, False])
+def test_export_downloads_the_file_its_click_wrote(gradio_4):
+    # Gradio 4's DownloadButton downloads the value it holds when clicked,
+    # before the server has written this click's file: the first Export got
+    # nothing (while the status said it worked) and later ones the previous
+    # file. A front-end step now downloads the new value and clears it.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    click = next(
+        node for node in calls
+        if node.func.attr == "click"
+        and getattr(node.func.value, "id", "") == "preset_export_btn"
+    )
+    then = next(
+        node for node in calls if node.func.attr == "then" and node.func.value is click
+    )
+    outputs = next(k.value for k in click.keywords if k.arg == "outputs")
+    assert [e.id for e in outputs.elts] == ["preset_export_btn", "preset_io_status"]
+    assert [ast.unparse(k) for k in then.keywords] == [
+        "queue=False", "**_export_then"
+    ]
+    assign = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "id", "") == "_export_then"
+    )
+    namespace = {
+        "preset_export_btn": "button",
+        "_EXPORT_JS": "js",
+        "_DownloadButton": object if gradio_4 else None,
+    }
+    kwargs = eval(compile(ast.Expression(assign.value), str(path), "eval"), namespace)
+    if gradio_4:
+        assert kwargs == {
+            "fn": None, "inputs": "button", "outputs": "button", "js": "js"
+        }
+    else:
+        # Gradio 3 names it `_js` and rejects `js`; nothing to download there.
+        assert kwargs == {"fn": None}
 
 
 CN_INPAINT = "control_v11p_sd15_inpaint [ebff9138]"
@@ -350,6 +396,77 @@ def test_controlnet_model_change_reads_the_current_module():
     assert [e.attr for e in inputs.elts] == [
         "ad_controlnet_model", "ad_controlnet_module"
     ]
+
+
+class Block:
+    """A Gradio block that records its settings; also a no-op layout."""
+
+    def __init__(self, *_args, **kwargs):
+        self.kwargs = kwargs
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def change(self, *_args, **_kwargs):
+        return self
+
+
+@pytest.mark.parametrize(
+    ("saved", "expected"),
+    [
+        # A restored model shows its module with the saved choice.
+        (
+            {"ad_controlnet_model": CN_INPAINT, "ad_controlnet_module": "inpaint_only+lama"},
+            (True, "inpaint_only+lama"),
+        ),
+        # A saved module that does not fit falls back to the model's first.
+        (
+            {"ad_controlnet_model": CN_INPAINT, "ad_controlnet_module": "openpose"},
+            (True, "inpaint_global_harmonious"),
+        ),
+        # No model, or one that is gone: hidden as before, value untouched.
+        ({"ad_controlnet_model": "None", "ad_controlnet_module": "inpaint_only"},
+         (False, "inpaint_only")),
+        ({"ad_controlnet_model": "deleted_model", "ad_controlnet_module": "x"},
+         (False, "x")),
+    ],
+)
+def test_restored_controlnet_model_shows_its_module_at_startup(saved, expected):
+    # .change does not fire at the first render, so after a restart the
+    # restored model's module dropdown stayed hidden with only "None" in it.
+    from functools import partial
+
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    source = ast.parse(path.read_text(encoding="utf-8"))
+    names = {"controlnet", "on_cn_model_update", "elem_id", "_sv", "suffix", "ordinal"}
+    nodes = [
+        node for node in source.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    choices = ["inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"]
+    namespace = {
+        "gr": SimpleNamespace(
+            update=lambda **kwargs: kwargs, Row=Block, Column=Block,
+            Dropdown=Block, Slider=Block,
+        ),
+        "partial": partial,
+        "get_cn_models": lambda: [CN_INPAINT],
+        "controlnet_exists": True,
+        "cn_module_choices": {"inpaint": choices},
+    }
+    module = ast.Module(body=[source.body[0], *nodes], type_ignores=[])
+    exec(compile(module, str(path), "exec"), namespace)
+    w = SimpleNamespace()
+
+    namespace["controlnet"](w, 0, False, saved)
+
+    visible, value = expected
+    dropdown = w.ad_controlnet_module.kwargs
+    assert (dropdown["visible"], dropdown["value"]) == (visible, value)
+    assert dropdown["choices"] == (choices if visible else ["None"])
 
 
 def _paste(fields, params):
@@ -479,6 +596,16 @@ def test_each_tab_registers_the_class_filter_paste_handlers():
         # Tab 3 is not in the image: leave it as it is.
         (2, {"ADetailer model": "face.pt", "ADetailer model 2nd": "hand.pt"}, (None, None)),
         (1, {"ADetailer model": "face.pt"}, (None, None)),
+        # An image made with ADetailer lists every tab that ran: a tab that
+        # is not in it did not run, so it is switched off.
+        (1, {"ADetailer model": "face.pt", "ADetailer version": "26.3.0"}, (False, None)),
+        (
+            0,
+            {"ADetailer model 2nd": "hand.pt", "ADetailer version": "26.3.0"},
+            (False, None),
+        ),
+        # Parameters without ADetailer leave every tab as it is.
+        (1, {"Steps": "20"}, (None, None)),
     ],
 )
 def test_png_info_paste_enables_the_tab_and_clears_old_indices(
@@ -545,6 +672,36 @@ def test_png_info_paste_leaves_tab_fields_the_user_disregards(callbacks, monkeyp
     assert pasted[w.ad_inpaint_indices] is None
 
 
+@pytest.mark.parametrize(
+    "skipped", [["ADetailer model 2nd"], ["ADetailer tab enable 2nd"]]
+)
+def test_png_info_paste_keeps_a_tab_whose_detector_the_user_disregards(
+    callbacks, monkeypatch, skipped
+):
+    # A disregarded detector key is removed before pasting: its absence does
+    # not mean that the tab did not run.
+    modules = ModuleType("modules")
+    modules.shared = SimpleNamespace(
+        opts=SimpleNamespace(infotext_skip_pasting=skipped)
+    )
+    monkeypatch.setitem(sys.modules, "modules", modules)
+    w = widgets()
+    pasted = _paste(
+        callbacks["_tab_infotext_fields"](w, 1),
+        {"ADetailer model": "face.pt", "ADetailer version": "26.3.0"},
+    )
+    assert pasted[w.ad_tab_enable] is None
+
+
+def test_the_master_switch_is_pasted_from_its_own_key():
+    # The infotext_pasted callback in scripts/!adetailer.py adds "ADetailer
+    # enable" to parameters with a detector; the switch must keep reading it
+    # (a string key also keeps it in "Disregard fields from pasted infotext").
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    source = path.read_text(encoding="utf-8")
+    assert 'infotext_fields.append((ad_enable, "ADetailer enable"))' in source
+
+
 # YOLO-World detects the typed classes and has no NOT mode: its "Exclude
 # selected (NOT)" checkbox must be hidden and off, never a visible promise of
 # an inversion that does not happen. Other detectors keep NOT mode.
@@ -573,7 +730,9 @@ def test_detector_change_hides_not_mode_for_yolo_world(callbacks, state, shown):
         current_excluded=state["ad_model_classes_excluded"],
     )
     assert result[2] == {"visible": shown, "value": shown}
-    assert result[3]["value"] == state["ad_model_classes_excluded"]
+    # With NOT mode off, a kept excluded list went into the image's
+    # parameters ("classes excluded: hand") and the preset preview.
+    assert result[3]["value"] == (state["ad_model_classes_excluded"] if shown else "")
     if not shown:
         assert result[0]["value"] == "person"  # the typed vocabulary is kept
 
@@ -592,6 +751,9 @@ def test_load_and_paste_hide_not_mode_for_yolo_world(callbacks, state, shown):
         )
     )
     assert restored["ad_model_classes_exclude"] == {"visible": shown, "value": shown}
+    assert restored["ad_model_classes_excluded"] == {
+        "value": state["ad_model_classes_excluded"] if shown else ""
+    }
 
 
 @pytest.mark.parametrize(
@@ -603,9 +765,27 @@ def test_png_info_paste_leaves_not_mode_off_for_yolo_world(callbacks, model, exp
     pasted = _paste(
         fields,
         {"ADetailer model": model, "ADetailer classes exclude": "True",
-         "ADetailer model classes": "person"},
+         "ADetailer model classes": "person",
+         "ADetailer model classes excluded": "hand"},
     )
     assert pasted[w.ad_model_classes_exclude] is expected
+    assert pasted[w.ad_model_classes_excluded] == ("hand" if expected else "")
+
+
+def test_yolo_world_switch_leaves_no_excluded_classes_in_the_parameters(callbacks):
+    from adetailer.args import ADetailerArgs
+
+    result = callbacks["on_ad_model_update"](
+        "custom-world.pt", ["hand"], {},
+        current_include="", current_exclude=True, current_excluded="hand",
+    )
+    args = ADetailerArgs(
+        ad_model="custom-world.pt", ad_model_classes="person,cat",
+        ad_model_classes_exclude=result[2]["value"],
+        ad_model_classes_excluded=result[3]["value"],
+    )
+    assert args.extra_params()["ADetailer model classes"] == "person,cat"
+    assert "ADetailer model classes excluded" not in args.extra_params()
 
 
 @pytest.mark.parametrize(("world", "shown"), [(True, False), (False, True)])
@@ -625,3 +805,20 @@ def test_saved_yolo_world_tab_starts_with_not_mode_hidden(world, shown):
 
     assert evaluate(keywords["visible"]) is shown
     assert evaluate(keywords["value"]) is shown
+
+
+@pytest.mark.parametrize(("world", "expected"), [(True, ""), (False, "hand")])
+def test_saved_yolo_world_tab_starts_without_excluded_classes(world, expected):
+    # Like its hidden NOT checkbox: an excluded list saved with a YOLO-World
+    # detector would otherwise go into the next image's parameters.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    textbox = next(
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "attr", "") == "ad_model_classes_excluded"
+    )
+    keywords = {k.arg: k.value for k in textbox.keywords}
+    namespace = {"sv": lambda attr, default: "hand", "_is_world_saved": world}
+    value = eval(compile(ast.Expression(keywords["value"]), str(path), "eval"), namespace)
+    assert value == expected
