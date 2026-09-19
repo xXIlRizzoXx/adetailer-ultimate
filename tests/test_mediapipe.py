@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -86,3 +87,53 @@ def test_face_features_filters_keep_masks_and_labels_aligned(
     assert result.class_names == expected
     assert len(result.bboxes) == len(result.masks) == len(result.confidences) == len(expected)
     assert all(mask.getbbox() == tuple(box) for mask, box in zip(result.masks, result.bboxes))
+
+
+def _fake_tasks_api(seen):
+    """A fake `mediapipe.tasks.python` whose loader, like MediaPipe's native one
+    on Windows, cannot open a model asset by a path with non-ASCII characters."""
+
+    class BaseOptions:
+        def __init__(self, model_asset_path=None, model_asset_buffer=None):
+            seen["path"], seen["buffer"] = model_asset_path, model_asset_buffer
+
+    def create_from_options(options):
+        path = seen["path"]
+        if path is not None and not str(path).isascii():
+            raise FileNotFoundError(f"Unable to open file at {path}")
+        return object()
+
+    factory = SimpleNamespace(create_from_options=create_from_options)
+    vision = SimpleNamespace(
+        FaceDetector=factory,
+        FaceLandmarker=factory,
+        FaceDetectorOptions=lambda **kw: kw,
+        FaceLandmarkerOptions=lambda **kw: kw,
+        RunningMode=SimpleNamespace(IMAGE=0),
+    )
+    return SimpleNamespace(BaseOptions=BaseOptions, vision=vision)
+
+
+@pytest.mark.parametrize("which", ["detector", "landmarker"])
+def test_model_asset_in_non_ascii_folder_loads_and_is_kept(
+    monkeypatch, tmp_path, which
+):
+    # A WebUI installed under a user or folder name with an accented or CJK
+    # character: the asset failed to load, was deleted as "corrupt" and was
+    # downloaded again on every call, while nothing was ever detected.
+    asset = tmp_path / "café_日本" / "model.bin"
+    asset.parent.mkdir()
+    asset.write_bytes(b"x" * 4096)
+    seen = {}
+    monkeypatch.setitem(sys.modules, "mediapipe.tasks.python", _fake_tasks_api(seen))
+    monkeypatch.setattr(detector, "_tasks_api_aborts", lambda: False)
+    monkeypatch.setattr(detector, "_ensure_model", lambda *_: str(asset))
+    monkeypatch.setattr(detector, "_DETECTOR_CACHE", {})
+    monkeypatch.setattr(detector, "_LANDMARKER_CACHE", {})
+
+    if which == "detector":
+        assert detector._get_face_detector(0.3) is not None
+    else:
+        assert detector._get_face_landmarker(0.3, 20) is not None
+    assert asset.exists()
+    assert seen["buffer"] == asset.read_bytes()

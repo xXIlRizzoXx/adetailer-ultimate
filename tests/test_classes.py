@@ -140,3 +140,21 @@ def test_undecodable_legacy_json_does_not_raise(tmp_path, monkeypatch):
     _fake_ultralytics(monkeypatch, lambda path: {0: "face"})
 
     assert get_model_class_names(str(pt)) == ["face"]
+
+
+def test_class_names_match_regardless_of_case(tmp_path, monkeypatch, capsys):
+    # An API call or an old preset may send "Face" for the model's "face"; it
+    # used to match nothing, so the class filter was dropped silently.
+    pt = tmp_path / "x.pt"
+    pt.write_bytes(b"x")
+    (tmp_path / "x.names.json").write_bytes(b'["face","hand","Eye","eye"]')
+    _fake_ultralytics(monkeypatch, _unreadable)
+
+    assert resolve_class_ids(str(pt), ["Face", "HAND"]) == [0, 1]
+    # An exact match wins over a case-insensitive one.
+    assert resolve_class_ids(str(pt), ["eye", "Eye"]) == [3, 2]
+    assert capsys.readouterr().out == ""
+
+    # Unknown, out-of-range and ambiguous entries are dropped and named.
+    assert resolve_class_ids(str(pt), ["hands", "9", "EYE", "face"]) == [0]
+    assert "hands, 9, EYE" in capsys.readouterr().out

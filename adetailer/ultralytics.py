@@ -77,12 +77,15 @@ def ultralytics_predict(
             and len(pred[0].boxes) > 0
         ):
             names = get_model_class_names(str(model_path))
+            # Same name matching as the include filter ("Hand" excludes "hand").
+            excluded_ids = resolve_class_ids(str(model_path), excluded)
             cls_ids = pred[0].boxes.cls.cpu().numpy().astype(int).tolist()
             keep = [
                 i
                 for i, cid in enumerate(cls_ids)
                 if (names[cid] if 0 <= cid < len(names) else str(cid)) not in excluded
                 and str(cid) not in excluded
+                and cid not in excluded_ids
             ]
             if not keep:
                 return PredictOutput()

@@ -209,9 +209,11 @@ def _get_face_landmarker(confidence: float, max_faces: int):
     if not path:
         return None
     try:
+        # Bytes, not the path: on Windows MediaPipe's native loader cannot open
+        # a path with a non-ASCII character (e.g. an accented user name).
         landmarker = vision.FaceLandmarker.create_from_options(
             vision.FaceLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=path),
+                base_options=BaseOptions(model_asset_buffer=Path(path).read_bytes()),
                 running_mode=vision.RunningMode.IMAGE,
                 num_faces=int(max_faces),
                 min_face_detection_confidence=float(confidence),
@@ -246,9 +248,10 @@ def _get_face_detector(confidence: float):
     if not path:
         return None
     try:
+        # Bytes, not the path (non-ASCII paths, see _get_face_landmarker).
         detector = vision.FaceDetector.create_from_options(
             vision.FaceDetectorOptions(
-                base_options=BaseOptions(model_asset_path=path),
+                base_options=BaseOptions(model_asset_buffer=Path(path).read_bytes()),
                 running_mode=vision.RunningMode.IMAGE,
                 min_detection_confidence=float(confidence),
             )

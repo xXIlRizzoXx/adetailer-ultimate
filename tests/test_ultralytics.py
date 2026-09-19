@@ -241,6 +241,46 @@ def test_looked_up_class_names_still_win_over_the_result(tmp_path, monkeypatch):
     assert result.class_names == ["hand", "5"]
 
 
+def test_class_filter_names_match_regardless_of_case(tmp_path, monkeypatch, capsys):
+    # "Face" from an API call or an old preset used to match no class, so the
+    # include filter was dropped and every class was inpainted.
+    model = tmp_path / "multi.pt"
+    model.write_bytes(b"x")
+    (tmp_path / "multi.names.json").write_text('["face", "hand"]', encoding="utf-8")
+    calls = []
+    module = ModuleType("ultralytics")
+
+    class YOLO:
+        def __init__(self, path):
+            self.names = {0: "face", 1: "hand"}
+
+        def __call__(self, image, **kwargs):
+            calls.append(kwargs)
+            wanted = kwargs.get("classes")
+            cls = [float(c) for c in (0, 1) if wanted is None or c in wanted]
+            return [_FakeResult(self.names, cls)]
+
+    module.YOLO = YOLO
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+    image = Image.new("RGB", (4, 4))
+    get_model_class_names.cache_clear()
+    try:
+        include = ultralytics_predict(str(model), image, classes="Face")
+        exclude = ultralytics_predict(str(model), image, exclude_classes="HAND")
+        unknown = ultralytics_predict(str(model), image, classes="hands")
+    finally:
+        get_model_class_names.cache_clear()
+
+    assert calls[0]["classes"] == [0]
+    assert include.class_names == ["face"]
+    assert exclude.class_names == ["face"]
+    # A name the model does not have is still dropped (every class is then
+    # detected, as before), but the console now says so.
+    assert "classes" not in calls[2]
+    assert unknown.class_names == ["face", "hand"]
+    assert "hands" in capsys.readouterr().out
+
+
 class TestMaskToPil:
     @pytest.mark.parametrize(
         ("content_size", "padding", "output_size"),

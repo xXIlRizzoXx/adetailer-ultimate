@@ -186,18 +186,34 @@ def _read_class_names(model_path: str) -> list[str]:
 
 def resolve_class_ids(model_path: str, requested: list[str]) -> list[int]:
     """Convert user-provided class names (or numeric ids as strings) to int ids.
-    Unknown entries are silently dropped — matches uddetailer's behavior.
+    Without an exact match a name matches case-insensitively, as an API call or
+    an old preset may send "Face" for "face". Unknown entries are dropped —
+    matches uddetailer's behavior — and named in the console when the model's
+    class names are known.
     """
     names = get_model_class_names(model_path)
+    folded = [n.casefold() for n in names]
     out: list[int] = []
+    unknown: list[str] = []
     for token in requested:
         if token.isdigit():
             i = int(token)
             if 0 <= i < max(1, len(names) or 10_000):
                 out.append(i)
+            else:
+                unknown.append(token)
             continue
         if token in names:
             out.append(names.index(token))
+        elif folded.count(token.casefold()) == 1:
+            out.append(folded.index(token.casefold()))
+        else:
+            unknown.append(token)
+    if unknown and names:
+        print(
+            f"[-] ADetailer: class not found in {Path(model_path).name}, ignored:"
+            f" {', '.join(unknown)}"
+        )
     return out
 
 
