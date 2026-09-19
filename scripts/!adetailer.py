@@ -248,7 +248,7 @@ _INLINE_CLASS_RE = re.compile(
 )
 
 
-def _resolve_inline_class_prompt(text: str, cls: str | None) -> str:
+def _resolve_inline_class_prompt(text: str, cls: str | Sequence[str] | None) -> str:
     """Resolve inline ``[CLASS=name]...[/CLASS]`` blocks for a region of class
     ``cls``.
 
@@ -257,9 +257,10 @@ def _resolve_inline_class_prompt(text: str, cls: str | None) -> str:
     kept inline; a block for a different class is removed. Text OUTSIDE any block
     is left untouched, so the intended pattern is a normal base prompt plus a few
     class-specific blocks. When ``cls`` is None (class-less model) every block is
-    kept — we can't filter. A prompt with no ``[CLASS=`` tag is returned
-    unchanged (fast path), so the feature is inert unless the user opts in by
-    typing the tags.
+    kept — we can't filter. ``cls`` may also be a list of classes (a merged
+    region holding several): a block for any of them is kept. A prompt with no
+    ``[CLASS=`` tag is returned unchanged (fast path), so the feature is inert
+    unless the user opts in by typing the tags.
     """
     if not text:
         return text
@@ -271,11 +272,15 @@ def _resolve_inline_class_prompt(text: str, cls: str | None) -> str:
     # rather than burn CPU once per mask per image.
     if low.count("[class=") > 100:
         return text
-    cls_cf = (cls or "").strip().casefold()
+    wanted = {
+        c.strip().casefold()
+        for c in ([cls] if isinstance(cls, str) else (cls or []))
+        if c and c.strip()
+    }
 
     def _sub(m: "re.Match[str]") -> str:
         names = {n.strip().casefold() for n in m.group(1).split(",") if n.strip()}
-        return m.group(2) if (not cls_cf or cls_cf in names) else ""
+        return m.group(2) if (not wanted or names & wanted) else ""
 
     out = _INLINE_CLASS_RE.sub(_sub, text)
     # Strip any orphan / malformed CLASS tags so they never leak into the prompt.
@@ -819,6 +824,15 @@ class AfterDetailerScript(scripts.Script):
                 prompts[n] = blank_replacement
             elif "[PROMPT]" in prompts[n]:
                 prompts[n] = prompts[n].replace("[PROMPT]", blank_replacement)
+            elif (
+                blank_replacement
+                and "[class=" in prompts[n].lower()
+                and not _resolve_inline_class_prompt(prompts[n], ",")
+            ):
+                # Only [CLASS=] blocks: the text outside them is blank, which
+                # means the main prompt, as for a blank prompt. Otherwise every
+                # region of another class would get an empty prompt.
+                prompts[n] = f"{blank_replacement}, {prompts[n]}"
 
             for pair in replacements:
                 prompts[n] = prompts[n].replace(pair.s, pair.r)
@@ -1154,6 +1168,12 @@ class AfterDetailerScript(scripts.Script):
             **version_args,
         )
 
+        # Forge / Forge Neo: keep the user's Distilled CFG Scale / Shift instead
+        # of the host's 3.5 default. Other hosts have no such field, and an
+        # unknown constructor keyword would fail there, so set the attribute.
+        if hasattr(p, "distilled_cfg_scale"):
+            i2i.distilled_cfg_scale = p.distilled_cfg_scale
+
         i2i.cached_c = [None, None]
         i2i.cached_uc = [None, None]
         i2i.scripts, i2i.script_args = self.script_filter(p, args)
@@ -1328,7 +1348,9 @@ class AfterDetailerScript(scripts.Script):
         after masks were dropped/merged. A one-source group keeps that detection;
         a merged group (>1 source) becomes a single entry — the UNION bbox, the
         max confidence, and the shared class name ("" when the merged sources
-        have different classes, so the region is treated as class-less)."""
+        have different classes, so the region is treated as class-less).
+        ``pred.group_classes`` keeps each region's distinct classes, for the
+        inline [CLASS=] blocks of a merged region that mixes classes."""
 
         def _union(boxes):
             return [
@@ -1343,6 +1365,9 @@ class AfterDetailerScript(scripts.Script):
                 max(pred.confidences[i] for i in g) for g in groups
             ]
         if pred.class_names:
+            pred.group_classes = [
+                list(dict.fromkeys(pred.class_names[i] for i in g)) for g in groups
+            ]
             pred.class_names = [
                 pred.class_names[g[0]]
                 if len({pred.class_names[i] for i in g}) == 1
@@ -1486,6 +1511,8 @@ class AfterDetailerScript(scripts.Script):
                 params_txt_content = self.read_params_txt()
             except Exception:  # noqa: BLE001
                 params_txt_content = ""
+            # Regions that failed with a NaN error, counted by the inner pass.
+            self._ad_nan_regions = 0
             try:
                 processed = self._postprocess_image_inner(p, pp, args)
             finally:
@@ -1500,6 +1527,10 @@ class AfterDetailerScript(scripts.Script):
                     or getattr(state, "stopping_generation", False)
                 ):
                     return image, "ℹ️ Cancelled — image unchanged."
+                if getattr(self, "_ad_nan_regions", 0):
+                    # Detected, but the inpaint failed: not "nothing detected".
+                    # No image, so a folder run counts the file as failed.
+                    return None, "⚠️ ADetailer run failed: NaN error while inpainting."
                 return image, "ℹ️ Nothing detected — image unchanged."
             status = "✅ ADetailer pass complete."
             if save:
@@ -1670,13 +1701,21 @@ class AfterDetailerScript(scripts.Script):
         returned unchanged, so this only affects users who type the tags.
         With ``inverted`` (Merge and Invert) the mask is the background, which
         none of the detected classes describe, so every class block is dropped.
+        A merged region (Merge) that mixes classes keeps the blocks of the
+        classes it holds, and is skipped only when every one of them is.
         """
         try:
             cn = getattr(pred, "class_names", None)
             cls = cn[j] if (cn and len(cn) == steps and j < len(cn)) else None
-            if inverted and cn:
+            if inverted:
                 # A comma never matches a tag name (tags are split on commas).
                 cls = ","
+            group = None
+            if cls == "":
+                gc = getattr(pred, "group_classes", None)
+                if gc and len(gc) == steps and j < len(gc):
+                    group = gc[j]
+                    cls = group
             had_inline = isinstance(p2.prompt, str) and "[class=" in p2.prompt.lower()
             new_pos = _resolve_inline_class_prompt(p2.prompt, cls)
             # A [SKIP] token surviving inline resolution — e.g. from a matching
@@ -1686,8 +1725,22 @@ class AfterDetailerScript(scripts.Script):
             # real SD prompt. Gated on `had_inline` so a normal prompt that just
             # happens to contain [SKIP] mid-text is left exactly as before.
             if had_inline and re.search(r"\[SKIP\]", new_pos, re.IGNORECASE):
-                p2.prompt = "[SKIP]"
-                return
+                if group is None or all(
+                    re.search(
+                        r"\[SKIP\]",
+                        _resolve_inline_class_prompt(p2.prompt, c),
+                        re.IGNORECASE,
+                    )
+                    for c in group
+                ):
+                    p2.prompt = "[SKIP]"
+                    return
+                # A merged region that mixes classes is also another class's
+                # region: one class's [SKIP] block does not skip it.
+                new_pos = re.sub(r"\[SKIP\]", "", new_pos, flags=re.IGNORECASE)
+                new_pos = re.sub(r"\s{2,}", " ", new_pos)
+                new_pos = re.sub(r"(,\s*){2,}", ", ", new_pos)
+                new_pos = new_pos.strip().strip(",").strip()
             p2.prompt = new_pos
             # The negative supports the same inline blocks, but only touch it when
             # it actually contains a tag — otherwise leave it byte-identical
@@ -1729,10 +1782,13 @@ class AfterDetailerScript(scripts.Script):
         Opt-in via ``ad_class_guard``. In a sequential pass (``seq_pass``), the
         only place ``ad_class_prompts`` are applied, a manual entry for the
         detected class wins (auto is suppressed for that class). Skipped for a
-        Merge and Invert mask, which is the background. The
-        whole thing degrades to a silent no-op — never a crash — for
-        mediapipe / class-less models, any per-mask misalignment, or on any
-        WebUI where the class-name lookup fails (universal-WebUI compat).
+        Merge and Invert mask, which is the background. For
+        mediapipe_face_features, whose "face" holds the other parts, the face
+        region gets no negatives and "face" is never a part's negative. The
+        whole thing degrades to a silent no-op — never a crash — for the
+        class-less MediaPipe models and other class-less models, any per-mask
+        misalignment, or on any WebUI where the class-name lookup fails
+        (universal-WebUI compat).
         """
         if not getattr(args, "ad_class_guard", False):
             return
@@ -1748,6 +1804,13 @@ class AfterDetailerScript(scripts.Script):
             detected = cn[j]
             if seq_pass and detected in _parse_class_prompts(args.ad_class_prompts):
                 return  # manual per-class prompt wins
+            if args.is_mediapipe_features():
+                # "face" is the whole face, which holds the other parts: never
+                # negate a part in the face region, nor "face" in a part's.
+                names_full = [
+                    c for c in names_full
+                    if c == detected or (detected != "face" and c != "face")
+                ]
 
             pos, neg = build_class_guard(
                 detected, names_full, getattr(args, "ad_class_guard_weight", 1.0)
@@ -1787,6 +1850,8 @@ class AfterDetailerScript(scripts.Script):
         #      (rounded down to a multiple of 8 for SD compatibility, floor 64).
         #   3. Otherwise the existing get_optimal_crop_image_size heuristic
         #      runs as before.
+        # 2 and 3 only apply with Inpaint only masked: in whole-picture mode the
+        # host resizes the whole image to width x height, so keep that size.
         # With Merge and Invert the inpainted region is the inverted mask, not
         # the detections, so size the canvas from the mask. Dynamic denoise
         # above keeps the detection box (a full-frame box would give 0).
@@ -1798,6 +1863,8 @@ class AfterDetailerScript(scripts.Script):
                 size_bbox = list(_mask_box)
         if args.ad_use_inpaint_width_height:
             pass  # user-supplied fixed dimensions already on p2.
+        elif not args.ad_inpaint_only_masked:
+            pass  # whole-picture inpaint: keep the size get_i2i_p set.
         elif args.ad_use_resolution_scale:
             x1, y1, x2, y2 = size_bbox
             scale = float(args.ad_resolution_scale)
@@ -2118,6 +2185,13 @@ class AfterDetailerScript(scripts.Script):
                 break
             p2.image_mask = masks[j]
             p2.init_images[0] = ensure_pil_image(p2.init_images[0], "RGB")
+            # Whole-picture inpaint returns the previous region at the canvas
+            # size: keep the mask on the same grid as the image it goes with
+            # (Forge Neo asserts a uniform scale in steps of 0.25 between them).
+            if p2.image_mask.size != p2.init_images[0].size:
+                p2.image_mask = p2.image_mask.resize(
+                    p2.init_images[0].size, resample=Image.LANCZOS
+                )
             self.i2i_prompts_replace(p2, ad_prompts, ad_negatives, j)
 
             # Resolve inline [CLASS=name]…[/CLASS] blocks against this mask's
@@ -2158,6 +2232,7 @@ class AfterDetailerScript(scripts.Script):
             except NansException as e:
                 msg = f"[-] ADetailer: 'NansException' occurred with {ordinal(n + 1)} settings.\n{e}"
                 print(msg, file=sys.stderr)
+                self._ad_nan_regions = getattr(self, "_ad_nan_regions", 0) + 1
                 # p2 is reused for the next region: undo what fix_p2 derived
                 # from its own previous values, or they would be applied twice.
                 p2.denoising_strength = i2i.denoising_strength

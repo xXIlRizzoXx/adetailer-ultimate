@@ -26,7 +26,9 @@ def is_inpaint_only_masked(p) -> bool:
 def get_i(p) -> int:
     it = p.iteration
     bs = p.batch_size
-    i = p.batch_index
+    # The host sets batch_index only after the scripts' process() hook, which
+    # reads the prompt for an XYZ Prompt S/R axis: that is the first image.
+    i = getattr(p, "batch_index", 0)
     return it * bs + i
 
 

@@ -7,11 +7,17 @@ on:
       - "**.py"
       - "pyproject.toml"
       - ".github/workflows/test.yml"
+      - "javascript/**"
+      - "style.css"
+      - "README.md"
   pull_request:
     paths:
       - "**.py"
       - "pyproject.toml"
       - ".github/workflows/test.yml"
+      - "javascript/**"
+      - "style.css"
+      - "README.md"
   workflow_call:
   workflow_dispatch:
   schedule:

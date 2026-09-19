@@ -28,6 +28,17 @@ def test_dynamic_denoise_strength(
     assert np.isclose(result, expected_result)
 
 
+@pytest.mark.parametrize("denoise_power", [2.5, 2.0, 1.0, 3.0])
+def test_dynamic_denoise_strength_box_larger_than_the_image(denoise_power: float):
+    # A merged MediaPipe box can reach past the frame: it counts as the whole
+    # image instead of giving a complex, negative or larger strength.
+    result = dynamic_denoise_strength(
+        denoise_power, 0.4, [-100, -100, 650, 650], (512, 512)
+    )
+    assert isinstance(result, float)
+    assert result == 0.0
+
+
 @given(denoise_strength=st.floats(allow_nan=False))
 def test_dynamic_denoise_strength_no_bbox(denoise_strength: float):
     with pytest.raises(ValueError, match="bbox length must be 4, got 0"):

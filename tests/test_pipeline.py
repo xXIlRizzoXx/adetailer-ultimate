@@ -1413,3 +1413,559 @@ def test_readme_sequential_note_matches_mediapipe_face_features():
     ]
     assert notes
     assert all(MEDIAPIPE_FACE_FEATURES_MODEL in line for line in notes)
+
+
+# Final debugging pass, round 2: generation pipeline, prompts and docs.
+
+
+@pytest.mark.parametrize(
+    ("prompt", "negative", "expected"),
+    [
+        # No eyes in the region: the eyes blocks do not apply to it.
+        ("detailed, [CLASS=eyes] [SKIP] [/CLASS]", "blurry", ("detailed", "blurry")),
+        (
+            "detailed, [CLASS=eyes]blue eyes[/CLASS]",
+            "blurry, [CLASS=eyes]red eyes[/CLASS]",
+            ("detailed", "blurry"),
+        ),
+        # The face in the region is not skipped for the hand's sake...
+        ("detailed, [CLASS=hand] [SKIP] [/CLASS]", "blurry", ("detailed", "blurry")),
+        # ...but the region is skipped when every class it holds is.
+        ("detailed, [CLASS=face,hand] [SKIP] [/CLASS]", "blurry", ("[SKIP]", "blurry")),
+        (
+            "detailed, [CLASS=face] [SKIP] [/CLASS], [CLASS=hand] [SKIP] [/CLASS]",
+            "blurry",
+            ("[SKIP]", "blurry"),
+        ),
+    ],
+)
+def test_merged_mixed_region_follows_only_the_classes_it_holds(
+    prompt, negative, expected
+):
+    from adetailer.args import ADetailerArgs
+
+    script = _class_prompt_script()
+    pred = _detections(["face", "hand"])
+    args = ADetailerArgs(ad_model="faces.pt", ad_mask_merge_invert="Merge")
+
+    masks = script.pred_preprocessing(SimpleNamespace(), pred, args)
+    p2 = SimpleNamespace(prompt=prompt, negative_prompt=negative)
+    script._apply_inline_class_prompts(p2, pred, 0, len(masks), False)
+
+    assert len(masks) == 1
+    assert (p2.prompt, p2.negative_prompt) == expected
+
+
+def test_class_blocks_are_dropped_on_a_classless_inverted_background():
+    # A class-less detector (the MediaPipe face models) reports no classes,
+    # but its Merge and Invert region is still the background.
+    script = _class_prompt_script()
+    pred = _detections(["face"])
+    pred.class_names = []
+    p2 = SimpleNamespace(
+        prompt="scenery, [CLASS=face] [SKIP] [/CLASS]",
+        negative_prompt="blurry, [CLASS=face]ugly[/CLASS]",
+    )
+
+    script._apply_inline_class_prompts(p2, pred, 0, 1, True)
+
+    assert (p2.prompt, p2.negative_prompt) == ("scenery", "blurry")
+    # Unchanged elsewhere: a class-less region keeps every block.
+    p2 = SimpleNamespace(prompt="scenery, [CLASS=face] [SKIP] [/CLASS]", negative_prompt="")
+    script._apply_inline_class_prompts(p2, pred, 0, 1, False)
+    assert p2.prompt == "[SKIP]"
+
+
+class _A1111I2I:
+    """The host's img2img processing class; like AUTOMATIC1111's dataclass it
+    has no Distilled CFG Scale field and refuses an unknown keyword."""
+
+    def __init__(self, **kwargs):
+        if "distilled_cfg_scale" in kwargs:
+            msg = "unexpected keyword argument 'distilled_cfg_scale'"
+            raise TypeError(msg)
+        self.__dict__.update(kwargs)
+
+
+class _ForgeI2I(_A1111I2I):
+    distilled_cfg_scale = 3.5  # the Forge / Forge Neo dataclass default
+
+
+@pytest.mark.parametrize(
+    ("host", "user_value", "expected"),
+    [(_ForgeI2I, 2.0, 2.0), (_ForgeI2I, 9.0, 9.0), (_A1111I2I, None, None)],
+)
+def test_detailer_pass_keeps_the_distilled_cfg_scale(host, user_value, expected):
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods={"get_i2i_p"},
+        StableDiffusionProcessingImg2Img=host,
+        schedulers=None,
+        controlnet_type="forge",
+        copy_extra_params=dict,
+    )
+    script = runtime.AfterDetailerScript()
+    script.get_seed = lambda _p: (1, 1)
+    script.get_width_height = lambda *_args: (512, 512)
+    script.get_steps = lambda *_args: 20
+    script.get_cfg_scale = lambda *_args: 1.0
+    script.get_initial_noise_multiplier = lambda *_args: None
+    script.get_sampler = lambda *_args: "Euler"
+    script.get_override_settings = lambda *_args: {}
+    script.script_filter = lambda *_args: (None, [])
+    p = SimpleNamespace(
+        sd_model=None, outpath_samples="", outpath_grids="", styles=[],
+        subseed_strength=0.0, seed_resize_from_h=0, seed_resize_from_w=0,
+        tiling=False, extra_generation_params={},
+    )
+    if user_value is not None:
+        p.distilled_cfg_scale = user_value
+
+    i2i = script.get_i2i_p(p, ADetailerArgs(ad_model="face_yolov8n.pt"), None)
+
+    assert getattr(i2i, "distilled_cfg_scale", None) == expected
+
+
+@pytest.mark.parametrize(
+    ("source", "canvas"),
+    [
+        ((96, 64), (64, 40)),  # capped standalone canvas: not a uniform scale
+        ((48, 48), (32, 32)),  # Hires fix x1.5: a scale that is not a 0.25 step
+        ((64, 64), (64, 64)),  # the canvas is the image: nothing changes
+    ],
+)
+def test_whole_picture_inpaint_keeps_the_next_mask_on_the_image_grid(source, canvas):
+    # With "Inpaint only masked" off the host returns each region at the
+    # canvas size. Forge Neo refuses a mask whose scale to the image is not
+    # uniform and a multiple of 0.25, which failed the second region.
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", source, "white")
+    masks = [Image.new("L", source, 255), Image.new("L", source, 255)]
+    seen = []
+
+    def process_images(p2):
+        init, mask = p2.init_images[0], p2.image_mask
+        seen.append((init.size, mask.size, any(mask is m for m in masks)))
+        sx, sy = (a / b for a, b in zip(init.size, mask.size))
+        assert sx == sy, "Only uniform Scaling is supported"
+        assert sx % 0.25 == 0, "Inpaint only supports Scale divisible by 0.25"
+        return SimpleNamespace(images=[init.resize((p2.width, p2.height))])
+
+    run, pp, _before = _detailer(
+        state, process_images, n_masks=2, Image=Image, ordinal=str
+    )
+    pp.image = image
+    i2i = SimpleNamespace(
+        init_images=[image], prompt="face", negative_prompt="",
+        width=canvas[0], height=canvas[1], close=lambda: None,
+    )
+    _script_of(run).get_i2i_p = lambda *_args: i2i
+    _script_of(run).pred_preprocessing = lambda *_args: masks
+
+    assert run() is True
+    assert [init for init, _mask, _same in seen] == [source, canvas]
+    assert all(init == mask for init, mask, _same in seen)
+    assert pp.image.size == canvas
+    if source == canvas:
+        assert all(same for _init, _mask, same in seen)
+
+
+def _script_of(run):
+    """The script instance a `_detailer` runner calls."""
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    return cells["script"].cell_contents
+
+
+_INLINE_PROMPT_METHODS = {
+    "_get_prompt", "prompt_blank_replacement", "get_prompt",
+    "i2i_prompts_replace", "_apply_inline_class_prompts",
+}
+_INLINE_PROMPT_FUNCTIONS = {
+    "_resolve_inline_class_prompt", "_extract_lora_tags", "_extract_lora_triggers",
+    "_merge_lora_tags", "_append_lora_triggers", "_strip_lora_tags",
+}
+_INLINE_PROMPT_ASSIGNS = {"_INLINE_CLASS_RE", "_LORA_TAG_RE", "_LORA_TRIGGER_RE"}
+
+
+@pytest.mark.parametrize(
+    ("prompt", "negative", "append", "face", "hand"),
+    [
+        # The documented way to skip only the hands.
+        (
+            "[CLASS=hand] [SKIP] [/CLASS]", "", "",
+            ("portrait, smiling", "blurry"), ("[SKIP]", "blurry"),
+        ),
+        (
+            "[CLASS=hand]five fingers[/CLASS]", "[CLASS=hand]extra fingers[/CLASS]",
+            "detailed",
+            ("portrait, smiling, detailed", "blurry"),
+            ("portrait, smiling, five fingers, detailed", "blurry, extra fingers"),
+        ),
+        # Unchanged: text outside the blocks, and a prompt without blocks.
+        (
+            "detailed, [CLASS=hand] [SKIP] [/CLASS]", "", "",
+            ("detailed", "blurry"), ("[SKIP]", "blurry"),
+        ),
+        ("detailed face", "", "", ("detailed face", "blurry"), ("detailed face", "blurry")),
+    ],
+)
+def test_a_prompt_of_only_class_blocks_keeps_the_main_prompt(
+    prompt, negative, append, face, hand
+):
+    # A blank ADetailer prompt means the main prompt. A prompt made only of
+    # [CLASS=...] blocks has blank text outside them, so every other region
+    # used to be inpainted with an empty prompt.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS,
+        functions=_INLINE_PROMPT_FUNCTIONS,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        get_i=lambda _p: 0,
+    )
+    script = runtime.AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="portrait, smiling", all_prompts=["portrait, smiling"],
+        negative_prompt="blurry", all_negative_prompts=["blurry"],
+    )
+    args = ADetailerArgs(
+        ad_model="faces.pt", ad_prompt=prompt, ad_negative_prompt=negative,
+        ad_prompt_append=append,
+    )
+    prompts, negatives = script.get_prompt(p, args)
+    pred = SimpleNamespace(class_names=["face", "hand"])
+
+    regions = []
+    for j in range(2):
+        p2 = SimpleNamespace()
+        script.i2i_prompts_replace(p2, prompts, negatives, j)
+        script._apply_inline_class_prompts(p2, pred, j, 2, False)
+        regions.append((p2.prompt, p2.negative_prompt))
+
+    assert regions == [face, hand]
+
+
+@pytest.mark.parametrize(
+    ("scale", "match", "only_masked", "size"),
+    [
+        (1.5, "Off", False, (1024, 1536)),
+        (None, "Free", False, (1024, 1536)),
+        (None, "Strict (SDXL only)", False, (1024, 1536)),
+        # Unchanged: with Inpaint only masked the canvas follows the box.
+        (1.5, "Off", True, (240, 296)),
+    ],
+)
+def test_whole_picture_inpaint_keeps_the_image_size(scale, match, only_masked, size):
+    # The host resizes the whole image to the canvas in whole-picture mode:
+    # a canvas sized from the box made the final image a small thumbnail or
+    # changed its aspect ratio.
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    runtime = _load_script(
+        methods={
+            "fix_p2", "get_dynamic_denoise_strength", "get_optimal_crop_image_size",
+            "get_seed", "get_each_tab_seed",
+        },
+        opts=SimpleNamespace(data={"ad_match_inpaint_bbox_size": match}),
+        shared=SimpleNamespace(
+            opts=SimpleNamespace(data={}), sd_model=SimpleNamespace(is_sdxl=True)
+        ),
+        get_i=lambda _p: 0,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    p2 = SimpleNamespace(width=1024, height=1536, denoising_strength=0.4, image_mask=None)
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt",
+        ad_inpaint_only_masked=only_masked,
+        ad_use_resolution_scale=scale is not None,
+        ad_resolution_scale=scale or 1.5,
+    )
+    outer = SimpleNamespace(seed=1, subseed=1, all_seeds=[1], all_subseeds=[1])
+
+    runtime.AfterDetailerScript().fix_p2(
+        outer, p2, SimpleNamespace(image=Image.new("RGB", (1024, 1536))), args,
+        SimpleNamespace(bboxes=[[400, 300, 560, 500]]), 0,
+    )
+
+    assert (p2.width, p2.height) == size
+
+
+@pytest.mark.parametrize(
+    ("detected", "expected"),
+    [
+        # The face holds the other parts: none of them is negated there.
+        ("face", ("face, detailed", "blurry")),
+        # A part never gets "face", which surrounds it, in its negative.
+        ("eyes", ("eyes, detailed", "blurry, mouth, nose, eyebrows")),
+        ("mouth", ("mouth, detailed", "blurry, eyes, nose, eyebrows")),
+    ],
+)
+def test_class_guard_of_face_features_never_negates_the_face_or_its_parts(
+    detected, expected
+):
+    from adetailer.args import ADetailerArgs
+    from adetailer.classes import (
+        MEDIAPIPE_FACE_FEATURES_MODEL,
+        _has_token,
+        build_class_guard,
+        get_model_class_names,
+    )
+
+    runtime = _load_script(
+        methods={"_apply_auto_class_guard"},
+        functions={"_parse_class_prompts"},
+        get_model_class_names=get_model_class_names,
+        build_class_guard=build_class_guard,
+        _has_token=_has_token,
+    )
+    script = runtime.AfterDetailerScript()
+    script.get_ad_model = lambda name: name
+    args = ADetailerArgs(ad_model=MEDIAPIPE_FACE_FEATURES_MODEL, ad_class_guard=True)
+    p2 = SimpleNamespace(prompt="detailed", negative_prompt="blurry")
+
+    script._apply_auto_class_guard(
+        p2, args, SimpleNamespace(class_names=[detected]), 0, 1
+    )
+
+    assert (p2.prompt, p2.negative_prompt) == expected
+    assert len(get_model_class_names(MEDIAPIPE_FACE_FEATURES_MODEL)) == 5
+
+
+def test_xyz_prompt_search_replace_writes_the_parameters_before_the_batch_starts():
+    # The host sets p.batch_index only after the scripts' process() hook, and
+    # the XYZ grid hands every cell a fresh copy of p. Reading the prompt for
+    # the Prompt S/R axis there raised AttributeError, logged an error panel
+    # for every cell and left the parameters out.
+    from aaaaaa.p_method import get_i
+    from adetailer.args import ADetailerArgs
+
+    assert get_i(SimpleNamespace(iteration=0, batch_size=2)) == 0
+    assert get_i(SimpleNamespace(iteration=2, batch_size=3, batch_index=1)) == 7
+
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS | {"process", "extra_params"},
+        functions=_INLINE_PROMPT_FUNCTIONS,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        get_i=get_i,
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: True
+    script.set_skip_img2img = lambda *_args: None
+    script.get_args = lambda *_args: [
+        ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="blue eyes")
+    ]
+    p = SimpleNamespace(
+        iteration=0, batch_size=1, prompt="a photo", negative_prompt="",
+        all_prompts=["a photo"], all_negative_prompts=[""],
+        extra_generation_params={},
+        _ad_xyz_prompt_sr=[SimpleNamespace(s="blue", r="red")],
+    )
+
+    script.process(p, True, False, {})
+
+    assert p.extra_generation_params["ADetailer prompt"] == "red eyes"
+    assert "ADetailer version" in p.extra_generation_params
+
+
+def test_merged_face_boxes_past_the_frame_get_a_real_denoise_strength():
+    # MediaPipe face boxes are not clipped to the image, so the union of two
+    # merged faces can be larger than the frame.
+    from adetailer.args import ADetailerArgs
+    from adetailer.common import PredictOutput
+    from adetailer.opts import dynamic_denoise_strength
+
+    boxes = [[-100, -100, 300, 300], [250, 250, 650, 650]]
+    masks = []
+    for box in boxes:
+        mask = Image.new("L", (512, 512), 0)
+        mask.paste(255, [max(0, v) for v in box])
+        masks.append(mask)
+    pred = PredictOutput(
+        bboxes=boxes, masks=masks, confidences=[0.9, 0.9],
+        preview=Image.new("RGB", (512, 512)),
+    )
+    args = ADetailerArgs(
+        ad_model="mediapipe_face_short", ad_mask_merge_invert="Merge",
+        ad_dynamic_denoise_power=2.5,
+    )
+
+    _class_prompt_script().pred_preprocessing(SimpleNamespace(), pred, args)
+    strength = _load_script(
+        methods={"get_dynamic_denoise_strength"},
+        opts=SimpleNamespace(data={}),
+        dynamic_denoise_strength=dynamic_denoise_strength,
+    ).AfterDetailerScript.get_dynamic_denoise_strength(
+        0.4, pred.bboxes[0], (512, 512), args
+    )
+
+    assert pred.bboxes == [[-100, -100, 650, 650]]
+    assert isinstance(strength, float)
+    assert 0.0 <= strength <= 0.4
+
+
+def _nan_standalone(tmp_path):
+    """A standalone runner: run(["nan", "ok", ...]) detects one region per
+    entry, which fails with a NaN error or succeeds; run(None) detects
+    nothing."""
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, stopping_generation=False,
+        job_count=0, assign_current_image=lambda _image: None,
+    )
+    nans = type("NansException", (Exception,), {})
+    image = Image.new("RGB", (64, 64), "white")
+    result = Image.new("RGB", (64, 64), "red")
+    todo = []
+
+    def process_images(_p2):
+        if todo.pop(0) == "nan":
+            raise nans("A tensor with NaNs was produced in Unet.")
+        return SimpleNamespace(images=[result])
+
+    def predict(*_args, **_kwargs):
+        return SimpleNamespace(preview=image if todo else None)
+
+    runtime = _load_script(
+        methods={
+            "run_detailer_on_image", "read_params_txt", "write_params_txt",
+            "_postprocess_image_inner",
+        },
+        paths=SimpleNamespace(data_path=str(tmp_path)),
+        PARAMS_TXT="params.txt",
+        shared=SimpleNamespace(
+            sd_model=None, state=state, opts=SimpleNamespace(data={})
+        ),
+        state=state,
+        opts=SimpleNamespace(samples_format="png"),
+        all_samplers=[],
+        images=None,
+        AD_APPLY_SUBDIR="ADetailer-Inpaint",
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=predict,
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=process_images,
+        NansException=nans,
+        ordinal=str,
+        Image=Image,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda _p, _args, im: SimpleNamespace(
+        init_images=[im], prompt="face", negative_prompt="", close=lambda: None,
+        denoising_strength=0.4, width=64, height=64,
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [Image.new("L", (64, 64), 255)] * len(
+        todo
+    )
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.fix_p2 = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    class Args(SimpleNamespace):
+        def copy(self, update):
+            return Args(**{**vars(self), **update})
+
+    args = Args(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+    )
+
+    def run(regions):
+        todo[:] = list(regions or [])
+        return script.run_detailer_on_image(image, args, save=False)
+
+    return run, image
+
+
+def test_standalone_run_reports_a_nan_error_instead_of_nothing_detected(tmp_path):
+    # Every detected region failed with a NaN error: the image was detected
+    # but not detailed, and a folder run must count it as failed.
+    run, image = _nan_standalone(tmp_path)
+
+    result, status = run(["nan", "nan"])
+    assert result is None
+    assert status.startswith("⚠️ ADetailer run failed")
+    assert "NaN" in status
+
+    # Unchanged, and nothing carried over from the failed run.
+    assert run(None) == (image, "ℹ️ Nothing detected — image unchanged.")
+    result, status = run(["nan", "ok"])
+    assert result is not None
+    assert status == "✅ ADetailer pass complete."
+
+
+def test_readme_says_each_sequential_class_pass_saves_its_own_preview():
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    result = Image.new("RGB", (8, 8), "red")
+    run, _pp, _before = _detailer(
+        state, lambda _p: SimpleNamespace(images=[result]), n_masks=1
+    )
+    saved = []
+    _script_of(run).save_image = lambda _p, _image, *, condition, suffix: saved.append(
+        (condition, suffix)
+    )
+
+    assert run(classes="face,hand", sequential=True) is True
+    assert [s for c, s in saved if c == "ad_save_previews"] == [
+        "-ad-preview-1-1-face", "-ad-preview-1-2-hand",
+    ]
+    readme = (_SCRIPT_PATH.parents[1] / "README.md").read_text(encoding="utf-8")
+    row = next(
+        line for line in readme.splitlines()
+        if line.startswith("| 🟢 | Sequential class detection |")
+    )
+    assert "first class only" not in readme
+    assert "saves its own mask preview" in row
+
+
+def test_readme_copy_and_preset_sections_match_the_ui():
+    script_text = _SCRIPT_PATH.read_text(encoding="utf-8")
+    option = script_text[script_text.index('"ad_max_models",'):]
+    default = re.search(r"default=(\d+)", option).group(1)
+    maximum = re.search(r'"maximum":\s*(\d+)', option).group(1)
+    ui_text = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    readme = (_SCRIPT_PATH.parents[1] / "README.md").read_text(encoding="utf-8")
+    copy_section = readme[readme.index("## Copy Settings Between Tabs"):]
+    copy_section = copy_section[: copy_section.index("## Preset Library")]
+    presets = readme[readme.index("## Preset Library"):]
+
+    max_tabs = next(line for line in copy_section.splitlines() if "**Max tabs**" in line)
+    assert f"default {default}, up to {maximum}" in max_tabs
+    assert 'f"\\U0001F4E5 Paste from {ordinal(idx + 1)} tab"' in ui_text
+    assert "📥 Paste from Nth tab" in copy_section
+    for escaped, label in [
+        ("\\U0001F4C2 Load", "📂 Load"),
+        ("✏️ Rename", "✏️ Rename"),
+        ("\\U0001F5D1 Delete", "🗑 Delete"),
+    ]:
+        assert f'value="{escaped}"' in ui_text
+        assert f"**{label}**" in presets
+    for stale in ("Paste settings from Nth tab here", "**Load preset**",
+                  "**Rename preset**", "**Delete preset**"):
+        assert stale not in readme

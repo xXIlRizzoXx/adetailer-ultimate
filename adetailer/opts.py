@@ -26,7 +26,9 @@ def dynamic_denoise_strength(
     image_pixels = width * height
     bbox_pixels = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
 
-    normalized_area = bbox_pixels / image_pixels
+    # A merged box can reach past the frame (MediaPipe face boxes are not
+    # clipped); a larger area would give a complex or negative strength.
+    normalized_area = min(bbox_pixels / image_pixels, 1.0)
     denoise_modifier = (1.0 - normalized_area) ** denoise_power
 
     return denoise_strength * denoise_modifier

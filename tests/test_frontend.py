@@ -461,3 +461,27 @@ def test_export_step_downloads_the_new_file_once_and_clears_it(tmp_path):
     ]
     assert out["fresh"] == [None]
     assert out["cleared"] == [None]
+
+
+def _workflow_paths(event: str) -> list[str]:
+    text = (ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+    block = re.search(rf"^  {event}:\n(.*?)(?=^  \S)", text, re.M | re.S).group(1)
+    return re.findall(r'^\s+- "([^"]+)"', block, re.M)
+
+
+def _glob(pattern: str) -> re.Pattern[str]:
+    # GitHub's path filters: "**" crosses folders, "*" does not.
+    parts = [re.escape(p).replace(r"\*", "[^/]*") for p in pattern.split("**")]
+    return re.compile(".*".join(parts) + r"\Z")
+
+
+@pytest.mark.parametrize("event", ["push", "pull_request"])
+def test_ci_runs_for_every_non_python_file_the_tests_read(event):
+    # The checks of the stylesheet, the scripts and the README never ran on
+    # a change to those files alone.
+    patterns = [_glob(p) for p in _workflow_paths(event)]
+    files = ["style.css", "README.md"] + [
+        f"javascript/{js.name}" for js in sorted((ROOT / "javascript").glob("*.js"))
+    ]
+    for name in files:
+        assert any(p.match(name) for p in patterns), name
