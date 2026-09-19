@@ -29,7 +29,7 @@ def _load_runtime(**host_globals):
     selected = ast.parse("from __future__ import annotations").body
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in {
-            "_forge_wanted_modules", "_parse_class_prompts"
+            "_forge_wanted_modules", "_parse_class_prompts", "_class_prompt_for"
         }:
             selected.append(node)
         elif isinstance(node, ast.ClassDef) and node.name == "AfterDetailerScript":
@@ -796,7 +796,9 @@ def _class_prompt_script():
             "pred_preprocessing", "_reindex_pred", "sort_bboxes",
             "_apply_auto_class_guard", "_apply_inline_class_prompts",
         },
-        functions={"_parse_class_prompts", "_resolve_inline_class_prompt"},
+        functions={
+            "_parse_class_prompts", "_class_prompt_for", "_resolve_inline_class_prompt"
+        },
         assigns={"_INLINE_CLASS_RE"},
         opts=SimpleNamespace(data={}),
         BBOX_SORTBY=BBOX_SORTBY,
@@ -1631,16 +1633,39 @@ _INLINE_PROMPT_ASSIGNS = {"_INLINE_CLASS_RE", "_LORA_TAG_RE", "_LORA_TRIGGER_RE"
             "[CLASS=hand] [SKIP] [/CLASS]", "", "",
             ("portrait, smiling", "blurry"), ("[SKIP]", "blurry"),
         ),
+        # Only the region no block matches gets the main prompt (with the
+        # append text); a matching block is kept alone, as before.
         (
             "[CLASS=hand]five fingers[/CLASS]", "[CLASS=hand]extra fingers[/CLASS]",
             "detailed",
             ("portrait, smiling, detailed", "blurry"),
-            ("portrait, smiling, five fingers, detailed", "blurry, extra fingers"),
+            ("five fingers, detailed", "extra fingers"),
+        ),
+        (
+            "[CLASS=face] detailed face [/CLASS] [CLASS=hand] detailed hand [/CLASS]",
+            "[CLASS=face] ugly face [/CLASS] [CLASS=hand] extra fingers [/CLASS]", "",
+            ("detailed face", "ugly face"), ("detailed hand", "extra fingers"),
+        ),
+        # [PROMPT] inside another class's block still leaves the hands without
+        # text of their own.
+        (
+            "[CLASS=face] [PROMPT], smile [/CLASS]",
+            "[CLASS=face] [PROMPT], bad teeth [/CLASS]", "",
+            ("portrait, smiling, smile", "blurry, bad teeth"),
+            ("portrait, smiling", "blurry"),
+        ),
+        (
+            "[CLASS=hand] [SKIP] [/CLASS]", "", "masterpiece",
+            ("portrait, smiling, masterpiece", "blurry"), ("[SKIP]", "blurry"),
         ),
         # Unchanged: text outside the blocks, and a prompt without blocks.
         (
             "detailed, [CLASS=hand] [SKIP] [/CLASS]", "", "",
             ("detailed", "blurry"), ("[SKIP]", "blurry"),
+        ),
+        (
+            "[PROMPT], [CLASS=hand] five fingers [/CLASS]", "", "",
+            ("portrait, smiling", "blurry"), ("portrait, smiling, five fingers", "blurry"),
         ),
         ("detailed face", "", "", ("detailed face", "blurry"), ("detailed face", "blurry")),
     ],
@@ -1648,9 +1673,9 @@ _INLINE_PROMPT_ASSIGNS = {"_INLINE_CLASS_RE", "_LORA_TAG_RE", "_LORA_TRIGGER_RE"
 def test_a_prompt_of_only_class_blocks_keeps_the_main_prompt(
     prompt, negative, append, face, hand
 ):
-    # A blank ADetailer prompt means the main prompt. A prompt made only of
-    # [CLASS=...] blocks has blank text outside them, so every other region
-    # used to be inpainted with an empty prompt.
+    # A blank ADetailer prompt means the main prompt. A region that the
+    # [CLASS=...] blocks leave with no text of its own used to be inpainted
+    # with an empty prompt; a region with a matching block keeps only it.
     from adetailer.args import ADetailerArgs
 
     runtime = _load_script(
@@ -1675,10 +1700,37 @@ def test_a_prompt_of_only_class_blocks_keeps_the_main_prompt(
     for j in range(2):
         p2 = SimpleNamespace()
         script.i2i_prompts_replace(p2, prompts, negatives, j)
-        script._apply_inline_class_prompts(p2, pred, j, 2, False)
+        script._apply_inline_class_prompts(p2, pred, j, 2, False, p, args)
         regions.append((p2.prompt, p2.negative_prompt))
 
     assert regions == [face, hand]
+
+
+def test_a_merged_region_whose_only_block_is_skipped_keeps_the_main_prompt():
+    # A merged face and hand is not skipped by the hands' [SKIP] block, and
+    # the blocks leave it no text of its own.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS,
+        functions=_INLINE_PROMPT_FUNCTIONS,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        get_i=lambda _p: 0,
+    )
+    script = runtime.AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="portrait, smiling", all_prompts=["portrait, smiling"],
+        negative_prompt="blurry", all_negative_prompts=["blurry"],
+    )
+    args = ADetailerArgs(ad_model="faces.pt", ad_prompt="[CLASS=hand] [SKIP] [/CLASS]")
+    prompts, negatives = script.get_prompt(p, args)
+    pred = SimpleNamespace(class_names=[""], group_classes=[["face", "hand"]])
+    p2 = SimpleNamespace()
+    script.i2i_prompts_replace(p2, prompts, negatives, 0)
+
+    script._apply_inline_class_prompts(p2, pred, 0, 1, False, p, args)
+
+    assert (p2.prompt, p2.negative_prompt) == ("portrait, smiling", "blurry")
 
 
 @pytest.mark.parametrize(
@@ -1752,7 +1804,7 @@ def test_class_guard_of_face_features_never_negates_the_face_or_its_parts(
 
     runtime = _load_script(
         methods={"_apply_auto_class_guard"},
-        functions={"_parse_class_prompts"},
+        functions={"_parse_class_prompts", "_class_prompt_for"},
         get_model_class_names=get_model_class_names,
         build_class_guard=build_class_guard,
         _has_token=_has_token,
@@ -2001,3 +2053,425 @@ def test_readme_copy_and_preset_sections_match_the_ui():
     for stale in ("Paste settings from Nth tab here", "**Load preset**",
                   "**Rename preset**", "**Delete preset**"):
         assert stale not in readme
+
+
+# Final debugging pass, round 3: generation pipeline, prompts and docs.
+
+
+def _i2i_script(host=_A1111I2I, methods=(), **host_globals):
+    """get_i2i_p with the host's img2img class and the other inputs stubbed."""
+    runtime = _load_script(
+        methods={"get_i2i_p", "get_width_height", *methods},
+        StableDiffusionProcessingImg2Img=host,
+        schedulers=None,
+        controlnet_type="forge",
+        copy_extra_params=dict,
+        **host_globals,
+    )
+    script = runtime.AfterDetailerScript()
+    script.get_seed = lambda _p: (1, 1)
+    script.get_steps = lambda *_args: 20
+    script.get_cfg_scale = lambda *_args: 1.0
+    script.get_initial_noise_multiplier = lambda *_args: None
+    script.get_sampler = lambda *_args: "Euler"
+    if "get_override_settings" not in methods:
+        script.get_override_settings = lambda *_args: {}
+    script.script_filter = lambda *_args: (None, [])
+    return script
+
+
+def _txt2img_p(**extra):
+    return SimpleNamespace(
+        sd_model=None, outpath_samples="", outpath_grids="", styles=[],
+        subseed_strength=0.0, seed_resize_from_h=0, seed_resize_from_w=0,
+        tiling=False, extra_generation_params={}, width=512, height=768, **extra,
+    )
+
+
+@pytest.mark.parametrize(
+    ("only_masked", "enable_hr", "separate", "canvas"),
+    [
+        # Hires fix x2: the host keeps p.width/height at the first pass.
+        (False, True, False, (1024, 1536)),
+        # Unchanged: the crop resolution, a generation without Hires fix (and
+        # the standalone run's capped canvas), and a separate size.
+        (True, True, False, (512, 768)),
+        (False, None, False, (512, 768)),
+        (False, True, True, (640, 640)),
+    ],
+)
+def test_whole_picture_inpaint_keeps_the_hires_fix_size(
+    only_masked, enable_hr, separate, canvas
+):
+    # The host resizes the whole image to the canvas and returns it at that
+    # size, so a 1024x1536 hires image came back at the 512x768 first pass.
+    from adetailer.args import ADetailerArgs
+
+    script = _i2i_script()
+    p = _txt2img_p() if enable_hr is None else _txt2img_p(enable_hr=enable_hr)
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_inpaint_only_masked=only_masked,
+        ad_use_inpaint_width_height=separate, ad_inpaint_width=640,
+        ad_inpaint_height=640,
+    )
+
+    i2i = script.get_i2i_p(p, args, Image.new("RGB", (1024, 1536)))
+
+    assert (i2i.width, i2i.height) == canvas
+
+
+@pytest.mark.parametrize(
+    ("use_checkpoint", "checkpoint", "expected"),
+    [
+        (True, "other.safetensors", 3.5),
+        (True, "Use same checkpoint", 9.0),
+        (False, "other.safetensors", 9.0),
+    ],
+)
+def test_a_separate_detailer_checkpoint_keeps_the_host_distilled_cfg_scale(
+    use_checkpoint, checkpoint, expected
+):
+    # Forge Neo's SDXL preset submits a hidden Shift of 9.0: a Flux detailer
+    # checkpoint read it as guidance 9.0 instead of the host's 3.5.
+    from adetailer.args import ADetailerArgs
+
+    script = _i2i_script(
+        _ForgeI2I,
+        methods={"get_override_settings"},
+        _is_forge_modules=lambda: True,
+        _forge_wanted_modules=lambda _args: None,
+    )
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_use_checkpoint=use_checkpoint,
+        ad_checkpoint=checkpoint,
+    )
+
+    i2i = script.get_i2i_p(_txt2img_p(distilled_cfg_scale=9.0), args, None)
+
+    assert i2i.distilled_cfg_scale == expected
+
+
+def test_saved_step_images_carry_their_own_seed_and_prompt():
+    # The -ad-before / -ad-preview / -ad-step files of images 2 and later
+    # carried image 1's seed and prompts, so PNG Info recreated image 1.
+    from aaaaaa.p_method import get_i
+
+    def create_infotext(
+        p, all_prompts, all_seeds, _all_subseeds, _comments=None, iteration=0,
+        position_in_batch=0,
+    ):
+        i = position_in_batch + iteration * p.batch_size
+        return f"{all_prompts[i]}|{p.all_negative_prompts[i]}|Seed: {all_seeds[i]}"
+
+    infotext = _load_script(
+        methods={"infotext"}, create_infotext=create_infotext, get_i=get_i
+    ).AfterDetailerScript.infotext
+    p = SimpleNamespace(
+        iteration=1, batch_size=2, batch_index=1,
+        all_prompts=["p0", "p1", "p2", "p3"],
+        all_negative_prompts=["n0", "n1", "n2", "n3"],
+        all_seeds=[10, 11, 12, 13], all_subseeds=[20, 21, 22, 23],
+    )
+
+    assert infotext(p) == "p3|n3|Seed: 13"
+    p.iteration, p.batch_index = 0, 0
+    assert infotext(p) == "p0|n0|Seed: 10"
+
+
+@pytest.mark.parametrize("fails", [True, False])
+def test_an_error_in_a_tab_still_restarts_the_scripts_and_keeps_params_txt(
+    tmp_path, fails
+):
+    # A tab that raised (a model that is not installed, out of memory) left
+    # the inner pass in params.txt and never re-ran the other scripts'
+    # before_process / process, so Forge Neo's ControlNet lost its units for
+    # every later batch.
+    from aaaaaa.p_method import need_call_postprocess, need_call_process
+
+    params_txt = tmp_path / "params.txt"
+    params_txt.write_text("user generation", encoding="utf-8")
+    script = _load_script(
+        methods={"postprocess_image", "read_params_txt", "write_params_txt"},
+        paths=SimpleNamespace(data_path=str(tmp_path)),
+        PARAMS_TXT="params.txt",
+        opts=SimpleNamespace(data={}),
+        ensure_pil_image=lambda image, _mode: image,
+        copy=copy,
+        _verbose_gen_header=lambda *_args: None,
+        need_call_postprocess=need_call_postprocess,
+        need_call_process=need_call_process,
+        Processed=lambda *_args: "dummy",
+        preserve_prompts=lambda _p: nullcontext(),
+        CNHijackRestore=nullcontext,
+        pause_total_tqdm=nullcontext,
+        cn_allow_script_control=nullcontext,
+        _should_skip_for_hires_only=lambda _p, _args: False,
+        is_skip_img2img=lambda _p: False,
+    ).AfterDetailerScript()
+    tab = SimpleNamespace(need_skip=lambda: False)
+    script.is_ad_enabled = lambda *_args: True
+    script.get_i2i_init_image = lambda _p, pp: pp.image
+    script.get_args = lambda *_args: [tab, tab]
+    script._will_run_sequential = lambda _args: False
+    script.save_image = lambda *_args, **_kwargs: None
+
+    def inner(_p, _pp, _args, n=0):
+        params_txt.write_text(f"inner pass {n}", encoding="utf-8")
+        if fails and n == 1:
+            msg = "Model 'missing.pt' not found"
+            raise ValueError(msg)
+        return True
+
+    script._postprocess_image_inner = inner
+    hooks = []
+    runner = SimpleNamespace(
+        postprocess=lambda *_args: hooks.append("postprocess"),
+        before_process=lambda *_args: hooks.append("before_process"),
+        process=lambda *_args: hooks.append("process"),
+    )
+    p = SimpleNamespace(batch_index=0, batch_size=1, seed=1, scripts=runner)
+    pp = SimpleNamespace(image=Image.new("RGB", (8, 8)))
+
+    if fails:
+        with pytest.raises(ValueError, match="not found"):
+            script.postprocess_image(p, pp, True)
+    else:
+        script.postprocess_image(p, pp, True)
+
+    assert params_txt.read_text(encoding="utf-8") == "user generation"
+    assert hooks == ["postprocess", "before_process", "process"]
+
+
+@pytest.mark.parametrize("global_dir", [True, False])
+def test_standalone_run_follows_the_global_output_directory(tmp_path, global_dir):
+    # Settings > Paths "Output directory for images" holds every generation;
+    # the standalone tool still wrote next to the img2img folder.
+    img2img_dir = tmp_path / "webui" / "outputs" / "img2img-images"
+    override = str(tmp_path / "other-drive" / "images") if global_dir else ""
+    saved, shells = [], []
+    script = _load_script(
+        methods={"run_detailer_on_image", "read_params_txt", "write_params_txt"},
+        paths=SimpleNamespace(data_path=str(tmp_path)),
+        PARAMS_TXT="params.txt",
+        shared=SimpleNamespace(sd_model=None),
+        state=SimpleNamespace(interrupted=False, skipped=False),
+        opts=SimpleNamespace(
+            samples_format="png", outdir_samples=override,
+            outdir_img2img_samples=str(img2img_dir),
+        ),
+        all_samplers=[],
+        ensure_pil_image=lambda image, _mode: image,
+        images=SimpleNamespace(
+            save_image=lambda _image, path, _basename, **_kwargs: saved.append(path)
+        ),
+        AD_APPLY_SUBDIR="ADetailer-Inpaint",
+    ).AfterDetailerScript()
+
+    def inner(p, _pp, _args):
+        shells.append(p)
+        return True
+
+    script._postprocess_image_inner = inner
+
+    _image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), save=True
+    )
+
+    assert "Saved" in status
+    if global_dir:
+        assert shells[0].outpath_samples == override
+        assert saved == [str(Path(override) / "ADetailer-Inpaint")]
+    else:
+        assert shells[0].outpath_samples == str(img2img_dir)
+        assert saved == [str(img2img_dir.resolve().parent / "ADetailer-Inpaint")]
+
+
+@pytest.mark.parametrize(
+    ("skip", "init_images", "attrs", "expected"),
+    [
+        # An API batch with one init image per batch position.
+        (True, ["A", "B"], {"batch_index": 1}, "B"),
+        (True, ["A", "B"], {"batch_index": 0}, "A"),
+        # Unchanged: one init image, repeated by the host; no batch index.
+        (True, ["A"], {"batch_index": 3}, "A"),
+        (True, ["A", "B"], {}, "A"),
+        (False, ["A", "B"], {"batch_index": 1}, "sample"),
+    ],
+)
+def test_skip_img2img_details_each_batch_images_own_init_image(
+    skip, init_images, attrs, expected
+):
+    get_init = _load_script(
+        methods={"get_i2i_init_image"},
+        is_skip_img2img=lambda p: getattr(p, "_ad_skip_img2img", False),
+    ).AfterDetailerScript.get_i2i_init_image
+    p = SimpleNamespace(_ad_skip_img2img=skip, init_images=init_images, **attrs)
+
+    assert get_init(p, SimpleNamespace(image="sample")) == expected
+
+
+@pytest.mark.parametrize("left_out_by", ["filters", "skip"])
+def test_standalone_run_says_when_detections_were_left_out(tmp_path, left_out_by):
+    # The detection numbers, the mask filters or [SKIP] can leave nothing to
+    # inpaint; the tool said "Nothing detected", against the preview.
+    run, image = _nan_standalone(tmp_path)
+    script = _script_of(run)
+    if left_out_by == "filters":
+        script.pred_preprocessing = lambda *_args: []
+    else:
+        script._apply_inline_class_prompts = lambda p2, *_args: setattr(
+            p2, "prompt", "[SKIP]"
+        )
+
+    result, status = run(["ok", "ok"])
+
+    assert result is image
+    assert status.startswith("ℹ️ Detections found")
+    assert "Nothing detected" not in status
+    # Nothing carried over to a run that detects nothing.
+    assert run(None) == (image, "ℹ️ Nothing detected — image unchanged.")
+
+
+@pytest.mark.parametrize(
+    ("classes", "class_prompts"),
+    [
+        ("Face,Hand", "face: detailed skin\nhand: five fingers"),
+        ("face,hand", "Face: detailed skin\nHand: five fingers"),
+        # An exact match wins over one in another case.
+        ("face,hand", "Face: other\nface: detailed skin\nhand: five fingers"),
+    ],
+)
+def test_class_prompt_lines_match_the_class_regardless_of_case(classes, class_prompts):
+    # The class filter matches regardless of case; its per-class prompt lines
+    # did not, so each pass got the tab prompt without the line or the guard.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_runtime(
+        state=SimpleNamespace(interrupted=False, skipped=False),
+        copy=copy, re=re,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+    )
+    script = runtime.AfterDetailerScript()
+    script.save_image = lambda *_args, **_kwargs: None
+    passes = []
+
+    def class_pass(_p, _pp, sub_args, **_kwargs):
+        passes.append(sub_args.ad_prompt)
+        return True
+
+    script._postprocess_image_inner = class_pass  # each class's own pass
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_prompt="main", ad_model_classes=classes,
+        ad_classes_sequential=True, ad_class_prompts=class_prompts,
+    )
+
+    assert runtime.AfterDetailerScript._postprocess_image_inner(
+        script, SimpleNamespace(), SimpleNamespace(image=Image.new("RGB", (8, 8))), args
+    )
+    assert passes == ["detailed skin", "five fingers"]
+
+
+def test_a_class_prompt_line_in_another_case_still_takes_priority_over_the_guard():
+    from adetailer.args import ADetailerArgs
+
+    script = _class_prompt_script()
+    args = ADetailerArgs(
+        ad_model="faces.pt", ad_class_guard=True,
+        ad_class_prompts="Face: detailed skin",
+    )
+    p2 = SimpleNamespace(prompt="detailed", negative_prompt="blurry")
+
+    script._apply_auto_class_guard(
+        p2, args, SimpleNamespace(class_names=["face"]), 0, 1, True
+    )
+
+    assert (p2.prompt, p2.negative_prompt) == ("detailed", "blurry")
+
+
+@pytest.mark.parametrize("suffix", ["", " 2nd"])
+def test_pasting_an_upstream_image_resets_the_forks_own_toggles(suffix):
+    # Upstream ADetailer never writes these keys, and this extension always
+    # does: a pasted upstream image kept the tab's hires-only toggle (so
+    # ADetailer was skipped without hires fix), bbox mask and scale.
+    from adetailer.args import ADetailerArgs
+
+    params = {
+        name + suffix: value
+        for name, value in {
+            "ADetailer model": "face_yolov8n.pt",
+            "ADetailer confidence": "0.3",
+            "ADetailer dilate erode": "4",
+            "ADetailer mask blur": "4",
+            "ADetailer denoising strength": "0.4",
+            "ADetailer inpaint only masked": "True",
+            "ADetailer inpaint padding": "32",
+        }.items()
+    }
+    params["ADetailer version"] = "24.11.1"
+    before = ADetailerArgs(
+        ad_model="hand_yolov8n.pt", ad_apply_on_hires_only=True,
+        ad_use_bbox_mask=True, ad_use_resolution_scale=True,
+        ad_resolution_scale=2.0, ad_use_main_loras=True, ad_use_lora_triggers=True,
+    ).dict()
+
+    _paste_callback()._clear_missing_class_prompts("", params)
+    after = ADetailerArgs(**_host_paste(params, before, suffix))
+
+    assert not after.ad_apply_on_hires_only
+    assert not after.ad_use_bbox_mask
+    assert not after.ad_use_resolution_scale
+    assert not after.ad_use_main_loras
+    # Only used while its toggle is on: the tab keeps its own value.
+    assert after.ad_resolution_scale == 2.0
+    assert after.ad_use_lora_triggers
+
+
+def test_an_image_made_by_this_extension_keeps_its_own_toggles_on_paste():
+    from adetailer.args import ADetailerArgs
+
+    made = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_apply_on_hires_only=True, ad_use_bbox_mask=True
+    )
+    params = _infotext(made)
+    skipped = dict(params)
+    del skipped["ADetailer use bbox mask"]
+
+    _paste_callback()._clear_missing_class_prompts("", params)
+    _paste_callback(["ADetailer use bbox mask"])._clear_missing_class_prompts(
+        "", skipped
+    )
+
+    assert params["ADetailer apply on hires only"] == "True"
+    assert params["ADetailer use bbox mask"] == "True"
+    assert "ADetailer use bbox mask" not in skipped  # "Disregard fields ..."
+
+
+def _public_docs():
+    root = _SCRIPT_PATH.parents[1]
+    return {
+        name: (root / name).read_text(encoding="utf-8")
+        for name in ("README.md", "CHANGELOG.md")
+    }
+
+
+def test_public_docs_are_in_english():
+    # Public text is English only; two older changelog passages were reworded.
+    changelog = _public_docs()["CHANGELOG.md"]
+    assert "Wrap-up of the 2026-05-18..2026-05-19 test session." in changelog
+    assert "add a button in the settings that resets the extension's" in changelog
+
+
+def test_public_docs_match_the_behaviour_of_this_beta():
+    docs = _public_docs()
+    readme, changelog = docs["README.md"], docs["CHANGELOG.md"]
+    paste = next(
+        line for line in readme.splitlines()
+        if line.startswith("- Loading a preset or pasting a tab")
+    )
+    # Parameters without ADetailer leave its tabs as they are.
+    assert "for an image made with ADetailer, switches off the tabs" in paste
+    # Earlier releases never loaded MediaPipe models from such a path.
+    assert "MediaPipe detectors work again" not in readme
+    # AUTOMATIC1111 now softens the later regions' mask edge at canvas size.
+    assert "its result does not change" not in changelog

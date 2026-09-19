@@ -260,6 +260,7 @@ def test_wired_folder_lists_cancelled_files_separately(
     assert "Batch interrupted" in status
     assert "1 cancelled" in status
     assert "nothing detected" not in status
+    assert "nothing to inpaint" not in status
     assert sorted(f.name for f in tmp_path.iterdir()) == ["a.png", "b.png"]
 
 
@@ -376,3 +377,29 @@ def test_wired_folder_still_skips_an_unreadable_file(host, monkeypatch, tmp_path
     assert "1 detailed" in status
     assert "1 skipped (unreadable)" in status
     assert "failed" not in status
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_counts_files_with_nothing_to_inpaint(
+    host, monkeypatch, tmp_path, same_folder
+):
+    # A file whose detections were all left out (detection numbers, mask
+    # filters or [SKIP]) was counted as "nothing detected".
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "a.png")
+
+    def detail(image, _args, save):
+        return image, (
+            "ℹ️ Detections found, but the detection numbers, mask filters or "
+            "[SKIP] left none to inpaint — image unchanged."
+        )
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    _gallery, status = callback(
+        None, str(tmp_path), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert "1 left unchanged (nothing to inpaint)" in status
+    assert "nothing detected" not in status
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["a.png"]

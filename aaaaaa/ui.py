@@ -1376,7 +1376,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 f"{dest_txt}"
             )
             if unchanged:
-                status += f", {unchanged} left unchanged (nothing detected)"
+                status += f", {unchanged} left unchanged (nothing to inpaint)"
             if cancelled:
                 status += f", {cancelled} cancelled (left unchanged)"
             if not_saved:

@@ -244,6 +244,18 @@ def _parse_class_prompts(text: str) -> dict[str, tuple[str, str]]:
     return result
 
 
+def _class_prompt_for(
+    class_prompts: dict[str, tuple[str, str]], name: str
+) -> tuple[str, str] | None:
+    """The `_parse_class_prompts` entry for class ``name``, matched regardless
+    of case like the class filter: an exact match wins, then the only line
+    whose name differs just by case. None when there is no such line."""
+    if name in class_prompts:
+        return class_prompts[name]
+    hits = [k for k in class_prompts if k.casefold() == name.casefold()]
+    return class_prompts[hits[0]] if len(hits) == 1 else None
+
+
 _INLINE_CLASS_RE = re.compile(
     r"\[CLASS=([^\]]+)\](.*?)\[/CLASS\]", re.IGNORECASE | re.DOTALL
 )
@@ -825,15 +837,6 @@ class AfterDetailerScript(scripts.Script):
                 prompts[n] = blank_replacement
             elif "[PROMPT]" in prompts[n]:
                 prompts[n] = prompts[n].replace("[PROMPT]", blank_replacement)
-            elif (
-                blank_replacement
-                and "[class=" in prompts[n].lower()
-                and not _resolve_inline_class_prompt(prompts[n], ",")
-            ):
-                # Only [CLASS=] blocks: the text outside them is blank, which
-                # means the main prompt, as for a blank prompt. Otherwise every
-                # region of another class would get an empty prompt.
-                prompts[n] = f"{blank_replacement}, {prompts[n]}"
 
             for pair in replacements:
                 prompts[n] = prompts[n].replace(pair.s, pair.r)
@@ -1019,8 +1022,14 @@ class AfterDetailerScript(scripts.Script):
     @staticmethod
     def infotext(p) -> str:
         try:
+            # The current image's parameters, picked like save_image picks the
+            # file name's prompt (the host's index is position + iteration *
+            # batch size); image 0's were written into every file of a batch.
+            i = get_i(p)
+            if p.all_prompts:
+                i %= len(p.all_prompts)
             return create_infotext(
-                p, p.all_prompts, p.all_seeds, p.all_subseeds, None, 0, 0
+                p, p.all_prompts, p.all_seeds, p.all_subseeds, None, 0, i
             )
         except Exception as e:  # noqa: BLE001
             # create_infotext's positional signature has drifted across
@@ -1121,6 +1130,17 @@ class AfterDetailerScript(scripts.Script):
     ) -> StableDiffusionProcessingImg2Img:
         seed, subseed = self.get_seed(p)
         width, height = self.get_width_height(p, args)
+        # Hires fix keeps p.width/height at the first-pass size. With the whole
+        # picture inpainted the host resizes the image to the canvas, so use
+        # the upscaled image's own size or the hires result is lost.
+        if (
+            not args.ad_inpaint_only_masked
+            and not args.ad_use_inpaint_width_height
+            and getattr(p, "enable_hr", False)
+            and image is not None
+        ):
+            width = max(64, image.width // 8 * 8)
+            height = max(64, image.height // 8 * 8)
         steps = self.get_steps(p, args)
         cfg_scale = self.get_cfg_scale(p, args)
         initial_noise_multiplier = self.get_initial_noise_multiplier(p, args)
@@ -1172,7 +1192,13 @@ class AfterDetailerScript(scripts.Script):
         # Forge / Forge Neo: keep the user's Distilled CFG Scale / Shift instead
         # of the host's 3.5 default. Other hosts have no such field, and an
         # unknown constructor keyword would fail there, so set the attribute.
-        if hasattr(p, "distilled_cfg_scale"):
+        # A separate detailer checkpoint keeps the default: it may be another
+        # model family, which reads the field as Flux guidance instead of
+        # shift or the other way round.
+        if (
+            hasattr(p, "distilled_cfg_scale")
+            and "sd_model_checkpoint" not in override_settings
+        ):
             i2i.distilled_cfg_scale = p.distilled_cfg_scale
 
         i2i.cached_c = [None, None]
@@ -1420,6 +1446,11 @@ class AfterDetailerScript(scripts.Script):
     @staticmethod
     def get_i2i_init_image(p, pp: PPImage):
         if is_skip_img2img(p):
+            # An API batch can pass one init image per batch position; a
+            # single one is repeated by the host.
+            i = getattr(p, "batch_index", 0)
+            if isinstance(i, int) and 0 <= i < len(p.init_images):
+                return p.init_images[i]
             return p.init_images[0]
         return pp.image
 
@@ -1467,9 +1498,10 @@ class AfterDetailerScript(scripts.Script):
             # still resolves to its effective default (which lives in
             # data_labels, not the saved-config dict) — otherwise the "Save
             # result to outputs" option would land the file in <webui>/outputs
-            # instead of the configured img2img folder.
-            outdir = getattr(opts, "outdir_img2img_samples", "") or getattr(
-                opts, "outdir_samples", ""
+            # instead of the configured img2img folder. The global "Output
+            # directory for images" comes first, as for the host's generations.
+            outdir = getattr(opts, "outdir_samples", "") or getattr(
+                opts, "outdir_img2img_samples", ""
             )
             outgrid = getattr(opts, "outdir_img2img_grids", "") or getattr(
                 opts, "outdir_grids", ""
@@ -1526,8 +1558,10 @@ class AfterDetailerScript(scripts.Script):
                 params_txt_content = self.read_params_txt()
             except Exception:  # noqa: BLE001
                 params_txt_content = ""
-            # Regions that failed with a NaN error, counted by the inner pass.
+            # Regions that failed with a NaN error, counted by the inner pass,
+            # and whether the detector found anything at all.
             self._ad_nan_regions = 0
+            self._ad_detected = False
             try:
                 processed = self._postprocess_image_inner(p, pp, args)
             finally:
@@ -1546,6 +1580,13 @@ class AfterDetailerScript(scripts.Script):
                     # Detected, but the inpaint failed: not "nothing detected".
                     # No image, so a folder run counts the file as failed.
                     return None, "⚠️ ADetailer run failed: NaN error while inpainting."
+                if getattr(self, "_ad_detected", False):
+                    # Found, but the detection numbers, the mask filters or
+                    # [SKIP] left no region: not "nothing detected".
+                    return image, (
+                        "ℹ️ Detections found, but the detection numbers, mask "
+                        "filters or [SKIP] left none to inpaint — image unchanged."
+                    )
                 return image, "ℹ️ Nothing detected — image unchanged."
             status = "✅ ADetailer pass complete."
             if save:
@@ -1559,16 +1600,18 @@ class AfterDetailerScript(scripts.Script):
                     # symlinks a launcher like Stability Matrix uses, so the
                     # folder lands in the real images dir (beside Img2Img /
                     # Text2Img), not buried in the raw package output; on a plain
-                    # install it lands beside output/img2img-images.
-                    base_out = (
-                        getattr(opts, "outdir_img2img_samples", "")
-                        or getattr(opts, "outdir_samples", "")
-                        or "output"
-                    )
-                    try:
-                        parent = Path(base_out).resolve().parent
-                    except Exception:  # noqa: BLE001
-                        parent = Path(base_out).parent
+                    # install it lands beside output/img2img-images. A global
+                    # "Output directory for images" holds every generation, so
+                    # the folder goes inside it.
+                    global_out = getattr(opts, "outdir_samples", "")
+                    if global_out:
+                        parent = Path(global_out)
+                    else:
+                        base_out = getattr(opts, "outdir_img2img_samples", "") or "output"
+                        try:
+                            parent = Path(base_out).resolve().parent
+                        except Exception:  # noqa: BLE001
+                            parent = Path(base_out).parent
                     save_dir = str(parent / AD_APPLY_SUBDIR)
                     images.save_image(
                         pp.image, save_dir, "",
@@ -1703,8 +1746,15 @@ class AfterDetailerScript(scripts.Script):
 
         return optimal_resolution
 
-    def _apply_inline_class_prompts(
-        self, p2, pred: PredictOutput, j: int, steps: int, inverted: bool = False
+    def _apply_inline_class_prompts(  # noqa: PLR0913, PLR0917
+        self,
+        p2,
+        pred: PredictOutput,
+        j: int,
+        steps: int,
+        inverted: bool = False,
+        p=None,
+        args: ADetailerArgs | None = None,
     ) -> None:
         """Resolve inline ``[CLASS=name]...[/CLASS]`` blocks in mask ``j``'s
         prompt against the class the detector found on that mask.
@@ -1718,6 +1768,9 @@ class AfterDetailerScript(scripts.Script):
         none of the detected classes describe, so every class block is dropped.
         A merged region (Merge) that mixes classes keeps the blocks of the
         classes it holds, and is skipped only when every one of them is.
+        Given the generation ``p`` and the tab's ``args``, a region the blocks
+        leave with no text of its own gets the main prompt, as a blank prompt
+        does, instead of an empty one.
         """
         try:
             cn = getattr(pred, "class_names", None)
@@ -1775,6 +1828,28 @@ class AfterDetailerScript(scripts.Script):
                 p2.negative_prompt = (
                     re.sub(r"\s{2,}", " ", new_neg).strip().strip(",").strip()
                 )
+            # No block matches this region and there is no text outside the
+            # blocks (or [PROMPT] sits only in another class's block): decided
+            # on the prompt as typed, before the append text and LoRAs.
+            if args is None:
+                return
+            blank = None
+            for field, attr, k in (
+                ("ad_prompt", "prompt", 0),
+                ("ad_negative_prompt", "negative_prompt", 1),
+            ):
+                raw = re.split(r"\s*\[SEP\]\s*", getattr(args, field))
+                raw = raw[min(j, len(raw) - 1)]
+                if "[class=" not in raw.lower():
+                    continue
+                own = _resolve_inline_class_prompt(raw, cls)
+                if re.sub(r"\[SKIP\]|[\s,]", "", own, flags=re.IGNORECASE):
+                    continue
+                if blank is None:
+                    blank = self.get_prompt(
+                        p, args.copy(update={"ad_prompt": "", "ad_negative_prompt": ""})
+                    )
+                setattr(p2, attr, blank[k][0])
         except Exception:  # noqa: BLE001
             return
 
@@ -1817,7 +1892,9 @@ class AfterDetailerScript(scripts.Script):
             if not cn or len(cn) != steps or j >= len(cn):
                 return
             detected = cn[j]
-            if seq_pass and detected in _parse_class_prompts(args.ad_class_prompts):
+            if seq_pass and _class_prompt_for(
+                _parse_class_prompts(args.ad_class_prompts), detected
+            ) is not None:
                 return  # manual per-class prompt wins
             if args.is_mediapipe_features():
                 # "face" is the whole face, which holds the other parts: never
@@ -2040,9 +2117,11 @@ class AfterDetailerScript(scripts.Script):
                         "ad_inpaint_indices": "",
                     }
                     # Apply per-class prompt overrides if any. Empty strings
-                    # leave the tab's default intact for that field.
-                    if cls in class_prompts:
-                        pos, neg = class_prompts[cls]
+                    # leave the tab's default intact for that field. The line's
+                    # class name matches regardless of case, like the filter.
+                    entry = _class_prompt_for(class_prompts, cls)
+                    if entry is not None:
+                        pos, neg = entry
                         if pos:
                             update["ad_prompt"] = pos
                         if neg:
@@ -2152,6 +2231,7 @@ class AfterDetailerScript(scripts.Script):
             )
             return False
 
+        self._ad_detected = True
         masks = self.pred_preprocessing(p, pred, args)
         _verbose_detection(pred, masks, _det_ms)
         shared.state.assign_current_image(pred.preview)
@@ -2218,6 +2298,8 @@ class AfterDetailerScript(scripts.Script):
                 j,
                 steps,
                 getattr(args, "ad_mask_merge_invert", "None") == "Merge and Invert",
+                p,
+                args,
             )
 
             if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
@@ -2334,49 +2416,52 @@ class AfterDetailerScript(scripts.Script):
             with preserve_prompts(p):
                 p.scripts.postprocess(copy(p), dummy)
 
-        is_processed = False
-        with CNHijackRestore(), pause_total_tqdm(), cn_allow_script_control():
-            for n, args in enumerate(arg_list):
-                if args.need_skip():
-                    continue
-                # Per-tab "Apply only on hires.fix" toggle — if on, run only
-                # during the post-hires-upscale postprocess call. See helper
-                # for the full decision matrix.
-                if _should_skip_for_hires_only(p, args):
-                    continue
-                tab_processed = self._postprocess_image_inner(p, pp, args, n=n)
-                is_processed |= tab_processed
-                # Save the image right after THIS tab finished its inpaint
-                # pass(es), so the user gets one file per ADetailer stage and
-                # can roll back to a previous one if the next pass spoils it.
-                # Sequential-class tabs are EXCLUDED here: they already save
-                # one step image per class inside `_postprocess_image_inner`,
-                # and the last of those equals this tab's final image — saving
-                # again would just duplicate it.
-                if (
-                    tab_processed
-                    and not is_skip_img2img(p)
-                    and not self._will_run_sequential(args)
-                ):
-                    self.save_image(
-                        p,
-                        pp.image,
-                        condition="ad_save_intermediate_steps",
-                        suffix=f"-ad-step-{n + 1}",
-                    )
+        # A tab that raises (a missing model, out of memory) must still
+        # restart the scripts shut down above and restore params.txt.
+        try:
+            is_processed = False
+            with CNHijackRestore(), pause_total_tqdm(), cn_allow_script_control():
+                for n, args in enumerate(arg_list):
+                    if args.need_skip():
+                        continue
+                    # Per-tab "Apply only on hires.fix" toggle — if on, run only
+                    # during the post-hires-upscale postprocess call. See helper
+                    # for the full decision matrix.
+                    if _should_skip_for_hires_only(p, args):
+                        continue
+                    tab_processed = self._postprocess_image_inner(p, pp, args, n=n)
+                    is_processed |= tab_processed
+                    # Save the image right after THIS tab finished its inpaint
+                    # pass(es), so the user gets one file per ADetailer stage and
+                    # can roll back to a previous one if the next pass spoils it.
+                    # Sequential-class tabs are EXCLUDED here: they already save
+                    # one step image per class inside `_postprocess_image_inner`,
+                    # and the last of those equals this tab's final image — saving
+                    # again would just duplicate it.
+                    if (
+                        tab_processed
+                        and not is_skip_img2img(p)
+                        and not self._will_run_sequential(args)
+                    ):
+                        self.save_image(
+                            p,
+                            pp.image,
+                            condition="ad_save_intermediate_steps",
+                            suffix=f"-ad-step-{n + 1}",
+                        )
 
-        if is_processed and not is_skip_img2img(p):
-            self.save_image(
-                p, init_image, condition="ad_save_images_before", suffix="-ad-before"
-            )
+            if is_processed and not is_skip_img2img(p):
+                self.save_image(
+                    p, init_image, condition="ad_save_images_before", suffix="-ad-before"
+                )
+        finally:
+            if need_call_process(p):
+                with preserve_prompts(p):
+                    copy_p = copy(p)
+                    p.scripts.before_process(copy_p)
+                    p.scripts.process(copy_p)
 
-        if need_call_process(p):
-            with preserve_prompts(p):
-                copy_p = copy(p)
-                p.scripts.before_process(copy_p)
-                p.scripts.process(copy_p)
-
-        self.write_params_txt(params_txt_content)
+            self.write_params_txt(params_txt_content)
 
 
 def _is_forge_modules() -> bool:
@@ -2994,6 +3079,8 @@ _INFOTEXT_MODEL_KEY = re.compile(r"ADetailer model( \d+(?:st|nd|rd|th))?")
 # The value of each key the infotext leaves out: extra_params drops these at
 # their defaults. Values that only apply when their "use separate ..." toggle
 # is on (steps, sampler, checkpoint, ...) are not listed; the toggle is enough.
+# The last three are always written by this extension, but images made with
+# upstream ADetailer or older builds leave them out.
 _INFOTEXT_PASTE_DEFAULTS = {
     "ADetailer classes sequential": "False",
     "ADetailer prompt": "",
@@ -3023,6 +3110,9 @@ _INFOTEXT_PASTE_DEFAULTS = {
     "ADetailer use separate CLIP skip": "False",
     "ADetailer restore face": "False",
     "ADetailer ControlNet model": "None",
+    "ADetailer apply on hires only": "False",
+    "ADetailer use bbox mask": "False",
+    "ADetailer use resolution scale": "False",
 }
 # Keys that the infotext leaves out at their defaults only while the key on
 # the left is written: the scheduler of a separate sampler, and the settings
