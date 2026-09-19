@@ -705,6 +705,17 @@ class AfterDetailerScript(scripts.Script):
         p.sampler_name = "Euler"
         p.width = 128
         p.height = 128
+        # The host writes the saved image's infotext from p. Its extra params
+        # are merged after the core keys, so record the user's settings there;
+        # p itself keeps the throwaway values, which later batch iterations
+        # still need.
+        p.extra_generation_params.update(
+            {
+                "Steps": p._ad_orig.steps,
+                "Sampler": p._ad_orig.sampler_name,
+                "Size": f"{p._ad_orig.width}x{p._ad_orig.height}",
+            }
+        )
 
     def get_args(self, p, *args_) -> list[ADetailerArgs]:
         args = [arg for arg in args_ if isinstance(arg, dict)]
@@ -737,6 +748,12 @@ class AfterDetailerScript(scripts.Script):
         params = {}
         for n, args in enumerate(arg_list):
             params.update(args.extra_params(suffix=suffix(n)))
+            # An empty or blank value makes AUTOMATIC1111's infotext parser
+            # fail on paste ("Error parsing"); _clear_missing_class_prompts
+            # pastes a missing key as empty instead.
+            key = "ADetailer class prompts" + suffix(n)
+            if key in params and not str(params[key]).strip():
+                del params[key]
         params["ADetailer version"] = __version__
         return params
 
@@ -921,6 +938,9 @@ class AfterDetailerScript(scripts.Script):
     def get_sampler(self, p, args: ADetailerArgs) -> str:
         if args.ad_use_sampler:
             if args.ad_sampler == "Use same sampler":
+                # Skip img2img replaced p.sampler_name with a placeholder.
+                if hasattr(p, "_ad_orig"):
+                    return p._ad_orig.sampler_name
                 return p.sampler_name
             return args.ad_sampler
 
@@ -1307,7 +1327,8 @@ class AfterDetailerScript(scripts.Script):
         """Rebuild pred's per-detection arrays so index j lines up with masks[j]
         after masks were dropped/merged. A one-source group keeps that detection;
         a merged group (>1 source) becomes a single entry — the UNION bbox, the
-        max confidence, and the first class name."""
+        max confidence, and the shared class name ("" when the merged sources
+        have different classes, so the region is treated as class-less)."""
 
         def _union(boxes):
             return [
@@ -1322,7 +1343,12 @@ class AfterDetailerScript(scripts.Script):
                 max(pred.confidences[i] for i in g) for g in groups
             ]
         if pred.class_names:
-            pred.class_names = [pred.class_names[g[0]] for g in groups]
+            pred.class_names = [
+                pred.class_names[g[0]]
+                if len({pred.class_names[i] for i in g}) == 1
+                else ""
+                for g in groups
+            ]
         pred.bboxes = [_union([pred.bboxes[i] for i in g]) for g in groups]
         pred.masks = masks
 
@@ -1365,6 +1391,7 @@ class AfterDetailerScript(scripts.Script):
         StableDiffusionProcessingImg2Img built by get_i2i_p), runs the detailer,
         and returns (result_image, status_str). Fully guarded — never raises."""
         try:
+            import random
             from types import SimpleNamespace
 
             # The standalone UI action owns the host queue lock and begins/ends
@@ -1408,16 +1435,21 @@ class AfterDetailerScript(scripts.Script):
                 opts, "outdir_grids", ""
             )
 
+            # Real random seeds, picked like the host does for -1. With -1 only
+            # the first region was random: region j gets seed + j, so the
+            # others always got the fixed seeds 0, 1, ...
+            seed = int(random.randrange(4294967294))
+            subseed = int(random.randrange(4294967294))
             p = SimpleNamespace(
                 sd_model=shared.sd_model,
                 prompt="",
                 negative_prompt="",
                 all_prompts=[""],
                 all_negative_prompts=[""],
-                seed=-1,
-                subseed=-1,
-                all_seeds=[-1],
-                all_subseeds=[-1],
+                seed=seed,
+                subseed=subseed,
+                all_seeds=[seed],
+                all_subseeds=[subseed],
                 subseed_strength=0.0,
                 seed_resize_from_h=0,
                 seed_resize_from_w=0,
@@ -1446,7 +1478,21 @@ class AfterDetailerScript(scripts.Script):
             # instantiated — _postprocess_image_inner only ever reads/reassigns
             # pp.image, so a plain namespace is the correct carrier here.
             pp = SimpleNamespace(image=image)
-            processed = self._postprocess_image_inner(p, pp, args)
+            # The inner pass makes the host rewrite params.txt, which the
+            # paste button reads with an empty prompt. Keep the user's last
+            # generation there, as postprocess_image does. Guarded so it can
+            # never cost the result.
+            try:
+                params_txt_content = self.read_params_txt()
+            except Exception:  # noqa: BLE001
+                params_txt_content = ""
+            try:
+                processed = self._postprocess_image_inner(p, pp, args)
+            finally:
+                try:
+                    self.write_params_txt(params_txt_content)
+                except Exception:  # noqa: BLE001
+                    pass
             if not processed:
                 if (
                     getattr(state, "interrupted", False)
@@ -1546,12 +1592,17 @@ class AfterDetailerScript(scripts.Script):
         if denoise_power == 0:
             return denoise_strength
 
-        modified_strength = dynamic_denoise_strength(
-            denoise_power=denoise_power,
-            denoise_strength=denoise_strength,
-            bbox=bbox,
-            image_size=image_size,
-        )
+        try:
+            modified_strength = dynamic_denoise_strength(
+                denoise_power=denoise_power,
+                denoise_strength=denoise_strength,
+                bbox=bbox,
+                image_size=image_size,
+            )
+        except ZeroDivisionError:
+            # A negative power on a region covering the whole image is
+            # 0 ** negative: keep the unmodified strength instead of aborting.
+            return denoise_strength
 
         print(
             f"[-] ADetailer: dynamic denoising -- {denoise_strength:.2f} -> {modified_strength:.2f}"
@@ -1607,7 +1658,7 @@ class AfterDetailerScript(scripts.Script):
         return optimal_resolution
 
     def _apply_inline_class_prompts(
-        self, p2, pred: PredictOutput, j: int, steps: int
+        self, p2, pred: PredictOutput, j: int, steps: int, inverted: bool = False
     ) -> None:
         """Resolve inline ``[CLASS=name]...[/CLASS]`` blocks in mask ``j``'s
         prompt against the class the detector found on that mask.
@@ -1617,10 +1668,15 @@ class AfterDetailerScript(scripts.Script):
         modes (the per-mask class comes straight from ``pred.class_names``), and
         is a guarded no-op — never a crash. A prompt with no ``[CLASS=`` tag is
         returned unchanged, so this only affects users who type the tags.
+        With ``inverted`` (Merge and Invert) the mask is the background, which
+        none of the detected classes describe, so every class block is dropped.
         """
         try:
             cn = getattr(pred, "class_names", None)
             cls = cn[j] if (cn and len(cn) == steps and j < len(cn)) else None
+            if inverted and cn:
+                # A comma never matches a tag name (tags are split on commas).
+                cls = ","
             had_inline = isinstance(p2.prompt, str) and "[class=" in p2.prompt.lower()
             new_pos = _resolve_inline_class_prompt(p2.prompt, cls)
             # A [SKIP] token surviving inline resolution — e.g. from a matching
@@ -1655,7 +1711,13 @@ class AfterDetailerScript(scripts.Script):
             return
 
     def _apply_auto_class_guard(
-        self, p2, args: ADetailerArgs, pred: PredictOutput, j: int, steps: int
+        self,
+        p2,
+        args: ADetailerArgs,
+        pred: PredictOutput,
+        j: int,
+        steps: int,
+        seq_pass: bool = False,
     ) -> None:
         """Auto class-guard for mask ``j``.
 
@@ -1664,13 +1726,17 @@ class AfterDetailerScript(scripts.Script):
         detector model to the negative prompt, so a correctly-detected region
         is not regenerated as a different class.
 
-        Opt-in via ``ad_class_guard``. A manual ``ad_class_prompts`` entry for
-        the detected class always wins (auto is suppressed for that class). The
+        Opt-in via ``ad_class_guard``. In a sequential pass (``seq_pass``), the
+        only place ``ad_class_prompts`` are applied, a manual entry for the
+        detected class wins (auto is suppressed for that class). Skipped for a
+        Merge and Invert mask, which is the background. The
         whole thing degrades to a silent no-op — never a crash — for
         mediapipe / class-less models, any per-mask misalignment, or on any
         WebUI where the class-name lookup fails (universal-WebUI compat).
         """
         if not getattr(args, "ad_class_guard", False):
+            return
+        if getattr(args, "ad_mask_merge_invert", "None") == "Merge and Invert":
             return
         try:
             names_full = get_model_class_names(str(self.get_ad_model(args.ad_model)))
@@ -1680,7 +1746,7 @@ class AfterDetailerScript(scripts.Script):
             if not cn or len(cn) != steps or j >= len(cn):
                 return
             detected = cn[j]
-            if detected in _parse_class_prompts(args.ad_class_prompts):
+            if seq_pass and detected in _parse_class_prompts(args.ad_class_prompts):
                 return  # manual per-class prompt wins
 
             pos, neg = build_class_guard(
@@ -1721,10 +1787,19 @@ class AfterDetailerScript(scripts.Script):
         #      (rounded down to a multiple of 8 for SD compatibility, floor 64).
         #   3. Otherwise the existing get_optimal_crop_image_size heuristic
         #      runs as before.
+        # With Merge and Invert the inpainted region is the inverted mask, not
+        # the detections, so size the canvas from the mask. Dynamic denoise
+        # above keeps the detection box (a full-frame box would give 0).
+        size_bbox = pred.bboxes[j]
+        if args.ad_mask_merge_invert == "Merge and Invert":
+            _mask = getattr(p2, "image_mask", None)
+            _mask_box = _mask.getbbox() if _mask is not None else None
+            if _mask_box:
+                size_bbox = list(_mask_box)
         if args.ad_use_inpaint_width_height:
             pass  # user-supplied fixed dimensions already on p2.
         elif args.ad_use_resolution_scale:
-            x1, y1, x2, y2 = pred.bboxes[j]
+            x1, y1, x2, y2 = size_bbox
             scale = float(args.ad_resolution_scale)
             scaled_w = max(64, int(round((x2 - x1) * scale)))
             scaled_h = max(64, int(round((y2 - y1) * scale)))
@@ -1735,7 +1810,7 @@ class AfterDetailerScript(scripts.Script):
             p2.height = (scaled_h // 8) * 8 or 64
         else:
             p2.width, p2.height = self.get_optimal_crop_image_size(
-                p2.width, p2.height, pred.bboxes[j]
+                p2.width, p2.height, size_bbox
             )
 
     @rich_traceback
@@ -2048,14 +2123,22 @@ class AfterDetailerScript(scripts.Script):
             # Resolve inline [CLASS=name]…[/CLASS] blocks against this mask's
             # detected class BEFORE the [SKIP] check, so `[CLASS=hand] [SKIP]
             # [/CLASS]` skips only hand regions.
-            self._apply_inline_class_prompts(p2, pred, j, steps)
+            self._apply_inline_class_prompts(
+                p2,
+                pred,
+                j,
+                steps,
+                getattr(args, "ad_mask_merge_invert", "None") == "Merge and Invert",
+            )
 
             if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
                 if _v:
                     _regions.append({"j": j, "skipped": True})
                 continue
 
-            self._apply_auto_class_guard(p2, args, pred, j, steps)
+            self._apply_auto_class_guard(
+                p2, args, pred, j, steps, _seq_label is not None
+            )
 
             self.fix_p2(p, p2, pp, args, pred, j)
 
@@ -2075,6 +2158,10 @@ class AfterDetailerScript(scripts.Script):
             except NansException as e:
                 msg = f"[-] ADetailer: 'NansException' occurred with {ordinal(n + 1)} settings.\n{e}"
                 print(msg, file=sys.stderr)
+                # p2 is reused for the next region: undo what fix_p2 derived
+                # from its own previous values, or they would be applied twice.
+                p2.denoising_strength = i2i.denoising_strength
+                p2.width, p2.height = i2i.width, i2i.height
                 continue
             except Exception as e:
                 # Forge Neo returns no latent when a cancel lands before the
@@ -2302,10 +2389,15 @@ def _forge_wanted_modules(args: ADetailerArgs) -> "list | None":
                 result.append(resolved)
 
     if want_vae:
-        resolved = _resolve(args.ad_vae)
-        if resolved:
+        if args.ad_vae == "Automatic":
+            # A dropdown choice, not a file: drop the base VAE so the detailer
+            # checkpoint uses its own, as "Automatic" does on AUTOMATIC1111.
             result = [m for m in result if not _is_vae(str(m))]
-            result.append(resolved)
+        else:
+            resolved = _resolve(args.ad_vae)
+            if resolved:
+                result = [m for m in result if not _is_vae(str(m))]
+                result.append(resolved)
 
     if sorted(map(str, result)) == sorted(map(str, base)):
         return None
@@ -2378,9 +2470,10 @@ def _make_reset_settings_button(**kwargs):  # noqa: ANN003
     reload so every Settings widget re-reads its (now-default) value from
     `shared.opts`.
 
-    The browser-side `confirm()` gates the destructive action: clicking
-    Cancel returns false from the JS callback which the WebUI runtime
-    translates into a no-op (no Python invocation, no reload).
+    The browser-side `confirm()` gates the destructive action. Gradio calls
+    Python with whatever the JS callback returns, so returning a value can't
+    cancel it: on Cancel the callback throws instead, which rejects its
+    promise before Gradio sends the request (no Python invocation, no reload).
     """
     elem_id = kwargs.pop("elem_id", "setting_ad_reset_button")
     label_text = kwargs.pop("value", None) or kwargs.pop("label", None) or (
@@ -2400,7 +2493,7 @@ def _make_reset_settings_button(**kwargs):  # noqa: ANN003
             "() => {"
             "  if (!confirm('Reset ALL ADetailer settings to their defaults?"
             "\\n\\nThis cannot be undone. The page will reload after reset.')) {"
-            "    return []; "
+            "    throw new Error('ADetailer reset cancelled'); "
             "  }"
             "  setTimeout(() => { location.reload(); }, 800);"
             "  return [];"
@@ -2806,8 +2899,35 @@ def on_ui_tabs():
         return []
 
 
+_INFOTEXT_MODEL_KEY = re.compile(r"ADetailer model( \d+(?:st|nd|rd|th))?")
+
+
+def _clear_missing_class_prompts(_infotext: str, params: dict) -> None:
+    """``infotext_pasted`` callback (PNG Info, Send to, the paste button).
+
+    Empty class prompts are left out of the infotext, and the WebUI keeps a
+    field unchanged when its key is missing. For every tab whose detector is
+    in the pasted parameters, a missing "ADetailer class prompts" key
+    therefore means empty. Keys listed in "Disregard fields from pasted
+    infotext" are left alone. Not a Gradio event, so index-safe; never raises.
+    """
+    try:
+        skipped = set(getattr(shared.opts, "infotext_skip_pasting", None) or [])
+        for key in list(params):
+            match = _INFOTEXT_MODEL_KEY.fullmatch(str(key))
+            if not match:
+                continue
+            name = "ADetailer class prompts" + (match.group(1) or "")
+            if name not in params and name not in skipped:
+                params[name] = ""
+    except Exception:  # noqa: BLE001
+        return
+
+
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_after_component(on_after_component)
 script_callbacks.on_app_started(add_api_endpoints)
 script_callbacks.on_before_ui(on_before_ui)
 script_callbacks.on_ui_tabs(on_ui_tabs)
+if hasattr(script_callbacks, "on_infotext_pasted"):
+    script_callbacks.on_infotext_pasted(_clear_missing_class_prompts)
