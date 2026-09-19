@@ -108,9 +108,11 @@ def get_model_class_names(model_path: str) -> list[str]:
     if names:
         return names
     refused = _host_refuses_unpickle()
-    if refused and model_path in _REFUSED_PATHS:
-        return []
-    names = _read_class_names(model_path)
+    # A .pt the host refused is not loaded again (the host would repeat its
+    # error report), but a sidecar added since then is still read.
+    names = _read_class_names(
+        model_path, load_pt=not (refused and model_path in _REFUSED_PATHS)
+    )
     if names:
         _RESOLVED_NAMES[model_path] = names
     elif refused:
@@ -127,7 +129,7 @@ def _clear_class_name_cache() -> None:
 get_model_class_names.cache_clear = _clear_class_name_cache  # type: ignore[attr-defined]
 
 
-def _read_class_names(model_path: str) -> list[str]:
+def _read_class_names(model_path: str, load_pt: bool = True) -> list[str]:
     """Resolve class names for a YOLO model.
 
     Resolution order:
@@ -172,6 +174,9 @@ def _read_class_names(model_path: str) -> list[str]:
             names = _names_from_json(data)
             if names:
                 return names
+
+    if not load_pt:
+        return []
 
     try:
         from ultralytics import YOLO

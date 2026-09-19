@@ -97,6 +97,30 @@ def test_detection_reads_names_the_ui_lookup_could_not(tmp_path, monkeypatch):
     assert len(fake.calls) == 2
 
 
+def test_sidecar_added_after_a_refused_ui_lookup_is_read(tmp_path, monkeypatch):
+    # AUTOMATIC1111: the UI lookup was refused and the CLASSES dropdown came
+    # up empty; a sidecar written afterwards is read on the next lookup,
+    # without loading the refused .pt again.
+    pt = tmp_path / "multi.pt"
+    pt.write_bytes(b"x")
+    _fake_host(monkeypatch)
+    fake = _fake_ultralytics(monkeypatch, _unreadable)
+
+    assert get_model_class_names(str(pt)) == []
+    assert len(fake.calls) == 1
+
+    # An unrelated <model>.json (e.g. model-manager metadata) is not a class
+    # list: still nothing, and the refused .pt is not loaded again.
+    (tmp_path / "multi.json").write_bytes(b'{"modelId": 1}')
+    assert get_model_class_names(str(pt)) == []
+    assert len(fake.calls) == 1
+
+    (tmp_path / "multi.names.json").write_bytes(b'["face","hand"]')
+    assert get_model_class_names(str(pt)) == ["face", "hand"]
+    assert resolve_class_ids(str(pt), ["hand"]) == [1]
+    assert len(fake.calls) == 1
+
+
 @pytest.mark.parametrize(
     "payload",
     [
