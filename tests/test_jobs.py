@@ -403,3 +403,105 @@ def test_wired_folder_counts_files_with_nothing_to_inpaint(
     assert "1 left unchanged (nothing to inpaint)" in status
     assert "nothing detected" not in status
     assert sorted(f.name for f in tmp_path.iterdir()) == ["a.png"]
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_that_wrote_nothing_is_headed_failed(
+    host, monkeypatch, tmp_path, same_folder
+):
+    # Every file was detailed but none could be written (a full disk or a
+    # folder you cannot write to): the batch said "Batch done".
+    for name in ("a.png", "b.png"):
+        Image.new("RGB", (8, 8), "white").save(tmp_path / name)
+
+    def detail(image, _args, save):
+        if same_folder:
+            return _Unsavable(), "✅ ADetailer pass complete."
+        return image, "✅ ADetailer pass complete. (couldn't save — see console)"
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    _gallery, status = callback(
+        None, str(tmp_path), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert status.startswith("⚠️ Batch failed")
+    assert "2 detailed but not saved" in status
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["a.png", "b.png"]
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+@pytest.mark.parametrize("files", [1, 3])
+def test_wired_folder_cancelled_on_its_last_file_is_headed_interrupted(
+    host, monkeypatch, tmp_path, same_folder, files
+):
+    # The loop checks for a stop only before each file, so a cancel during the
+    # last (or only) file ended the batch as "Batch done".
+    for i in range(files):
+        Image.new("RGB", (8, 8), "white").save(tmp_path / f"{i}.png")
+    calls = []
+
+    def detail(image, _args, save):
+        calls.append(save)
+        if len(calls) < files:
+            return image, "ℹ️ Nothing detected — image unchanged."
+        host.state.interrupted = True
+        return image, "ℹ️ Cancelled — image unchanged."
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    _gallery, status = callback(
+        None, str(tmp_path), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert len(calls) == files
+    assert status.startswith(f"⏹️ Batch interrupted — {files}/{files} image(s)")
+    assert "1 cancelled" in status
+
+
+def test_wired_folder_interrupted_count_includes_failed_files(
+    host, monkeypatch, tmp_path
+):
+    # The "done/total" figure of an interrupted batch left out the files that
+    # failed: "0/3" after one failed run.
+    for name in ("a.png", "b.png", "c.png"):
+        Image.new("RGB", (8, 8), "white").save(tmp_path / name)
+
+    def detail(image, _args, save):
+        host.state.interrupted = True
+        return None, "⚠️ ADetailer run failed: CUDA out of memory."
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    _gallery, status = callback(
+        None, str(tmp_path), False, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert status.startswith("⏹️ Batch interrupted — 1/3 image(s)")
+    assert "1 failed" in status
+
+
+def test_wired_folder_with_nothing_to_inpaint_is_still_done(
+    host, monkeypatch, tmp_path
+):
+    # Files left unchanged are a success: with an unreadable file beside
+    # them the batch is still "done", not "failed".
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "a.png")
+    (tmp_path / "b.png").write_bytes(b"not an image")
+
+    def detail(image, _args, save):
+        return image, "ℹ️ Nothing detected — image unchanged."
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    _gallery, status = callback(
+        None, str(tmp_path), False, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert status.startswith("✅ Batch done")
+    assert "1 left unchanged" in status
+    assert "1 skipped (unreadable)" in status

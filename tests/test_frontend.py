@@ -51,6 +51,34 @@ def test_amber_status_text_is_limited_to_the_dark_theme():
     assert found  # the dark theme keeps its amber
 
 
+def _contrast_on_white(hex_colour: str) -> float:
+    def channel(c: int) -> float:
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (int(hex_colour[i : i + 2], 16) for i in (1, 3, 5))
+    lum = 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    return 1.05 / (lum + 0.05)
+
+
+def test_guide_link_accent_and_badge_dimming_are_limited_to_the_dark_theme():
+    # On the light theme the light-blue "Guide" link, dimmed by the version
+    # badge's 0.55 opacity (a child cannot undo it), was about 1.6:1 on white.
+    accent = re.compile(r"(?<![-\w])color:\s*#6ea8fe\b", re.I)
+    dim = re.compile(r"(?<![-\w])opacity:\s*0?\.\d")
+    found = 0
+    for selectors, body in css_rules():
+        badge_p = any(s.endswith(".ad-version-overlay p") for s in selectors)
+        if accent.search(body) or (badge_p and dim.search(body)):
+            found += 1
+            assert all(s.startswith(".dark ") for s in selectors), selectors
+    assert found == 2  # the dark theme keeps its accent and its dimming
+    rules = {s: body for selectors, body in css_rules() for s in selectors}
+    link = rules['div[id*="adetailer_ad_version"].ad-version-overlay .ad-guide-open']
+    colour = re.search(r"(?<![-\w])color:\s*(#[0-9a-f]{6})\b", link, re.I).group(1)
+    assert _contrast_on_white(colour) >= 4.5
+
+
 def test_version_badge_inner_copy_stays_in_normal_flow():
     # Gradio 3 repeats the badge's id and class on its inner .prose div; that
     # copy must not be positioned (offset) a second time.
@@ -360,6 +388,43 @@ def test_tooltips_are_shown_in_the_webui_language(tmp_path, translated):
     assert titles["load2"] == titles["load"]
     assert titles["exportBtn"] == ("EXPORT (translated)" if translated else export)
     assert titles["remove"] == remove  # no translation: English
+
+
+EXPORT_TOOLTIPS = r"""
+const P = "script_txt2img_adetailer_";
+const inner = new El("button", {});
+const els = {
+    // Gradio 3: the plain fallback button carries the id and the class.
+    gradio3: new El("button", {
+        id: P + "ad_preset_export_btn", class: "lg secondary gradio-button ad-export-unavailable",
+    }),
+    gradio4: new El("div", { id: P + "ad_preset_export_btn_2nd" }, [inner]),
+};
+run(SCRIPT, new El("body", {}, Object.values(els)), { localization: CASE });
+console.log(JSON.stringify({ gradio3: els.gradio3.title, gradio4: inner.title }));
+"""
+
+
+@needs_node
+@pytest.mark.parametrize("translated", [True, False])
+def test_export_tooltip_tells_gradio_3_that_it_cannot_download(tmp_path, translated):
+    # On AUTOMATIC1111 (Gradio 3) Export cannot download a file, but its
+    # tooltip promised a JSON file.
+    export = _tooltip("adetailer_ad_preset_export_btn")
+    source = (ROOT / "javascript" / "button-tooltips.js").read_text(encoding="utf-8")
+    match = re.search(r'EXPORT_UNAVAILABLE =\s*"([^"]*)"', source)
+    fallback = match.group(1) if match else "(missing)"
+    localization = {fallback: "NO DOWNLOAD (translated)"} if translated else {}
+    scenario = f"const CASE = {json.dumps(localization)};\n" + EXPORT_TOOLTIPS
+    titles = run_js(tmp_path, "button-tooltips.js", scenario)
+    assert titles["gradio4"] == export
+    if translated:
+        assert titles["gradio3"] == "NO DOWNLOAD (translated)"
+    else:
+        assert titles["gradio3"] != export
+        assert titles["gradio3"] == fallback
+        assert "user_presets.json" in fallback
+        assert "Gradio 4" in fallback
 
 
 CHANGED_LABEL = r"""

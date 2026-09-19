@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 from rich.traceback import Traceback
 from typing_extensions import ParamSpec
 
@@ -134,7 +135,8 @@ def get_table(title: str, data: dict[str, Any]) -> Table:
     for key, value in data.items():
         if not isinstance(value, str):
             value = repr(value)  # noqa: PLW2901
-        table.add_row(key, value)
+        # Text, not a str: rich would parse a prompt's "[/CLASS]" as markup.
+        table.add_row(key, Text(value))
 
     return table
 

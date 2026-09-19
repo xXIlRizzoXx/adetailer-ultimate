@@ -272,7 +272,7 @@ Two sibling tools live inside each tab's **Detection** section (roughly the midd
     (
         "💾 Presets, copy/paste & saving",
         """
-- **Preset library** — save / load / rename / delete a whole tab's settings by name; **export / import** the library as a file to move it between machines (on AUTOMATIC1111, which ships Gradio 3, Export cannot download a file: back up `user_presets.json` from the extension folder instead; Import works everywhere).
+- **Preset library** — save / load / rename / delete a whole tab's settings by name; **export / import** the library as a file to move it between machines (on WebUIs that ship Gradio 3, such as AUTOMATIC1111 and reForge's main branch, Export cannot download a file: back up `user_presets.json` from the extension folder instead; Import works everywhere).
 - **Copy settings / Paste settings** — clone one tab's settings into another.
 - **Remember last-used settings between restarts** (`Settings → ADetailer`) — restore your last setup after a restart.
 - **Reset ADetailer settings** (`Settings → ADetailer`) — restore factory defaults.
@@ -1364,13 +1364,18 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 if same_folder
                 else "saved to the 'ADetailer-Inpaint' folder"
             )
+            # A cancel during the last file ends the loop before its stop check.
+            interrupted = interrupted or bool(cancelled)
             if interrupted:
                 head = "⏹️ Batch interrupted"
-            elif not have and (run_failed or failed):
+            elif not (saved + unchanged) and (run_failed or failed or not_saved):
+                # Nothing was written: every file failed, was unreadable or
+                # was detailed but could not be saved.
                 head = "⚠️ Batch failed"
             else:
                 head = "✅ Batch done"
-            scope = f"{have}/{len(files)}" if interrupted else f"{len(files)}"
+            attempted = have + run_failed + failed
+            scope = f"{attempted}/{len(files)}" if interrupted else f"{len(files)}"
             status = (
                 f"{head} — {scope} image(s): {saved} detailed and "
                 f"{dest_txt}"
@@ -1642,8 +1647,14 @@ def _wire_presets(
                     ]
                 # A preset saved by an older version lacks the settings added
                 # since: those take their defaults instead of keeping the tab's
-                # current values. "Enable this tab" is left as it is.
-                filled = {a: v for a, v in _defaults.items() if a != "ad_tab_enable"}
+                # current values. "Enable this tab" is left as it is, and so are
+                # the override dropdowns whose default is None (not one of their
+                # choices): their "Use separate …" checkbox still resets.
+                filled = {
+                    a: v
+                    for a, v in _defaults.items()
+                    if a != "ad_tab_enable" and v is not None
+                }
                 return [
                     f"✅ Loaded '{selected}'.",
                     *_restored_tab_updates({**filled, **preset}, attrs, model_mapping),
@@ -1932,6 +1943,9 @@ def one_ui_group(
                 preset_export_btn = gr.Button(
                     value="\U0001F4E4 Esport",
                     elem_id=eid("ad_preset_export_btn"),
+                    # Marks the fallback for its tooltip
+                    # (javascript/button-tooltips.js).
+                    elem_classes=["ad-export-unavailable"],
                     scale=0,
                     min_width=160,
                 )

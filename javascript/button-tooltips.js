@@ -57,6 +57,12 @@
             "Run the full ADetailer detect + inpaint pass on the input image, using this tab's detector / detailer checkpoint / prompt / LoRAs — without regenerating the base image. Tick 'Save result to outputs' to also write it to your outputs folder.",
     };
 
+    // Gradio 3 (AUTOMATIC1111) has no download button: Export is then a plain
+    // button that cannot download a file (aaaaaa/ui.py gives it this class).
+    const EXPORT_UNAVAILABLE_CLASS = "ad-export-unavailable";
+    const EXPORT_UNAVAILABLE =
+        "Export as a download needs Gradio 4 (Forge / Forge Neo). On this WebUI, back up user_presets.json from the extension folder instead.";
+
     function applyTooltips() {
         for (const [idFragment, tooltipText] of Object.entries(TOOLTIPS)) {
             // Match any element whose id contains the fragment — covers
@@ -77,15 +83,20 @@
                 const target =
                     el.tagName === "BUTTON" ? el : el.querySelector("button") || el;
                 if (!target.title) {
+                    const text =
+                        el.classList.contains(EXPORT_UNAVAILABLE_CLASS) ||
+                        target.classList.contains(EXPORT_UNAVAILABLE_CLASS)
+                            ? EXPORT_UNAVAILABLE
+                            : tooltipText;
                     // The WebUI's localizer translates a title only when the
                     // node is added, before this runs: look it up here, as
                     // the WebUI's own hints.js does for its tooltips.
                     const l10n = window.localization;
-                    const translated = l10n && l10n[tooltipText];
+                    const translated = l10n && l10n[text];
                     target.title =
                         typeof translated === "string" && translated
                             ? translated
-                            : tooltipText;
+                            : text;
                 }
             }
         }

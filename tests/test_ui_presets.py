@@ -297,6 +297,27 @@ def test_export_on_gradio_3_keeps_the_button_label(callbacks, tmp_path, monkeypa
     assert "Gradio 4" in status
 
 
+def test_only_the_gradio_3_export_button_is_marked_for_its_tooltip():
+    # The tooltip promised a JSON download that the Gradio 3 fallback button
+    # cannot give; button-tooltips.js tells it apart by this class.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    branch = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "_DownloadButton is not None"
+        and any("ad_preset_export_btn" in ast.unparse(n) for n in node.body)
+    )
+
+    def classes(nodes):
+        calls = [n for s in nodes for n in ast.walk(s) if isinstance(n, ast.Call)]
+        call = next(c for c in calls if "ad_preset_export_btn" in ast.unparse(c))
+        kw = {k.arg: k.value for k in call.keywords}
+        return ast.literal_eval(kw["elem_classes"]) if "elem_classes" in kw else []
+
+    assert "ad-export-unavailable" in classes(branch.orelse)
+    assert "ad-export-unavailable" not in classes(branch.body)
+
+
 def test_export_on_gradio_4_still_serves_the_file(callbacks, tmp_path, monkeypatch):
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     callbacks["_DownloadButton"] = object
@@ -849,6 +870,30 @@ def test_load_resets_settings_an_older_preset_does_not_have(callbacks):
     assert "value" not in restored["ad_tab_enable"]
 
 
+def test_load_keeps_an_override_choice_an_older_preset_does_not_have(callbacks):
+    # Presets saved before the per-pass text encoder existed have no
+    # ad_text_encoder. Its schema default is None, which is not one of the
+    # dropdown's choices, so Load left the dropdown blank.
+    callbacks["get_preset"] = lambda name: {
+        "ad_model": "faces.pt",
+        "ad_checkpoint": "Use same checkpoint",
+        "ad_vae": "Use same VAE",
+    }
+    preset_widgets = [tuple(Component() for _ in range(9))]
+    callbacks["_wire_presets"](
+        [widgets()], preset_widgets, [Component()], Component(), 1,
+        {"faces.pt": "faces.pt"},
+    )
+    result = preset_widgets[0][1].callback("saved")[1:]
+    restored = dict(zip(ALL_ARGS.attrs, result[:-1]))
+    assert "value" not in restored["ad_text_encoder"]  # the tab keeps its choice
+    assert restored["ad_use_text_encoder"]["value"] is False
+    assert restored["ad_checkpoint"]["value"] == "Use same checkpoint"
+    assert not any(
+        "value" in u and u["value"] is None for u in result if isinstance(u, dict)
+    )
+
+
 @pytest.mark.parametrize("exclude", [False, True])
 def test_detector_change_keeps_a_class_name_in_another_case(callbacks, exclude):
     # Pasted parameters or a preset may hold "Face" for the model's "face".
@@ -965,3 +1010,6 @@ def test_guide_describes_source_folder_batches_and_the_export_fallback():
     assert "Save results in the source folder instead" in where
     library = next(line for line in presets.splitlines() if "Preset library" in line)
     assert "AUTOMATIC1111" in library and "user_presets.json" in library
+    # reForge's main branch ships Gradio 3 too, so the limit is the Gradio
+    # version, not one WebUI.
+    assert "Gradio 3" in library and "reForge" in library

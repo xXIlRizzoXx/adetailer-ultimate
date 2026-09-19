@@ -337,24 +337,38 @@ div[id*="adetailer_ad_version"].ad-version-overlay p {
     margin: 0 !important;
     padding: 0 !important;
     font-size: 11px !important;
-    opacity: 0.55 !important;
+    /* Dimmed by colour, not opacity, on the light theme: a child cannot undo
+     * its parent's opacity, and the Guide link below needs full strength
+     * there. The text looks as it did with a 0.55 opacity. */
+    color: var(--body-text-color-subdued) !important;
+    color: color-mix(in srgb, var(--body-text-color) 55%, transparent) !important;
     white-space: nowrap;
     text-align: right;
+}
+
+/* The dark theme keeps its 0.55 opacity (Gradio 3 and 4 set .dark there). */
+.dark div[id*="adetailer_ad_version"].ad-version-overlay p {
+    color: var(--body-text-color) !important;
+    opacity: 0.55 !important;
 }
 
 /* The "📖 Guide" quick-link injected into the header version overlay
  * (javascript/guide-button.js). The overlay is pointer-events:none so header
  * clicks still toggle the accordion; re-enable pointer events on the link only.
- * The link shares the overlay <p>'s 0.55 opacity, so the accent colour + bold
- * are what keep it distinguishable from the grey version text (clearly legible
- * on the dark default theme). */
+ * The accent colour + bold are what keep it distinguishable from the grey
+ * version text. On the light theme the light-blue accent, dimmed with the
+ * version text, was about 1.6:1 on white, so it uses a darker blue there. */
 div[id*="adetailer_ad_version"].ad-version-overlay .ad-guide-open {
     pointer-events: auto !important;
     cursor: pointer !important;
     font-weight: 600 !important;
-    color: #6ea8fe !important;
+    color: #2563eb !important;
     text-decoration: none !important;
     white-space: nowrap;
+}
+/* On the dark theme the link shares the <p>'s 0.55 opacity. */
+.dark div[id*="adetailer_ad_version"].ad-version-overlay .ad-guide-open {
+    color: #6ea8fe !important;
 }
 div[id*="adetailer_ad_version"].ad-version-overlay .ad-guide-open:hover {
     text-decoration: underline !important;
