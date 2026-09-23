@@ -29,7 +29,7 @@ def callbacks():
         "_restored_tab_updates", "_sync_class_dropdown", "on_ad_model_update",
         "_do_import", "suffix", "_class_filter_infotext_fields",
         "_skipped_infotext_keys", "_tab_infotext_fields", "on_cn_model_update",
-        "_do_export", "_do_export_status",
+        "_do_export", "_do_export_status", "_format_preset_preview",
     }
     functions = [
         node for node in ast.walk(source)
@@ -104,7 +104,7 @@ def test_restore_changes_detector_and_keeps_class_filter(
         result = paste_buttons[1].callback((0, [state.get(a) for a in attrs]))
     else:
         callbacks["get_preset"] = lambda name: state
-        preset_widgets = [tuple(Component() for _ in range(9)) for _ in range(2)]
+        preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(2)]
         callbacks["_wire_presets"](
             all_widgets, preset_widgets, [Component(), Component()], Component(), 2,
             mapping,
@@ -137,7 +137,7 @@ def test_restore_changes_detector_and_keeps_class_filter(
 
 
 def test_reset_hides_previous_world_vocabulary_field(callbacks):
-    preset_widgets = [tuple(Component() for _ in range(9))]
+    preset_widgets = [tuple(Component() for _ in range(10))]
     callbacks["_wire_presets"](
         [widgets()], preset_widgets, [Component()], Component(), 1
     )
@@ -155,7 +155,7 @@ def test_reset_every_tab_gives_each_tab_its_own_updates(callbacks):
     # tab empty, and that tab is silently left unchanged. Every target tab must
     # receive its own update objects, as it did before plus.7.5.
     tabs = 3
-    preset_widgets = [tuple(Component() for _ in range(9)) for _ in range(tabs)]
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(tabs)]
     callbacks["_wire_presets"](
         [widgets() for _ in range(tabs)], preset_widgets,
         [Component() for _ in range(tabs)], Component(), tabs,
@@ -187,7 +187,7 @@ def test_reset_leaves_extra_tabs_disabled_like_a_fresh_setup(callbacks):
     # A fresh build starts only the first tab enabled. Reset used the schema
     # default (enabled) for every tab, so all extra tabs came back ticked.
     tabs = 3
-    preset_widgets = [tuple(Component() for _ in range(9)) for _ in range(tabs)]
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(tabs)]
     callbacks["_wire_presets"](
         [widgets() for _ in range(tabs)], preset_widgets,
         [Component() for _ in range(tabs)], Component(), tabs,
@@ -202,6 +202,45 @@ def test_reset_leaves_extra_tabs_disabled_like_a_fresh_setup(callbacks):
     assert enabled(preset_widgets[0][6].callback(True)) == [True, False, False]
     # Resetting the second tab alone turns it off and leaves the others.
     assert enabled(preset_widgets[1][6].callback(False)) == [None, False, None]
+
+
+@pytest.mark.parametrize("reset_all", [False, True])
+def test_reset_puts_override_dropdowns_back_on_their_first_choice(callbacks, reset_all):
+    # Their schema default is None, which is not one of their choices, so
+    # Reset left the separate checkpoint, VAE and text encoder dropdowns blank.
+    tabs = 2
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(tabs)]
+    callbacks["_wire_presets"](
+        [widgets() for _ in range(tabs)], preset_widgets,
+        [Component() for _ in range(tabs)], Component(), tabs,
+    )
+    result = preset_widgets[0][6].callback(reset_all)
+    count = len(ALL_ARGS.attrs)
+    base = 4 * tabs + 1  # status, preset, name and paste per tab + clipboard
+    first = {
+        "ad_checkpoint": "Use same checkpoint",
+        "ad_vae": "Use same VAE",
+        "ad_text_encoder": "Use same text encoder",
+    }
+    for t in range(tabs if reset_all else 1):
+        restored = dict(zip(ALL_ARGS.attrs, result[base + t * count : base + (t + 1) * count]))
+        for attr, value in first.items():
+            assert restored[attr]["value"] == value
+        assert restored["ad_use_checkpoint"]["value"] is False
+    assert not any(isinstance(u, dict) and u.get("value", "") is None for u in result)
+    # These are the first choices a fresh build gives the three dropdowns.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    lists = {
+        node.targets[0].id: node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.List)
+        and getattr(node.targets[0], "id", "") in ("ckpts", "vaes", "tes")
+    }
+    assert [ast.literal_eval(lists[n].elts[0]) for n in ("ckpts", "vaes", "tes")] == list(
+        first.values()
+    )
 
 
 def test_mediapipe_face_feature_selection_has_choices(callbacks):
@@ -261,7 +300,7 @@ def test_import_accepts_gradio_3_and_4_upload_values(callbacks, tmp_path, upload
         return 1, 0, []
 
     callbacks["import_presets_json"] = import_payload
-    choices, status = callbacks["_do_import"](uploaded, True)
+    choices, status, _preview = callbacks["_do_import"](uploaded, True)
     assert received == [(payload, True)]
     assert choices["choices"] == ["(none)", "saved"]
     assert "added" in status
@@ -280,7 +319,7 @@ def test_import_accepts_a_file_with_a_byte_order_mark(callbacks, tmp_path):
         return 1, 0, []
 
     callbacks["import_presets_json"] = import_payload
-    _choices, status = callbacks["_do_import"](str(uploaded), False)
+    _choices, status, _preview = callbacks["_do_import"](str(uploaded), False)
     assert received == [payload]
     assert "added" in status
 
@@ -316,6 +355,26 @@ def test_only_the_gradio_3_export_button_is_marked_for_its_tooltip():
 
     assert "ad-export-unavailable" in classes(branch.orelse)
     assert "ad-export-unavailable" not in classes(branch.body)
+
+
+def test_hires_only_help_says_the_tab_is_skipped_without_hires_fix():
+    # The help text said the option has no effect when hires.fix is off, but
+    # the tab is then skipped; it also named a pre-hires call no WebUI makes.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    call = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and any(
+            k.arg == "elem_id" and "ad_apply_on_hires_only" in ast.unparse(k.value)
+            for k in node.keywords
+        )
+    )
+    info = ast.literal_eval(next(k.value for k in call.keywords if k.arg == "info"))
+    assert "skipped" in info
+    assert "when hires.fix is off" not in info
+    assert "pre-hires" not in info
+    assert not any(mark in info for mark in ("**", "`", "["))
 
 
 def test_export_on_gradio_4_still_serves_the_file(callbacks, tmp_path, monkeypatch):
@@ -852,7 +911,7 @@ def test_load_resets_settings_an_older_preset_does_not_have(callbacks):
     callbacks["get_preset"] = lambda name: {
         "ad_model": "faces.pt", "ad_prompt": "old preset", "ad_model_classes": "face",
     }
-    preset_widgets = [tuple(Component() for _ in range(9))]
+    preset_widgets = [tuple(Component() for _ in range(10))]
     callbacks["_wire_presets"](
         [widgets()], preset_widgets, [Component()], Component(), 1,
         {"faces.pt": "faces.pt"},
@@ -879,7 +938,7 @@ def test_load_keeps_an_override_choice_an_older_preset_does_not_have(callbacks):
         "ad_checkpoint": "Use same checkpoint",
         "ad_vae": "Use same VAE",
     }
-    preset_widgets = [tuple(Component() for _ in range(9))]
+    preset_widgets = [tuple(Component() for _ in range(10))]
     callbacks["_wire_presets"](
         [widgets()], preset_widgets, [Component()], Component(), 1,
         {"faces.pt": "faces.pt"},
@@ -932,11 +991,13 @@ def test_detector_change_drops_an_ambiguous_or_unknown_class_name(callbacks):
     assert result[0]["value"] == "Face"
 
 
-def test_preset_save_delete_rename_keep_other_tabs_selection(callbacks):
+def test_preset_save_delete_rename_keep_other_tabs_selection(callbacks, monkeypatch):
     # Save, Delete and Rename refresh every tab's list of presets, but they
     # also moved every tab's selection to the acting tab's preset (or to
     # "(none)" on an error), so a Delete in another tab removed the wrong one.
     disk = {"hands": {}, "eyes": {}}
+    # Save also refreshes the preview of tabs showing the saved preset.
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: {})
 
     def rename(old, new):
         disk[new] = disk.pop(old)
@@ -950,7 +1011,7 @@ def test_preset_save_delete_rename_keep_other_tabs_selection(callbacks):
         rename_preset=rename,
     )
     tabs = 3
-    preset_widgets = [tuple(Component() for _ in range(9)) for _ in range(tabs)]
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(tabs)]
     callbacks["_wire_presets"](
         [widgets() for _ in range(tabs)], preset_widgets,
         [Component() for _ in range(tabs)], Component(), tabs,
@@ -961,7 +1022,7 @@ def test_preset_save_delete_rename_keep_other_tabs_selection(callbacks):
     values = [None] * len(ALL_ARGS.attrs)
 
     def chosen(result):
-        return [u["value"] for u in result[1:]]
+        return [u["value"] for u in result[1 : 1 + tabs]]
 
     save = preset_widgets[0][5].callback
     assert chosen(save("faces", *values, "(none)", "hands", "eyes")) == [
@@ -985,8 +1046,99 @@ def test_preset_save_delete_rename_keep_other_tabs_selection(callbacks):
     ]
     assert chosen(rename_cb("", "faces", "hand", "hand")) == ["faces", "hand", "hand"]
     result = save("faces", *values, "(none)", "hand", "faces")
-    assert len({id(u) for u in result[1:]}) == tabs
-    assert all(u["choices"] == ["(none)", "faces", "hand"] for u in result[1:])
+    assert len({id(u) for u in result[1 : 1 + tabs]}) == tabs
+    assert all(u["choices"] == ["(none)", "faces", "hand"] for u in result[1 : 1 + tabs])
+
+
+def test_save_over_the_selected_preset_refreshes_its_preview(callbacks, monkeypatch):
+    # Saving over the preset a tab shows keeps the dropdown's value, so its
+    # .change never rebuilt the preview, which kept the old contents.
+    disk = {"faces": {"ad_prompt": "old face prompt", "ad_negative_prompt": ""}, "hands": {}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    callbacks.update(
+        get_preset_names=lambda: sorted(disk),
+        is_valid_name=lambda name: True,
+        save_preset=lambda name, state: disk.__setitem__(name, state) is None,
+    )
+    tabs = 3
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(tabs)]
+    callbacks["_wire_presets"](
+        [widgets() for _ in range(tabs)], preset_widgets,
+        [Component() for _ in range(tabs)], Component(), tabs,
+    )
+    save = preset_widgets[0][5]
+    assert save.outputs[1 + tabs :] == [p[9] for p in preset_widgets]
+    values = dict.fromkeys(ALL_ARGS.attrs)
+    values.update(ad_prompt="new face prompt", ad_negative_prompt="")
+
+    result = save.callback("faces", *values.values(), "faces", "faces", "hands")
+
+    assert len(result) == 1 + 2 * tabs
+    previews = result[1 + tabs :]
+    for preview in previews[:2]:  # the acting tab and another showing "faces"
+        assert preview["visible"] is True
+        assert "new face prompt" in preview["value"]
+        assert "old face prompt" not in preview["value"]
+    assert previews[0] is not previews[1]
+    assert previews[2] == {}
+    # A save that fails changes no preview.
+    result = save.callback("", *values.values(), "faces", "faces", "hands")
+    assert result[1 + tabs :] == [{}, {}, {}]
+    # The tuple built by one_ui_group ends with the preview.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    built = next(
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "id", "") == "preset_widgets"
+    )
+    assert [ast.unparse(e) for e in built.elts][9:] == ["preset_preview"]
+
+
+def test_import_replacing_the_selected_preset_refreshes_its_preview(
+    callbacks, monkeypatch, tmp_path
+):
+    # An import with "Overwrite on conflict" replaced the selected preset but
+    # kept the dropdown's value, so the preview kept the old contents.
+    disk = {"faces": {"ad_prompt": "old face prompt", "ad_negative_prompt": ""}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+
+    def import_payload(_value, *, overwrite):
+        disk["faces"] = {"ad_prompt": "imported face prompt", "ad_negative_prompt": ""}
+        return 0, 1, []
+
+    callbacks["import_presets_json"] = import_payload
+    uploaded = tmp_path / "presets.json"
+    uploaded.write_text('{"faces": {}}', encoding="utf-8")
+
+    _choices, status, preview = callbacks["_do_import"](str(uploaded), True, "faces")
+
+    assert "replaced" in status
+    assert preview["visible"] is True
+    assert "imported face prompt" in preview["value"]
+    # With no preset selected the preview stays hidden; an unreadable file
+    # changes nothing.
+    assert callbacks["_do_import"](str(uploaded), True, "(none)")[2] == {
+        "value": "", "visible": False,
+    }
+    assert callbacks["_do_import"](str(tmp_path / "missing.json"), True, "faces")[2] == {}
+    # A selected preset the preview cannot show (edited by hand) does not
+    # cost the import its status.
+    disk["hands"] = {"ad_prompt": None, "ad_negative_prompt": None}
+    _choices, status, preview = callbacks["_do_import"](str(uploaded), True, "hands")
+    assert "replaced" in status
+    assert preview == {}
+    # The upload reads the tab's dropdown and updates its preview.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    upload = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "preset_import_btn.upload"
+    )
+    kw = {k.arg: ast.unparse(k.value) for k in upload.keywords}
+    assert kw["inputs"].endswith("preset_dropdown]")
+    assert kw["outputs"].endswith("preset_preview]")
 
 
 def test_guide_describes_source_folder_batches_and_the_export_fallback():

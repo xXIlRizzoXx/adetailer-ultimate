@@ -2229,7 +2229,7 @@ class AfterDetailerScript(scripts.Script):
                     pp.image = initial_image
                     print(
                         f"[-] ADetailer: sequential class pass on tab "
-                        f"{n + 1} was skipped — rolled back to the "
+                        f"{n + 1} was skipped - rolled back to the "
                         f"pre-sequential image."
                     )
                     return False
@@ -2686,7 +2686,7 @@ def _reset_adetailer_settings() -> str:
         return f"Reset {reset_count} options (save failed: {exc})"
 
     print(
-        f"[ADetailer] reset complete — {reset_count} option(s) restored to "
+        f"[ADetailer] reset complete - {reset_count} option(s) restored to "
         f"defaults ({skipped_count} skipped)."
     )
     return f"Reset {reset_count} option(s) to defaults."

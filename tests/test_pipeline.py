@@ -962,6 +962,40 @@ def test_inpaint_indices_accept_preview_labels_and_warn_when_unreadable(
     assert out.isascii()
 
 
+def test_console_messages_are_ascii():
+    # A console in a legacy code page (output redirected to a file on a
+    # Japanese or Korean system) cannot print a dash those code pages lack:
+    # the print raised, and the tab-restore line then stopped the ADetailer
+    # panel from being built at every start.
+    root = Path(__file__).resolve().parents[1]
+    paths = [
+        *sorted(root.glob("aaaaaa/*.py")),
+        *sorted(root.glob("adetailer/*.py")),
+        *sorted(root.glob("controlnet_ext/*.py")),
+        *sorted(root.glob("scripts/*.py")),
+        root / "install.py",
+        root / "preload.py",
+    ]
+    found = []
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = ast.unparse(node.func)
+            if func not in ("print", "sys.stdout.write", "sys.stderr.write"):
+                continue
+            found.extend(
+                f"{path.name}:{node.lineno}"
+                for sub in ast.walk(node)
+                if isinstance(sub, ast.Constant)
+                and isinstance(sub.value, str)
+                and not sub.value.isascii()
+            )
+    assert "!adetailer.py" in {p.name for p in paths}
+    assert found == []
+
+
 def test_class_skip_block_does_not_skip_the_inverted_background():
     script = _class_prompt_script()
     pred = _detections(["hand"])

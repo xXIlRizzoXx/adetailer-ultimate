@@ -459,7 +459,7 @@ def on_generate_click(
         )
         _mode_word = "NOT/exclude" if state.get("ad_model_classes_exclude") else "include"
         print(
-            f"[-] ADetailer: saved tab {tab_index + 1} ({mode}) — "
+            f"[-] ADetailer: saved tab {tab_index + 1} ({mode}) - "
             f"detector={state.get('ad_model')!r}, classes[{_mode_word}]={_cls!r}"
         )
     return state
@@ -1207,7 +1207,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             if not is_dir:
                 return None, f"⚠️ Folder not found: {folder}"
 
-            exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+            exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
             try:
                 files = sorted(
                     f
@@ -1368,9 +1368,10 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             interrupted = interrupted or bool(cancelled)
             if interrupted:
                 head = "⏹️ Batch interrupted"
-            elif not (saved + unchanged) and (run_failed or failed or not_saved):
-                # Nothing was written: every file failed, was unreadable or
-                # was detailed but could not be saved.
+            elif not saved and (not_saved or run_failed or (failed and not unchanged)):
+                # Nothing was written: every file that needed work failed or
+                # could not be saved, also beside files left unchanged.
+                # Unreadable files count only when none was left unchanged.
                 head = "⚠️ Batch failed"
             else:
                 head = "✅ Batch done"
@@ -1552,9 +1553,9 @@ def _wire_presets(
 ) -> None:
     """Wire each tab's preset Load/Save/Delete/Rename/Reset buttons.
 
-    Layout reminder — each entry of `all_presets` is the 9-tuple returned
+    Layout reminder — each entry of `all_presets` is the 10-tuple returned
     from one_ui_group: (dropdown, load_btn, rename_btn, delete_btn,
-    name_box, save_btn, reset_btn, status_md, reset_all_cb).
+    name_box, save_btn, reset_btn, status_md, reset_all_cb, preview_md).
 
     Saving / deleting / renaming from any tab refreshes ALL tabs'
     dropdown choices; each other tab keeps its selection.
@@ -1573,6 +1574,7 @@ def _wire_presets(
     # as its static output list; per-tab wiring below still uses the narrow refs.
     all_name_boxes = [p[4] for p in all_presets]
     all_status_mds = [p[7] for p in all_presets]
+    all_previews = [p[9] for p in all_presets]
     all_classes_dds = [_w.ad_model_classes_dropdown for _w in all_widgets]
     all_widget_refs = [
         getattr(all_widgets[i], a) for i in range(num_models) for a in attrs
@@ -1625,6 +1627,7 @@ def _wire_presets(
             reset_btn,
             status_md,
             reset_all_cb,
+            _preview_md,
         ) = all_presets[idx]
         widget_refs = [getattr(all_widgets[idx], a) for a in attrs]
 
@@ -1672,16 +1675,24 @@ def _wire_presets(
         # SAVE: capture current widget values and write a new preset. Refresh
         # every tab's dropdown so the preset becomes selectable everywhere; the
         # other tabs keep their selection (every dropdown is also an input).
+        # A preset saved over the one a tab shows keeps that tab's dropdown
+        # value, so its .change never fires: refresh those previews here.
         def _make_save(idx: int):
             def _save(name: str, *values):
                 values, current = values[: len(attrs)], values[len(attrs) :]
+                keep_previews = [gr.update() for _ in all_previews]
                 name = (name or "").strip()
                 if not name:
-                    return ["⚠️ Enter a preset name first.", *_refresh_dropdowns_update(current)]
+                    return [
+                        "⚠️ Enter a preset name first.",
+                        *_refresh_dropdowns_update(current),
+                        *keep_previews,
+                    ]
                 if not is_valid_name(name):
                     return [
                         f"⚠️ Invalid preset name '{name}'.",
                         *_refresh_dropdowns_update(current),
+                        *keep_previews,
                     ]
                 state_dict = {a: v for a, v in zip(attrs, values)}
                 ok = save_preset(name, state_dict)
@@ -1691,10 +1702,18 @@ def _wire_presets(
                         f"⚠️ Could not save preset '{name}'. Check disk space and folder permissions."
                         + (f" {note}" if note else ""),
                         *_refresh_dropdowns_update(current),
+                        *keep_previews,
                     ]
+                dd_updates = _refresh_dropdowns_update(current, idx, selected=name)
                 return [
                     f"✅ Saved preset '{name}'." + (f" ⚠️ {note}" if note else ""),
-                    *_refresh_dropdowns_update(current, idx, selected=name),
+                    *dd_updates,
+                    # One fresh update per tab: Gradio 4 pops "value" out of
+                    # an update dict in place, so tabs cannot share one.
+                    *(
+                        _format_preset_preview(name) if u["value"] == name else gr.update()
+                        for u in dd_updates
+                    ),
                 ]
 
             return _save
@@ -1702,7 +1721,7 @@ def _wire_presets(
         save_btn.click(
             fn=_make_save(idx),
             inputs=[name_box, *widget_refs, *all_dropdowns],
-            outputs=[status_md, *all_dropdowns],
+            outputs=[status_md, *all_dropdowns, *all_previews],
             queue=False,
         )
 
@@ -1812,13 +1831,22 @@ def _wire_presets(
                 # it, so one set of dicts shared by several tabs reaches every
                 # tab after the first without a value and leaves it unchanged.
                 # "Enable this tab" follows the build default (only the first
-                # tab on), not the schema default, as on a fresh setup.
+                # tab on), not the schema default, as on a fresh setup. So do
+                # the override dropdowns: their schema default None is not one
+                # of their choices and would blank them; a fresh build shows
+                # their first choice.
                 widget_updates = []
                 classes_updates = []
                 for i in range(num_models):
                     if i in targets:
                         restored = _restored_tab_updates(
-                            {**_defaults, "ad_tab_enable": i == 0},
+                            {
+                                **_defaults,
+                                "ad_checkpoint": "Use same checkpoint",
+                                "ad_vae": "Use same VAE",
+                                "ad_text_encoder": "Use same text encoder",
+                                "ad_tab_enable": i == 0,
+                            },
                             attrs,
                             model_mapping,
                         )
@@ -2124,10 +2152,15 @@ def one_ui_group(
             )
         return f"✅ Exported **{len(get_preset_names())}** preset(s)."
 
-    def _do_import(uploaded_path: Any, overwrite: bool) -> tuple[Any, str]:
-        """Accept Gradio 4 paths and Gradio 3 temporary-file wrappers."""
+    def _do_import(
+        uploaded_path: Any, overwrite: bool, selected: str | None = None
+    ) -> tuple[Any, str, Any]:
+        """Accept Gradio 4 paths and Gradio 3 temporary-file wrappers.
+
+        Also refreshes the preview of the selected preset, which an import
+        may have replaced without changing the dropdown's value."""
         if not uploaded_path:
-            return gr.update(), "_no file received._"
+            return gr.update(), "_no file received._", gr.update()
         if not isinstance(uploaded_path, (str, Path)):
             uploaded_path = getattr(uploaded_path, "name", uploaded_path)
         try:
@@ -2136,7 +2169,7 @@ def one_ui_group(
             with open(uploaded_path, "r", encoding="utf-8-sig") as f:
                 payload = f.read()
         except (OSError, UnicodeError, TypeError) as e:
-            return gr.update(), f"_could not read file: {e}_"
+            return gr.update(), f"_could not read file: {e}_", gr.update()
         added, replaced, skipped = import_presets_json(
             payload, overwrite=overwrite
         )
@@ -2157,7 +2190,11 @@ def one_ui_group(
         if note:
             msg += f" · ⚠️ {note}"
         names = [PRESET_NONE] + get_preset_names()
-        return gr.update(choices=names), msg
+        try:
+            preview = _format_preset_preview(selected)
+        except Exception:  # noqa: BLE001 — a malformed preset must not cost the status
+            preview = gr.update()
+        return gr.update(choices=names), msg, preview
 
     # DownloadButton wiring: the click refreshes the button's `value` AND the
     # status line; the front-end-only step then downloads that value. Gradio 3
@@ -2183,8 +2220,8 @@ def one_ui_group(
     # button's value (the upload path) is included in `inputs`.
     preset_import_btn.upload(
         fn=_do_import,
-        inputs=[preset_import_btn, preset_import_overwrite],
-        outputs=[preset_dropdown, preset_io_status],
+        inputs=[preset_import_btn, preset_import_overwrite, preset_dropdown],
+        outputs=[preset_dropdown, preset_io_status, preset_preview],
         queue=False,
     )
 
@@ -2300,14 +2337,14 @@ def one_ui_group(
             _saved_model_raw = saved.get("ad_model")
             if _saved_model_raw and _saved_model_raw != _saved_model:
                 print(
-                    f"[-] ADetailer: tab {n + 1} — saved detector "
+                    f"[-] ADetailer: tab {n + 1} - saved detector "
                     f"{_saved_model_raw!r} is NOT in the current model list; "
                     f"fell back to {_saved_model!r}. (saved classes: "
                     f"{_wanted_classes!r})"
                 )
             elif _saved_model_raw and _saved_model_raw != "None":
                 print(
-                    f"[-] ADetailer: tab {n + 1} restored — detector="
+                    f"[-] ADetailer: tab {n + 1} restored - detector="
                     f"{_saved_model!r}, classes={_dd_value!r}"
                 )
 
@@ -2553,7 +2590,7 @@ def one_ui_group(
         with gr.Row(variant="compact"):
             w.ad_apply_on_hires_only = gr.Checkbox(
                 label="Apply only on hires.fix" + suffix(n),
-                info="Skip the lowres pre-hires call; run ADetailer only on the upscale output. Has no effect in img2img or when hires.fix is off.",
+                info="Run this tab only when hires.fix is on, on the upscaled image. With hires.fix off this tab is skipped. No effect in img2img.",
                 value=sv("ad_apply_on_hires_only", False),
                 visible=not is_img2img,
                 elem_id=eid("ad_apply_on_hires_only"),
@@ -2793,6 +2830,7 @@ def one_ui_group(
         preset_reset_btn,
         preset_status,
         preset_reset_all,
+        preset_preview,
     )
     return w, copy_btn, paste_btn, preset_widgets, state, infotext_fields
 

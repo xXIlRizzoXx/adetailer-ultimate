@@ -432,6 +432,71 @@ def test_wired_folder_that_wrote_nothing_is_headed_failed(
 
 
 @pytest.mark.parametrize("same_folder", [False, True])
+@pytest.mark.parametrize("kind", ["not saved", "failed"])
+def test_wired_folder_that_saved_none_beside_unchanged_files_is_headed_failed(
+    host, monkeypatch, tmp_path, same_folder, kind
+):
+    # One file with nothing to inpaint made a run whose every detailed
+    # result failed or could not be saved "Batch done", although nothing
+    # was written.
+    for name in ("a.png", "b.png", "c.png"):
+        Image.new("RGB", (8, 8), "white").save(tmp_path / name)
+    calls = []
+
+    def detail(image, _args, save):
+        calls.append(save)
+        if len(calls) == 1:
+            return image, "ℹ️ Nothing detected — image unchanged."
+        if kind == "failed":
+            return None, "⚠️ ADetailer run failed: CUDA out of memory."
+        if same_folder:
+            return _Unsavable(), "✅ ADetailer pass complete."
+        return image, "✅ ADetailer pass complete. (couldn't save — see console)"
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    _gallery, status = callback(
+        None, str(tmp_path), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert len(calls) == 3
+    assert status.startswith("⚠️ Batch failed")
+    assert "1 left unchanged (nothing to inpaint)" in status
+    assert ("2 failed" if kind == "failed" else "2 detailed but not saved") in status
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["a.png", "b.png", "c.png"]
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_details_tif_images(host, monkeypatch, tmp_path, same_folder):
+    # Only the ".tiff" spelling was accepted: a folder of scans saved as
+    # ".tif" had "No images", and in a mixed folder they were left out.
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "a.png")
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "scan.tif")
+    calls = []
+
+    def detail(image, _args, save):
+        calls.append(save)
+        return image, "✅ ADetailer pass complete."
+
+    script = SimpleNamespace(run_detailer_on_image=detail)
+    callback = _wired_apply(monkeypatch, script)
+    _gallery, status = callback(
+        None, str(tmp_path), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert calls == [not same_folder] * 2
+    assert status.startswith("✅ Batch done — 2 image(s): 2 detailed")
+    if same_folder:
+        assert sorted(f.name for f in tmp_path.iterdir()) == [
+            "a-ad.png", "a.png", "scan-ad.tif", "scan.tif",
+        ]
+        with Image.open(tmp_path / "scan-ad.tif") as result:
+            assert result.format == "TIFF"
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
 @pytest.mark.parametrize("files", [1, 3])
 def test_wired_folder_cancelled_on_its_last_file_is_headed_interrupted(
     host, monkeypatch, tmp_path, same_folder, files

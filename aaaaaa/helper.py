@@ -54,10 +54,35 @@ def disable_safe_unpickle():
         yield
 
 
+# Options ADetailer's inner pass can set through override_settings (see
+# get_override_settings in scripts/!adetailer.py). The host puts such an
+# option back afterwards only if it was already in opts.data.
+_AD_OVERRIDE_KEYS = (
+    "CLIP_stop_at_last_layers",
+    "sd_model_checkpoint",
+    "sd_vae",
+    "forge_additional_modules",
+)
+
+
 @contextmanager
 def pause_total_tqdm():
-    with patch.dict(opts.data, {"multiple_tqdm": False}, clear=False):
+    # Undo only the pass's own changes: restoring a snapshot of the whole
+    # opts.data also undid every setting changed from the UI meanwhile.
+    data = opts.data
+    had_key = "multiple_tqdm" in data
+    orig = data.get("multiple_tqdm")
+    absent = [key for key in _AD_OVERRIDE_KEYS if key not in data]
+    data["multiple_tqdm"] = False
+    try:
         yield
+    finally:
+        if had_key:
+            data["multiple_tqdm"] = orig
+        else:
+            data.pop("multiple_tqdm", None)
+        for key in absent:
+            data.pop(key, None)
 
 
 @contextmanager
