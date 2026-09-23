@@ -705,6 +705,10 @@ def test_skip_img2img_keeps_the_users_sampler_and_infotext():
             {"width": 1216, "height": 832, "steps": 40, "sampler_name": "DDIM"},
             (40, "DDIM", 1216, 832),
         ),
+        # A file of its own made with Euler, or with one step, keeps it: the
+        # host puts back steps and sampler together.
+        ({"steps": 25, "sampler_name": "Euler"}, (25, "Euler", 832, 1216)),
+        ({"steps": 1, "sampler_name": "Euler a"}, (1, "Euler a", 832, 1216)),
         # Batch count, loopback, "Resize to": p keeps the throwaway values.
         ({}, (30, "DPM++ 2M", 832, 1216)),
     ],
@@ -2580,9 +2584,11 @@ def test_class_prompt_lines_match_the_class_regardless_of_case(classes, class_pr
         # class and repainted the faces with the hands' prompt.
         ("face,hands", [("face", "main")]),
         ("Face,hand,hands", [("Face", "main"), ("hand", "five fingers")]),
-        # Unchanged: known names, and no known name at all (every class).
+        # No known name at all: one pass for every class with the tab prompt,
+        # as in single-pass mode, instead of one full pass per name.
+        ("faces,hands", [("faces,hands", "main")]),
+        # Unchanged: known names.
         ("face,hand", [("face", "main"), ("hand", "five fingers")]),
-        ("faces,hands", [("faces", "main"), ("hands", "five fingers")]),
     ],
 )
 def test_a_sequential_pass_runs_only_for_a_class_the_detector_has(
@@ -2750,7 +2756,277 @@ def test_public_docs_match_the_behaviour_of_this_beta():
     assert "slightly wider than before" not in changelog
     # The dictionaries lack the reworded tooltips and help text.
     l10n = next(
-        line for line in readme.splitlines() if line.startswith("- 🟡 Every UI label")
+        line for line in readme.splitlines() if "translated into 10 locales" in line
     )
     assert "Copy settings and Reset tooltips" in l10n
     assert "stay English" in l10n
+    # ... and the options added since plus.7 and the Gradio 3 Export tooltip,
+    # while the README said every fork label was translated.
+    assert not l10n.startswith("- 🟡 Every UI label")
+    for name in ("Auto class-guard", "Inpaint only these detections",
+                 "Reset every tab", "Verbose diagnostic log", "Export tooltip"):
+        assert name in l10n
+    tooltips = next(
+        line for line in changelog.splitlines()
+        if line.startswith("- **The button tooltips were always in English,**")
+    )
+    assert "Export tooltip" in tooltips
+
+
+# Final debugging pass, round 5: generation pipeline, prompts and docs.
+
+
+def test_readme_says_when_an_added_sidecar_needs_a_restart():
+    # Once names were found for a detector (a generation reads them from the
+    # .pt on AUTOMATIC1111), they are cached for the session: a sidecar added
+    # afterwards is read only after a restart, which the README left out.
+    readme = _public_docs()["README.md"]
+    section = readme[readme.index("#### Custom class names via sidecar JSON"):]
+    section = section[: section.index("#### Backwards compatibility")]
+
+    assert "adding or changing this file" in section
+    assert "still empty" in section
+    assert "fills an empty CLASSES dropdown without a restart" in readme
+
+
+@pytest.mark.parametrize(
+    ("main", "prompt", "options", "face", "hand"),
+    [
+        # A LoRA the face block names at another weight: the hands still get
+        # the main prompt's one, the faces keep the block's weight.
+        (
+            "portrait <lora:style:1>",
+            "[CLASS=face]<lora:style:0.5> smiling[/CLASS] detailed", {},
+            "<lora:style:0.5> smiling detailed", "detailed <lora:style:1>",
+        ),
+        (
+            "portrait <lora:style:1>",
+            "[CLASS=face]<lora:style:1> smiling[/CLASS] detailed", {},
+            "<lora:style:1> smiling detailed", "detailed <lora:style:1>",
+        ),
+        # A trigger phrase written only in the face block.
+        (
+            "portrait <lora:style (cool look):1>",
+            "[CLASS=face]cool look, smiling[/CLASS] detailed",
+            {"ad_use_lora_triggers": True},
+            "cool look, smiling detailed <lora:style (cool look):1>",
+            "detailed <lora:style (cool look):1>, cool look",
+        ),
+        # Unchanged: no LoRA in the blocks, one outside them, Strip LoRAs.
+        (
+            "portrait <lora:style:1>", "[CLASS=face]smiling[/CLASS] detailed", {},
+            "smiling detailed <lora:style:1>", "detailed <lora:style:1>",
+        ),
+        (
+            "portrait <lora:style:1>",
+            "[CLASS=face]smiling[/CLASS] detailed <lora:style:0.5>", {},
+            "smiling detailed <lora:style:0.5>", "detailed <lora:style:0.5>",
+        ),
+        (
+            "portrait <lora:style:1>",
+            "[CLASS=face]<lora:style:0.5> smiling[/CLASS] detailed",
+            {"ad_strip_loras": True},
+            "smiling detailed", "detailed",
+        ),
+    ],
+)
+def test_a_lora_named_in_another_class_block_still_reaches_the_region(
+    main, prompt, options, face, hand
+):
+    # "Use LoRAs from main prompt" skipped a LoRA the tab prompt named
+    # anywhere, also inside the face block the hand region drops, so the
+    # hands were inpainted without it.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS,
+        functions=_INLINE_PROMPT_FUNCTIONS,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        get_i=lambda _p: 0,
+    )
+    script = runtime.AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt=main, all_prompts=[main], negative_prompt="",
+        all_negative_prompts=[""],
+    )
+    args = ADetailerArgs(
+        ad_model="faces.pt", ad_prompt=prompt, ad_use_main_loras=True, **options
+    )
+    prompts, negatives = script.get_prompt(p, args)
+    pred = SimpleNamespace(class_names=["face", "hand"])
+
+    regions = []
+    for j, inverted in ((0, False), (1, False), (0, True)):
+        p2 = SimpleNamespace()
+        script.i2i_prompts_replace(p2, prompts, negatives, j)
+        script._apply_inline_class_prompts(p2, pred, j, 2, inverted, p, args)
+        regions.append(p2.prompt)
+
+    # A Merge and Invert background drops every block, like the hands.
+    assert regions == [face, hand, hand]
+
+
+def test_whole_picture_skip_img2img_canvas_is_rounded_down_to_a_multiple_of_8():
+    # The docs said the result keeps the init image's size; the WebUI needs a
+    # multiple of 8, so a 1080x1350 image comes back at 1080x1344.
+    from adetailer.args import ADetailerArgs
+
+    script = _i2i_script()
+    p = _txt2img_p(
+        _ad_skip_img2img=True,
+        _ad_orig=SimpleNamespace(
+            steps=20, sampler_name="Euler a", width=512, height=512
+        ),
+    )
+    p.width = p.height = 128
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_only_masked=False)
+
+    i2i = script.get_i2i_p(p, args, Image.new("RGB", (1080, 1350)))
+
+    assert (i2i.width, i2i.height) == (1080, 1344)
+    docs = _public_docs()
+    row = next(
+        line for line in docs["README.md"].splitlines()
+        if line.startswith("| Skip img2img")
+    )
+    entry = next(
+        line for line in docs["CHANGELOG.md"].splitlines()
+        if line.startswith('- **With Skip img2img and "Inpaint only masked" off')
+    )
+    assert "multiple of 8" in row
+    assert "multiple of 8" in entry
+
+
+@pytest.mark.parametrize(
+    ("field", "values", "key"),
+    [
+        ("ad_model", ["face_yolov8n.pt", "None"], "ADetailer model"),
+        ("ad_prompt", ["smile", ""], "ADetailer prompt"),
+        (
+            "ad_controlnet_model", ["control_v11p_sd15_inpaint", "None"],
+            "ADetailer ControlNet model",
+        ),
+    ],
+)
+def test_an_xyz_cell_does_not_keep_the_previous_cells_parameters(field, values, key):
+    # Every X/Y/Z grid cell is a shallow copy of p sharing its parameters:
+    # the second cell, which skips the tab or leaves the field at its
+    # default, kept the first cell's ADetailer parameters in its images.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods={
+            "process", "is_ad_enabled", "set_skip_img2img", "get_args",
+            "extra_params",
+        },
+        functions={"set_value"},
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        ADetailerArgs=ADetailerArgs,
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    script = runtime.AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="a photo", negative_prompt="",
+        extra_generation_params={"Hires upscale": 2},
+    )
+    tab = {
+        "ad_model": "face_yolov8n.pt", "ad_prompt": "smiling face",
+        "ad_controlnet_model": "control_v11p_sd15_inpaint",
+    }
+
+    cells = []
+    for value in values:
+        pc = copy(p)
+        runtime.set_value(pc, value, values, field=field)
+        script.process(pc, True, False, tab)
+        cells.append(dict(pc.extra_generation_params))
+
+    assert key in cells[0]
+    assert key not in cells[1]
+    assert cells[1]["Hires upscale"] == 2
+    assert "ADetailer version" in cells[1]
+    # Unchanged: running process again with the same settings (as the host's
+    # re-run after the detailer pass does) keeps the keys and their order.
+    single = SimpleNamespace(
+        prompt="a photo", negative_prompt="",
+        extra_generation_params={"Hires upscale": 2},
+    )
+    script.process(single, True, False, tab)
+    single.extra_generation_params["Later"] = 1
+    before = list(single.extra_generation_params.items())
+    script.process(copy(single), True, False, tab)
+    assert list(single.extra_generation_params.items()) == before
+
+
+def test_an_empty_mask_in_an_inpaint_batch_does_not_stop_the_later_files():
+    # The img2img Batch tab reuses p for every file: one empty mask switched
+    # ADetailer off for every later file of the batch.
+    from adetailer.mask import is_all_black
+
+    runtime = _load_script(
+        methods={"process", "postprocess_image"},
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda p: p.image_mask is not None,
+        is_all_black=is_all_black,
+    )
+    script = runtime.AfterDetailerScript()
+    script.get_image_mask = lambda p: p.image_mask
+    script.is_ad_enabled = lambda *_args: True
+    script.set_skip_img2img = lambda *_args: None
+    script.get_args = lambda *_args: []
+    script.extra_params = lambda _args: {"ADetailer model": "face_yolov8n.pt"}
+
+    class Reached(Exception):
+        pass
+
+    def reached(*_args):
+        raise Reached
+
+    script.get_i2i_init_image = reached
+    p = SimpleNamespace(image_mask=None, extra_generation_params={})
+
+    ran = []
+    for value in (0, 255, 0, 255):
+        p.image_mask = Image.new("L", (64, 64), value)
+        p.extra_generation_params = {}
+        script.process(p, True, False, {})
+        try:
+            script.postprocess_image(p, SimpleNamespace(image=None), True, False, {})
+        except Reached:
+            ran.append(bool(p.extra_generation_params))
+        else:
+            ran.append(False)
+
+    assert ran == [False, True, False, True]
+    assert not getattr(p, "_ad_disabled", False)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        # Prompt alternation: the "|" inside the brackets is not the separator.
+        (
+            "face: {smiling|laughing}, detailed face",
+            ("{smiling|laughing}, detailed face", ""),
+        ),
+        (
+            "face: [smiling|laughing], detailed face | blurry",
+            ("[smiling|laughing], detailed face", "blurry"),
+        ),
+        ("face: smile | {blurry|ugly}", ("smile", "{blurry|ugly}")),
+        # Unchanged: plain lines, a second "|", unbalanced or escaped brackets.
+        ("face: detailed face | blurry, ugly", ("detailed face", "blurry, ugly")),
+        ("face: a | b | c", ("a", "b | c")),
+        ("face: (smile | frown", ("(smile", "frown")),
+        ("face: \\(smile\\) | blurry", ("\\(smile\\)", "blurry")),
+        ("face: detailed face", ("detailed face", "")),
+    ],
+)
+def test_a_pipe_inside_brackets_stays_in_the_class_prompt(line, expected):
+    # The line was split at the first "|", so "{smiling|laughing}" moved half
+    # of the positive prompt into the negative one.
+    runtime = _load_script(functions={"_parse_class_prompts"})
+
+    assert runtime._parse_class_prompts(line) == {"face": expected}

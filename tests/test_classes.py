@@ -122,6 +122,34 @@ def test_sidecar_added_after_a_refused_ui_lookup_is_read(tmp_path, monkeypatch):
     assert len(fake.calls) == 1
 
 
+def test_sidecar_added_after_names_were_found_waits_for_a_restart(
+    tmp_path, monkeypatch
+):
+    # The README promises a sidecar added while the WebUI runs only while no
+    # names were found: once a generation has read the .pt, the names found
+    # are cached for the session, so adding a sidecar needs a restart.
+    pt = tmp_path / "multi.pt"
+    pt.write_bytes(b"x")
+    cmd_opts = _fake_host(monkeypatch)
+
+    def load(path):
+        if not cmd_opts.disable_safe_unpickle:
+            raise AttributeError("the host's safe loader returned None")
+        return {0: "class0", 1: "class1"}
+
+    _fake_ultralytics(monkeypatch, load)
+
+    assert get_model_class_names(str(pt)) == []  # UI, check on
+    cmd_opts.disable_safe_unpickle = True  # detection bypasses the check
+    assert get_model_class_names(str(pt)) == ["class0", "class1"]
+    cmd_opts.disable_safe_unpickle = False
+
+    (tmp_path / "multi.names.json").write_bytes(b'["face","hand"]')
+    assert get_model_class_names(str(pt)) == ["class0", "class1"]
+    get_model_class_names.cache_clear()  # a restart
+    assert get_model_class_names(str(pt)) == ["face", "hand"]
+
+
 @pytest.mark.parametrize(
     "payload",
     [

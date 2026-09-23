@@ -222,7 +222,8 @@ def _parse_class_prompts(text: str) -> dict[str, tuple[str, str]]:
 
     Lines that don't contain ``:`` are ignored. Whitespace around values is
     stripped. The pipe ``|`` separates positive from negative; negative is
-    optional and defaults to empty.
+    optional and defaults to empty. A ``|`` inside ``()``, ``[]`` or ``{}``
+    (prompt alternation such as ``[smiling|laughing]``) belongs to the prompt.
 
     Returns
     -------
@@ -243,8 +244,28 @@ def _parse_class_prompts(text: str) -> dict[str, tuple[str, str]]:
         if not class_name:
             continue
         if "|" in rest:
-            pos, _, neg = rest.partition("|")
-            result[class_name] = (pos.strip(), neg.strip())
+            # The first "|" outside brackets (a backslash escapes the next
+            # character); unbalanced brackets keep the first "|", as before.
+            depth, cut, escaped = 0, -1, False
+            for k, ch in enumerate(rest):
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    depth -= 1
+                    if depth < 0:
+                        break
+                elif ch == "|" and depth == 0 and cut < 0:
+                    cut = k
+            if depth != 0:
+                cut = rest.find("|")
+            if cut < 0:
+                result[class_name] = (rest.strip(), "")
+            else:
+                result[class_name] = (rest[:cut].strip(), rest[cut + 1 :].strip())
         else:
             result[class_name] = (rest.strip(), "")
     return result
@@ -703,16 +724,17 @@ class AfterDetailerScript(scripts.Script):
             # each one, may put back that file's own size ("Resize by") or its
             # PNG Info steps and sampler. Record those and switch p back to
             # the throwaway pass; values still at the throwaway ones (Batch
-            # count, loopback) keep the recorded settings.
+            # count, loopback) keep the recorded settings. The host puts back
+            # steps and sampler together, so a file's own Euler or one step
+            # counts as well.
             if (p.steps, p.sampler_name, p.width, p.height) != (1, "Euler", 128, 128):
                 orig = p._ad_orig
                 resized = (p.width, p.height) != (128, 128)
+                rewritten = (p.steps, p.sampler_name) != (1, "Euler")
                 p._ad_orig = SkipImg2ImgOrig(
-                    steps=p.steps if p.steps != 1 else orig.steps,
+                    steps=p.steps if rewritten else orig.steps,
                     sampler_name=(
-                        p.sampler_name
-                        if p.sampler_name != "Euler"
-                        else orig.sampler_name
+                        p.sampler_name if rewritten else orig.sampler_name
                     ),
                     width=p.width if resized else orig.width,
                     height=p.height if resized else orig.height,
@@ -1868,6 +1890,27 @@ class AfterDetailerScript(scripts.Script):
                 p2.negative_prompt = (
                     re.sub(r"\s{2,}", " ", new_neg).strip().strip(",").strip()
                 )
+            # "Use LoRAs from main prompt" skipped a LoRA (or trigger phrase)
+            # the segment named anywhere, also inside a block this region just
+            # dropped: add back the ones its prompt no longer names. A LoRA a
+            # kept block names keeps that block's weight.
+            if (
+                had_inline
+                and p is not None
+                and args is not None
+                and args.ad_use_main_loras
+                and not args.ad_strip_loras
+            ):
+                i = get_i(p)
+                main_idx = min(i, len(p.all_prompts) - 1) if p.all_prompts else 0
+                extras = _extract_lora_tags(
+                    p.all_prompts[main_idx] if p.all_prompts else (p.prompt or "")
+                )
+                p2.prompt = _merge_lora_tags(p2.prompt, extras)
+                if args.ad_use_lora_triggers:
+                    p2.prompt = _append_lora_triggers(
+                        p2.prompt, _extract_lora_triggers(extras)
+                    )
             # No block matches this region and there is no text outside the
             # blocks (or [PROMPT] sits only in another class's block): decided
             # on the prompt as typed, before the append text and LoRAs.
@@ -2025,8 +2068,11 @@ class AfterDetailerScript(scripts.Script):
             print("[-] ADetailer: manual mode is ON, skipping auto-run.")
             return
 
+        # Decided for each image: the img2img Batch tab reuses p for every
+        # file, so one empty mask must not switch ADetailer off for the rest.
+        p._ad_no_mask = False
         if is_img2img_inpaint(p) and is_all_black(self.get_image_mask(p)):
-            p._ad_disabled = True
+            p._ad_no_mask = True
             msg = (
                 "[-] ADetailer: img2img inpainting with no mask -- adetailer disabled."
             )
@@ -2052,6 +2098,14 @@ class AfterDetailerScript(scripts.Script):
             arg_list[0].ad_negative_prompt = replaced_negative_prompt[0]
 
         extra_params = self.extra_params(arg_list)
+        # An X/Y/Z grid cell is a shallow copy of p sharing this dict: drop the
+        # earlier cell's keys this cell does not write, or a tab it skips (or a
+        # field back at its default) keeps them in its saved images.
+        for key in [
+            k for k in p.extra_generation_params
+            if str(k).startswith("ADetailer ") and k not in extra_params
+        ]:
+            del p.extra_generation_params[key]
         p.extra_generation_params.update(extra_params)
 
     @staticmethod
@@ -2117,8 +2171,9 @@ class AfterDetailerScript(scripts.Script):
                 # parameters or the API) would give a pass with no class
                 # filter, repainting every class with that name's prompt.
                 # Drop it, as the single-pass filter does; when no name is
-                # known, the every-class fallback is kept. Looked up like
-                # detection, past the host's safe-unpickle check.
+                # known, one pass with the whole filter inpaints every class
+                # once with the tab prompt, as in single-pass mode. Looked up
+                # like detection, past the host's safe-unpickle check.
                 if not args.is_mediapipe():
                     try:
                         with disable_safe_unpickle():
@@ -2127,7 +2182,7 @@ class AfterDetailerScript(scripts.Script):
                                 classes = [
                                     c for c in classes
                                     if resolve_class_ids(_model, [c])
-                                ] or classes
+                                ] or [",".join(classes)]
                     except Exception:  # noqa: BLE001
                         pass
                 # Class-specific prompts: each class can have its own
@@ -2450,7 +2505,11 @@ class AfterDetailerScript(scripts.Script):
 
     @rich_traceback
     def postprocess_image(self, p, pp: PPImage, *args_):
-        if getattr(p, "_ad_disabled", False) or not self.is_ad_enabled(*args_):
+        if (
+            getattr(p, "_ad_disabled", False)
+            or getattr(p, "_ad_no_mask", False)
+            or not self.is_ad_enabled(*args_)
+        ):
             return
 
         # Manual-mode short-circuit: user wants to review the raw image first
