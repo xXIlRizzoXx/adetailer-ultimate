@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from enum import IntEnum
 from functools import partial, reduce
 from math import dist
@@ -272,6 +273,8 @@ def parse_indices(spec: str, n: int) -> list[int] | None:
     the labels drawn on the Detection preview (``"#2"``, ``"#1-#3"``) work too.
     Spaces around a range dash are ignored; tokens that aren't a positive int
     or an ``a-b`` range are skipped; indices outside ``[1, n]`` are dropped.
+    Full-width digits and the CJK punctuation an IME types (``"1，3"``,
+    ``"1、3"``, ``"1～3"``) work like their ASCII forms.
     Returns ``None`` when the string contains no usable
     number at all — the caller treats that (and a blank string) as "keep all".
     An in-range parse that resolves to nothing (e.g. only out-of-range numbers)
@@ -280,10 +283,16 @@ def parse_indices(spec: str, n: int) -> list[int] | None:
     seen: set[int] = set()
     order: list[int] = []
     found_any = False
+    # An IME may type full-width digits and CJK punctuation: NFKC makes the
+    # full-width digits, commas, semicolons, "#", "-" and "~" ASCII, then
+    # the tilde, wave dash, hyphen/en/em dashes and minus sign become the
+    # range dash, and the list comma U+3001 separates like ",".
+    spec = unicodedata.normalize("NFKC", spec)
+    spec = re.sub(r"[~\u301c\u2010-\u2015\u2212]", "-", spec)
     # Glue "1 - 3" into "1-3" BEFORE splitting on whitespace, so a spaced range
     # stays a range instead of becoming the two numbers 1 and 3.
     spec = re.sub(r"\s*-\s*", "-", spec.replace("#", ""))
-    for tok in re.split(r"[,;\s]+", spec):
+    for tok in re.split(r"[,;\s\u3001]+", spec):
         tok = tok.strip()
         if not tok:
             continue

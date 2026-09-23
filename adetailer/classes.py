@@ -215,10 +215,14 @@ def resolve_class_ids(model_path: str, requested: list[str]) -> list[int]:
         else:
             unknown.append(token)
     if unknown and names:
-        print(
+        msg = (
             f"[-] ADetailer: class not found in {Path(model_path).name}, ignored:"
             f" {', '.join(unknown)}"
         )
+        # ASCII only (other characters escaped), so a console pipe in any
+        # legacy code page can print it instead of raising and stopping
+        # ADetailer for the image.
+        print(msg.encode("ascii", "backslashreplace").decode("ascii"))
     return out
 
 

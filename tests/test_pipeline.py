@@ -9,6 +9,7 @@ they do not replace an end-to-end generation test in A1111 / Forge.
 from __future__ import annotations
 
 import ast
+import io
 import random
 import re
 import sys
@@ -932,6 +933,8 @@ def test_merged_and_inverted_masks_get_the_right_class_prompts(
     [
         # The label drawn on the Detection preview keeps only that detection.
         ("#2", [list(_FACE_BOXES[1])], False),
+        # So does a full-width comma typed with a Chinese or Japanese IME.
+        ("1\uff0c3", [list(_FACE_BOXES[0]), list(_HAND_BOX)], False),
         # No readable number keeps every detection, and the console says so.
         ("x", [list(_FACE_BOXES[0]), list(_FACE_BOXES[1]), list(_HAND_BOX)], True),
         # Also for non-Latin text, echoed as ASCII so no console code page
@@ -2620,6 +2623,24 @@ def test_a_sequential_pass_runs_only_for_a_class_the_detector_has(
         script, SimpleNamespace(), SimpleNamespace(image=Image.new("RGB", (8, 8))), args
     )
     assert passes == expected
+
+
+def test_an_unknown_non_latin_class_gets_no_sequential_pass_on_a_legacy_console(
+    tmp_path, monkeypatch
+):
+    # A console pipe in a legacy code page (cp1252 here) could not print the
+    # "class not found" line: the check that drops the name failed quietly,
+    # and the name then got a pass of its own.
+    monkeypatch.setattr(
+        sys,
+        "stdout",
+        io.TextIOWrapper(
+            io.BytesIO(), encoding="cp1252", errors="strict", write_through=True
+        ),
+    )
+    test_a_sequential_pass_runs_only_for_a_class_the_detector_has(
+        "face,\u9854", [("face", "main")], tmp_path
+    )
 
 
 def test_a_class_prompt_line_in_another_case_still_takes_priority_over_the_guard():

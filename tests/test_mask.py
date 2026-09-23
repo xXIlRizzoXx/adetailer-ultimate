@@ -174,6 +174,18 @@ def test_merge_invert_keeps_the_background_around_detections():
         ("1 - 3", [0, 1, 2]),
         ("1 -3", [0, 1, 2]),
         ("#", None),
+        # A Chinese or Japanese IME types full-width or CJK commas, dashes and
+        # digits: they select those detections instead of keeping every one.
+        ("1\uff0c3", [0, 2]),
+        ("1\u30013", [0, 2]),
+        ("\uff11\uff0c\uff13", [0, 2]),
+        ("2\uff1b3", [1, 2]),
+        ("\uff032", [1]),
+        ("1\uff5e3", [0, 1, 2]),
+        ("1\u301c3", [0, 1, 2]),
+        ("1\u20133", [0, 1, 2]),
+        ("1\uff0d3", [0, 1, 2]),
+        ("1 \u2014 3", [0, 1, 2]),
     ],
 )
 def test_parse_indices_preserves_selection_rules(spec, expected):

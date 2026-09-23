@@ -1,6 +1,7 @@
 """Class-name lookup: caching and sidecar reading (offline, no real models)."""
 
 import codecs
+import io
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -182,3 +183,29 @@ def test_class_names_match_regardless_of_case(tmp_path, monkeypatch, capsys):
     # Unknown, out-of-range and ambiguous entries are dropped and named.
     assert resolve_class_ids(str(pt), ["hands", "9", "EYE", "face"]) == [0]
     assert "hands, 9, EYE" in capsys.readouterr().out
+
+
+def test_class_not_found_line_prints_on_a_legacy_code_page(tmp_path, monkeypatch):
+    # Console output redirected to a file or pipe in a legacy code page
+    # (cp1252 here): a non-Latin class name from a preset, pasted parameters
+    # or the API, or a non-ASCII model file name, could not be printed, and
+    # the error stopped ADetailer for the image.
+    out = io.TextIOWrapper(
+        io.BytesIO(), encoding="cp1252", errors="strict", write_through=True
+    )
+    monkeypatch.setattr(sys, "stdout", out)
+    _fake_ultralytics(monkeypatch, _unreadable)
+    pt = tmp_path / "x.pt"
+    pt.write_bytes(b"x")
+    (tmp_path / "x.names.json").write_bytes(b'["face","hand"]')
+    other = tmp_path / "x\u9854.pt"
+    other.write_bytes(b"x")
+    (tmp_path / "x\u9854.names.json").write_bytes(b'["face","hand"]')
+
+    assert resolve_class_ids(str(pt), ["face", "\u9854"]) == [0]
+    assert resolve_class_ids(str(other), ["hands"]) == []
+
+    # Other characters are escaped; ASCII names print as they are.
+    printed = out.buffer.getvalue()
+    assert b"class not found in x.pt, ignored: \\u9854" in printed
+    assert b"class not found in x\\u9854.pt, ignored: hands" in printed
