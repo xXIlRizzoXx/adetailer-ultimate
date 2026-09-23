@@ -12,8 +12,8 @@
  * Why override `min_width`: the Python widgets ship hard-coded
  * `min_width=90` / `110` / `130` / `160` values that were tuned for the
  * English labels ("Load", "Reset", "Save preset", "Copy settings", …).
- * Non-English locales have longer words ("Carica", "Ripristina",
- * "Incolla impostazioni", …) which get clipped or padded asymmetrically
+ * Non-English locales have longer words ("Réinitialiser",
+ * "Einstellungen einfügen", …) which get clipped or padded asymmetrically
  * inside the fixed pixel widths.
  *
  * `min-width: auto !important` lets each button grow only as wide as its

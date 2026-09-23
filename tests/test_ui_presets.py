@@ -153,7 +153,7 @@ def test_reset_every_tab_gives_each_tab_its_own_updates(callbacks):
     # Gradio 4 pops "value" out of an update dict while post-processing it, in
     # place. An update object shared by two tabs therefore reaches the second
     # tab empty, and that tab is silently left unchanged. Every target tab must
-    # receive its own update objects, as it did before plus.7.5.
+    # receive its own update objects, as it did before plus.8.
     tabs = 3
     preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(tabs)]
     callbacks["_wire_presets"](
