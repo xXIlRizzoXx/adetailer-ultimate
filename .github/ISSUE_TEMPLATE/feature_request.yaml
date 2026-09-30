@@ -1,26 +1,54 @@
 name: Feature request
-description: Suggest an idea for this project
+description: Suggest an idea for ADetailer Ultimate
 title: "[Feature Request]: "
 labels:
   - enhancement
 
 body:
   - type: textarea
+    id: problem
     attributes:
       label: Is your feature request related to a problem? Please describe.
-      description: A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+      description: A clear and short description of what the problem is. For example, "I'm always frustrated when [...]"
+      placeholder: |
+        Any language accepted
+        아무 언어 사용가능
+        すべての言語に対応
+        接受所有语言
+        Se aceptan todos los idiomas
+        Alle Sprachen werden akzeptiert
+        Toutes les langues sont acceptées
+        Принимаются все языки
 
   - type: textarea
+    id: solution
     attributes:
       label: Describe the solution you'd like
-      description: A clear and concise description of what you want to happen.
+      description: A clear and short description of what you want to happen.
+    validations:
+      required: true
 
   - type: textarea
+    id: alternatives
     attributes:
       label: Describe alternatives you've considered
-      description: A clear and concise description of any alternative solutions or features you've considered.
+      description: A clear and short description of any other solutions or features you've considered.
+
+  - type: dropdown
+    id: webui
+    attributes:
+      label: Which WebUI do you use?
+      description: You can pick more than one.
+      multiple: true
+      options:
+        - AUTOMATIC1111
+        - Forge
+        - Forge Neo
+        - reForge
+        - Other
 
   - type: textarea
+    id: context
     attributes:
       label: Additional context
-      description: Add any other context or screenshots about the feature request here.
+      description: Add any other context or screenshots about the feature request here. Remove anything personal from screenshots first (user name in folder paths, private prompts).
