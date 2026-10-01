@@ -76,53 +76,48 @@ def _names_from_json(data: Any) -> list[str]:
 
 
 def _host_refuses_unpickle() -> bool:
-    """True while the WebUI refuses to unpickle model classes: AUTOMATIC1111's
-    safe-unpickle check (also in classic Forge / reForge) is on and not
-    bypassed. Detection bypasses it; the UI's class lookups do not. False on
-    hosts without the check (Forge Neo) and outside a WebUI."""
+    """True when the WebUI would refuse to read the detector file at this
+    point; the class names then come only from a sidecar JSON. False
+    otherwise, and outside a WebUI."""
     try:
         from modules import shared
 
-        return getattr(shared.cmd_opts, "disable_safe_unpickle", True) is False
+        if getattr(shared.cmd_opts, "disable_safe_unpickle", True) is not False:
+            return False
+        import torch
+        from modules import safe
+
+        return torch.load is getattr(safe, "load", None)
     except Exception:  # noqa: BLE001
         return False
 
 
 # Class names read successfully, per model path, kept for the session.
 _RESOLVED_NAMES: dict[str, list[str]] = {}
-# Models the host's safe-unpickle check refused outside detection. Remembered
-# so the UI does not repeat the host's error report on every lookup.
-_REFUSED_PATHS: set[str] = set()
 
 
 def get_model_class_names(model_path: str) -> list[str]:
     """Resolve class names for a YOLO model (see _read_class_names).
 
-    Only names that were found are cached. On AUTOMATIC1111 the UI looks them
-    up with the host's safe-unpickle check on, which refuses a .pt without a
-    sidecar; detection bypasses the check, so its lookup must still read the
-    real names instead of reusing the UI's empty result (which would silently
-    ignore a class filter). Names found once are then reused everywhere.
+    Only names that were found are cached. Where the WebUI does not let the UI
+    read the detector file, the UI's lookup of a .pt without a sidecar comes
+    back empty; detection's own lookup must still read the real names instead
+    of reusing that empty result (which would silently ignore a class filter).
+    Names found once are then reused everywhere.
     """
     names = _RESOLVED_NAMES.get(model_path)
     if names:
         return names
-    refused = _host_refuses_unpickle()
-    # A .pt the host refused is not loaded again (the host would repeat its
-    # error report), but a sidecar added since then is still read.
-    names = _read_class_names(
-        model_path, load_pt=not (refused and model_path in _REFUSED_PATHS)
-    )
+    # Where the WebUI would refuse the .pt here (and print an error report for
+    # it), only a sidecar is read.
+    names = _read_class_names(model_path, load_pt=not _host_refuses_unpickle())
     if names:
         _RESOLVED_NAMES[model_path] = names
-    elif refused:
-        _REFUSED_PATHS.add(model_path)
     return names
 
 
 def _clear_class_name_cache() -> None:
     _RESOLVED_NAMES.clear()
-    _REFUSED_PATHS.clear()
 
 
 # Keeps the reset hook of the lru_cache this replaced.
@@ -137,9 +132,10 @@ def _read_class_names(model_path: str, load_pt: bool = True) -> list[str]:
          class-names format. Two names are tried, in order:
            a. <model>.names.json  — a DEDICATED file that never collides with
               civitai_helper / Stability Matrix metadata (which claims the plain
-              <model>.json). This is the escape hatch for models whose .pt a
-              WebUI's safe-unpickle refuses to read (e.g. non-standard
-              segmentation models -> otherwise-empty class dropdown).
+              <model>.json). It is the first file tried, and a sidecar is the
+              only source of names where the WebUI does not let the panel read
+              the .pt (the class dropdown would otherwise be empty until a
+              detection).
            b. <model>.json        — legacy/plain sidecar; unrelated JSONs (e.g.
               civitai_helper metadata) don't match the format and are ignored.
       2. model.names from a transient YOLO() load.
@@ -201,8 +197,12 @@ def resolve_class_ids(model_path: str, requested: list[str]) -> list[int]:
     out: list[int] = []
     unknown: list[str] = []
     for token in requested:
-        if token.isdigit():
-            i = int(token)
+        # Not isdigit(): it is also true for "²" or "①", which int() rejects.
+        if token.isdecimal():
+            try:
+                i = int(token)
+            except ValueError:  # not a usable number
+                i = -1
             if 0 <= i < max(1, len(names) or 10_000):
                 out.append(i)
             else:

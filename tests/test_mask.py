@@ -186,13 +186,34 @@ def test_merge_invert_keeps_the_background_around_detections():
         ("1\u20133", [0, 1, 2]),
         ("1\uff0d3", [0, 1, 2]),
         ("1 \u2014 3", [0, 1, 2]),
+        # The Japanese long-vowel mark (the minus key in Japanese mode) and the
+        # middle dot, full-width or half-width, work like "-" and ",".
+        ("1\u30fc3", [0, 1, 2]),
+        ("\uff11\u30fc\uff13", [0, 1, 2]),
+        ("1\uff703", [0, 1, 2]),
+        ("1\u30fb3", [0, 2]),
+        ("1\uff653", [0, 2]),
+        ("\u30fc2", []),
+        # A doubled dash (a Chinese IME types two em dashes for Shift and
+        # minus) is still a range, instead of silently keeping only the first
+        # number, or a detection before it.
+        ("1\u2014\u20143", [0, 1, 2]),
+        ("1\uff0d\uff0d3", [0, 1, 2]),
+        ("1--3", [0, 1, 2]),
+        ("2\u2014\u20143", [1, 2]),
+        ("1 - - 3", [0, 1, 2]),
+        ("1\u30fc\u30fc3", [0, 1, 2]),
+        ("3--1", [0, 1, 2]),
+        ("1--", None),
     ],
 )
 def test_parse_indices_preserves_selection_rules(spec, expected):
     assert parse_indices(spec, 3) == expected
 
 
-@pytest.mark.parametrize("spec", ["1-999999999999", "999999999999-1"])
+@pytest.mark.parametrize(
+    "spec", ["1-999999999999", "999999999999-1", "1--999999999999"]
+)
 def test_parse_indices_bounds_range_before_iteration(monkeypatch, spec):
     import adetailer.mask as mask_module
 

@@ -12,7 +12,7 @@ from typing_extensions import Protocol
 
 try:
     from modules import safe
-except Exception:  # variant without modules.safe (Forge Neo is moving off it)
+except Exception:  # a WebUI without this module
     safe = None
 from modules.shared import cmd_opts, opts
 
@@ -44,9 +44,9 @@ def change_torch_load():
 
 @contextmanager
 def disable_safe_unpickle():
-    # Forge Neo (>= neo-2.x) dropped the `disable_safe_unpickle` attribute from
-    # cmd_opts. patch.object(..., create=True) makes the patch resilient: it
-    # creates the attribute if missing, restores it (or deletes it) afterward.
+    # Some WebUIs have no `disable_safe_unpickle` attribute in cmd_opts.
+    # patch.object(..., create=True) makes the patch resilient: it creates the
+    # attribute if missing, restores it (or deletes it) afterward.
     with (
         patch.dict(os.environ, {"TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1"}, clear=False),
         patch.object(cmd_opts, "disable_safe_unpickle", True, create=True),
@@ -73,6 +73,24 @@ def pause_total_tqdm():
     had_key = "multiple_tqdm" in data
     orig = data.get("multiple_tqdm")
     absent = [key for key in _AD_OVERRIDE_KEYS if key not in data]
+    # Give a missing Clip skip / VAE entry its default (what the option reads
+    # anyway), so the host puts it back after every inner pass, reloading the
+    # base VAE: a tab's own value could otherwise reach the next tabs, and its
+    # VAE stayed loaded after the pass. Forge's VAE / text-encoder list too
+    # (registered only there, so it still tells ADetailer the WebUI): until
+    # it is saved once, the detailer's modules stayed loaded, and a separate
+    # VAE was sent as sd_vae, which Forge Neo fails to load.
+    seeded = {}
+    for key in ("CLIP_stop_at_last_layers", "sd_vae", "forge_additional_modules"):
+        if key in absent:
+            try:
+                default = opts.get_default(key)
+            except Exception:  # noqa: BLE001 — a host without it: as before
+                default = None
+            if isinstance(default, list):
+                default = list(default)  # never the option's own list
+            if default is not None:
+                data[key] = seeded[key] = default
     data["multiple_tqdm"] = False
     try:
         yield
@@ -82,7 +100,10 @@ def pause_total_tqdm():
         else:
             data.pop("multiple_tqdm", None)
         for key in absent:
-            data.pop(key, None)
+            # A seeded entry that no longer holds its default was changed
+            # from the UI meanwhile: keep it.
+            if key not in seeded or data.get(key) == seeded[key]:
+                data.pop(key, None)
 
 
 @contextmanager

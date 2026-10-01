@@ -28,13 +28,29 @@ _PRESETS_FILE = _EXT_ROOT / "user_presets.json"
 # Preset actions are unqueued and can arrive from different tabs/sessions.
 _PRESETS_LOCK = RLock()
 
-# Reasonable preset name = printable, no path separators or quotes. Doesn't
-# need to be airtight; this is just to keep the JSON keys + dropdown labels
-# sane.
+# Reasonable preset name = letters, digits, spaces and the punctuation below
+# (no path separators or quotes). Doesn't need to be airtight; this is just
+# to keep the JSON keys + dropdown labels sane.
 _VALID_NAME = re.compile(r"^[\w\- .,()\[\]+!?@#&]{1,80}$")
 # The dropdowns' "no preset selected" entry (PRESET_NONE in aaaaaa/ui.py). A
 # preset with this name could never be loaded, renamed or deleted in the UI.
 _RESERVED_NAME = "(none)"
+# A preset is a flat {setting: value} dict; an imported one nested deeper
+# than this is skipped.
+_MAX_IMPORT_DEPTH = 32
+
+
+def _nested_too_deeply(value: Any) -> bool:
+    """Whether dicts/lists in `value` go past _MAX_IMPORT_DEPTH (iterative walk)."""
+    stack = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, (dict, list)):
+            if depth > _MAX_IMPORT_DEPTH:
+                return True
+            children = item.values() if isinstance(item, dict) else item
+            stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def _read_raw() -> tuple[dict[str, Any] | None, bool]:
@@ -90,7 +106,8 @@ def _write_raw(presets: dict[str, Any]) -> bool:
             except OSError:
                 pass  # best effort: some file systems cannot sync
         os.replace(tmp, _PRESETS_FILE)
-    except OSError:
+    # An encoding error caught here is a failed write too.
+    except (OSError, RecursionError):
         return False
     return True
 
@@ -184,14 +201,17 @@ def import_presets_json(payload: str, *, overwrite: bool = False) -> tuple[int, 
         - ``replaced`` — number of existing presets overwritten (only > 0
           when ``overwrite=True``).
         - ``skipped``  — list of names skipped (conflicts when
-          ``overwrite=False``, plus any names that fail `is_valid_name`).
+          ``overwrite=False``, plus any names that fail `is_valid_name` or
+          whose preset is nested deeper than `_MAX_IMPORT_DEPTH`; an
+          entry that is not a {setting: value} dict is left out without
+          being listed).
 
     If the library cannot be written, added and replaced are both zero and
     the incoming valid names are reported as skipped.
     """
     try:
         incoming = json.loads(payload)
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):  # JSONDecodeError is a ValueError
         return 0, 0, []
     if not isinstance(incoming, dict):
         return 0, 0, []
@@ -208,7 +228,7 @@ def import_presets_json(payload: str, *, overwrite: bool = False) -> tuple[int, 
             if not isinstance(name, str) or not isinstance(value, dict):
                 continue
             clean_name = name.strip()
-            if not is_valid_name(clean_name):
+            if not is_valid_name(clean_name) or _nested_too_deeply(value):
                 skipped.append(name)
                 continue
             if clean_name in current:

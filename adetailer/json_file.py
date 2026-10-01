@@ -25,15 +25,15 @@ def read_json_object(path: Path) -> tuple[dict[str, Any] | None, bool]:
     try:
         if not path.is_file():
             return {}, False
-        # utf-8-sig also accepts the byte-order mark some Windows editors add.
-        text = path.read_text(encoding="utf-8-sig")
-    except ValueError:  # UnicodeDecodeError
-        return None, True
+        raw = path.read_bytes()
     except OSError:
         return None, False
     try:
-        data = json.loads(text)
-    except (ValueError, RecursionError):
+        # Decoded as json decodes bytes: UTF-8 with or without the byte-order
+        # mark some Windows editors add, or UTF-16/32 as Windows PowerShell 5.1
+        # and Notepad's "Unicode" write it (strict, so other encodings fail).
+        data = json.loads(raw.decode(json.detect_encoding(raw)))
+    except (ValueError, RecursionError):  # UnicodeDecodeError is a ValueError
         return None, True
     if not isinstance(data, dict):
         return None, True

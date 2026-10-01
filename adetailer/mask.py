@@ -274,7 +274,8 @@ def parse_indices(spec: str, n: int) -> list[int] | None:
     Spaces around a range dash are ignored; tokens that aren't a positive int
     or an ``a-b`` range are skipped; indices outside ``[1, n]`` are dropped.
     Full-width digits and the CJK punctuation an IME types (``"1，3"``,
-    ``"1、3"``, ``"1～3"``) work like their ASCII forms.
+    ``"1、3"``, ``"1～3"``, ``"1ー3"``, ``"1・3"``) work like their ASCII forms,
+    and so does a doubled range dash (``"1--3"``, ``"1——3"``).
     Returns ``None`` when the string contains no usable
     number at all — the caller treats that (and a blank string) as "keep all".
     An in-range parse that resolves to nothing (e.g. only out-of-range numbers)
@@ -285,21 +286,24 @@ def parse_indices(spec: str, n: int) -> list[int] | None:
     found_any = False
     # An IME may type full-width digits and CJK punctuation: NFKC makes the
     # full-width digits, commas, semicolons, "#", "-" and "~" ASCII, then
-    # the tilde, wave dash, hyphen/en/em dashes and minus sign become the
-    # range dash, and the list comma U+3001 separates like ",".
+    # the tilde, wave dash, hyphen/en/em dashes, minus sign and Japanese
+    # long-vowel mark U+30FC become the range dash, and the list comma U+3001
+    # and the Japanese middle dot U+30FB separate like ",".
     spec = unicodedata.normalize("NFKC", spec)
-    spec = re.sub(r"[~\u301c\u2010-\u2015\u2212]", "-", spec)
+    spec = re.sub(r"[~\u301c\u2010-\u2015\u2212\u30fc]", "-", spec)
     # Glue "1 - 3" into "1-3" BEFORE splitting on whitespace, so a spaced range
     # stays a range instead of becoming the two numbers 1 and 3.
     spec = re.sub(r"\s*-\s*", "-", spec.replace("#", ""))
-    for tok in re.split(r"[,;\s\u3001]+", spec):
+    for tok in re.split(r"[,;\s\u3001\u30fb]+", spec):
         tok = tok.strip()
         if not tok:
             continue
         if "-" in tok[1:]:  # inclusive range like "2-4" (a leading "-" is not a range)
             a, _, b = tok.partition("-")
             try:
-                lo, hi = int(a), int(b)
+                # A doubled dash ("1--3", or "1——3" as a Chinese IME types it)
+                # is still a range: detection numbers are never negative.
+                lo, hi = int(a), int(b.lstrip("-"))
             except ValueError:
                 continue
             found_any = True

@@ -39,7 +39,8 @@ def ultralytics_predict(
     excluded = parse_csv(exclude_classes)
 
     # Higher detector inference resolution (e.g. 1024) finds smaller / distant
-    # parts than the Ultralytics default of 640. 0 keeps the library default.
+    # parts than the model's own size (640 for the bundled models). 0 keeps the
+    # size stored in the checkpoint, which Ultralytics uses when none is passed.
     # Detected boxes are rescaled back to the original image space internally,
     # so nothing downstream changes. imgsz is a universally-supported predict
     # kwarg; the multiclass branch additionally drops it on TypeError alongside

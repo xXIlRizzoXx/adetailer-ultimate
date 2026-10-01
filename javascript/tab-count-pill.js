@@ -10,7 +10,8 @@
  * the same on A1111 (Gradio 3) and Forge / Forge Neo (Gradio 4); WebUIs
  * auto-load javascript/*.js. Reactivity: a light childList observer (for
  * re-renders) plus delegated change/input listeners scoped to the accordion
- * (for the "Enable this tab" checkbox toggles).
+ * (for the "Enable this tab" checkbox toggles), plus Gradio's own "change"
+ * event (for Paste settings / Load / Reset switching a tab on or off).
  */
 
 (function () {
@@ -117,6 +118,19 @@
         };
         document.addEventListener("change", onEvt, true);
         document.addEventListener("input", onEvt, true);
+        // A server update (Paste settings, Load, Reset) sets the checkbox's
+        // `checked` property: no DOM change and no user event. Gradio reports
+        // every value change as a bubbling "gradio" event on its app root, not
+        // on the component, so it cannot be scoped to the accordion; the
+        // recount is coalesced to one per frame. A DOM listener only, not a
+        // Gradio event (index-safe).
+        document.addEventListener(
+            "gradio",
+            function (e) {
+                if (e.detail && e.detail.event === "change") scheduleUpdate();
+            },
+            true
+        );
     }
 
     if (document.readyState === "loading") {

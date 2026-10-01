@@ -281,6 +281,31 @@ def test_class_filter_names_match_regardless_of_case(tmp_path, monkeypatch, caps
     assert "hands" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    "token", ["²", "①", "1" * 5000], ids=["superscript", "circled", "bad-number"]
+)
+def test_a_digit_that_int_rejects_does_not_stop_the_class_filter(
+    tmp_path, monkeypatch, token
+):
+    # A class with a digit that int() rejects, or a number that cannot be
+    # converted, in the include or the NOT filter is dropped as an unknown
+    # class.
+    model = tmp_path / "multi.pt"
+    model.write_bytes(b"x")
+    (tmp_path / "multi.names.json").write_text('["face", "hand"]', encoding="utf-8")
+    _fake_yolo(monkeypatch, [0.0, 1.0], {0: "face", 1: "hand"})
+    image = Image.new("RGB", (4, 4))
+    get_model_class_names.cache_clear()
+    try:
+        include = ultralytics_predict(str(model), image, classes="face," + token)
+        exclude = ultralytics_predict(str(model), image, exclude_classes=token)
+    finally:
+        get_model_class_names.cache_clear()
+
+    assert include.class_names == ["face", "hand"]
+    assert exclude.class_names == ["face", "hand"]
+
+
 class TestMaskToPil:
     @pytest.mark.parametrize(
         ("content_size", "padding", "output_size"),

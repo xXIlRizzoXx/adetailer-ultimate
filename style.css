@@ -315,6 +315,11 @@ div[id*="adetailer_ad_version"].ad-version-overlay {
     /* Was 360px; widened to fit the injected "📖 Guide · " prefix (see
      * javascript/guide-button.js) without clipping the version text. */
     max-width: 460px !important;
+    /* Never wider than the room the title, the Enable checkbox and the
+     * "Nx Tabs" pill leave on the header, or a narrow panel (half a screen)
+     * slid the badge over them; the text ends in an ellipsis instead. The
+     * line above stays as the fallback for browsers without min(). */
+    max-width: min(460px, calc(100% - 240px)) !important;
     z-index: 5;
     pointer-events: none;
     margin: 0 !important;
@@ -331,6 +336,9 @@ div.prose[id*="adetailer_ad_version"].ad-version-overlay {
     position: static !important;
     top: auto !important;
     right: auto !important;
+    /* Fill the capped outer badge; its own copy of the cap would count the
+     * 240px again against the badge's width. */
+    max-width: 100% !important;
 }
 
 div[id*="adetailer_ad_version"].ad-version-overlay p {
@@ -344,6 +352,10 @@ div[id*="adetailer_ad_version"].ad-version-overlay p {
     color: color-mix(in srgb, var(--body-text-color) 55%, transparent) !important;
     white-space: nowrap;
     text-align: right;
+    /* On a narrow panel the end (version, hash) is cut; the Guide link at
+     * the start stays visible. */
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* The dark theme keeps its 0.55 opacity (Gradio 3 and 4 set .dark there). */

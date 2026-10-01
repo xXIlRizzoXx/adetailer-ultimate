@@ -104,12 +104,11 @@ if TYPE_CHECKING:
 
 # Raise PIL's decompression-bomb ceiling so the "Run ADetailer on an image",
 # batch-folder and detection-preview tools accept large upscales. Gradio's Image
-# component PIL.open()s the dropped file BEFORE our code runs, and Forge Neo
-# leaves PIL's ~179 MP default in place, so a big drop raises a
-# DecompressionBombError and the detector never even sees the image. Only ever
-# RAISE the ceiling (never lower it, and never override a host that already
-# disabled the check with None), keeping a generous finite cap so a genuinely
-# absurd image is still refused. Reported during testing (a 216 MP upscale).
+# component PIL.open()s the dropped file BEFORE our code runs, and some WebUIs
+# leave PIL's ~179 MP default in place, so a big drop raises a
+# DecompressionBombError and the detector never even sees the image. The
+# ceiling is only ever raised, never lowered, and stays a generous finite cap
+# so a genuinely absurd image is still refused. Reported during testing (a 216 MP upscale).
 try:
     if (
         Image.MAX_IMAGE_PIXELS is not None
@@ -207,6 +206,44 @@ def _merge_lora_tags(prompt: str, extras: list[str]) -> str:
     base = (prompt or "").rstrip().rstrip(",").rstrip()
     tail = " ".join(to_add)
     return f"{base} {tail}" if base else tail
+
+
+def _without_style_loras(tags: list[str], p) -> list[str]:
+    """`tags` less one copy of each LoRA tag the selected styles hold.
+
+    The host applies the styles to the detailer pass again, their LoRAs
+    included: taken from the main prompt as well, they would apply twice.
+    """
+    styles = getattr(p, "styles", None) or []
+    if not tags or not styles:
+        return tags
+    try:
+        added = _extract_lora_tags(shared.prompt_styles.apply_styles_to_prompt("", styles))
+    except Exception:  # noqa: BLE001 — every tag is kept, as before
+        return tags
+    tags = list(tags)
+    for tag in added:
+        if tag in tags:
+            tags.remove(tag)
+    return tags
+
+
+def _strip_host_comments(text: str) -> str:
+    """`text` as the WebUI's built-in Comments script leaves it.
+
+    That script (modules/processing_scripts/comments.py) removes prompt
+    comments from the main prompts after the styles are applied. Found like
+    xyz_grid, never imported again; without it, or with its option off, the
+    text is returned unchanged.
+    """
+    if not opts.data.get("enable_prompt_comments", True):
+        return text
+    for script in getattr(scripts, "scripts_data", None) or []:
+        if script.script_class.__module__ == "comments.py":
+            strip = getattr(script.module, "strip_comments", None)
+            if callable(strip):
+                return strip(text)
+    return text
 
 
 def _parse_class_prompts(text: str) -> dict[str, tuple[str, str]]:
@@ -423,7 +460,14 @@ def _ad_verbose() -> bool:
 
 def _vprint(text: str) -> None:
     try:
-        sys.stdout.write(text + "\n")
+        try:
+            sys.stdout.write(text + "\n")
+        except UnicodeEncodeError:
+            # A console pipe in a legacy code page refuses the whole block:
+            # draw the rules in ASCII and escape the rest it lacks.
+            text = text.translate({0x2500: "-", 0x2550: "="})
+            enc = getattr(sys.stdout, "encoding", None) or "ascii"
+            sys.stdout.write(text.encode(enc, "backslashreplace").decode(enc) + "\n")
         sys.stdout.flush()
     except Exception:  # noqa: BLE001
         pass
@@ -828,18 +872,26 @@ class AfterDetailerScript(scripts.Script):
             params.update(args.extra_params(suffix=suffix(n)))
             # An empty or blank value makes AUTOMATIC1111's infotext parser
             # fail on paste ("Error parsing"); _clear_missing_class_prompts
-            # pastes a missing key as empty instead.
-            key = "ADetailer class prompts" + suffix(n)
-            if key in params and not str(params[key]).strip():
-                del params[key]
+            # (ui.py for the inpaint indices) pastes a missing key as empty
+            # instead, which a blank value means anyway.
+            for name in (
+                "ADetailer prompt",
+                "ADetailer negative prompt",
+                "ADetailer prompt append",
+                "ADetailer negative prompt append",
+                "ADetailer class prompts",
+                "ADetailer inpaint indices",
+            ):
+                key = name + suffix(n)
+                if key in params and not str(params[key]).strip():
+                    del params[key]
         params["ADetailer version"] = __version__
         return params
 
     @staticmethod
     def get_ultralytics_device() -> str:
         # Forge Neo (>= neo-2.x) ships a slimmer `cmd_opts` Namespace that
-        # doesn't expose `use_cpu`. Same pattern as the `disable_safe_unpickle`
-        # patch in aaaaaa/helper.py — fall back to an empty list when the
+        # doesn't expose `use_cpu`: fall back to an empty list when the
         # attribute is missing (or None) so the check just no-ops.
         use_cpu = getattr(shared.cmd_opts, "use_cpu", None) or []
         if "adetailer" in use_cpu:
@@ -875,6 +927,7 @@ class AfterDetailerScript(scripts.Script):
         include_loras_from: str = "",
         include_triggers: bool = False,
         strip_loras: bool = False,
+        merge_loras: list[str] | None = None,
     ) -> list[str]:
         prompts = re.split(r"\s*\[SEP\]\s*", ad_prompt)
         blank_replacement = self.prompt_blank_replacement(all_prompts, i, default)
@@ -885,6 +938,10 @@ class AfterDetailerScript(scripts.Script):
         # append them to the prompt as comma-separated tokens after the LoRA
         # tags themselves. See `_extract_lora_triggers` for the convention.
         extra_triggers = _extract_lora_triggers(extra_loras) if include_triggers else []
+        # When given, only these are merged (the ones the selected styles do
+        # not add again); the trigger phrases still come from every tag.
+        if merge_loras is not None:
+            extra_loras = merge_loras
         for n in range(len(prompts)):
             # A bare [SKIP] segment is a control token, not a prompt: leave it
             # exactly "[SKIP]" so the per-mask skip gate still matches it. Without
@@ -893,13 +950,24 @@ class AfterDetailerScript(scripts.Script):
             if re.match(r"^\s*\[SKIP\]\s*$", prompts[n]):
                 prompts[n] = "[SKIP]"
                 continue
-            if not prompts[n]:
+            # A box that looks empty (a stray space or newline) is blank too.
+            if not prompts[n].strip():
                 prompts[n] = blank_replacement
-            elif "[PROMPT]" in prompts[n]:
-                prompts[n] = prompts[n].replace("[PROMPT]", blank_replacement)
+            else:
+                # An X/Y/Z S/R that also changed the main prompt has already
+                # reached the text [PROMPT] stands for: it replaces only the
+                # tab's own text, or it would replace twice there.
+                parts = prompts[n].split("[PROMPT]")
+                for pair in replacements:
+                    if getattr(pair, "main", False):
+                        parts = [part.replace(pair.s, pair.r) for part in parts]
+                prompts[n] = (
+                    parts[0] if len(parts) == 1 else blank_replacement.join(parts)
+                )
 
             for pair in replacements:
-                prompts[n] = prompts[n].replace(pair.s, pair.r)
+                if not getattr(pair, "main", False):
+                    prompts[n] = prompts[n].replace(pair.s, pair.r)
 
             # Apply the always-appended suffix AFTER substitution so the
             # text the user typed there is literal — not subject to
@@ -941,9 +1009,38 @@ class AfterDetailerScript(scripts.Script):
                 p.all_prompts[main_idx] if p.all_prompts else (p.prompt or "")
             )
 
+        # The host has applied the selected styles to all_prompts and applies
+        # them again to the detailer pass: a blank or [PROMPT] segment takes
+        # the prompt as typed instead, when those styles give back exactly
+        # the host's text, so the styles are applied once.
+        def main_prompts(all_prompts, typed, negative):
+            try:
+                styles = getattr(p, "styles", None) or []
+                db = getattr(shared, "prompt_styles", None)
+                if isinstance(typed, list) and typed:
+                    typed = typed[i % len(typed)]
+                if styles and db is not None and isinstance(typed, str):
+                    apply = (
+                        db.apply_negative_styles_to_prompt
+                        if negative
+                        else db.apply_styles_to_prompt
+                    )
+                    styled = self.prompt_blank_replacement(all_prompts, i, typed)
+                    if apply(typed, styles) == styled:
+                        return [typed]
+                    # The WebUI removed the prompt comments after styling: take
+                    # the text without them (by default the detailer pass runs
+                    # without the Comments script, so nothing strips them).
+                    stripped = _strip_host_comments(typed)
+                    if stripped != typed and apply(stripped, styles) == styled:
+                        return [stripped]
+            except Exception:  # noqa: BLE001
+                pass
+            return all_prompts
+
         prompt = self._get_prompt(
             ad_prompt=args.ad_prompt,
-            all_prompts=p.all_prompts,
+            all_prompts=main_prompts(p.all_prompts, p.prompt, False),
             i=i,
             default=p.prompt,
             replacements=prompt_sr,
@@ -953,13 +1050,14 @@ class AfterDetailerScript(scripts.Script):
                 args.ad_use_main_loras and args.ad_use_lora_triggers
             ),
             strip_loras=args.ad_strip_loras,
+            merge_loras=_without_style_loras(_extract_lora_tags(loras_source), p),
         )
         # Triggers only make sense on the positive prompt — leaving the
         # negative pipeline unchanged keeps the negative prompt the exact
         # same shape it would have without this feature.
         negative_prompt = self._get_prompt(
             ad_prompt=args.ad_negative_prompt,
-            all_prompts=p.all_negative_prompts,
+            all_prompts=main_prompts(p.all_negative_prompts, p.negative_prompt, True),
             i=i,
             default=p.negative_prompt,
             replacements=prompt_sr,
@@ -1074,6 +1172,17 @@ class AfterDetailerScript(scripts.Script):
             _fmods = None
         if _fmods is not None:
             d["forge_additional_modules"] = _fmods
+        # "Inpaint only masked" gets the whole picture back only through the
+        # host's "Overlay original for inpaint" option: with it off the host
+        # returns the bare crop, which then replaced the image. The host puts
+        # a saved value back after the pass, and can set only an option it
+        # has (AUTOMATIC1111 1.8 and later, Forge Neo).
+        if (
+            args.ad_inpaint_only_masked
+            and "overlay_inpaint" in getattr(opts, "data_labels", {})
+            and not opts.data.get("overlay_inpaint", True)
+        ):
+            d["overlay_inpaint"] = True
         return d
 
     def get_initial_noise_multiplier(self, _p, args: ADetailerArgs) -> float | None:
@@ -1265,6 +1374,14 @@ class AfterDetailerScript(scripts.Script):
         i2i.cached_c = [None, None]
         i2i.cached_uc = [None, None]
         i2i.scripts, i2i.script_args = self.script_filter(p, args)
+        # Assigning script_args runs the scripts' setup, and the host's
+        # built-in Sampler script (kept when "Apply only selected scripts" is
+        # off) copies the main steps, sampler and scheduler onto the pass:
+        # put back the ones ADetailer chose for it.
+        i2i.steps = steps
+        i2i.sampler_name = sampler_name
+        if "scheduler" in version_args:
+            i2i.scheduler = version_args["scheduler"]
         i2i._ad_disabled = True
         i2i._ad_inner = True
 
@@ -1493,16 +1610,19 @@ class AfterDetailerScript(scripts.Script):
 
     @staticmethod
     def compare_prompt(extra_params: dict[str, Any], processed, n: int = 0):
+        # sys.stdout, not the rich print: a prompt can hold "[..]" that rich
+        # would treat as markup. ascii(), so a console pipe in a legacy code
+        # page can print any character of it.
         pt = "ADetailer prompt" + suffix(n)
         if pt in extra_params and extra_params[pt] != processed.all_prompts[0]:
-            print(
-                f"[-] ADetailer: applied {ordinal(n + 1)} ad_prompt: {processed.all_prompts[0]!r}"
+            sys.stdout.write(
+                f"[-] ADetailer: applied {ordinal(n + 1)} ad_prompt: {processed.all_prompts[0]!a}\n"
             )
 
         ng = "ADetailer negative prompt" + suffix(n)
         if ng in extra_params and extra_params[ng] != processed.all_negative_prompts[0]:
-            print(
-                f"[-] ADetailer: applied {ordinal(n + 1)} ad_negative_prompt: {processed.all_negative_prompts[0]!r}"
+            sys.stdout.write(
+                f"[-] ADetailer: applied {ordinal(n + 1)} ad_negative_prompt: {processed.all_negative_prompts[0]!a}\n"
             )
 
     @staticmethod
@@ -1512,8 +1632,18 @@ class AfterDetailerScript(scripts.Script):
             # single one is repeated by the host.
             i = getattr(p, "batch_index", 0)
             if isinstance(i, int) and 0 <= i < len(p.init_images):
-                return p.init_images[i]
-            return p.init_images[0]
+                image = p.init_images[i]
+            else:
+                image = p.init_images[0]
+            # The host fills the transparent parts of the init image with its
+            # img2img background colour only in a copy of its own; dropping
+            # the alpha channel instead turned them black.
+            if getattr(image, "mode", None) == "RGBA":
+                try:
+                    image = images.flatten(image, opts.img2img_background_color)
+                except Exception:  # noqa: BLE001 — a host without them: as before
+                    pass
+            return image
         return pp.image
 
     def run_detailer_on_image(self, image, args: ADetailerArgs, save: bool = False):
@@ -1532,6 +1662,13 @@ class AfterDetailerScript(scripts.Script):
             # cancellation flags here: a request arriving between files must
             # remain visible to this pass and the folder loop.
 
+            # Fill transparency with the img2img background colour, as the
+            # host does before img2img (dropping the alpha turned it black).
+            if getattr(image, "mode", None) == "RGBA":
+                try:
+                    image = images.flatten(image, opts.img2img_background_color)
+                except Exception:  # noqa: BLE001 — a host without them: as before
+                    pass
             image = ensure_pil_image(image, "RGB")
             w, h = image.size
             # The detailer inpaints at p.width/p.height whenever the user hasn't
@@ -1617,18 +1754,27 @@ class AfterDetailerScript(scripts.Script):
             # generation there, as postprocess_image does. Guarded so it can
             # never cost the result.
             try:
+                params_txt_existed = Path(paths.data_path, PARAMS_TXT).exists()
                 params_txt_content = self.read_params_txt()
             except Exception:  # noqa: BLE001
-                params_txt_content = ""
+                params_txt_existed, params_txt_content = True, ""
             # Regions that failed with a NaN error, counted by the inner pass,
             # and whether the detector found anything at all.
             self._ad_nan_regions = 0
             self._ad_detected = False
             try:
-                processed = self._postprocess_image_inner(p, pp, args)
+                # As in postprocess_image: puts back the tab's override
+                # options (Clip skip, VAE) that the host would leave set.
+                with pause_total_tqdm():
+                    processed = self._postprocess_image_inner(p, pp, args)
             finally:
                 try:
-                    self.write_params_txt(params_txt_content)
+                    if params_txt_existed:
+                        self.write_params_txt(params_txt_content)
+                    else:
+                        # There was no last generation to keep: remove the
+                        # record the inner pass has just created.
+                        Path(paths.data_path, PARAMS_TXT).unlink(missing_ok=True)
                 except Exception:  # noqa: BLE001
                     pass
             if not processed:
@@ -1651,6 +1797,13 @@ class AfterDetailerScript(scripts.Script):
                     )
                 return image, "ℹ️ Nothing detected — image unchanged."
             status = "✅ ADetailer pass complete."
+            nan = getattr(self, "_ad_nan_regions", 0)
+            if nan:
+                # Other regions were detailed: say which part was not.
+                status += (
+                    f" {nan} region(s) failed with a NaN error and were left "
+                    "unchanged (see console)."
+                )
             if save:
                 # koblue's request (#4): also write the result to the outputs
                 # folder, not just Gradio's temp dir. Guarded — a save failure
@@ -1675,9 +1828,16 @@ class AfterDetailerScript(scripts.Script):
                         except Exception:  # noqa: BLE001
                             parent = Path(base_out).parent
                     save_dir = str(parent / AD_APPLY_SUBDIR)
+                    # The pass's own parameters, which the host put on the
+                    # result: without them a PNG records the text "None". The
+                    # host adds them only with "Write infotext to metadata" on;
+                    # with it off, "" would write an empty .txt sidecar.
+                    info = (getattr(pp.image, "info", None) or {}).get("parameters")
+                    if info is None and getattr(opts, "enable_pnginfo", True):
+                        info = ""
                     images.save_image(
                         pp.image, save_dir, "",
-                        extension=opts.samples_format, p=p,
+                        extension=opts.samples_format, p=p, info=info,
                     )
                     status += f" Saved to the '{AD_APPLY_SUBDIR}' folder."
                 except Exception as e:  # noqa: BLE001
@@ -1717,6 +1877,15 @@ class AfterDetailerScript(scripts.Script):
     @staticmethod
     def get_image_mask(p) -> Image.Image:
         mask = p.image_mask
+        # Binarize first, as the host does: a mask drawn on a transparent
+        # layer is in its alpha channel, which the conversion to L drops.
+        # Soft inpainting sets p.mask_round = False (WebUI 1.8+, which added
+        # the round argument too): the host then keeps a faint alpha.
+        if isinstance(mask, Image.Image):
+            if getattr(p, "mask_round", True):
+                mask = create_binary_mask(mask)
+            else:
+                mask = create_binary_mask(mask, round=False)
         mask = ensure_pil_image(mask, "L")
         if getattr(p, "inpainting_mask_invert", False):
             mask = ImageChops.invert(mask)
@@ -1906,7 +2075,7 @@ class AfterDetailerScript(scripts.Script):
                 extras = _extract_lora_tags(
                     p.all_prompts[main_idx] if p.all_prompts else (p.prompt or "")
                 )
-                p2.prompt = _merge_lora_tags(p2.prompt, extras)
+                p2.prompt = _merge_lora_tags(p2.prompt, _without_style_loras(extras, p))
                 if args.ad_use_lora_triggers:
                     p2.prompt = _append_lora_triggers(
                         p2.prompt, _extract_lora_triggers(extras)
@@ -1954,7 +2123,8 @@ class AfterDetailerScript(scripts.Script):
 
         Opt-in via ``ad_class_guard``. In a sequential pass (``seq_pass``), the
         only place ``ad_class_prompts`` are applied, a manual entry for the
-        detected class wins (auto is suppressed for that class). Skipped for a
+        detected class, or for the pass's class id, wins (auto is suppressed
+        for that class). Skipped for a
         Merge and Invert mask, which is the background. For
         mediapipe_face_features, whose "face" holds the other parts, the face
         region gets no negatives and "face" is never a part's negative. The
@@ -1975,10 +2145,15 @@ class AfterDetailerScript(scripts.Script):
             if not cn or len(cn) != steps or j >= len(cn):
                 return
             detected = cn[j]
-            if seq_pass and _class_prompt_for(
-                _parse_class_prompts(args.ad_class_prompts), detected
-            ) is not None:
-                return  # manual per-class prompt wins
+            if seq_pass:
+                lines = _parse_class_prompts(args.ad_class_prompts)
+                if (
+                    _class_prompt_for(lines, detected) is not None
+                    # The pass's own class, as the sequential branch looks it
+                    # up first: a line written for a class id such as "0".
+                    or _class_prompt_for(lines, args.ad_model_classes) is not None
+                ):
+                    return  # manual per-class prompt wins
             if args.is_mediapipe_features():
                 # "face" is the whole face, which holds the other parts: never
                 # negate a part in the face region, nor "face" in a part's.
@@ -2060,12 +2235,34 @@ class AfterDetailerScript(scripts.Script):
         if getattr(p, "_ad_disabled", False):
             return
 
+        # An X/Y/Z "ADetailer model 1st" axis sets the 1st tab's detector for
+        # this cell only (get_args merges it), also on a tab left on None:
+        # checked as one more tab, so it can switch a cell on, never off.
+        tabs = [arg for arg in args_ if isinstance(arg, dict)]
+        xyz_tab = [{**tabs[0], **p._ad_xyz}] if tabs and hasattr(p, "_ad_xyz") else []
+
         # Bypass before Skip img2img replaces the host's settings with a
         # throwaway 128px / one-step pass. Manual mode must preserve the
         # normal generation, including when Skip img2img remains checked.
-        if opts.data.get("ad_manual_mode", False):
+        # Read once per job: the img2img Batch tab and Loopback reuse p, and a
+        # file that an earlier one left on that pass must still be detailed.
+        if not hasattr(p, "_ad_manual_mode"):
+            p._ad_manual_mode = opts.data.get("ad_manual_mode", False)
+        if p._ad_manual_mode:
             p._ad_disabled = True
-            print("[-] ADetailer: manual mode is ON, skipping auto-run.")
+            # An X/Y/Z grid cell shares this dict with the earlier cells: drop
+            # what they wrote, or this image, which is not detailed, keeps it
+            # (Steps, Sampler and Size are written only by Skip img2img).
+            for key in [
+                k for k in p.extra_generation_params if str(k).startswith("ADetailer ")
+            ]:
+                del p.extra_generation_params[key]
+            if len(args_) >= 2 and args_[1] is True and getattr(p, "init_images", None):
+                for key in ("Steps", "Sampler", "Size"):
+                    p.extra_generation_params.pop(key, None)
+            # Only when ADetailer would have run: switched off, it says nothing.
+            if self.is_ad_enabled(*args_, *xyz_tab):
+                print("[-] ADetailer: manual mode is ON, skipping auto-run.")
             return
 
         # Decided for each image: the img2img Batch tab reuses p for every
@@ -2077,10 +2274,26 @@ class AfterDetailerScript(scripts.Script):
                 "[-] ADetailer: img2img inpainting with no mask -- adetailer disabled."
             )
             print(msg)
+            # The Batch tab reuses this dict too: drop the previous file's
+            # keys, or this file is saved as detailed although it was not.
+            for key in [
+                k for k in p.extra_generation_params if str(k).startswith("ADetailer ")
+            ]:
+                del p.extra_generation_params[key]
             return
 
-        if not self.is_ad_enabled(*args_):
+        if not self.is_ad_enabled(*args_, *xyz_tab):
             p._ad_disabled = True
+            if hasattr(p, "_ad_xyz"):
+                # The earlier cells, sharing this dict, may have run: drop what
+                # they wrote, as in manual mode above.
+                for key in [
+                    k for k in p.extra_generation_params if str(k).startswith("ADetailer ")
+                ]:
+                    del p.extra_generation_params[key]
+                if len(args_) >= 2 and args_[1] is True and getattr(p, "init_images", None):
+                    for key in ("Steps", "Sampler", "Size"):
+                        p.extra_generation_params.pop(key, None)
             return
 
         self.set_skip_img2img(p, *args_)
@@ -2091,11 +2304,7 @@ class AfterDetailerScript(scripts.Script):
         arg_list = self.get_args(p, *args_)
 
         if hasattr(p, "_ad_xyz_prompt_sr"):
-            replaced_positive_prompt, replaced_negative_prompt = self.get_prompt(
-                p, arg_list[0]
-            )
-            arg_list[0].ad_prompt = replaced_positive_prompt[0]
-            arg_list[0].ad_negative_prompt = replaced_negative_prompt[0]
+            self._record_xyz_prompt_sr(p, arg_list)
 
         extra_params = self.extra_params(arg_list)
         # An X/Y/Z grid cell is a shallow copy of p sharing this dict: drop the
@@ -2108,11 +2317,44 @@ class AfterDetailerScript(scripts.Script):
             del p.extra_generation_params[key]
         p.extra_generation_params.update(extra_params)
 
+    def _record_xyz_prompt_sr(self, p, arg_list: list[ADetailerArgs]) -> None:
+        """Put in `arg_list` the prompts an X/Y/Z Prompt S/R cell saves."""
+        # Record every [SEP] segment, without the append text and the
+        # LoRA options the parameters save on their own: pasted back,
+        # they would be applied a second time. Every tab: the S/R
+        # reaches each tab's prompt in the detailer pass.
+        for tab in arg_list:
+            bare = tab.copy(
+                update={
+                    "ad_prompt_append": "",
+                    "ad_negative_prompt_append": "",
+                    "ad_use_main_loras": False,
+                    "ad_strip_loras": False,
+                }
+            )
+            replaced_positive_prompt, replaced_negative_prompt = self.get_prompt(
+                p, bare
+            )
+            tab.ad_prompt = " [SEP] ".join(replaced_positive_prompt)
+            tab.ad_negative_prompt = " [SEP] ".join(replaced_negative_prompt)
+            # The sequential passes replace it in the per-class lines too,
+            # after the class name, which stays as typed.
+            if tab.ad_class_prompts:
+                lines = []
+                for line in tab.ad_class_prompts.splitlines():
+                    name, colon, rest = line.partition(":")
+                    if colon:
+                        for pair in p._ad_xyz_prompt_sr:
+                            rest = rest.replace(pair.s, pair.r)
+                    lines.append(name + colon + rest)
+                tab.ad_class_prompts = "\n".join(lines)
+
     @staticmethod
     def _will_run_sequential(args: ADetailerArgs) -> bool:
         """True when the sequential-class branch in `_postprocess_image_inner`
         will engage for these args: sequential ON, a multiclass include
-        filter (>1 class), and neither MediaPipe nor exclude/NOT mode.
+        filter (>1 class), and neither MediaPipe nor exclude/NOT mode nor
+        Merge and Invert.
 
         Kept byte-for-byte in sync with that branch's guard so the outer save
         loop can decide whether step images are saved per-class (inside the
@@ -2122,6 +2364,7 @@ class AfterDetailerScript(scripts.Script):
             not args.ad_classes_sequential
             or (args.is_mediapipe() and not args.is_mediapipe_features())
             or args.ad_model_classes_exclude
+            or getattr(args, "ad_mask_merge_invert", "None") == "Merge and Invert"
         ):
             return False
         return len(parse_csv(args.ad_model_classes)) > 1
@@ -2160,10 +2403,13 @@ class AfterDetailerScript(scripts.Script):
         # one detect+inpaint pass per class, in the order the user selected
         # them. Each pass operates on the output of the previous (pp.image is
         # mutated in place by the inner inpaint).
+        # Merge and Invert runs as one pass: its inverted region is the
+        # background of every selected class, not one class.
         if (
             args.ad_classes_sequential
             and (not args.is_mediapipe() or args.is_mediapipe_features())
             and not args.ad_model_classes_exclude
+            and getattr(args, "ad_mask_merge_invert", "None") != "Merge and Invert"
         ):
             classes = parse_csv(args.ad_model_classes)
             if len(classes) > 1:
@@ -2173,12 +2419,14 @@ class AfterDetailerScript(scripts.Script):
                 # Drop it, as the single-pass filter does; when no name is
                 # known, one pass with the whole filter inpaints every class
                 # once with the tab prompt, as in single-pass mode. Looked up
-                # like detection, past the host's safe-unpickle check.
+                # the same way detection looks them up.
+                _names: list[str] = []
                 if not args.is_mediapipe():
                     try:
                         with disable_safe_unpickle():
                             _model = str(self.get_ad_model(args.ad_model))
-                            if get_model_class_names(_model):
+                            _names = get_model_class_names(_model)
+                            if _names:
                                 classes = [
                                     c for c in classes
                                     if resolve_class_ids(_model, [c])
@@ -2228,10 +2476,25 @@ class AfterDetailerScript(scripts.Script):
                         # feature).
                         "ad_inpaint_indices": "",
                     }
+                    if "," in cls:
+                        # The whole filter, no name known: no per-class line
+                        # applies to this pass, so none may switch the Auto
+                        # class-guard off either, as in single-pass mode.
+                        update["ad_class_prompts"] = ""
                     # Apply per-class prompt overrides if any. Empty strings
                     # leave the tab's default intact for that field. The line's
                     # class name matches regardless of case, like the filter.
                     entry = _class_prompt_for(class_prompts, cls)
+                    # No names known: the id is never looked up or converted.
+                    if (
+                        entry is None
+                        and _names
+                        and cls.isdecimal()
+                        and int(cls) < len(_names)
+                    ):
+                        # A class id (API, pasted parameters, a preset): its
+                        # line is written with the detector's class name.
+                        entry = _class_prompt_for(class_prompts, _names[int(cls)])
                     if entry is not None:
                         pos, neg = entry
                         if pos:
@@ -2259,7 +2522,7 @@ class AfterDetailerScript(scripts.Script):
                     # sequential tabs (see `_will_run_sequential`), so these
                     # per-class files are the single source of steps and
                     # nothing is duplicated.
-                    if cls_processed and not is_skip_img2img(p):
+                    if cls_processed:
                         self.save_image(
                             p,
                             pp.image,
@@ -2425,6 +2688,24 @@ class AfterDetailerScript(scripts.Script):
 
             self.fix_p2(p, p2, pp, args, pred, j)
 
+            # The host adds the selected styles after Strip LoRAs, a style's
+            # <lora:...> included: apply them here instead, where the host
+            # would, and strip them too. From i2i: p2 is reused after a NaN.
+            ad_styles = getattr(i2i, "styles", None) or []
+            if ad_styles and getattr(args, "ad_strip_loras", False):
+                p2.styles = ad_styles
+                try:
+                    db = shared.prompt_styles
+                    styled = db.apply_styles_to_prompt(p2.prompt, ad_styles)
+                    styled_neg = db.apply_negative_styles_to_prompt(
+                        p2.negative_prompt, ad_styles
+                    )
+                    p2.prompt = _strip_lora_tags(styled)
+                    p2.negative_prompt = _strip_lora_tags(styled_neg)
+                    p2.styles = []
+                except Exception:  # noqa: BLE001 — the host applies them, as before
+                    pass
+
             if _v:
                 _reg = {
                     "j": j,
@@ -2443,9 +2724,12 @@ class AfterDetailerScript(scripts.Script):
                 print(msg, file=sys.stderr)
                 self._ad_nan_regions = getattr(self, "_ad_nan_regions", 0) + 1
                 # p2 is reused for the next region: undo what fix_p2 derived
-                # from its own previous values, or they would be applied twice.
+                # from its own previous values, or they would be applied twice,
+                # and the host's colour correction of the failed region, which
+                # its init() would otherwise keep for the next one.
                 p2.denoising_strength = i2i.denoising_strength
                 p2.width, p2.height = i2i.width, i2i.height
+                p2.color_corrections = None
                 continue
             except Exception as e:
                 # Forge Neo returns no latent when a cancel lands before the
@@ -2505,25 +2789,38 @@ class AfterDetailerScript(scripts.Script):
 
     @rich_traceback
     def postprocess_image(self, p, pp: PPImage, *args_):
+        # As in process(): an X/Y/Z axis may give the 1st tab its detector.
+        tabs = [arg for arg in args_ if isinstance(arg, dict)]
+        xyz_tab = [{**tabs[0], **p._ad_xyz}] if tabs and hasattr(p, "_ad_xyz") else []
         if (
             getattr(p, "_ad_disabled", False)
             or getattr(p, "_ad_no_mask", False)
-            or not self.is_ad_enabled(*args_)
+            or not self.is_ad_enabled(*args_, *xyz_tab)
         ):
             return
 
-        # Manual-mode short-circuit: user wants to review the raw image first
-        # and only apply ADetailer on selected results (e.g. via img2img +
-        # disable this setting). The Generate produces the unmodified image
-        # and ADetailer is fully bypassed here.
-        if opts.data.get("ad_manual_mode", False):
-            print("[-] ADetailer: manual mode is ON, skipping auto-run.")
-            return
-
+        # Manual mode is decided once per generation, in process(): read here
+        # again, a change made mid-job left a Skip img2img image at the
+        # throwaway size or the other scripts stopped for the next batches.
         pp.image = self.get_i2i_init_image(p, pp)
         pp.image = ensure_pil_image(pp.image, "RGB")
         init_image = copy(pp.image)
         arg_list = self.get_args(p, *args_)
+        if hasattr(p, "_ad_xyz_prompt_sr"):
+            # The host saves this image with these parameters: record its own
+            # prompts. process() had only the first image's main prompt, from
+            # before a wildcard script resolved it. On copies: the pass
+            # applies the S/R itself.
+            record = [tab.copy() for tab in arg_list]
+            self._record_xyz_prompt_sr(p, record)
+            written = self.extra_params(record)
+            for n in range(len(record)):
+                for name in ("ADetailer prompt", "ADetailer negative prompt"):
+                    key = name + suffix(n)
+                    if key in written:
+                        p.extra_generation_params[key] = written[key]
+                    else:
+                        p.extra_generation_params.pop(key, None)
         params_txt_content = self.read_params_txt()
         _verbose_gen_header(p, arg_list)
 
@@ -2553,10 +2850,11 @@ class AfterDetailerScript(scripts.Script):
                     # Sequential-class tabs are EXCLUDED here: they already save
                     # one step image per class inside `_postprocess_image_inner`,
                     # and the last of those equals this tab's final image — saving
-                    # again would just duplicate it.
+                    # again would just duplicate it. Saved with Skip img2img too:
+                    # a step is a detailer result, unlike the -ad-before image,
+                    # which is then the init image.
                     if (
                         tab_processed
-                        and not is_skip_img2img(p)
                         and not self._will_run_sequential(args)
                     ):
                         self.save_image(
@@ -2574,6 +2872,15 @@ class AfterDetailerScript(scripts.Script):
             if need_call_process(p):
                 with preserve_prompts(p):
                     copy_p = copy(p)
+                    # Its own parameters: a script's process() writes there
+                    # again (Dynamic Prompts' Template, from the prompts it
+                    # has already resolved) and p's images would keep it.
+                    copy_p.extra_generation_params = copy(p.extra_generation_params)
+                    # And its own list of the images a script attaches (Forge's
+                    # ControlNet adds its preview again): p's list already has
+                    # the job's own.
+                    if isinstance(getattr(copy_p, "extra_result_images", None), list):
+                        copy_p.extra_result_images = []
                     p.scripts.before_process(copy_p)
                     p.scripts.process(copy_p)
 
@@ -2885,7 +3192,7 @@ def on_ui_settings():
             label="Manual mode — don't auto-run ADetailer after generation",
             section=section,
         ).info(
-            "When enabled, ADetailer no longer runs automatically after each generation. The image goes straight to the gallery untouched. To actually apply ADetailer, use the 'Detection preview' accordion in any ADetailer tab to test detections on an image, then send the image to img2img and disable this option to apply the inpaint. Useful when you want to review the generated image first and only run ADetailer on the ones worth refining."
+            "When enabled, ADetailer no longer runs automatically after each generation. The image goes straight to the gallery untouched. To apply ADetailer to a finished image, use 'Run ADetailer on an image' in any ADetailer tab, which works while this option is on, or send the image to img2img and disable this option. Useful when you want to review the generated image first and only run ADetailer on the ones worth refining."
         ),
     )
 
@@ -2977,11 +3284,11 @@ def on_ui_settings():
     # `do_not_save=True` already (OptionHTML/OptionDiv set the flag in their
     # ctor), so they don't add anything to the saved config.
     #
-    # COMPATIBILITY (issue #2): `OptionDiv` and `OptionHTML` are Forge / Forge
-    # Neo classes; A1111 vanilla's `modules.options` doesn't ship `OptionDiv`.
-    # Guard both so the extension still loads on A1111 — there we simply skip
-    # the cosmetic divider + help block; the Reset button itself (a plain
-    # `OptionInfo`, below) still registers and works everywhere.
+    # COMPATIBILITY (issue #2): `OptionDiv` is a Forge / Forge Neo class;
+    # A1111 vanilla's `modules.options` doesn't ship it (A1111 1.10 does ship
+    # `OptionHTML`). Guard both so the extension still loads on any host — on
+    # A1111 we simply skip the cosmetic divider; the help block and the Reset
+    # button itself (a plain `OptionInfo`, below) still register and work.
     #
     # CRITICAL (Forge): `OptionDiv` / `OptionHTML` do NOT set `.section` in
     # their ctor (only `OptionInfo.__init__` accepts a `section` kwarg), so
@@ -3027,6 +3334,9 @@ def on_ui_settings():
 class PromptSR(NamedTuple):
     s: str
     r: str
+    # Set by the "(AD 1st and main prompt)" axis, which also replaced it in
+    # the main prompt.
+    main: bool = False
 
 
 def set_value(p, x: Any, xs: Any, *, field: str):
@@ -3042,7 +3352,7 @@ def search_and_replace_prompt(p, x: Any, xs: Any, replace_in_main_prompt: bool):
 
     if not hasattr(p, "_ad_xyz_prompt_sr"):
         p._ad_xyz_prompt_sr = []
-    p._ad_xyz_prompt_sr.append(PromptSR(s=xs[0], r=x))
+    p._ad_xyz_prompt_sr.append(PromptSR(s=xs[0], r=x, main=replace_in_main_prompt))
 
 
 def make_axis_on_xyz_grid():
@@ -3251,10 +3561,11 @@ def _clear_missing_class_prompts(_infotext: str, params: dict) -> None:
     class prompts, unticked toggles, ...), and the WebUI keeps a field
     unchanged when its key is missing. For every tab whose detector is in the
     pasted parameters, a missing key therefore means its default. Pasted
-    parameters with a detector also switch ADetailer itself on: the infotext
-    never writes "ADetailer enable". Keys listed in "Disregard fields from
-    pasted infotext" are left alone. Not a Gradio event, so index-safe; never
-    raises. The API's infotext field does not run it.
+    parameters with a detector installed here also switch ADetailer itself
+    on: the infotext never writes "ADetailer enable". Keys listed in
+    "Disregard fields from pasted infotext" are left alone. Not a Gradio
+    event, so index-safe; never raises. The API's infotext field does not
+    run it.
     """
     try:
         skipped = set(getattr(shared.opts, "infotext_skip_pasting", None) or [])
@@ -3264,7 +3575,14 @@ def _clear_missing_class_prompts(_infotext: str, params: dict) -> None:
             if not match:
                 continue
             sfx = match.group(1) or ""
-            detector = detector or str(params[key]) != "None"
+            # A detector not installed here would fail Generate for this tab
+            # and the later ones: as Load does, the tab keeps its detector
+            # and classes, and this detector does not switch ADetailer on.
+            model = str(params[key])
+            missing = model != "None" and bool(model_mapping) and (
+                model not in model_mapping
+            )
+            detector = detector or (model != "None" and not missing)
             defaults = dict(_INFOTEXT_PASTE_DEFAULTS)
             for written, extra in _INFOTEXT_PASTE_DEPENDENT_DEFAULTS.items():
                 if written + sfx in params:
@@ -3272,6 +3590,36 @@ def _clear_missing_class_prompts(_infotext: str, params: dict) -> None:
             for name, default in defaults.items():
                 if name + sfx not in params and name + sfx not in skipped:
                     params[name + sfx] = default
+            # An old combined sampler name ("DPM++ 2M Karras", from WebUI < 1.9
+            # or the API's default) is not a choice of the sampler dropdown:
+            # split it by the scheduler's label, into the sampler plus the
+            # scheduler the WebUI ran it with. Without schedulers (WebUI < 1.9)
+            # it is a choice. Unlike Load, any other name is kept as it is,
+            # also a sampler this WebUI does not have.
+            sampler = params.get("ADetailer sampler" + sfx)
+            if (
+                str(params.get("ADetailer use separate sampler" + sfx)) == "True"
+                and isinstance(sampler, str)
+                and "ADetailer scheduler" + sfx not in skipped
+            ):
+                names = [s.name for s in all_samplers]
+                if sampler != "Use same sampler" and sampler not in names:
+                    for label in (x.label for x in schedulers):
+                        if label and sampler.endswith(" " + label):
+                            if sampler[: -len(label) - 1] in names:
+                                params["ADetailer sampler" + sfx] = sampler[: -len(label) - 1]
+                                params["ADetailer scheduler" + sfx] = label
+                            break
+            if missing:
+                # Without its detector key the tab's detector, class filter
+                # and detection numbers are left alone and the tab is
+                # switched off. ASCII only, for a console in any code page.
+                del params[key]
+                sys.stdout.write(
+                    f"[-] ADetailer: the detector {model!a} of the pasted "
+                    f"{sfx.strip() or '1st'} tab is not installed: that tab "
+                    "keeps its detector and classes.\n"
+                )
         if detector and "ADetailer enable" not in params and (
             "ADetailer enable" not in skipped
         ):

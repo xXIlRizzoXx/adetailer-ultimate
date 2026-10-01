@@ -1,14 +1,24 @@
 name: Bug report
-description: Create a report
+description: Report a problem with ADetailer Ultimate
 title: "[Bug]: "
 labels:
   - bug
 
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a problem. Any language is welcome.
+
+        Before you post a log, a screenshot or an image, remove anything personal: your user name in folder paths (for example `C:\Users\your-name\...`, `/home/your-name/...` or `/Users/your-name/...`), folder and file names you do not want to show, any password, API key or token in the "Launching Web UI with arguments" line, any public link to your WebUI (a `gradio.live`, ngrok or similar address after "Running on public URL"), and prompts you do not want to share. The Verbose diagnostic log also prints the prompt of every region.
+
+        If the same problem happens with the original ADetailer too, it may belong in [its issue tracker](https://github.com/Bing-su/adetailer/issues).
+
   - type: textarea
+    id: description
     attributes:
       label: Describe the bug
-      description: A clear and concise description of what the bug is.
+      description: A clear and short description of the problem.
       placeholder: |
         Any language accepted
         아무 언어 사용가능
@@ -21,22 +31,92 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: webui
+    attributes:
+      label: WebUI
+      description: Which WebUI do you use ADetailer Ultimate in?
+      options:
+        - AUTOMATIC1111
+        - Forge
+        - Forge Neo
+        - reForge
+        - Other (please write which one below)
+    validations:
+      required: true
+
+  - type: input
+    id: webui-version
+    attributes:
+      label: WebUI version
+      description: |
+        The version shown at the bottom of the WebUI page, or its commit. For "Other", also write the name of the WebUI.
+      placeholder: "for example: v1.10.1"
+    validations:
+      required: true
+
+  - type: input
+    id: adetailer-version
+    attributes:
+      label: ADetailer Ultimate version
+      description: |
+        Open the ADetailer panel (this also switches ADetailer on): the badge at the top right of its header shows the version and the build; on a narrow window, widen it to see the whole badge. The console also prints the version at startup, in the line that starts with "[-] ADetailer initialized. version:".
+      placeholder: "for example: ADetailer Ultimate · v26.2.0+plus.8.beta.2 · abc1234"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: Stable or beta?
+      description: The stable release is on the main branch, the beta on the beta branch.
+      options:
+        - Stable
+        - Beta
+        - Not sure
+    validations:
+      required: true
+
   - type: textarea
+    id: steps
     attributes:
       label: Steps to reproduce
-      description: |
-        Description of how we can reproduce this issue.
+      description: What did you do, step by step, so that the problem can be seen again? Include the ADetailer settings that matter (detector, classes, options).
+      placeholder: |
+        1. Open txt2img and turn ADetailer on
+        2. In the 1st tab, pick face_yolov8n.pt
+        3. Click Generate
+        4. ...
+    validations:
+      required: true
 
   - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+      description: What did you expect to happen?
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: What happened instead? Include any message shown in the ADetailer panel.
+
+  - type: textarea
+    id: screenshots
     attributes:
       label: Screenshots
-      description: Screenshots related to the issue.
+      description: |
+        Screenshots of the problem and of the ADetailer settings you used. You can drag images into this field. Remove anything personal first. An image made by the WebUI keeps its prompt and settings inside the file: post a screenshot instead if you do not want to share them.
 
   - type: textarea
+    id: logs
     attributes:
-      label: Console logs, from start to end.
+      label: Console logs, from start to end
       description: |
-        The FULL console log of your terminal.
+        The FULL console log of your terminal, from the start of the WebUI to the error. For a more detailed log, turn on Settings → ADetailer → "Verbose diagnostic log" and repeat the problem.
+
+        ⚠️ Before you paste it, remove anything personal: your user name in folder paths (for example `C:\Users\your-name\...`, `/home/your-name/...` or `/Users/your-name/...`), folder and file names you do not want to show, any password, API key or token in the "Launching Web UI with arguments" line, any public link to your WebUI (a `gradio.live`, ngrok or similar address after "Running on public URL"), and prompts you do not want to share. The Verbose diagnostic log also prints the prompt of every region.
       placeholder: |
         Python ...
         Version: ...
@@ -57,5 +137,15 @@ body:
       required: true
 
   - type: textarea
+    id: extensions
     attributes:
       label: List of installed extensions
+      description: The list in Extensions → Installed. Keep only one ADetailer extension installed; with two, the ADetailer panel appears twice.
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Personal data
+      options:
+        - label: I removed my user name, passwords, API keys, tokens, public links to my WebUI and private prompts from the log, the screenshots and any attached image.
+          required: true

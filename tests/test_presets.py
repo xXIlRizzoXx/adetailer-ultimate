@@ -111,7 +111,7 @@ def test_reserved_name_matches_the_ui_placeholder():
 
 
 def test_unreadable_encoding_does_not_break_ui_startup(preset_file):
-    preset_file.write_bytes(b"\xff\xfe{\x00}\x00")
+    preset_file.write_bytes('{"caf\xe9": {"ad_prompt": "face"}}'.encode("cp1252"))
     assert presets.load_presets() == {}
 
 
@@ -122,9 +122,24 @@ def test_library_with_byte_order_mark_is_read(preset_file):
     assert set(presets.load_presets()) == {"faces", "hands"}
 
 
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-be", "utf-32"])
+def test_library_saved_as_utf16_is_read(preset_file, encoding):
+    # Windows PowerShell 5.1 (">", Out-File) and Notepad's "Unicode" save
+    # UTF-16. Class-name sidecars were read in it; the preset library was
+    # treated as damaged, so every preset vanished from the dropdowns and the
+    # next save set the whole library aside.
+    preset_file.write_bytes('{"faces": {"ad_prompt": "face"}}'.encode(encoding))
+    assert presets.load_presets() == {"faces": {"ad_prompt": "face"}}
+    assert presets.save_preset("hands", {"ad_prompt": "hand"})
+    assert presets.load_presets() == {
+        "faces": {"ad_prompt": "face"},
+        "hands": {"ad_prompt": "hand"},
+    }
+    assert not list(preset_file.parent.glob("user_presets.unreadable-*"))
+
+
 DAMAGED_LIBRARIES = {
     "cp1252": '{"caf\xe9": {"ad_prompt": "face"}}'.encode("cp1252"),
-    "utf16": '{"faces": {"ad_prompt": "face"}}'.encode("utf-16"),
     "trailing-comma": b'{"faces": {"ad_prompt": "face"},}',
     "not-an-object": b'[{"ad_prompt": "face"}]',
 }
@@ -157,7 +172,7 @@ def test_unreadable_library_is_kept_aside_before_a_save(
 def test_unreadable_library_is_left_alone_when_nothing_is_written(
     preset_file, operation
 ):
-    original = DAMAGED_LIBRARIES["utf16"]
+    original = DAMAGED_LIBRARIES["cp1252"]
     preset_file.write_bytes(original)
     if operation == "delete":
         assert not presets.delete_preset("faces")
@@ -178,7 +193,7 @@ def test_library_that_cannot_be_read_right_now_is_not_replaced(
         raise PermissionError("file in use")
 
     with monkeypatch.context() as patched:
-        patched.setattr(type(preset_file), "read_text", locked)
+        patched.setattr(type(preset_file), "read_bytes", locked)
         if operation == "save":
             assert not presets.save_preset("new", {"ad_prompt": "new"})
         else:
@@ -190,11 +205,113 @@ def test_library_that_cannot_be_read_right_now_is_not_replaced(
     assert not list(preset_file.parent.glob("user_presets.unreadable-*"))
 
 
-def test_deeply_nested_library_is_damaged_not_fatal(preset_file):
+def test_undecodable_library_is_damaged_not_fatal(preset_file):
     preset_file.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
     assert presets.load_presets() == {}
     assert presets.save_preset("new", {"ad_prompt": "new"})
     assert len(list(preset_file.parent.glob("user_presets.unreadable-*.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["[" * 100_000, '{"face": {"ad_steps": ' + "1" * 5000 + "}}"],
+    ids=["bad-structure", "bad-number"],
+)
+def test_undecodable_import_is_rejected_not_fatal(preset_file, payload):
+    # Neither payload can be decoded: the import is refused and nothing is
+    # written.
+    import sys
+
+    if "1" * 5000 in payload:
+        if not hasattr(sys, "set_int_max_str_digits"):
+            pytest.skip("not applicable here")
+        limit = sys.get_int_max_str_digits()
+        sys.set_int_max_str_digits(4300)  # the same value in every environment
+        try:
+            result = presets.import_presets_json(payload)
+        finally:
+            sys.set_int_max_str_digits(limit)
+    else:
+        result = presets.import_presets_json(payload)
+
+    assert result == (0, 0, [])
+    assert not preset_file.exists()
+
+
+@pytest.mark.parametrize("operation", ["import", "import-overwrite", "save", "rename", "delete"])
+def test_library_that_cannot_be_encoded_is_reported_not_fatal(
+    preset_file, monkeypatch, operation
+):
+    # A library that cannot be encoded: every write reports a failure and the
+    # file on disk is kept. The encoding error is patched in.
+    import json
+    from types import SimpleNamespace
+
+    assert presets.save_preset("original", {"ad_prompt": "face"})
+    original = preset_file.read_bytes()
+
+    def cannot_encode(*_args, **_kwargs):
+        msg = "cannot encode"
+        raise RecursionError(msg)
+
+    monkeypatch.setattr(presets, "json", SimpleNamespace(loads=json.loads, dumps=cannot_encode))
+    if operation == "import":
+        result = presets.import_presets_json('{"hands": {"ad_prompt": "hand"}}')
+        assert result == (0, 0, ["hands"])
+    elif operation == "import-overwrite":
+        result = presets.import_presets_json(
+            '{"hands": {"ad_prompt": "hand"}, "original": {"ad_prompt": "eyes"}}',
+            overwrite=True,
+        )
+        assert result == (0, 0, ["hands", "original"])
+    elif operation == "save":
+        assert not presets.save_preset("hands", {"ad_prompt": "hand"})
+    elif operation == "rename":
+        ok, message = presets.rename_preset("original", "renamed")
+        assert not ok
+        assert "write" in message
+    else:
+        assert not presets.delete_preset("original")
+
+    assert preset_file.read_bytes() == original
+    # Not monkeypatch.undo(): that would also point _PRESETS_FILE back at the
+    # real library.
+    monkeypatch.setattr(presets, "json", json)
+    assert presets.import_presets_json('{"hands": {"ad_prompt": "hand"}}') == (1, 0, [])
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_import_of_a_preset_nested_too_deeply_is_refused(preset_file, overwrite):
+    # A preset nested too deeply is skipped and reported, and the library on
+    # disk is left as it was.
+    assert presets.save_preset("original", {"ad_prompt": "face"})
+    original = preset_file.read_bytes()
+    deep = '{"x": ' + "[" * 100 + "]" * 100 + "}"
+
+    result = presets.import_presets_json(
+        '{"deep": ' + deep + ', "original": ' + deep + "}", overwrite=overwrite
+    )
+
+    assert result == (0, 0, ["deep", "original"])
+    assert preset_file.read_bytes() == original
+    assert presets.get_preset_names() == ["original"]
+    assert not list(preset_file.parent.glob("user_presets.unreadable-*"))
+    # A normal preset beside it, also with a list value, still imports.
+    assert presets.import_presets_json(
+        '{"deep": ' + deep + ', "hands": {"ad_prompt": "hand", "x": [["hand"]]}}'
+    ) == (1, 0, ["deep"])
+    assert presets.get_preset_names() == ["hands", "original"]
+    assert presets.get_preset("hands") == {"ad_prompt": "hand", "x": [["hand"]]}
+
+
+def test_import_depth_limit_is_far_above_a_real_preset(preset_file):
+    # Right at the limit still imports; one level more does not.
+    limit = presets._MAX_IMPORT_DEPTH
+    at_limit = "[" * (limit - 1) + "]" * (limit - 1)
+    past_limit = "[" * limit + "]" * limit
+    assert presets.import_presets_json('{"ok": {"x": ' + at_limit + "}}") == (1, 0, [])
+    assert presets.import_presets_json('{"no": {"x": ' + past_limit + "}}") == (0, 0, ["no"])
+    assert 8 <= limit <= 64
 
 
 def test_backup_made_in_the_same_second_is_never_overwritten(preset_file, monkeypatch):

@@ -65,7 +65,7 @@ class ControlNetExt:
             module = None
         if module is None:
             for m, v in cn_model_module.items():
-                if m in model:
+                if m in model.lower():  # listed in any case (cn_model_regex)
                     module = v
                     break
 

@@ -195,6 +195,54 @@ def _tasks_api_aborts() -> bool:
     return True
 
 
+# Set once the console has said that MediaPipe cannot be loaded.
+_UNAVAILABLE_REPORTED = False
+
+
+def _report_mediapipe_unavailable(exc: BaseException) -> None:
+    """Say once per session that MediaPipe cannot be loaded (not installed, or
+    a broken install): the detectors then find nothing, which otherwise looked
+    exactly like an image without a face."""
+    global _UNAVAILABLE_REPORTED
+    if _UNAVAILABLE_REPORTED:
+        return
+    _UNAVAILABLE_REPORTED = True
+    msg = (
+        f"[-] ADetailer: MediaPipe could not be loaded ({type(exc).__name__}:"
+        f" {exc}), so the MediaPipe detectors may find nothing until it is"
+        " fixed (reinstall mediapipe in the WebUI's environment)."
+    )
+    try:
+        # ASCII only, so a console in a legacy code page can print it.
+        print(msg.encode("ascii", "backslashreplace").decode("ascii"), file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _native_library_error() -> BaseException | None:
+    """The error that keeps MediaPipe's native library from loading, if any.
+
+    Current MediaPipe wheels load that library only when a detector is created,
+    so a library that cannot load passes the import above and makes
+    create_from_options fail, just like a corrupt model asset. Called only after
+    such a failure, to tell the two apart. Older wheels load their native code
+    at import (already reported there) and have no such loader: None."""
+    try:
+        import importlib
+
+        bindings = importlib.import_module(
+            "mediapipe.tasks.python.core.mediapipe_c_bindings"
+        )
+        load = bindings.load_raw_library
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        load()  # the same call create_from_options makes first
+    except Exception as e:  # noqa: BLE001
+        return e
+    return None
+
+
 def _get_face_landmarker(confidence: float, max_faces: int):
     key = (round(float(confidence), 3), int(max_faces))
     if key in _LANDMARKER_CACHE:
@@ -203,7 +251,8 @@ def _get_face_landmarker(confidence: float, max_faces: int):
         return None
     try:
         from mediapipe.tasks.python import BaseOptions, vision
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _report_mediapipe_unavailable(e)
         return None
     path = _ensure_model(*_FACE_LANDMARKER_ASSET)
     if not path:
@@ -222,6 +271,10 @@ def _get_face_landmarker(confidence: float, max_faces: int):
             )
         )
     except Exception:  # noqa: BLE001
+        err = _native_library_error()
+        if err is not None:  # MediaPipe itself cannot run: keep the asset
+            _report_mediapipe_unavailable(err)
+            return None
         _discard_model(path)  # corrupt asset -> re-download next time
         return None
     _LANDMARKER_CACHE[key] = landmarker
@@ -242,7 +295,8 @@ def _get_face_detector(confidence: float):
         return None
     try:
         from mediapipe.tasks.python import BaseOptions, vision
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _report_mediapipe_unavailable(e)
         return None
     path = _ensure_model(*_FACE_DETECTOR_ASSET)
     if not path:
@@ -257,6 +311,10 @@ def _get_face_detector(confidence: float):
             )
         )
     except Exception:  # noqa: BLE001
+        err = _native_library_error()
+        if err is not None:  # MediaPipe itself cannot run: keep the asset
+            _report_mediapipe_unavailable(err)
+            return None
         _discard_model(path)  # corrupt asset -> re-download next time
         return None
     _DETECTOR_CACHE[key] = detector
@@ -405,11 +463,76 @@ def mediapipe_predict(
     }
     if model_type in mapping:
         try:
+            # MediaPipe takes RGB data only; Gradio 4 hands a GIF over as a
+            # palette or grayscale image, which then found nothing.
+            if image.mode != "RGB":
+                image = image.convert("RGB")
             return mapping[model_type](image, confidence)
         except Exception:  # noqa: BLE001
             return PredictOutput()
     msg = f"[-] ADetailer: Invalid mediapipe model type: {model_type}, Available: {list(mapping.keys())!r}"
     raise RuntimeError(msg)
+
+
+def _unclamp_edge_boxes(detector, arr: np.ndarray, bboxes: list[list[float]]) -> None:
+    """Fit the box of a face cut by the left or top edge to its visible part.
+
+    The tasks FaceDetector clamps such a box's origin to 0 but keeps its full
+    width and height, so the box slid past the face onto the neck or the
+    background. Detect once more on a copy padded with black on those sides,
+    where the whole face fits, and take the matching face's box, shifted back
+    and starting at the edge the face is cut by. Other boxes, and an edge box
+    without a match, are left as they are."""
+    pad_l = int(max((b[2] - b[0] for b in bboxes if b[0] <= 0), default=0))
+    pad_t = int(max((b[3] - b[1] for b in bboxes if b[1] <= 0), default=0))
+    if pad_l <= 0 and pad_t <= 0:
+        return
+    try:
+        import mediapipe as mp
+
+        padded = np.ascontiguousarray(
+            np.pad(arr, ((pad_t, 0), (pad_l, 0), (0, 0)), mode="constant")
+        )
+        res = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=padded))
+        found = []
+        for d in res.detections:
+            bb = d.bounding_box
+            x1 = float(bb.origin_x) - pad_l
+            y1 = float(bb.origin_y) - pad_t
+            found.append([x1, y1, x1 + float(bb.width), y1 + float(bb.height)])
+    except Exception:  # noqa: BLE001
+        return
+    for i, (x1, y1, x2, y2) in enumerate(bboxes):
+        if x1 > 0 and y1 > 0:
+            continue
+        # A re-detected face cut by the same edge (give or take a tenth of the
+        # box) whose visible part's centre lies in this box (a face more than
+        # half outside has its full centre outside the image); the one nearest
+        # its centre.
+        best = None
+        for f in found:
+            cx, cy = (max(f[0], 0) + f[2]) / 2, (max(f[1], 0) + f[3]) / 2
+            if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+                continue
+            if (x1 <= 0 and f[0] > (x2 - x1) / 10) or (
+                y1 <= 0 and f[1] > (y2 - y1) / 10
+            ):
+                continue  # another face that is not cut by that edge
+            dist = (cx - (x1 + x2) / 2) ** 2 + (cy - (y1 + y2) / 2) ** 2
+            if best is None or dist < best[0]:
+                best = (dist, f)
+        if best is not None:
+            f = best[1]
+            # Still touching the edge the detector saw the face cut by, and
+            # inside the image: the re-detected box of a face that fills the
+            # frame can run past the far edge, and with an area ratio over 1.0
+            # the "Mask max area ratio" filter dropped the face.
+            bboxes[i] = [
+                0.0 if x1 <= 0 else max(f[0], 0.0),
+                0.0 if y1 <= 0 else max(f[1], 0.0),
+                min(f[2], float(arr.shape[1])),
+                min(f[3], float(arr.shape[0])),
+            ]
 
 
 def mediapipe_face_detection(
@@ -449,6 +572,7 @@ def mediapipe_face_detection(
             )
         if not bboxes:
             return PredictOutput()
+        _unclamp_edge_boxes(detector, arr, bboxes)
         masks = create_mask_from_bbox(bboxes, image.size)
         preview = draw_preview(image.convert("RGB").copy(), bboxes, masks)
         return PredictOutput(
