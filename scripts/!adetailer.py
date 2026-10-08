@@ -1646,7 +1646,9 @@ class AfterDetailerScript(scripts.Script):
             return image
         return pp.image
 
-    def run_detailer_on_image(self, image, args: ADetailerArgs, save: bool = False):
+    def run_detailer_on_image(
+        self, image, args: ADetailerArgs, save: bool = False, tab: int = 0
+    ):
         """Run the ADetailer detect+inpaint pass on a standalone image, with NO
         base generation — powers the Detection-preview "also run ADetailer"
         option (issue #4). Builds a minimal p-shell that get_i2i_p reads its base
@@ -1681,10 +1683,13 @@ class AfterDetailerScript(scripts.Script):
             # regeneration resolution is capped. In the non-default "inpaint
             # whole picture" mode the output itself is produced at this capped
             # size — an accepted tradeoff to avoid OOM on an auxiliary preview.
+            # Integer arithmetic, so the longest side of a large picture is
+            # exactly 1024: with a float scale, 1288 * (1024 / 1288) is
+            # 1023.99..., which became 1016. Up to 1024 the size is unscaled.
             max_side = 1024
-            scale = min(1.0, max_side / max(w, h))
-            w8 = max(64, (int(w * scale) // 8) * 8)
-            h8 = max(64, (int(h * scale) // 8) * 8)
+            longest = max(w, h, max_side)
+            w8 = max(64, (w * max_side // longest // 8) * 8)
+            h8 = max(64, (h * max_side // longest // 8) * 8)
 
             sampler = "Euler a"
             try:
@@ -1711,6 +1716,19 @@ class AfterDetailerScript(scripts.Script):
             # others always got the fixed seeds 0, 1, ...
             seed = int(random.randrange(4294967294))
             subseed = int(random.randrange(4294967294))
+            # The tab's "ADetailer ..." parameters, as a generation where only
+            # this tab (`tab`, 0-based) runs writes them: the pass copies them
+            # into its own (get_i2i_p), so pasted back the result restores the
+            # tab, not only the img2img pass. The tab ran, so it counts as
+            # enabled. Guarded: without them the result keeps the pass's
+            # parameters, as before.
+            try:
+                off = args.copy(update={"ad_model": "None"})
+                ad_params = self.extra_params(
+                    [*([off] * tab), args.copy(update={"ad_tab_enable": True})]
+                )
+            except Exception:  # noqa: BLE001
+                ad_params = {}
             p = SimpleNamespace(
                 sd_model=shared.sd_model,
                 prompt="",
@@ -1739,10 +1757,11 @@ class AfterDetailerScript(scripts.Script):
                 restore_faces=False,
                 outpath_samples=outdir,
                 outpath_grids=outgrid,
-                extra_generation_params={},
+                extra_generation_params=ad_params,
                 scripts=None,
                 script_args=[],
                 override_settings={},
+                _ad_standalone=True,
             )
 
             # NB: PPImage is a typing Protocol (helper.py) and cannot be
@@ -2763,7 +2782,11 @@ class AfterDetailerScript(scripts.Script):
                 processed = None
                 break
 
-            self.compare_prompt(p.extra_generation_params, processed, n=n)
+            # Not for "Run ADetailer on an image" and folder runs, which printed
+            # no such line before their shell got the tab's parameters: this
+            # pass runs as the 1st tab (n=0), so only the 1st tab's would match.
+            if not getattr(p, "_ad_standalone", False):
+                self.compare_prompt(p.extra_generation_params, processed, n=n)
             p2 = copy(i2i)
             p2.init_images = [processed.images[0]]
 

@@ -448,13 +448,14 @@ def on_generate_click(
     # pair scopes the persisted state by pipeline so txt2img and img2img
     # don't overwrite each other. Never raise — see adetailer.persistence
     # for the swallowed-error policy.
-    save_tab_state(mode, tab_index, state)
+    written = save_tab_state(mode, tab_index, state)
     # Diagnostic log (console) — show exactly what each active tab persisted on
     # this Generate, so saved settings are visible/auditable in the log (paired
-    # with the restore log in one_ui_group). Only logs tabs with a real
-    # detector to avoid noise. Plain print → index-safe. !a writes any
+    # with the restore log in one_ui_group). Only logs tabs really written (not
+    # with "Remember last-used settings" off or a failed save) with a real
+    # detector, to avoid noise. Plain print → index-safe. !a writes any
     # non-ASCII character as an escape, so a console in any code page prints it.
-    if state.get("ad_model") and state.get("ad_model") != "None":
+    if written and state.get("ad_model") and state.get("ad_model") != "None":
         _cls = (
             state.get("ad_model_classes_excluded")
             if state.get("ad_model_classes_exclude")
@@ -929,13 +930,84 @@ def adui(
     return components, infotext_fields
 
 
+def _chip_spot(first, box, size, image_size, taken):
+    """Top-left corner (x, y) for a ``size`` (w, h) label chip of ``box``
+    (x1, y1, x2, y2) that keeps it clear of the chips already drawn: ``taken``
+    holds their [x0, y0, x1, y1] and gets this chip's too. ``first`` is the
+    chip's usual spot and is kept whenever it is free and inside the image, so
+    a preview without crowded boxes is drawn as before. Otherwise the chip takes
+    the first free spot next to the box: above it, inside one of its corners,
+    below it, beside it, or above or below it just past a chip in the way; when
+    no spot is free, the one that covers the least of the other chips. Every
+    spot is moved inside the image. Only the chips near the box are compared,
+    and with more than 40 of them (hundreds of boxes, as at a confidence near
+    0) the chip keeps its usual spot, so such a preview stays quick. Plain
+    arithmetic, no fonts."""
+    w, h = size
+    img_w, img_h = image_size
+    x1, y1, x2, y2 = box
+
+    def inside(sx, sy):
+        # Inside the image; a chip larger than the image still starts in it.
+        return (
+            max(0, min(sx, img_w - w if w <= img_w else img_w - 1)),
+            max(0, min(sy, img_h - h if h <= img_h else img_h - 1)),
+        )
+
+    fixed = (
+        first,
+        (x1, y1 - h), (x1 + 2, y1 + 2), (x1 + 2, y2 - h - 2), (x1, y2 + 2),
+        (x2 - w - 2, y1 + 2), (x2 - w, y1 - h), (x2 - w, y2 + 2),
+        (x1 - w - 2, y1), (x2 + 2, y1),
+    )
+    # Every spot, before and after it is moved inside the image, lies in the
+    # area these fixed spots span: a chip that does not touch that area can be
+    # neither in the way of a spot nor the chip a spot slides past.
+    corners = fixed + tuple(inside(*s) for s in fixed)
+    left, right = min(c[0] for c in corners), max(c[0] for c in corners) + w
+    top, bottom = min(c[1] for c in corners), max(c[1] for c in corners) + h
+    near = [
+        r for r in taken
+        if r[0] <= right and left <= r[2] and r[1] <= bottom and top <= r[3]
+    ]
+
+    def spots():
+        yield from fixed
+        for y in (y1 - h, y2 + 2):
+            for r in near:
+                if r[1] < y + h and y < r[3]:
+                    yield from (
+                        (x, y) for x in (r[2] + 1, r[0] - w - 1) if x1 - w < x < x2
+                    )
+
+    if len(near) > 40:
+        x, y = inside(*first)
+    else:
+        best = None
+        for sx, sy in spots():
+            x, y = inside(sx, sy)
+            cover = sum(
+                max(0, min(x + w, r[2]) - max(x, r[0]))
+                * max(0, min(y + h, r[3]) - max(y, r[1]))
+                for r in near
+            )
+            if best is None or cover < best[0]:
+                best = (cover, x, y)
+            if not cover:
+                break
+        _cover, x, y = best
+    taken.append([x, y, x + w, y + h])
+    return x, y
+
+
 def _draw_detection_numbers(img, bboxes, class_names=None):
     """Overlay a bold 1-based ordinal (#1, #2, …) on each detection box, in RAW
     detector order — the same order the ``ad_inpaint_indices`` filter uses — so a
     user can read a number off the single-tab Detection preview and type it to
     keep only that region. With ``class_names`` (parallel to ``bboxes``) the
     chip also names the class ("#1 eyes"): it sits where a MediaPipe plot writes
-    its label, and hides it. Cosmetic and fully guarded: any failure (bad font,
+    its label, and hides it. A chip that would cover an earlier one moves next
+    to its box (see _chip_spot). Cosmetic and fully guarded: any failure (bad font,
     bad box) returns the image unchanged rather than breaking the preview."""
     try:
         from PIL import ImageDraw, ImageFont
@@ -955,9 +1027,10 @@ def _draw_detection_numbers(img, bboxes, class_names=None):
                 font = ImageFont.load_default(size=fsize)  # Pillow >= 10.1
             except Exception:  # noqa: BLE001
                 font = ImageFont.load_default()
+        taken = []  # the chips drawn so far, kept clear of each other
         for j, box in enumerate(bboxes):
             try:
-                x1, y1 = int(box[0]), int(box[1])
+                x1, y1, x2, y2 = (int(v) for v in box[:4])
             except Exception:  # noqa: BLE001
                 continue
             label = f"#{j + 1}"
@@ -971,10 +1044,15 @@ def _draw_detection_numbers(img, bboxes, class_names=None):
                 label = f"#{j + 1}"
                 tb = draw.textbbox((0, 0), label, font=font)
             tw, th = tb[2] - tb[0], tb[3] - tb[1]
-            lx, ly = x1 + 2, y1 + 2  # just inside the box's top-left corner
+            # Just inside the box's top-left corner, unless a chip is there.
+            lx, ly = _chip_spot(
+                (x1 + 2, y1 + 2), (x1, y1, x2, y2), (tw + 8, th + 7), out.size, taken
+            )
             # Solid dark chip + bright number so it reads over any preview colour.
             draw.rectangle([lx, ly, lx + tw + 8, ly + th + 7], fill=(0, 0, 0))
-            draw.text((lx + 4, ly + 3), label, fill=(255, 255, 0), font=font)
+            # A font draws its text tb[0] right of and tb[1] below the point it
+            # is given, more at a larger size: start it 4 and 3 px inside the chip.
+            draw.text((lx + 4 - tb[0], ly + 3 - tb[1]), label, fill=(255, 255, 0), font=font)
         return out
     except Exception:  # noqa: BLE001
         return img
@@ -1083,7 +1161,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     return None, f"⚠️ Couldn't read this tab's settings: {e}"
                 if not args_obj.ad_model or args_obj.ad_model == "None":
                     return None, "⚠️ Pick a detector model first."
-                return script.run_detailer_on_image(image, args_obj, save=save)
+                return script.run_detailer_on_image(
+                    image, args_obj, save=save, tab=tab_idx
+                )
 
             # Single-tab: reuse the rich ultralytics/mediapipe plot (class
             # labels + confidence baked in by the detector's own plotter).
@@ -1189,7 +1269,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                         continue
             canvas = canvas.convert("RGB")
 
-            # Pass 2: box outline + readable label on top of the tints.
+            # Pass 2: box outlines, then readable labels on top of the tints.
             draw = ImageDraw.Draw(canvas)
             fsize = max(15, canvas.height // 45)
             line_w = max(3, canvas.height // 320)
@@ -1206,10 +1286,16 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 except Exception:  # noqa: BLE001
                     font = ImageFont.load_default()
 
+            # Every outline first, then every label: drawn together, the
+            # outline of a later box (3 px or wider) ran across earlier labels.
+            for _i, color, bboxes, _cf, _nm, _masks in results:
+                for box in bboxes:
+                    x1, y1, x2, y2 = [int(v) for v in box[:4]]
+                    draw.rectangle([x1, y1, x2, y2], outline=color, width=line_w)
+            taken = []  # the labels drawn so far, kept clear of each other
             for i, color, bboxes, confs, names, _masks in results:
                 for j, box in enumerate(bboxes):
                     x1, y1, x2, y2 = [int(v) for v in box[:4]]
-                    draw.rectangle([x1, y1, x2, y2], outline=color, width=line_w)
                     cls = names[j] if j < len(names) else f"T{i + 1}"
                     c = confs[j] if j < len(confs) else None
                     # "#<det> <tab>:<class> <conf>" — the leading #N is this tab's
@@ -1230,8 +1316,12 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                         tb = draw.textbbox((0, 0), label, font=font)
                     tw, th = tb[2] - tb[0], tb[3] - tb[1]
                     ly = y1 - th - 7 if (y1 - th - 7) >= 0 else y1 + 2
-                    draw.rectangle([x1, ly, x1 + tw + 8, ly + th + 7], fill=color)
-                    draw.text((x1 + 4, ly + 3), label, fill=(255, 255, 255), font=font)
+                    lx, ly = _chip_spot(
+                        (x1, ly), (x1, y1, x2, y2), (tw + 8, th + 7), canvas.size, taken
+                    )
+                    draw.rectangle([lx, ly, lx + tw + 8, ly + th + 7], fill=color)
+                    # The text inside the chip, as for the single-tab numbers.
+                    draw.text((lx + 4 - tb[0], ly + 3 - tb[1]), label, fill=(255, 255, 255), font=font)
 
             return (
                 canvas,
@@ -1424,6 +1514,23 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                                 )
                                 print(msg.encode("ascii", "backslashreplace").decode("ascii"))
                             else:
+                                # The pass's parameters, the tab's ADetailer keys
+                                # included, which the WebUI puts on the result
+                                # only with "Write infotext to metadata" on. They
+                                # are written as the WebUI writes its own: a PNG
+                                # text chunk, the EXIF comment of a JPEG or WebP,
+                                # nothing for BMP and TIFF.
+                                _info = (getattr(img, "info", None) or {}).get("parameters")
+                                if not isinstance(_info, str) or not _info:
+                                    _info = None
+                                try:
+                                    from modules import shared as _host
+
+                                    if not getattr(_host.opts, "enable_pnginfo", True):
+                                        _info = None
+                                except Exception:  # noqa: BLE001 — no setting: the result decides
+                                    pass
+                                _ext = f.suffix.lower()
                                 try:
                                     _kw = {"icc_profile": _icc} if _icc else {}
                                     if f.suffix.lower() in {".jpg", ".jpeg"}:
@@ -1439,8 +1546,55 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                                         )
                                         img.save(dst, **_q, **_kw)
                                     else:
+                                        if _info and _ext == ".png":
+                                            from PIL import PngImagePlugin
+
+                                            _kw["pnginfo"] = PngImagePlugin.PngInfo()
+                                            _kw["pnginfo"].add_text("parameters", _info)
                                         img.save(dst, **_kw)
                                     saved += 1
+                                    if _info and _ext in {".jpg", ".jpeg", ".webp"}:
+                                        # The WebUI's own way (piexif, which it
+                                        # ships): the copy is written first and
+                                        # only a complete new file replaces it (a
+                                        # rewrite in place would empty it), so a
+                                        # failure here only leaves it without them.
+                                        _tmp = dst.with_name(dst.name + ".tmp")
+                                        _made = False
+                                        try:
+                                            import io as _io
+
+                                            import piexif
+                                            import piexif.helper
+
+                                            _with = _io.BytesIO()
+                                            piexif.insert(
+                                                piexif.dump({
+                                                    "Exif": {
+                                                        piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
+                                                            _info, encoding="unicode"
+                                                        )
+                                                    }
+                                                }),
+                                                dst.read_bytes(),
+                                                _with,
+                                            )
+                                            # "x": never over a file already there.
+                                            with open(_tmp, "xb") as _fh:
+                                                _made = True
+                                                _fh.write(_with.getvalue())
+                                            _tmp.replace(dst)
+                                        except Exception as e:  # noqa: BLE001 — keep the copy
+                                            if _made:
+                                                try:
+                                                    _tmp.unlink()
+                                                except OSError:
+                                                    pass
+                                            msg = (
+                                                f"[-] ADetailer: saved {dst.name} without "
+                                                f"its parameters ({e})."
+                                            )
+                                            print(msg.encode("ascii", "backslashreplace").decode("ascii"))
                                 except Exception as e:  # noqa: BLE001 — keep the result
                                     not_saved += 1
                                     msg = f"[-] ADetailer: couldn't save {dst} ({e})."
@@ -2654,18 +2808,27 @@ def one_ui_group(
             # model list (so it fell back to the default) — the usual reason a
             # tab "resets" on restart. Plain print → index-safe. ASCII only (!a),
             # or a console in a legacy code page could not build the panel.
+            # The class filter is named as the saved-tab line names it: NOT
+            # mode is marked, and a YOLO-World tab, which has no NOT mode,
+            # shows the classes typed in its free-text box.
             _saved_model_raw = saved.get("ad_model")
             if _saved_model_raw and _saved_model_raw != _saved_model:
+                _mode_word = "NOT/exclude" if _saved_exclude else "include"
                 print(
                     f"[-] ADetailer: tab {n + 1} - saved detector "
                     f"{_saved_model_raw!a} is NOT in the current model list; "
-                    f"fell back to {_saved_model!a}. (saved classes: "
+                    f"fell back to {_saved_model!a}. (saved classes[{_mode_word}]: "
                     f"{_wanted_classes!a})"
                 )
             elif _saved_model_raw and _saved_model_raw != "None":
+                _not = _saved_exclude and not _is_world_saved  # as the checkbox
+                _mode_word = "NOT/exclude" if _not else "include"
+                _restored_classes = (
+                    sv("ad_model_classes", "") if _is_world_saved else _dd_value
+                )
                 print(
                     f"[-] ADetailer: tab {n + 1} restored - detector="
-                    f"{_saved_model!a}, classes={_dd_value!a}"
+                    f"{_saved_model!a}, classes[{_mode_word}]={_restored_classes!a}"
                 )
 
             # UI-only dropdown: not in ALL_ARGS. It syncs into ad_model_classes

@@ -107,17 +107,20 @@ def load_state(mode: str = "txt2img") -> dict[str, dict[str, Any]]:
 
 def save_tab_state(
     mode: str, tab_index: int, state: dict[str, Any]
-) -> None:
+) -> bool:
     """Persist a single tab's state to disk under the scoped key
     `"<mode>:<tab_index>"`.
 
-    No-op if the user disabled the feature in Settings > ADetailer.
+    Returns True only when the file was written. Nothing is written, and
+    False is returned, when the user disabled the feature in Settings >
+    ADetailer, the file cannot be read right now, a damaged file cannot be
+    set aside, or the write fails.
     Writes the full file atomically: read existing -> mutate -> tmp file ->
     rename. Drops `is_api` (it's transient, tuple-vs-bool serialization
     causes infotext quirks).
     """
     if not _enabled():
-        return
+        return False
     with _STATE_LOCK:
         try:
             current, damaged = _read_raw()
@@ -125,7 +128,7 @@ def save_tab_state(
                 # Unreadable right now: skip this save. Damaged: keep the old
                 # file under a new name rather than overwrite every other tab.
                 if not damaged or set_aside(_STATE_FILE) is None:
-                    return
+                    return False
                 current = {}
             cleaned = {k: v for k, v in state.items() if k != "is_api"}
             current[_state_key(mode, tab_index)] = cleaned
@@ -144,4 +147,5 @@ def save_tab_state(
         except OSError:
             # Disk full / permission denied / network drive flaked / ... — we
             # don't want a save failure to break the user's generation.
-            pass
+            return False
+    return True

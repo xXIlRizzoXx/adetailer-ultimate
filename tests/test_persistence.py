@@ -164,3 +164,40 @@ def test_state_saves_where_the_file_system_cannot_sync(state_file, monkeypatch):
     persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
     assert persistence.load_state() == {"0": {"ad_prompt": "face"}}
     assert not state_file.with_suffix(".json.tmp").exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "written", "damaged, set aside", "off", "replace fails", "locked",
+        "damaged, not set aside",
+    ],
+)
+def test_save_tab_state_says_whether_it_wrote_the_file(state_file, monkeypatch, case):
+    # Generate prints "saved tab N" only when this returns True. It returned
+    # None in every case, so the line could not tell a skipped or failed save
+    # (the option off, the file in use, a full disk) from a real one.
+    if case.startswith("damaged"):
+        state_file.write_bytes(b'{"txt2img:1": ')
+    else:
+        persistence.save_tab_state("txt2img", 1, {"ad_prompt": "hands"})
+    before = state_file.read_bytes()
+
+    def fail(*_args, **_kwargs):
+        msg = "file in use"
+        raise PermissionError(msg)
+
+    with monkeypatch.context() as patched:
+        if case == "off":
+            patched.setattr(persistence, "_enabled", lambda: False)
+        elif case == "replace fails":
+            patched.setattr(persistence.os, "replace", fail)
+        elif case == "locked":
+            patched.setattr(type(state_file), "read_bytes", fail)
+        elif case == "damaged, not set aside":
+            patched.setattr(persistence, "set_aside", lambda _path: None)
+        written = persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
+
+    expected = case in {"written", "damaged, set aside"}
+    assert written is expected
+    assert (state_file.read_bytes() != before) is expected

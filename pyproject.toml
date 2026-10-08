@@ -31,7 +31,7 @@ repository = "https://github.com/xXIlRizzoXx/adetailer-ultimate"
 
 [project.optional-dependencies]
 dev = ["devtools"]
-test = ["pytest", "hypothesis"]
+test = ["pytest", "hypothesis", "piexif"]
 
 [tool.pytest.ini_options]
 markers = [

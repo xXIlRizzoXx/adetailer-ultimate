@@ -1048,7 +1048,7 @@ def test_saved_tab_line_prints_on_a_legacy_code_page(monkeypatch, model, classes
                 "ad_model_classes_excluded",
             )
         ),
-        "save_tab_state": lambda mode, tab, state: saved.append(dict(state)),
+        "save_tab_state": lambda mode, tab, state: saved.append(dict(state)) or True,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(ui_path), "exec"), namespace)
     buffer = io.BytesIO()
@@ -1065,6 +1065,187 @@ def test_saved_tab_line_prints_on_a_legacy_code_page(monkeypatch, model, classes
     assert [s["ad_model"] for s in saved] == [model]
     assert b"saved tab 2 (txt2img)" in buffer.getvalue()
     assert printed in buffer.getvalue()
+
+
+@pytest.mark.parametrize("remember", [True, False])
+def test_saved_tab_line_only_when_the_tab_was_written(
+    tmp_path, monkeypatch, capsys, remember
+):
+    # With Settings -> ADetailer -> "Remember last-used settings between
+    # restarts" off, every Generate still printed "saved tab N" for each tab
+    # with a detector, although nothing was written to user_state.json.
+    from adetailer import persistence
+
+    state_file = tmp_path / "user_state.json"
+    monkeypatch.setattr(persistence, "_STATE_FILE", state_file)
+    modules = ModuleType("modules")
+    modules.shared = ModuleType("modules.shared")
+    modules.shared.opts = SimpleNamespace(data={"ad_remember_last_settings": remember})
+    monkeypatch.setitem(sys.modules, "modules", modules)
+    monkeypatch.setitem(sys.modules, "modules.shared", modules.shared)
+    ui_path = _SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(ui_path.read_text(encoding="utf-8"))
+    nodes = [
+        tree.body[0],  # from __future__ import annotations
+        *(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "on_generate_click"
+        ),
+    ]
+    namespace = {
+        "ALL_ARGS": SimpleNamespace(
+            attrs=(
+                "ad_model", "ad_model_classes", "ad_model_classes_exclude",
+                "ad_model_classes_excluded",
+            )
+        ),
+        "save_tab_state": persistence.save_tab_state,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(ui_path), "exec"), namespace)
+
+    state = namespace["on_generate_click"](
+        {}, "face_yolov8n.pt", "face", False, "", mode="txt2img", tab_index=0
+    )
+
+    assert (state["ad_model"], state["ad_model_classes"]) == ("face_yolov8n.pt", "face")
+    assert state_file.exists() is remember
+    assert ("saved tab 1 (txt2img)" in capsys.readouterr().out) is remember
+
+
+def _start_up_class_filter(monkeypatch, saved):
+    # Runs one_ui_group's own start-up code for the detector and its class
+    # filter (the fallback for a detector that is gone, the class widgets'
+    # starting values and the "tab N restored" / "fell back" line) on a
+    # console in a legacy code page. Returns the console output and what the
+    # class widgets start with.
+    from functools import partial
+
+    ui_path = _SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(ui_path.read_text(encoding="utf-8"))
+    group = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "one_ui_group"
+    )
+
+    def assigned(node, name):
+        return isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == name
+
+    def index(body, name):
+        return next(i for i, node in enumerate(body) if assigned(node, name))
+
+    start = index(group.body, "_saved_model")
+    detection = next(
+        node for node in group.body[start:]
+        if isinstance(node, ast.With) and any(assigned(s, "_is_world_saved") for s in node.body)
+    )
+    rows = [s for s in detection.body if isinstance(s, ast.With)]
+    row = next(r for r in rows if any(assigned(s, "_saved_exclude") for s in r.body))
+    first = index(row.body, "_saved_exclude")
+    last = next(
+        i for i, s in enumerate(row.body)
+        if isinstance(s, ast.If) and "_saved_model_raw" in ast.unparse(s.test)
+    )
+    body = [
+        tree.body[0],  # from __future__ import annotations
+        *(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_sv"),
+        group.body[index(group.body, "saved")],
+        group.body[index(group.body, "sv")],
+        *group.body[start : start + 2],  # a detector that is gone falls back
+        detection.body[index(detection.body, "_is_world_saved")],
+        *row.body[first : last + 1],
+    ]
+    widgets = {
+        ast.unparse(s.targets[0]): {k.arg: k.value for k in s.value.keywords}
+        for r in rows
+        for s in r.body
+        if isinstance(s, ast.Assign) and ast.unparse(s.targets[0]).startswith("w.ad_model")
+    }
+    namespace = {
+        "partial": partial,
+        "saved_tab_state": saved,
+        "n": 0,
+        "model_choices": ["animals.pt", "custom-world.pt", "None"],
+        "webui_info": SimpleNamespace(model_mapping={"animals.pt": "animals.pt"}),
+        "MEDIAPIPE_FACE_FEATURES_MODEL": "mediapipe_face_features",
+        "get_model_class_names": lambda path: {"animals.pt": ["cat", "dog"]}.get(path, []),
+    }
+    buffer = io.BytesIO()
+    monkeypatch.setattr(
+        sys, "stdout",
+        io.TextIOWrapper(buffer, encoding="cp1252", errors="strict", write_through=True),
+    )
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(ui_path), "exec"), namespace)
+
+    def value(name):
+        node = widgets[f"w.{name}"]["value"]
+        return eval(compile(ast.Expression(node), str(ui_path), "eval"), namespace)
+
+    return buffer.getvalue(), {
+        "classes": value("ad_model_classes"),
+        "selection": value("ad_model_classes_dropdown"),
+        "not": value("ad_model_classes_exclude"),
+        "excluded": value("ad_model_classes_excluded"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("saved", "printed"),
+    [
+        # YOLO-World: the classes typed in its free-text box.
+        (
+            {"ad_model": "custom-world.pt", "ad_model_classes": "person,cat"},
+            b"tab 1 restored - detector='custom-world.pt', classes[include]='person,cat'",
+        ),
+        # Saved in NOT mode by an older release: YOLO-World starts with NOT
+        # mode off and detects its typed classes.
+        (
+            {
+                "ad_model": "custom-world.pt", "ad_model_classes": "person",
+                "ad_model_classes_exclude": True, "ad_model_classes_excluded": "hand",
+            },
+            b"detector='custom-world.pt', classes[include]='person'",
+        ),
+        ({"ad_model": "custom-world.pt", "ad_model_classes": "顔"},
+         b"classes[include]='\\u9854'"),
+        # NOT mode says that the classes are excluded.
+        (
+            {
+                "ad_model": "animals.pt", "ad_model_classes_exclude": True,
+                "ad_model_classes_excluded": "dog",
+            },
+            b"detector='animals.pt', classes[NOT/exclude]=['dog']",
+        ),
+        ({"ad_model": "animals.pt", "ad_model_classes": "cat"},
+         b"detector='animals.pt', classes[include]=['cat']"),
+        ({"ad_model": "animals.pt"}, b"detector='animals.pt', classes[include]=[]"),
+        # A saved detector that is gone: its saved filter, marked the same way.
+        (
+            {
+                "ad_model": "gone.pt", "ad_model_classes_exclude": True,
+                "ad_model_classes_excluded": "dog",
+            },
+            b"fell back to 'animals.pt'. (saved classes[NOT/exclude]: ['dog'])",
+        ),
+        ({"ad_model": "gone.pt", "ad_model_classes": "cat"},
+         b"(saved classes[include]: ['cat'])"),
+    ],
+)
+def test_start_up_line_names_the_class_filter_each_tab_restored(monkeypatch, saved, printed):
+    # A tab with a YOLO-World detector printed "classes=[]" although its typed
+    # classes were restored, and a tab in NOT mode listed its excluded classes
+    # as "classes=[...]", without saying that they are excluded.
+    output, shown = _start_up_class_filter(monkeypatch, saved)
+
+    assert printed in output
+    line = output.decode("cp1252").strip()
+    assert "\n" not in line  # one line for the tab
+    if " restored - " in line:
+        # The line names what the class widgets really start with.
+        assert ("[NOT/exclude]" in line) is shown["not"]
+        world = "-world" in saved["ad_model"]
+        assert line.endswith(f"={(shown['classes'] if world else shown['selection'])!a}")
+        if shown["not"]:
+            assert ",".join(shown["selection"]) == shown["excluded"]
 
 
 def test_class_skip_block_does_not_skip_the_inverted_background():
@@ -2066,6 +2247,58 @@ def test_whole_picture_inpaint_keeps_the_image_size(scale, match, only_masked, s
     )
 
     assert (p2.width, p2.height) == size
+
+
+def test_readme_says_how_scale_inpaint_to_bbox_rounds_its_sizes():
+    # The README said that the sizes are rounded down to a multiple of 8, but
+    # fix_p2 first rounds the box's side times the scale to the nearest pixel:
+    # a 114-pixel side at scale 1.4 (159.6 pixels) gives 160, not 152.
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    runtime = _load_script(
+        methods={
+            "fix_p2", "get_dynamic_denoise_strength", "get_optimal_crop_image_size",
+            "get_seed", "get_each_tab_seed",
+        },
+        opts=SimpleNamespace(data={}),
+        shared=SimpleNamespace(opts=SimpleNamespace(data={})),
+        get_i=lambda _p: 0,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    outer = SimpleNamespace(seed=1, subseed=1, all_seeds=[1], all_subseeds=[1])
+
+    def scaled(side, scale):
+        p2 = SimpleNamespace(width=512, height=512, denoising_strength=0.4, image_mask=None)
+        args = ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_use_resolution_scale=True,
+            ad_resolution_scale=scale,
+        )
+        runtime.AfterDetailerScript().fix_p2(
+            outer, p2, SimpleNamespace(image=Image.new("RGB", (1024, 1024))), args,
+            SimpleNamespace(bboxes=[[10, 10, 10 + side, 10 + side]]), 0,
+        )
+        return p2.width
+
+    section = _readme_section("### Scale inpaint to bbox", "### Dynamic denoise by area")
+    rule = next(
+        flat for flat in map(_flat_doc_text, section.split("\n- "))
+        if "multiple of 8" in flat
+    )
+    assert "nearest pixel, then down to a multiple of 8" in rule, rule
+    assert "at least 64" in rule
+    assert scaled(40, 1.0) == 64
+    # The README's example is what the code gives, and shows the rounding
+    # to the nearest pixel: rounded down at once, its side would be 152.
+    side, scale, exact, result = re.search(
+        r"(\d+)-pixel side at scale ([\d.]+) \(([\d.]+) pixels\) gives (\d+)", rule
+    ).groups()
+    assert float(exact) == pytest.approx(int(side) * float(scale))
+    assert scaled(int(side), float(scale)) == int(result)
+    assert int(float(exact)) // 8 * 8 != int(result)
+    assert scaled(101.3, 1.5) == 152  # a fractional box: 151.95 pixels
 
 
 @pytest.mark.parametrize(
@@ -3710,6 +3943,105 @@ def test_the_applied_prompt_line_prints_on_a_legacy_console(monkeypatch):
     out = stdout.buffer.getvalue().decode("ascii")
     assert "ad_prompt: 'smile, \\u7b11\\u9854, <lora:detail:1>'" in out
     assert "ad_negative_prompt: 'blurry, [cat:dog:0.5], \\U0001f600'" in out
+
+
+@pytest.mark.parametrize("tab", [0, 1])
+def test_a_standalone_run_prints_no_applied_prompt_line(tmp_path, capsys, tab):
+    # From beta 3 the standalone pass carries the tab's "ADetailer ..."
+    # parameters, and its inner pass, which runs as the 1st tab (n=0),
+    # compared their "ADetailer prompt" with the prompt used: a run from the
+    # 1st tab printed "applied 1st ad_prompt: ...", while a run from the 2nd
+    # tab, whose key is "ADetailer prompt 2nd", printed nothing. As in beta 2,
+    # these runs print no such line; a generation still prints it.
+    from adetailer.args import ADetailerArgs
+
+    sfx = _ui_suffix()
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, stopping_generation=False,
+        job_count=0, assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", (64, 64), "white")
+    result = Image.new("RGB", (64, 64), "red")
+    runtime = _load_script(
+        methods={
+            "run_detailer_on_image", "read_params_txt", "write_params_txt",
+            "_postprocess_image_inner", "compare_prompt", "extra_params",
+        },
+        paths=SimpleNamespace(data_path=str(tmp_path)),
+        PARAMS_TXT="params.txt",
+        shared=SimpleNamespace(
+            sd_model=None, state=state, opts=SimpleNamespace(data={})
+        ),
+        state=state,
+        opts=SimpleNamespace(samples_format="png"),
+        all_samplers=[],
+        images=None,
+        AD_APPLY_SUBDIR="ADetailer-Inpaint",
+        pause_total_tqdm=nullcontext,
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: SimpleNamespace(preview=image),
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=lambda _p2: SimpleNamespace(
+            images=[result], all_prompts=["detailed face, sharp eyes"],
+            all_negative_prompts=["blurry"],
+        ),
+        NansException=type("NansException", (Exception,), {}),
+        ordinal=sfx.__globals__["ordinal"],
+        suffix=sfx,
+        __version__="test",
+        Image=Image,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    shells = []
+
+    def get_i2i_p(p, _args, im):
+        shells.append(p)
+        return SimpleNamespace(
+            init_images=[im], prompt="detailed face", negative_prompt="",
+            close=lambda: None, denoising_strength=0.4, width=64, height=64,
+        )
+
+    script.get_i2i_p = get_i2i_p
+    script.get_prompt = lambda *_args: (["detailed face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [Image.new("L", (64, 64), 255)]
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.fix_p2 = lambda *_args: None
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_prompt="detailed face",
+        ad_negative_prompt="blurry, low quality",
+    )
+
+    _image, status = script.run_detailer_on_image(image, args, save=False, tab=tab)
+
+    assert status == "✅ ADetailer pass complete."
+    # Premise: the pass carried the tab's prompts under the tab's own keys.
+    params = shells[0].extra_generation_params
+    assert params["ADetailer prompt" + sfx(tab)] == "detailed face"
+    assert params["ADetailer negative prompt" + sfx(tab)] == "blurry, low quality"
+    assert "applied" not in capsys.readouterr().out
+
+    # A generation, here in its 2nd tab, prints it as before.
+    generation = SimpleNamespace(extra_generation_params={
+        "ADetailer prompt 2nd": "detailed face",
+        "ADetailer negative prompt 2nd": "blurry, low quality",
+    })
+    assert script._postprocess_image_inner(
+        generation, SimpleNamespace(image=image), args, n=1
+    )
+    out = capsys.readouterr().out
+    assert "[-] ADetailer: applied 2nd ad_prompt: 'detailed face, sharp eyes'" in out
+    assert "[-] ADetailer: applied 2nd ad_negative_prompt: 'blurry'" in out
 
 
 @pytest.mark.parametrize("outcome", ["detailed", "nothing", "error", "no record"])
@@ -5393,6 +5725,395 @@ def test_a_saved_standalone_result_records_the_passs_parameters(
     assert saved[0]["info"] == expected
 
 
+@pytest.mark.parametrize(
+    ("size", "working"),
+    [
+        ((853, 480), (848, 480)),  # rounded down to a multiple of 8
+        ((2048, 1536), (1024, 768)),  # at most 1024 on the longest side
+        ((40, 40), (64, 64)),  # at least 64
+        ((1024, 768), (1024, 768)),
+        # Exactly 1024, not 1016: as a float, 1288 * (1024 / 1288) is
+        # 1023.99..., and 644 * (1024 / 1288) is 511.99...
+        ((1288, 966), (1024, 768)),
+        ((966, 1288), (768, 1024)),
+        ((1288, 644), (1024, 512)),
+        ((1568, 1176), (1024, 768)),
+    ],
+)
+def test_standalone_run_redraws_at_the_documented_working_size(tmp_path, size, working):
+    # The Size a standalone result records is this working size (the WebUI
+    # writes p.width x p.height for an img2img pass), not the picture's size:
+    # the README says how it is made, so the two must not drift apart.
+    script = _standalone_runtime(tmp_path).AfterDetailerScript()
+    sizes = []
+
+    def inner(p, _pp, _args):
+        sizes.append((p.width, p.height))
+        return False
+
+    script._postprocess_image_inner = inner
+
+    script.run_detailer_on_image(Image.new("RGB", size), SimpleNamespace())
+
+    assert sizes == [working]
+
+
+def test_standalone_working_size_is_exact_for_every_side_length(tmp_path):
+    # Each side is the picture's side scaled by 1024 / longest side (not
+    # scaled up to 1024), rounded down to a multiple of 8 and at least 64.
+    # A float scale lost a pixel on about one long side in seven up to 8192
+    # (one in ten over the sizes swept here), so the longest side of such a
+    # picture came out at 1016 instead of 1024.
+    from fractions import Fraction
+
+    def documented(side, longest):
+        exact = Fraction(side * 1024, max(longest, 1024))
+        return max(64, exact.numerator // exact.denominator // 8 * 8)
+
+    script = _standalone_runtime(tmp_path).AfterDetailerScript()
+    sizes = []
+
+    def inner(p, _pp, _args):
+        sizes.append((p.width, p.height))
+        return False
+
+    script._postprocess_image_inner = inner
+
+    longs = range(960, 1700)
+    # Premise: the float scale gets some of these long sides wrong.
+    assert sum(int(m * (1024 / m)) != 1024 for m in longs if m > 1024) > 50
+    cases = []
+    for m in longs:
+        short = m * 3 // 4
+        cases += [(m, short), (short, m)]
+    for size in cases:
+        # A 1-bit picture: only its size matters here, and it is quick to make.
+        script.run_detailer_on_image(Image.new("1", size), SimpleNamespace())
+
+    longest = [max(size) for size in cases]
+    expected = [
+        (documented(w, top), documented(h, top))
+        for (w, h), top in zip(cases, longest)
+    ]
+    assert sizes == expected
+    # The longest side of a large picture is always exactly 1024.
+    assert all(max(s) == 1024 for s, top in zip(sizes, longest) if top > 1024)
+
+
+def test_a_saved_standalone_result_keeps_the_passs_working_size(tmp_path):
+    # An 853x480 picture is redrawn at 848x480 and keeps its own pixels: the
+    # parameters say "Size: 848x480", as the WebUI writes them for the pass,
+    # both in the file saved to ADetailer-Inpaint and on the picture shown in
+    # Result. They are passed on as they are, not rewritten.
+    parameters = "detailed face\nSteps: 28, Sampler: DPM++ 2M, Size: 848x480"
+    saved = []
+    script = _load_script(
+        methods={"run_detailer_on_image", "read_params_txt", "write_params_txt"},
+        paths=SimpleNamespace(data_path=str(tmp_path)),
+        PARAMS_TXT="params.txt",
+        shared=SimpleNamespace(sd_model=None),
+        state=SimpleNamespace(interrupted=False, skipped=False),
+        opts=SimpleNamespace(
+            samples_format="png", outdir_samples=str(tmp_path / "out"),
+            enable_pnginfo=True,
+        ),
+        all_samplers=[],
+        ensure_pil_image=lambda image, _mode: image,
+        images=SimpleNamespace(
+            save_image=lambda _image, _path, _basename, **kwargs: saved.append(kwargs)
+        ),
+        AD_APPLY_SUBDIR="ADetailer-Inpaint",
+        pause_total_tqdm=nullcontext,
+    ).AfterDetailerScript()
+
+    def inner(p, pp, _args):
+        assert (p.width, p.height) == (848, 480)
+        result = Image.new("RGB", pp.image.size)
+        result.info["parameters"] = parameters  # set by the WebUI's pass
+        pp.image = result
+        return True
+
+    script._postprocess_image_inner = inner
+
+    image, status = script.run_detailer_on_image(
+        Image.new("RGB", (853, 480)), SimpleNamespace(), save=True
+    )
+
+    assert "Saved" in status
+    assert saved[0]["info"] == parameters
+    assert image.info["parameters"] == parameters
+    assert image.size == (853, 480)
+
+
+def _flat_doc_text(text):
+    """``text`` on one line without code marks, with "853 x 480" read as
+    "853x480" and "1,024" as "1024", so a rewording keeps its facts."""
+    text = " ".join(text.replace("`", "").split())
+    text = re.sub(r"(\d) ?[x\u00d7] ?(\d)", r"\1x\2", text)
+    return re.sub(r"(\d),(\d{3})\b", r"\1\2", text)
+
+
+def _size_text(doc):
+    """The bullet of ``doc`` that says what the Size of a standalone result is."""
+    text = _public_docs()[doc]
+    if doc == "README.md":
+        text = _readme_section("### Run ADetailer on an image", "### Batch a whole folder")
+    return next(
+        flat for flat in map(_flat_doc_text, text.split("\n- "))
+        if "Size" in flat and "848x480" in flat
+    )
+
+
+# Wordings that make "Inpaint only masked" optional where the code needs it on.
+_LOOSE_CONDITIONS = (" or off", " or not", "whether or not", "regardless")
+
+
+def test_readme_says_size_is_the_standalone_working_size():
+    # Users read "Size: 848x480" in the parameters of an 853x480 result as a
+    # wrong size: no text said that it is the size the regions were redrawn at.
+    # Each fact is checked on its own (and
+    # test_standalone_run_redraws_at_the_documented_working_size holds the
+    # code to the same rule), so a rewording of the bullet keeps it green.
+    bullet = _size_text("README.md")
+
+    for fact in ("853x480", "multiple of 8", "1024", "64", "last region"):
+        assert fact in bullet
+
+
+@pytest.mark.parametrize("doc", ["README.md", "CHANGELOG.md"])
+def test_the_size_text_says_when_the_picture_keeps_its_pixels(doc):
+    # The picture keeps its pixels, and "Scale inpaint to bbox" or the bbox
+    # size setting give the Size, only with "Inpaint only masked" on: with it
+    # off the whole picture comes back at the working size (see
+    # test_whole_picture_inpaint_keeps_the_image_size). Both texts said so
+    # without the condition.
+    clauses = re.split(r"(?<=[.;]) ", _size_text(doc))
+    about = [c for c in clauses if "853x480 pixels" in c or "Scale inpaint to bbox" in c]
+
+    assert len(about) >= 2  # premise: both statements are there
+    for clause in about:
+        assert '"Inpaint only masked" on' in clause
+        # ... and not "on or off", "on or not" or "regardless" of it, which
+        # still contain '"Inpaint only masked" on'.
+        for loose in _LOOSE_CONDITIONS:
+            assert loose not in clause, clause
+    # The part that keeps the pixels ties them to the option being on, not
+    # to "on or off" or to the option the other way round.
+    keeps = next(
+        part for clause in about for part in clause.split(", ")
+        if "853x480 pixels" in part
+    )
+    assert '"Inpaint only masked" on' in keeps
+    for loose in _LOOSE_CONDITIONS:
+        assert loose not in keeps
+
+
+@pytest.mark.parametrize("doc", ["README.md", "CHANGELOG.md"])
+def test_the_size_text_says_the_published_releases_gave_1016(doc):
+    # Both texts give the Size as the picture scaled down to 1024 pixels on the
+    # longest side, and the CHANGELOG's says it has been so since plus.6. The
+    # float scale of plus.6 to beta 2 gave 1016 for some sizes (see
+    # test_standalone_working_size_is_exact_for_every_side_length), so without
+    # that exception the text told a beta 2 user whose 1288x966 picture
+    # recorded 1016x768 that it had recorded 1024x768.
+    bullet = _size_text(doc)
+
+    assert "exactly 1024" in bullet
+    assert "beta 3" in bullet
+    assert "1016" in bullet
+
+
+def _bbox_cap_note_problems(section):
+    """What the note in ``section`` on the 1024-pixel working size gets wrong
+    about the options that lift that cap (an empty list when it is right)."""
+    sentences = re.split(r"(?<=[.;]) ", _flat_doc_text(section))
+    notes = [s for s in sentences if "1024 pixels on the longest side" in s and "unless" in s]
+    if len(notes) != 1:
+        return [f"expected one note on the working size, found {len(notes)}"]
+    lifted = notes[0][notes[0].index("unless"):]
+    problems = [
+        f"{option} is left out" for option in (
+            "Scale inpaint to bbox", "Try to match inpainting size to bounding box size"
+        ) if option not in lifted
+    ]
+    if '"Inpaint only masked"' not in lifted:
+        problems.append('the bbox options are not tied to "Inpaint only masked"')
+    if re.search(r'"Inpaint only masked" (?:is )?off\b|\bwithout "Inpaint only masked"', lifted):
+        problems.append('the bbox options are tied to "Inpaint only masked" off')
+    problems += [
+        f"{loose.strip()!r} makes \"Inpaint only masked\" optional"
+        for loose in _LOOSE_CONDITIONS if loose in lifted
+    ]
+    return problems
+
+
+def test_the_working_size_note_says_when_the_bbox_options_lift_the_cap():
+    # fix_p2 keeps the capped working size in whole-picture mode before it
+    # looks at "Scale inpaint to bbox" or the bbox size setting (see
+    # test_whole_picture_inpaint_keeps_the_image_size), but the note on that
+    # size said "Scale inpaint to bbox" lifts the cap with no condition, and
+    # left the setting out, while the Size note after it gave the condition.
+    script = _SCRIPT_PATH.read_text(encoding="utf-8")
+    assert (  # premise: the code's order
+        script.index("elif not args.ad_inpaint_only_masked:")
+        < script.index("elif args.ad_use_resolution_scale:")
+    )
+    section = _readme_section("### Run ADetailer on an image", "### Batch a whole folder")
+
+    assert _bbox_cap_note_problems(section) == []
+    # Only the note is read: a right sentence on another topic that names
+    # "Scale inpaint to bbox" (fix_p2 takes "Use separate width/height"
+    # first) keeps the test green ...
+    control = (
+        '\n- A tab\'s "Use separate width/height" takes the place of'
+        ' "Scale inpaint to bbox", as in a generation.\n'
+    )
+    assert _bbox_cap_note_problems(section + control) == []
+    # ... and a note that states the wrong rule fails.
+    note = (
+        "\n- For a large picture, the regions are redrawn at a working size of"
+        " at most 1024 pixels on the longest side, unless the tab uses"
+        ' "Use separate width/height", {} or Settings → ADetailer →'
+        ' "Try to match inpainting size to bounding box size".\n'
+    )
+    assert _bbox_cap_note_problems(
+        note.format('or "Inpaint only masked" with "Scale inpaint to bbox"')
+    ) == []
+    for wrong in (
+        'or "Scale inpaint to bbox"',  # no condition
+        'or "Inpaint only masked" off with "Scale inpaint to bbox"',
+        'or "Scale inpaint to bbox" (with "Inpaint only masked" on or off)',
+        'or "Scale inpaint to bbox" whether or not "Inpaint only masked" is on',
+        'or "Scale inpaint to bbox" regardless of "Inpaint only masked"',
+        'or "Scale inpaint to bbox" without "Inpaint only masked"',
+    ):
+        assert _bbox_cap_note_problems(note.format(wrong)), wrong
+    # The note as it was, which also left the bbox size setting out.
+    assert _bbox_cap_note_problems(
+        "\n- For a large picture, the regions are redrawn at a working size of"
+        " at most 1024 pixels on the longest side, to avoid running out of"
+        ' memory, unless the tab uses "Use separate width/height" or'
+        ' "Scale inpaint to bbox".\n'
+    )
+
+
+def test_the_changelog_dates_the_bbox_note_to_beta_2():
+    # The README's note that "Scale inpaint to bbox" lifts the 1024-pixel
+    # working size first came with beta 2: the READMEs of the stable release
+    # and beta 1 only said that the per-region regeneration is capped. The
+    # beta 3 entry that corrects the note said "Earlier releases had the
+    # same text", which by the CHANGELOG's own rule (see the beta 1 section)
+    # takes in the stable release.
+    older = re.compile(
+        r"\b(?:earlier releases|the stable release|beta 1|plus\.7[\d.]*)\b[^.,;]*"
+        r" had the same text",
+        re.IGNORECASE,
+    )
+    bullets = [
+        bullet for bullet in map(_flat_doc_text, _public_docs()["CHANGELOG.md"].split("\n- "))
+        if "README" in bullet and "Scale inpaint to bbox" in bullet and "working size" in bullet
+    ]
+
+    assert bullets, "premise: the CHANGELOG has the entry on the note"
+    for bullet in bullets:
+        assert not older.search(bullet), bullet
+    # The check itself: the old ending fails, the right one and an ending on
+    # another topic pass.
+    assert older.search("Earlier releases had the same text.")
+    assert not older.search("Beta 2 had the same text.")
+    assert not older.search("Earlier releases had the same problem.")
+
+
+def _changelog_beta_heading(changelog, beta, version=None):
+    """The ``## `` heading of ``changelog`` for ``version``, or the top one,
+    when it is a section of beta number ``beta``; None otherwise."""
+    headings = [line for line in changelog.splitlines() if line.startswith("## ")]
+    if version is not None:
+        headings = [h for h in headings if h.startswith(f"## {version} ")]
+    if headings and re.match(rf"## v\S+\.beta\.{beta} ", headings[0]):
+        return headings[0]
+    return None
+
+
+def test_a_beta_summary_points_at_the_changelog_section_of_its_beta():
+    # Starting the beta 3 section put it on top of the CHANGELOG, and the
+    # "Coming in beta 2" summary still sent readers to "the top section" for
+    # beta 2's details. Under a beta's heading, or in a beta's own paragraph,
+    # "the top" of the CHANGELOG must be that beta's section, and the
+    # "The details are in" pointer must name it; headings and wording may
+    # change.
+    changelog = _public_docs()["CHANGELOG.md"]
+    heading_beta = None
+    checked = []
+    for line in _public_docs()["README.md"].splitlines():
+        if re.match(r"#{1,3} ", line):
+            found = re.search(r"\bbeta (\d+)\b", line, re.IGNORECASE)
+            heading_beta = found.group(1) if found else None
+            continue
+        own = re.match(r"\*\*Beta (\d+)\b", line)
+        beta = own.group(1) if own else heading_beta
+        named = re.search(r"\bthe (v\S+) section of \[CHANGELOG\.md\]", line)
+        if not line.startswith("The details are in "):
+            named = None  # another line may name another release's section
+        top = re.search(r"\bthe top (?:section )?of \[CHANGELOG\.md\]", line)
+        if beta is None or not (named or top):
+            continue
+        version = named.group(1) if named else None
+        assert _changelog_beta_heading(changelog, beta, version), (
+            f"beta {beta}: {line}"
+        )
+        checked.append(beta)
+
+    assert checked, "premise: the README points at the CHANGELOG for a beta"
+    # The check itself, on a CHANGELOG whose top section is beta 3.
+    sample = "# Changelog\n\n## v1.0+plus.9.beta.3 — x\n\n## v1.0+plus.9.beta.2 — y\n"
+    assert _changelog_beta_heading(sample, "3")
+    assert not _changelog_beta_heading(sample, "2")
+    assert _changelog_beta_heading(sample, "2", "v1.0+plus.9.beta.2")
+    assert not _changelog_beta_heading(sample, "3", "v1.0+plus.9.beta.2")
+    assert not _changelog_beta_heading(sample, "2", "v1.0+plus.9.beta.1")
+
+
+def test_the_readme_puts_a_beta_on_the_beta_branch_only_while_the_branch_holds_it():
+    # The `beta` branch moved on to beta 3 (its badge shows that version), but
+    # the beta 2 paragraph still said beta 2 was on the `beta` branch. A
+    # beta's own paragraph may put it on that branch only while the version
+    # there is that beta's.
+    version = re.search(
+        r'__version__ = "([^"]+)"',
+        (_SCRIPT_PATH.parents[1] / "adetailer" / "__version__.py").read_text(encoding="utf-8"),
+    ).group(1)
+    on_branch = re.compile(r"\bon\b[^.;]*\bthe `beta` branch\b")
+    paragraphs = [
+        line for line in _public_docs()["README.md"].splitlines()
+        if re.match(r"\*\*Beta \d+\b", line)
+    ]
+
+    assert paragraphs, "premise: the README has a paragraph for a beta"
+    for paragraph in paragraphs:
+        beta = re.match(r"\*\*Beta (\d+)", paragraph).group(1)
+        if on_branch.search(paragraph):
+            assert version.endswith(f".beta.{beta}"), paragraph
+    # The check itself: the wording of the old beta 2 paragraph is caught.
+    assert on_branch.search("is on the Releases page and the `beta` branch.")
+    assert not on_branch.search("is on the Releases page; the `beta` branch moved on.")
+
+
+def test_readme_says_which_tabs_generate_names_as_saved():
+    # Generate saves every tab but names only the tabs with a detector, and
+    # the start-up line too: the README said it named each tab it saved.
+    ui_text = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    assert 'state.get("ad_model") != "None"' in ui_text  # premise: the code's rule
+    line = next(
+        line for line in _public_docs()["README.md"].splitlines()
+        if "saved tab 1 (" in line
+    )
+    first = re.sub(r"`[^`]*`", "", line).split(". ")[0]
+
+    assert "names each tab it saved" not in first
+    assert "with a detector" in first
+
+
 _LORA_TAG = re.compile(r"<lora:[^>]+>")
 
 
@@ -6014,3 +6735,111 @@ def test_the_readme_says_that_comments_typed_in_an_adetailer_prompt_reach_the_mo
     assert '"Apply only selected scripts to ADetailer"' in note
     assert '"Script names to apply to ADetailer"' in note
     assert "append text" in note
+
+
+class _HostI2I:
+    """The WebUI's img2img pass as get_i2i_p builds it: keeps its keywords."""
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+@pytest.mark.parametrize(("tab", "enabled"), [(0, True), (1, True), (1, False)])
+def test_a_standalone_result_records_its_tabs_adetailer_parameters(
+    tmp_path, tab, enabled
+):
+    # "Run ADetailer on an image" and folder runs saved only the img2img
+    # pass's parameters: PNG Info and Send to brought back that pass but not
+    # the tab. The pass now carries the "ADetailer ..." keys a generation
+    # where only this tab runs writes, with this tab's suffix (" 2nd" for the
+    # 2nd tab), also when its "Enable this tab" is off, as the run ignores it.
+    # With the 2nd tab enabled too: a disabled tab writes no keys, so only an
+    # enabled one shows that the tabs before it are written as off.
+    from adetailer.args import ADetailerArgs
+
+    sfx = _ui_suffix()
+    runtime = _load_script(
+        methods={
+            "run_detailer_on_image", "read_params_txt", "write_params_txt",
+            "extra_params", "get_i2i_p",
+        },
+        paths=SimpleNamespace(data_path=str(tmp_path)),
+        PARAMS_TXT="params.txt",
+        shared=SimpleNamespace(sd_model=None),
+        state=SimpleNamespace(interrupted=False, skipped=False),
+        opts=SimpleNamespace(samples_format="png"),
+        all_samplers=[],
+        ensure_pil_image=lambda image, _mode: image,
+        images=None,
+        AD_APPLY_SUBDIR="ADetailer-Inpaint",
+        pause_total_tqdm=nullcontext,
+        suffix=sfx,
+        __version__="test",
+        StableDiffusionProcessingImg2Img=_HostI2I,
+        schedulers=None,
+        controlnet_type="forge",
+        copy_extra_params=dict,
+    )
+    script = runtime.AfterDetailerScript()
+    script.get_seed = lambda _p: (1, 1)
+    script.get_width_height = lambda *_args: (64, 64)
+    script.get_steps = lambda *_args: 28
+    script.get_cfg_scale = lambda *_args: 7.0
+    script.get_initial_noise_multiplier = lambda *_args: None
+    script.get_sampler = lambda *_args: "Euler"
+    script.get_override_settings = lambda *_args: {}
+    script.script_filter = lambda *_args: (None, [])
+    made = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_prompt="detailed face", ad_confidence=0.5,
+        ad_tab_enable=enabled,
+    )
+    passes = []
+
+    def inner(p, pp, args):
+        passes.append(script.get_i2i_p(p, args, pp.image).extra_generation_params)
+        return False
+
+    script._postprocess_image_inner = inner
+
+    script.run_detailer_on_image(Image.new("RGB", (64, 64)), made, tab=tab)
+
+    # What a generation writes (process()) when this tab runs and the tabs
+    # before it are off.
+    ran = made.copy(update={"ad_tab_enable": True})
+    expected = runtime.AfterDetailerScript().extra_params(
+        [*([ADetailerArgs()] * tab), ran]
+    )
+    assert passes == [expected]
+    assert all(k.endswith(sfx(tab)) for k in expected if k != "ADetailer version")
+    assert expected["ADetailer model" + sfx(tab)] == "face_yolov8n.pt"
+
+    # Pasted back (PNG Info, Send to), they switch ADetailer on and give the
+    # tab its setup again.
+    params = {k: str(v) for k, v in expected.items()}
+    _paste_callback()._clear_missing_class_prompts("", params)
+    before = ADetailerArgs(ad_model="hand_yolov8n.pt", ad_prompt="detailed eyes").dict()
+    after = ADetailerArgs(**_host_paste(params, before, suffix=sfx(tab)))
+    assert params["ADetailer enable"] == "True"
+    assert after.extra_params() == ran.extra_params()
+
+
+def test_a_standalone_result_keeps_its_passs_parameters_when_the_tab_cannot_be_read(
+    tmp_path,
+):
+    # Guarded: a tab whose keys cannot be built leaves the pass with its own
+    # parameters, as before, and the run goes on.
+    script = _standalone_runtime(tmp_path).AfterDetailerScript()
+    shells = []
+
+    def inner(p, _pp, _args):
+        shells.append(dict(p.extra_generation_params))
+        return False
+
+    script._postprocess_image_inner = inner
+
+    _image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), tab=1
+    )
+
+    assert shells == [{}]
+    assert "Nothing detected" in status
