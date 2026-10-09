@@ -61,7 +61,7 @@ body:
       label: ADetailer Ultimate version
       description: |
         Open the ADetailer panel (this also switches ADetailer on): the badge at the top right of its header shows the version and the build; on a narrow window, widen it to see the whole badge. The console also prints the version at startup, in the line that starts with "[-] ADetailer initialized. version:".
-      placeholder: "for example: ADetailer Ultimate · v26.2.0+plus.8.beta.2 · abc1234"
+      placeholder: "for example: ADetailer Ultimate · v26.2.0+plus.8 · abc1234"
     validations:
       required: true
 

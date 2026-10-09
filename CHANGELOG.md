@@ -1,5 +1,19 @@
 # Changelog
 
+## v26.2.0+plus.8 — the plus.8 reliability update, 2026-10-10
+
+The stable release of the plus.8 reliability update. It is beta 3 (v26.2.0+plus.8.beta.3, below) with one more fix, listed here. Together with the beta 1, beta 2 and beta 3 sections below, this section lists everything that changed since the previous stable release, v26.3.0+plus.7.4: no new buttons, but the existing ones now do what you asked, keep your settings and report what really happened, and the sections you leave open are remembered. All 1014 offline regression tests pass on AUTOMATIC1111 and on Forge Neo.
+
+Updating from v26.3.0+plus.7.4 works as usual, from the WebUI's Extensions tab or with `git pull`, and keeps your presets and remembered settings. The version number starts with 26.2.0, the version of the original ADetailer this fork is built on, so it sorts before v26.3.0+plus.7.4 although it is newer.
+
+**Fixed: "Run ADetailer on an image" and folder runs**
+
+- **A run started from the 2nd tab or a later one named the 1st tab in some console messages and file names.** The messages for a picture where nothing was detected or a region failed with a NaN error said "1st settings", the pass's header in the Verbose diagnostic log and the message for a cancelled sequential pass said "tab 1", and the `-ad-preview` files (and the `-ad-step` files of a tab with "Process classes sequentially") were numbered 1. They now name the tab the run was started from. The result itself already used the right tab and recorded its settings under the right tab's number. Earlier releases had the same problem.
+
+**Known issues**
+
+The known issues listed at the end of the beta 2 section below still apply; where they say "the stable release", they mean v26.3.0+plus.7.4. The one added in beta 3 is fixed above.
+
 ## v26.2.0+plus.8.beta.3 — third beta, 2026-10-08
 
 Third beta of the plus.8 reliability update, published on GitHub as a **pre-release** for testing, like beta 1 and beta 2. It is not a stable release: the stable version is still v26.3.0+plus.7.4. This section lists only the changes made since beta 2 (v26.2.0+plus.8.beta.2, below): some additions to the README and fixes, grouped by area; most of the problems fixed were also in earlier releases. All 1011 offline regression tests pass on AUTOMATIC1111 and on Forge Neo, and so do 9 live checks in the browser on each, which cover the fixes below. To try it, follow "Switch to the beta and back" in the README. Known issues are listed at the end of this section.

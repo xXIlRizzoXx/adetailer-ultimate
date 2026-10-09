@@ -788,7 +788,7 @@ def test_standalone_run_keeps_the_last_generation_in_params_txt(tmp_path, outcom
     params_txt.write_text("user generation", encoding="utf-8")
     script = _standalone_runtime(tmp_path).AfterDetailerScript()
 
-    def inner(_p, _pp, _args):
+    def inner(_p, _pp, _args, n=0):
         params_txt.write_text("inner pass", encoding="utf-8")
         if outcome == "error":
             raise RuntimeError("CUDA out of memory")
@@ -808,13 +808,35 @@ def test_standalone_run_keeps_the_last_generation_in_params_txt(tmp_path, outcom
         assert image is not None
 
 
+@pytest.mark.parametrize("tab", [0, 1, 3])
+def test_standalone_run_names_the_tab_it_was_started_from(tmp_path, tab):
+    # "Run ADetailer on an image" and folder runs from the 2nd tab or a later
+    # one ran their inner pass as the 1st tab (n=0): its console lines and
+    # its -ad-preview / -ad-step files named the 1st tab.
+    script = _standalone_runtime(tmp_path).AfterDetailerScript()
+    tabs = []
+
+    def inner(_p, _pp, _args, n=0):
+        tabs.append(n)
+        return True
+
+    script._postprocess_image_inner = inner
+
+    _image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), save=False, tab=tab
+    )
+
+    assert status == "✅ ADetailer pass complete."
+    assert tabs == [tab]
+
+
 def test_standalone_run_gives_every_region_a_random_seed(tmp_path, monkeypatch):
     values = iter([1000, 2000, 3000, 4000])
     monkeypatch.setattr(random, "randrange", lambda _stop: next(values))
     script = _standalone_runtime(tmp_path).AfterDetailerScript()
     shells = []
 
-    def inner(p, _pp, _args):
+    def inner(p, _pp, _args, n=0):
         shells.append(p)
         return False
 
@@ -2852,7 +2874,7 @@ def test_standalone_run_follows_the_global_output_directory(tmp_path, global_dir
         pause_total_tqdm=nullcontext,
     ).AfterDetailerScript()
 
-    def inner(p, _pp, _args):
+    def inner(p, _pp, _args, n=0):
         shells.append(p)
         return True
 
@@ -3902,7 +3924,7 @@ def test_standalone_run_leaves_no_override_option_behind(tmp_path, saved):
     ).AfterDetailerScript()
     during = []
 
-    def inner(_p, _pp, _args):
+    def inner(_p, _pp, _args, n=0):
         override = {"CLIP_stop_at_last_layers": 2, "sd_vae": "detail-vae.safetensors"}
         stored = {k: data[k] for k in override if k in data}
         data.update(override)
@@ -3948,8 +3970,8 @@ def test_the_applied_prompt_line_prints_on_a_legacy_console(monkeypatch):
 @pytest.mark.parametrize("tab", [0, 1])
 def test_a_standalone_run_prints_no_applied_prompt_line(tmp_path, capsys, tab):
     # From beta 3 the standalone pass carries the tab's "ADetailer ..."
-    # parameters, and its inner pass, which runs as the 1st tab (n=0),
-    # compared their "ADetailer prompt" with the prompt used: a run from the
+    # parameters, and its inner pass, which ran as the 1st tab (n=0) until the
+    # stable plus.8, compared their "ADetailer prompt" with the prompt used: a run from the
     # 1st tab printed "applied 1st ad_prompt: ...", while a run from the 2nd
     # tab, whose key is "ADetailer prompt 2nd", printed nothing. As in beta 2,
     # these runs print no such line; a generation still prints it.
@@ -4012,7 +4034,8 @@ def test_a_standalone_run_prints_no_applied_prompt_line(tmp_path, capsys, tab):
     script.get_prompt = lambda *_args: (["detailed face"], [""])
     script.get_ad_model = lambda _name: "model.pt"
     script.pred_preprocessing = lambda *_args: [Image.new("L", (64, 64), 255)]
-    script.save_image = lambda *_args, **_kwargs: None
+    saved = []
+    script.save_image = lambda *_args, **kwargs: saved.append(kwargs.get("suffix"))
     script.i2i_prompts_replace = lambda *_args: None
     script._apply_inline_class_prompts = lambda *_args: None
     script._apply_auto_class_guard = lambda *_args: None
@@ -4025,6 +4048,8 @@ def test_a_standalone_run_prints_no_applied_prompt_line(tmp_path, capsys, tab):
     _image, status = script.run_detailer_on_image(image, args, save=False, tab=tab)
 
     assert status == "✅ ADetailer pass complete."
+    # The preview file names the tab the run was started from.
+    assert saved == [f"-ad-preview-{tab + 1}"]
     # Premise: the pass carried the tab's prompts under the tab's own keys.
     params = shells[0].extra_generation_params
     assert params["ADetailer prompt" + sfx(tab)] == "detailed face"
@@ -4052,7 +4077,7 @@ def test_standalone_run_leaves_no_params_txt_when_there_was_none(tmp_path, outco
     params_txt = tmp_path / "params.txt"
     script = _standalone_runtime(tmp_path).AfterDetailerScript()
 
-    def inner(_p, _pp, _args):
+    def inner(_p, _pp, _args, n=0):
         if outcome != "no record":  # --no-prompt-history writes none
             params_txt.write_text("inner pass", encoding="utf-8")
         if outcome == "error":
@@ -4587,7 +4612,7 @@ def test_standalone_run_fills_a_transparent_image_like_the_host(tmp_path, host, 
     ).AfterDetailerScript()
     seen = []
 
-    def inner(_p, pp, _args):
+    def inner(_p, pp, _args, n=0):
         seen.append(pp.image)
         return False
 
@@ -5708,7 +5733,7 @@ def test_a_saved_standalone_result_records_the_passs_parameters(
         pause_total_tqdm=nullcontext,
     ).AfterDetailerScript()
 
-    def inner(_p, pp, _args):
+    def inner(_p, pp, _args, n=0):
         result = Image.new("RGB", (64, 64))
         if parameters is not None:
             result.info["parameters"] = parameters  # set by the WebUI's pass
@@ -5747,7 +5772,7 @@ def test_standalone_run_redraws_at_the_documented_working_size(tmp_path, size, w
     script = _standalone_runtime(tmp_path).AfterDetailerScript()
     sizes = []
 
-    def inner(p, _pp, _args):
+    def inner(p, _pp, _args, n=0):
         sizes.append((p.width, p.height))
         return False
 
@@ -5773,7 +5798,7 @@ def test_standalone_working_size_is_exact_for_every_side_length(tmp_path):
     script = _standalone_runtime(tmp_path).AfterDetailerScript()
     sizes = []
 
-    def inner(p, _pp, _args):
+    def inner(p, _pp, _args, n=0):
         sizes.append((p.width, p.height))
         return False
 
@@ -5826,7 +5851,7 @@ def test_a_saved_standalone_result_keeps_the_passs_working_size(tmp_path):
         pause_total_tqdm=nullcontext,
     ).AfterDetailerScript()
 
-    def inner(p, pp, _args):
+    def inner(p, pp, _args, n=0):
         assert (p.width, p.height) == (848, 480)
         result = Image.new("RGB", pp.image.size)
         result.info["parameters"] = parameters  # set by the WebUI's pass
@@ -5919,8 +5944,17 @@ def test_the_size_text_says_the_published_releases_gave_1016(doc):
     bullet = _size_text(doc)
 
     assert "exactly 1024" in bullet
-    assert "beta 3" in bullet
     assert "1016" in bullet
+    if doc == "CHANGELOG.md":
+        assert "beta 3" in bullet
+    else:
+        # The README of the stable release names the release, plus.8, from
+        # which the size is exact, and the published beta 2 among the
+        # versions that gave 1016.
+        assert re.search(
+            r"\bplus\.8\b[^.;]*\bexactly 1024|\bexactly 1024\b[^.;]*\bplus\.8\b", bullet
+        ), bullet
+        assert "beta 2" in bullet
 
 
 def _bbox_cap_note_problems(section):
@@ -6035,14 +6069,38 @@ def _changelog_beta_heading(changelog, beta, version=None):
     return None
 
 
-def test_a_beta_summary_points_at_the_changelog_section_of_its_beta():
+def _changelog_stable_heading(changelog, stable, version=None):
+    """The ``## `` heading of ``changelog`` for ``version``, or the top one,
+    when it is the section of the stable release ``stable`` (such as
+    ``v1.0+plus.9``); None otherwise."""
+    headings = [line for line in changelog.splitlines() if line.startswith("## ")]
+    if version is not None:
+        headings = [h for h in headings if h.startswith(f"## {version} ")]
+    if headings and headings[0].startswith(f"## {stable} "):
+        return headings[0]
+    return None
+
+
+def _current_version():
+    """The version in adetailer/__version__.py, such as ``26.2.0+plus.8``."""
+    return re.search(
+        r'__version__ = "([^"]+)"',
+        (_SCRIPT_PATH.parents[1] / "adetailer" / "__version__.py").read_text(encoding="utf-8"),
+    ).group(1)
+
+
+def test_a_summary_points_at_the_changelog_section_of_its_release():
     # Starting the beta 3 section put it on top of the CHANGELOG, and the
     # "Coming in beta 2" summary still sent readers to "the top section" for
     # beta 2's details. Under a beta's heading, or in a beta's own paragraph,
     # "the top" of the CHANGELOG must be that beta's section, and the
     # "The details are in" pointer must name it; headings and wording may
-    # change.
+    # change. When the README is that of a stable release, a pointer outside
+    # any beta's heading or paragraph describes that release: it must name,
+    # or "the top" must be, the section of the version in __version__.py.
     changelog = _public_docs()["CHANGELOG.md"]
+    current = _current_version()
+    stable = None if ".beta." in current else f"v{current}"
     heading_beta = None
     checked = []
     for line in _public_docs()["README.md"].splitlines():
@@ -6056,15 +6114,23 @@ def test_a_beta_summary_points_at_the_changelog_section_of_its_beta():
         if not line.startswith("The details are in "):
             named = None  # another line may name another release's section
         top = re.search(r"\bthe top (?:section )?of \[CHANGELOG\.md\]", line)
-        if beta is None or not (named or top):
+        if not (named or top):
             continue
         version = named.group(1) if named else None
+        if beta is None:
+            if stable is None:
+                continue
+            assert _changelog_stable_heading(changelog, stable, version), (
+                f"{stable}: {line}"
+            )
+            checked.append(stable)
+            continue
         assert _changelog_beta_heading(changelog, beta, version), (
             f"beta {beta}: {line}"
         )
         checked.append(beta)
 
-    assert checked, "premise: the README points at the CHANGELOG for a beta"
+    assert checked, "premise: the README points at the CHANGELOG for its release"
     # The check itself, on a CHANGELOG whose top section is beta 3.
     sample = "# Changelog\n\n## v1.0+plus.9.beta.3 — x\n\n## v1.0+plus.9.beta.2 — y\n"
     assert _changelog_beta_heading(sample, "3")
@@ -6072,24 +6138,38 @@ def test_a_beta_summary_points_at_the_changelog_section_of_its_beta():
     assert _changelog_beta_heading(sample, "2", "v1.0+plus.9.beta.2")
     assert not _changelog_beta_heading(sample, "3", "v1.0+plus.9.beta.2")
     assert not _changelog_beta_heading(sample, "2", "v1.0+plus.9.beta.1")
+    # ... and on one whose top section is the stable release built on it.
+    released = "# Changelog\n\n## v1.0+plus.9 — x\n\n## v1.0+plus.9.beta.3 — y\n"
+    assert _changelog_stable_heading(released, "v1.0+plus.9")
+    assert _changelog_stable_heading(released, "v1.0+plus.9", "v1.0+plus.9")
+    assert not _changelog_stable_heading(released, "v1.0+plus.9", "v1.0+plus.9.beta.3")
+    assert not _changelog_stable_heading(released, "v1.0+plus.8")
+    assert not _changelog_stable_heading(sample, "v1.0+plus.9")
 
 
 def test_the_readme_puts_a_beta_on_the_beta_branch_only_while_the_branch_holds_it():
     # The `beta` branch moved on to beta 3 (its badge shows that version), but
     # the beta 2 paragraph still said beta 2 was on the `beta` branch. A
     # beta's own paragraph may put it on that branch only while the version
-    # there is that beta's.
-    version = re.search(
-        r'__version__ = "([^"]+)"',
-        (_SCRIPT_PATH.parents[1] / "adetailer" / "__version__.py").read_text(encoding="utf-8"),
-    ).group(1)
+    # there is that beta's. Once the stable release is out, the branch holds
+    # that stable version until the next beta starts, so no beta's paragraph
+    # may put the beta there, and the README says what the branch holds.
+    version = _current_version()
+    readme = _public_docs()["README.md"].splitlines()
     on_branch = re.compile(r"\bon\b[^.;]*\bthe `beta` branch\b")
-    paragraphs = [
-        line for line in _public_docs()["README.md"].splitlines()
-        if re.match(r"\*\*Beta \d+\b", line)
-    ]
+    paragraphs = [line for line in readme if re.match(r"\*\*Beta \d+\b", line)]
 
-    assert paragraphs, "premise: the README has a paragraph for a beta"
+    def holds(version):
+        return re.compile(
+            rf"\bthe `beta` branch holds\b[^;]*?\bv{re.escape(version)}(?![.\w])"
+        )
+
+    if ".beta." in version:
+        assert paragraphs, "premise: the README has a paragraph for a beta"
+    else:
+        assert any(holds(version).search(line) for line in readme), (
+            "premise: the README says that the `beta` branch holds the stable version"
+        )
     for paragraph in paragraphs:
         beta = re.match(r"\*\*Beta (\d+)", paragraph).group(1)
         if on_branch.search(paragraph):
@@ -6097,6 +6177,11 @@ def test_the_readme_puts_a_beta_on_the_beta_branch_only_while_the_branch_holds_i
     # The check itself: the wording of the old beta 2 paragraph is caught.
     assert on_branch.search("is on the Releases page and the `beta` branch.")
     assert not on_branch.search("is on the Releases page; the `beta` branch moved on.")
+    # ... and the stable wording names the stable version, not a beta of it.
+    stable = "the `beta` branch holds the same version as the stable release, v1.0+plus.9, until"
+    assert holds("1.0+plus.9").search(stable)
+    assert not holds("1.0+plus.9").search(stable.replace("plus.9,", "plus.9.beta.3,"))
+    assert not holds("1.0+plus.8").search(stable)
 
 
 def test_readme_says_which_tabs_generate_names_as_saved():
@@ -6795,7 +6880,7 @@ def test_a_standalone_result_records_its_tabs_adetailer_parameters(
     )
     passes = []
 
-    def inner(p, pp, args):
+    def inner(p, pp, args, n=0):
         passes.append(script.get_i2i_p(p, args, pp.image).extra_generation_params)
         return False
 
@@ -6831,7 +6916,7 @@ def test_a_standalone_result_keeps_its_passs_parameters_when_the_tab_cannot_be_r
     script = _standalone_runtime(tmp_path).AfterDetailerScript()
     shells = []
 
-    def inner(p, _pp, _args):
+    def inner(p, _pp, _args, n=0):
         shells.append(dict(p.extra_generation_params))
         return False
 

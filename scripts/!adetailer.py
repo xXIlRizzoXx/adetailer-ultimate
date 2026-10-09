@@ -1785,7 +1785,9 @@ class AfterDetailerScript(scripts.Script):
                 # As in postprocess_image: puts back the tab's override
                 # options (Clip skip, VAE) that the host would leave set.
                 with pause_total_tqdm():
-                    processed = self._postprocess_image_inner(p, pp, args)
+                    # n=tab: the console lines and the -ad-preview / -ad-step
+                    # file names name the tab the run was started from.
+                    processed = self._postprocess_image_inner(p, pp, args, n=tab)
             finally:
                 try:
                     if params_txt_existed:
@@ -2783,8 +2785,8 @@ class AfterDetailerScript(scripts.Script):
                 break
 
             # Not for "Run ADetailer on an image" and folder runs, which printed
-            # no such line before their shell got the tab's parameters: this
-            # pass runs as the 1st tab (n=0), so only the 1st tab's would match.
+            # no such line before their shell got the tab's parameters: they
+            # keep printing none.
             if not getattr(p, "_ad_standalone", False):
                 self.compare_prompt(p.extra_generation_params, processed, n=n)
             p2 = copy(i2i)
