@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import unicodedata
 from enum import IntEnum
 from functools import partial, reduce
 from math import dist
@@ -84,7 +86,11 @@ def offset(img: Image.Image, x: int = 0, y: int = 0) -> Image.Image:
         PIL.Image.Image
             A new image that is offset by x and y
     """
-    return ImageChops.offset(img, x, -y)
+    # Mask regions that leave the canvas must disappear, not wrap around onto
+    # unrelated pixels at the opposite edge (ImageChops.offset is circular).
+    shifted = Image.new(img.mode, img.size, 0)
+    shifted.paste(img, (x, -y))
+    return shifted
 
 
 def is_all_black(img: Image.Image | np.ndarray) -> bool:
@@ -146,6 +152,10 @@ def mask_preprocess(
 
     if kernel != 0:
         masks = [dilate_erode(m, kernel) for m in masks]
+
+    if kernel != 0 or x_offset != 0 or y_offset != 0:
+        # An offset can now move a region completely outside the image, just
+        # as erosion can remove it. Drop its metadata together with its mask.
         kept = [k for k, m in enumerate(masks) if not is_all_black(m)]
         masks = [masks[k] for k in kept]
         groups = [groups[k] for k in kept]
@@ -154,6 +164,11 @@ def mask_preprocess(
     if len(merged) != len(masks):
         # Merge / Merge-and-Invert collapsed every surviving mask into one.
         groups = [[i for g in groups for i in g]] if merged else []
+    if len(merged) == 1 and is_all_black(merged[0]):
+        # Merge and Invert of detections that fill the whole frame leaves
+        # nothing to inpaint. The host treats a blank mask as "no mask" and
+        # would repaint the entire image, so return no mask at all.
+        return [], []
     return merged, groups
 
 
@@ -253,10 +268,15 @@ def parse_indices(spec: str, n: int) -> list[int] | None:
     """Parse a 1-based selection string into sorted, de-duped 0-based indices
     within ``[0, n)``.
 
-    Accepts comma- (or semicolon-) separated single numbers and inclusive
-    ranges, e.g. ``"1,3,5"`` or ``"1-3,5"``. Whitespace is ignored; tokens that
-    aren't a positive int or an ``a-b`` range are skipped; indices outside
-    ``[1, n]`` are dropped. Returns ``None`` when the string contains no usable
+    Accepts comma-, semicolon- or space-separated single numbers and inclusive
+    ranges, e.g. ``"1,3,5"``, ``"1 3 5"`` or ``"1-3,5"``. A ``#`` is ignored, so
+    the labels drawn on the Detection preview (``"#2"``, ``"#1-#3"``) work too.
+    Spaces around a range dash are ignored; tokens that aren't a positive int
+    or an ``a-b`` range are skipped; indices outside ``[1, n]`` are dropped.
+    Full-width digits and the CJK punctuation an IME types (``"1，3"``,
+    ``"1、3"``, ``"1～3"``, ``"1ー3"``, ``"1・3"``) work like their ASCII forms,
+    and so does a doubled range dash (``"1--3"``, ``"1——3"``).
+    Returns ``None`` when the string contains no usable
     number at all — the caller treats that (and a blank string) as "keep all".
     An in-range parse that resolves to nothing (e.g. only out-of-range numbers)
     returns an empty list, i.e. "keep none".
@@ -264,20 +284,34 @@ def parse_indices(spec: str, n: int) -> list[int] | None:
     seen: set[int] = set()
     order: list[int] = []
     found_any = False
-    for tok in spec.replace(";", ",").split(","):
+    # An IME may type full-width digits and CJK punctuation: NFKC makes the
+    # full-width digits, commas, semicolons, "#", "-" and "~" ASCII, then
+    # the tilde, wave dash, hyphen/en/em dashes, minus sign and Japanese
+    # long-vowel mark U+30FC become the range dash, and the list comma U+3001
+    # and the Japanese middle dot U+30FB separate like ",".
+    spec = unicodedata.normalize("NFKC", spec)
+    spec = re.sub(r"[~\u301c\u2010-\u2015\u2212\u30fc]", "-", spec)
+    # Glue "1 - 3" into "1-3" BEFORE splitting on whitespace, so a spaced range
+    # stays a range instead of becoming the two numbers 1 and 3.
+    spec = re.sub(r"\s*-\s*", "-", spec.replace("#", ""))
+    for tok in re.split(r"[,;\s\u3001\u30fb]+", spec):
         tok = tok.strip()
         if not tok:
             continue
         if "-" in tok[1:]:  # inclusive range like "2-4" (a leading "-" is not a range)
             a, _, b = tok.partition("-")
             try:
-                lo, hi = int(a), int(b)
+                # A doubled dash ("1--3", or "1——3" as a Chinese IME types it)
+                # is still a range: detection numbers are never negative.
+                lo, hi = int(a), int(b.lstrip("-"))
             except ValueError:
                 continue
             found_any = True
             if lo > hi:
                 lo, hi = hi, lo
-            values: range | tuple[int, ...] = range(lo, hi + 1)
+            # Only existing detections can match. Clip BEFORE iterating so a
+            # pasted range such as "1-999999999999" cannot stall generation.
+            values: range | tuple[int, ...] = range(max(1, lo), min(n, hi) + 1)
         else:
             try:
                 v = int(tok)

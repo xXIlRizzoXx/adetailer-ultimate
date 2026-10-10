@@ -39,7 +39,8 @@ def ultralytics_predict(
     excluded = parse_csv(exclude_classes)
 
     # Higher detector inference resolution (e.g. 1024) finds smaller / distant
-    # parts than the Ultralytics default of 640. 0 keeps the library default.
+    # parts than the model's own size (640 for the bundled models). 0 keeps the
+    # size stored in the checkpoint, which Ultralytics uses when none is passed.
     # Detected boxes are rescaled back to the original image space internally,
     # so nothing downstream changes. imgsz is a universally-supported predict
     # kwarg; the multiclass branch additionally drops it on TypeError alongside
@@ -77,12 +78,15 @@ def ultralytics_predict(
             and len(pred[0].boxes) > 0
         ):
             names = get_model_class_names(str(model_path))
+            # Same name matching as the include filter ("Hand" excludes "hand").
+            excluded_ids = resolve_class_ids(str(model_path), excluded)
             cls_ids = pred[0].boxes.cls.cpu().numpy().astype(int).tolist()
             keep = [
                 i
                 for i, cid in enumerate(cls_ids)
                 if (names[cid] if 0 <= cid < len(names) else str(cid)) not in excluded
                 and str(cid) not in excluded
+                and cid not in excluded_ids
             ]
             if not keep:
                 return PredictOutput()
@@ -116,8 +120,16 @@ def ultralytics_predict(
     try:
         _names = get_model_class_names(str(model_path))
         _cids = pred[0].boxes.cls.cpu().numpy().astype(int).tolist()
+        # No names for YOLO-World (or a model whose names could not be looked
+        # up): use the result's own vocabulary, which follows set_classes.
+        _result_names = None if _names else getattr(pred[0], "names", None)
+        if isinstance(_result_names, (list, tuple)):
+            _result_names = dict(enumerate(_result_names))
+        if not isinstance(_result_names, dict):
+            _result_names = {}
         class_names = [
-            _names[c] if 0 <= c < len(_names) else str(c) for c in _cids
+            _names[c] if 0 <= c < len(_names) else str(_result_names.get(c, c))
+            for c in _cids
         ]
     except Exception:  # noqa: BLE001
         class_names = []
@@ -225,5 +237,17 @@ def mask_to_pil(masks: torch.Tensor, shape: tuple[int, int]) -> list[Image.Image
         (W, H) of the original image
     """
     masks = masks.float()
-    n = masks.shape[0]
+    n, mask_height, mask_width = masks.shape
+    width, height = shape
+    # Standard Ultralytics segmentation returns masks in letterboxed inference
+    # coordinates, while boxes are already in original-image coordinates.
+    # Remove the centered padding before resizing (same rounding as scale_masks)
+    # so a rectangular image's mask stays aligned with the detected subject.
+    gain = min(mask_height / height, mask_width / width)
+    pad_x = (mask_width - round(width * gain)) / 2
+    pad_y = (mask_height - round(height * gain)) / 2
+    left, top = round(pad_x - 0.1), round(pad_y - 0.1)
+    right = mask_width - round(pad_x + 0.1)
+    bottom = mask_height - round(pad_y + 0.1)
+    masks = masks[:, top:bottom, left:right]
     return [to_pil_image(masks[i], mode="L").resize(shape) for i in range(n)]

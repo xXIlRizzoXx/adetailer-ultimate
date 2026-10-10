@@ -18,7 +18,9 @@
  * This patch re-applies the dictionary to exactly those three blind spots:
  *   (1) emoji-prefixed text nodes      — strict complement to Forge's
  *                                         re_emoji skip; key-gated.
- *   (2) input[role=listbox] .value     — dropdown selected values.
+ *   (2) input[role=listbox] .value     — dropdown selected values (the
+ *                                         ADetailer ones again after each
+ *                                         value change).
  *   (3) #setting_ad_reset_info block   — whole-block innerHTML swap, matched
  *                                         on the block's tag-stripped text.
  * It deliberately leaves everything Forge already handles (labels, accordion
@@ -124,6 +126,8 @@
 
     // OptionHTML settings this fork registers that need block-level handling.
     const HTML_BLOCK_IDS = ["setting_ad_reset_info"];
+    // The ADetailer panels (txt2img and img2img).
+    const ACCORDION_SEL = 'div[id*="adetailer_ad_main_accordion"]';
 
     function sweep() {
         translateInTree(document.body);
@@ -145,8 +149,24 @@
         // Re-translate as new nodes mount — lazy ADetailer accordion, preset
         // Load, cross-tab paste, dropdown re-render, the Settings tab opening
         // (where the reset block lives), and "Reload UI" without a full reload.
+        // Also when a label's text changes in place: Gradio rewrites a
+        // button's text node when its value changes (the Paste button after
+        // Copy or Reset), adding no node.
         const obs = new MutationObserver((mutations) => {
             for (const m of mutations) {
+                if (m.type === "characterData") {
+                    const t = m.target;
+                    const raw = t.textContent;
+                    if (t.nodeType === 3 && raw && re_emoji.test(raw)) {
+                        const tl = translateText(raw);
+                        // Never write a text that is itself a key: that
+                        // write would come back here as another change.
+                        if (tl !== null && translateText(tl) === null) {
+                            t.textContent = tl;
+                        }
+                    }
+                    continue;
+                }
                 for (const addedNode of m.addedNodes) {
                     if (addedNode.nodeType === 1) {
                         translateInTree(addedNode);
@@ -158,7 +178,43 @@
         obs.observe(document.body, {
             childList: true,
             subtree: true,
+            characterData: true,
         });
+
+        // A value change (a pick, Reset, Load, Paste settings, a pasted
+        // infotext) makes Gradio 4 write the dropdown input's `value` in
+        // English again, which is not a DOM mutation. Step (2) runs again on
+        // the ADetailer dropdowns after Gradio's "change" or "blur" event, one
+        // frame later, once the input has been written; the field being typed
+        // into is left alone. A DOM listener only, not a Gradio event
+        // (index-safe).
+        let queued = false;
+        const retranslateValues = function () {
+            queued = false;
+            for (const acc of document.querySelectorAll(ACCORDION_SEL)) {
+                for (const inp of acc.querySelectorAll('input[role="listbox"]')) {
+                    if (inp === document.activeElement) continue;
+                    const tl = translateText(inp.value);
+                    if (tl !== null) {
+                        inp.value = tl;
+                    }
+                }
+            }
+        };
+        document.addEventListener(
+            "gradio",
+            function (e) {
+                const ev = e && e.detail && e.detail.event;
+                if ((ev !== "change" && ev !== "blur") || queued) return;
+                queued = true;
+                if (window.requestAnimationFrame) {
+                    window.requestAnimationFrame(retranslateValues);
+                } else {
+                    setTimeout(retranslateValues, 16);
+                }
+            },
+            true
+        );
     }
 
     if (document.readyState === "loading") {

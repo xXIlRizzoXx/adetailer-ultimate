@@ -1,13 +1,22 @@
+import sys
+from types import ModuleType
+
 import numpy as np
 import pytest
 import torch
 from huggingface_hub import hf_hub_download
 from PIL import Image
 
-from adetailer.classes import _names_from_json, parse_csv, resolve_class_ids
+from adetailer.classes import (
+    _names_from_json,
+    get_model_class_names,
+    parse_csv,
+    resolve_class_ids,
+)
 from adetailer.ultralytics import mask_to_pil, ultralytics_predict
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "model_name",
     [
@@ -34,6 +43,7 @@ def test_ultralytics_hf_models(sample_image: Image.Image, model_name: str):
     assert len(result.bboxes) == len(result.masks) == len(result.confidences)
 
 
+@pytest.mark.integration
 def test_yolo_world_default(sample_image: Image.Image):
     model_path = hf_hub_download("Bingsu/yolo-world-mirror", "yolov8x-worldv2.pt")
     result = ultralytics_predict(model_path, sample_image)
@@ -44,6 +54,7 @@ def test_yolo_world_default(sample_image: Image.Image):
     assert len(result.bboxes) == len(result.masks) == len(result.confidences)
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "klass",
     [
@@ -65,6 +76,7 @@ def test_yolo_world(sample_image2: Image.Image, klass: str):
     assert len(result.bboxes) == len(result.masks) == len(result.confidences)
 
 
+@pytest.mark.integration
 def test_class_filter_include_person(sample_image: Image.Image):
     """Single-class model: filtering on its only class is a no-op vs unfiltered."""
     model_path = hf_hub_download("Bingsu/adetailer", "person_yolov8n-seg.pt")
@@ -74,6 +86,7 @@ def test_class_filter_include_person(sample_image: Image.Image):
     assert len(filtered.masks) == len(full.masks)
 
 
+@pytest.mark.integration
 def test_class_filter_include_unknown_falls_back(sample_image: Image.Image):
     """Unknown class names are dropped; if no valid id remains, falls back to no filter."""
     model_path = hf_hub_download("Bingsu/adetailer", "person_yolov8n-seg.pt")
@@ -82,6 +95,7 @@ def test_class_filter_include_unknown_falls_back(sample_image: Image.Image):
     assert len(filtered.bboxes) == len(full.bboxes)
 
 
+@pytest.mark.integration
 def test_class_filter_exclude_person(sample_image: Image.Image):
     """Excluding the only class the model produces should yield zero detections."""
     model_path = hf_hub_download("Bingsu/adetailer", "person_yolov8n-seg.pt")
@@ -141,6 +155,7 @@ class TestNamesFromJson:
         assert _names_from_json("face") == []
 
 
+@pytest.mark.integration
 def test_resolve_class_ids_with_known_model():
     """resolve_class_ids should accept names AND numeric strings."""
     model_path = hf_hub_download("Bingsu/adetailer", "person_yolov8n-seg.pt")
@@ -149,7 +164,178 @@ def test_resolve_class_ids_with_known_model():
     assert all(isinstance(i, int) for i in ids)
 
 
+class _FakeBoxes:
+    def __init__(self, cls):
+        n = len(cls)
+        self.xyxy = torch.tensor([[1.0, 1.0, 3.0, 3.0]] * n)
+        self.conf = torch.tensor([0.9] * n)
+        self.cls = torch.tensor(cls)
+
+    def __len__(self):
+        return len(self.cls)
+
+
+class _FakeResult:
+    def __init__(self, names, cls):
+        self.names = names
+        self.boxes = _FakeBoxes(cls)
+        self.masks = None
+
+    def plot(self):
+        return np.zeros((4, 4, 3), np.uint8)
+
+
+def _fake_yolo(monkeypatch, cls, names):
+    """Fake Ultralytics model returning one result with boxes of class ids
+    `cls`. Like YOLO-World, set_classes replaces its vocabulary, which the
+    result reports as `names`."""
+    module = ModuleType("ultralytics")
+
+    class YOLO:
+        def __init__(self, path):
+            self.names = names
+
+        def set_classes(self, classes):
+            self.names = list(classes)
+
+        def __call__(self, image, **kwargs):
+            return [_FakeResult(self.names, cls)]
+
+    module.YOLO = YOLO
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+
+
+@pytest.mark.parametrize(
+    ("classes", "cls", "expected"),
+    [
+        # No typed classes: the model's own vocabulary names the regions.
+        ("", [1.0, 0.0], ["bicycle", "person"]),
+        # Typed classes: the region carries the typed name, so inline
+        # [CLASS=hand] blocks and [SKIP] match it.
+        ("face, hand", [1.0], ["hand"]),
+    ],
+)
+def test_world_regions_are_named_after_their_classes(
+    tmp_path, monkeypatch, classes, cls, expected
+):
+    _fake_yolo(monkeypatch, cls, {0: "person", 1: "bicycle"})
+    model = tmp_path / "yolov8x-worldv2.pt"
+
+    result = ultralytics_predict(str(model), Image.new("RGB", (4, 4)), classes=classes)
+
+    assert result.class_names == expected
+
+
+def test_looked_up_class_names_still_win_over_the_result(tmp_path, monkeypatch):
+    model = tmp_path / "multi.pt"
+    model.write_bytes(b"x")
+    (tmp_path / "multi.names.json").write_text('["face", "hand"]', encoding="utf-8")
+    _fake_yolo(monkeypatch, [1.0, 5.0], {0: "other", 1: "thing"})
+    get_model_class_names.cache_clear()
+    try:
+        result = ultralytics_predict(str(model), Image.new("RGB", (4, 4)))
+    finally:
+        get_model_class_names.cache_clear()
+
+    # An id outside the looked-up names stays numeric, as before.
+    assert result.class_names == ["hand", "5"]
+
+
+def test_class_filter_names_match_regardless_of_case(tmp_path, monkeypatch, capsys):
+    # "Face" from an API call or an old preset used to match no class, so the
+    # include filter was dropped and every class was inpainted.
+    model = tmp_path / "multi.pt"
+    model.write_bytes(b"x")
+    (tmp_path / "multi.names.json").write_text('["face", "hand"]', encoding="utf-8")
+    calls = []
+    module = ModuleType("ultralytics")
+
+    class YOLO:
+        def __init__(self, path):
+            self.names = {0: "face", 1: "hand"}
+
+        def __call__(self, image, **kwargs):
+            calls.append(kwargs)
+            wanted = kwargs.get("classes")
+            cls = [float(c) for c in (0, 1) if wanted is None or c in wanted]
+            return [_FakeResult(self.names, cls)]
+
+    module.YOLO = YOLO
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+    image = Image.new("RGB", (4, 4))
+    get_model_class_names.cache_clear()
+    try:
+        include = ultralytics_predict(str(model), image, classes="Face")
+        exclude = ultralytics_predict(str(model), image, exclude_classes="HAND")
+        unknown = ultralytics_predict(str(model), image, classes="hands")
+    finally:
+        get_model_class_names.cache_clear()
+
+    assert calls[0]["classes"] == [0]
+    assert include.class_names == ["face"]
+    assert exclude.class_names == ["face"]
+    # A name the model does not have is still dropped (every class is then
+    # detected, as before), but the console now says so.
+    assert "classes" not in calls[2]
+    assert unknown.class_names == ["face", "hand"]
+    assert "hands" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "token", ["²", "①", "1" * 5000], ids=["superscript", "circled", "bad-number"]
+)
+def test_a_digit_that_int_rejects_does_not_stop_the_class_filter(
+    tmp_path, monkeypatch, token
+):
+    # A class with a digit that int() rejects, or a number that cannot be
+    # converted, in the include or the NOT filter is dropped as an unknown
+    # class.
+    model = tmp_path / "multi.pt"
+    model.write_bytes(b"x")
+    (tmp_path / "multi.names.json").write_text('["face", "hand"]', encoding="utf-8")
+    _fake_yolo(monkeypatch, [0.0, 1.0], {0: "face", 1: "hand"})
+    image = Image.new("RGB", (4, 4))
+    get_model_class_names.cache_clear()
+    try:
+        include = ultralytics_predict(str(model), image, classes="face," + token)
+        exclude = ultralytics_predict(str(model), image, exclude_classes=token)
+    finally:
+        get_model_class_names.cache_clear()
+
+    assert include.class_names == ["face", "hand"]
+    assert exclude.class_names == ["face", "hand"]
+
+
 class TestMaskToPil:
+    @pytest.mark.parametrize(
+        ("content_size", "padding", "output_size"),
+        [
+            ((8, 6), (0, 0, 1, 1), (16, 12)),  # landscape
+            ((6, 8), (1, 1, 0, 0), (12, 16)),  # portrait
+            ((8, 5), (0, 0, 1, 2), (16, 10)),  # odd vertical padding
+            ((5, 8), (1, 2, 0, 0), (10, 16)),  # odd horizontal padding
+            ((8, 8), (0, 0, 0, 0), (16, 16)),  # square, no padding
+            ((8, 6), (0, 0, 0, 0), (16, 12)),  # rectangular, no padding
+            ((8, 6), (0, 0, 0, 0), (8, 6)),  # native-resolution mask
+        ],
+    )
+    def test_mask_to_pil_preserves_regions_after_letterbox(
+        self, content_size, padding, output_size
+    ):
+        width, height = content_size
+        original = torch.zeros((2, height, width), dtype=torch.float32)
+        original[0, :2, :3] = 1
+        original[1, -2:, -3:] = 1
+        letterboxed = torch.nn.functional.pad(original, padding)
+
+        results = mask_to_pil(letterboxed, output_size)
+
+        assert len(results) == 2
+        for content, result in zip(original, results):
+            expected = Image.fromarray((content.numpy() * 255).astype(np.uint8))
+            expected = expected.resize(output_size)
+            np.testing.assert_array_equal(np.array(result), np.array(expected))
+
     def test_mask_to_pil_float32(self):
         mask = torch.tensor([[[0.0, 1.0], [0.0, 1.0]]], dtype=torch.float32)
         imgs = mask_to_pil(mask, shape=(2, 2))

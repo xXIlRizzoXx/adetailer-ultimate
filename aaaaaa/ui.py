@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import chain
@@ -9,7 +10,8 @@ from typing import Any
 
 import gradio as gr
 
-from aaaaaa.conditional import InputAccordion
+from aaaaaa.conditional import InputAccordion, schedulers
+from aaaaaa.jobs import wrap_adetailer_detection, wrap_adetailer_job
 from adetailer import ADETAILER, __version__
 from adetailer.args import ALL_ARGS, MASK_MERGE_INVERT
 from adetailer.classes import MEDIAPIPE_FACE_FEATURES_MODEL, get_model_class_names
@@ -20,8 +22,10 @@ from adetailer.presets import (
     get_preset,
     get_preset_names,
     import_presets_json,
+    is_valid_name,
     rename_preset,
     save_preset,
+    take_recovery_note,
 )
 from controlnet_ext import controlnet_exists, controlnet_type, get_cn_models
 
@@ -188,8 +192,9 @@ _GUIDE_SECTIONS: list[tuple[str, str]] = [
         "🚀 Getting started",
         """
 - **Enable ADetailer** — the checkbox on the accordion header turns it on for this generation.
-- **ADetailer detector** — the first dropdown at the top of each tab. This is the model that finds what to fix (a face model, hand model, a segmentation or MediaPipe model…). `None` disables that tab.
+- **ADetailer detector** — the dropdown below the Preset library and the Copy / Paste settings buttons in each tab. This is the model that finds what to fix (a face model, hand model, a segmentation or MediaPipe model…). `None` disables that tab.
 - **Tabs (1st, 2nd, …)** — each numbered tab is an independent detector + its own settings, and they run **in order** (e.g. tab 1 = faces, tab 2 = hands). Change how many tabs you have in `Settings → ADetailer`.
+- **Enable this tab** — the checkbox at the top of each tab. On a fresh setup only the 1st tab is switched on: tick it in the 2nd and later tabs, or they are skipped even with a detector picked. The green "Nx Tabs" pill next to the ADetailer title counts the tabs switched on.
 - **First run:** enable ADetailer, pick `face_yolov8n.pt` in the detector dropdown, and generate — every face is detected and re-detailed automatically.
 """,
     ),
@@ -199,7 +204,7 @@ _GUIDE_SECTIONS: list[tuple[str, str]] = [
 - **YOLO models** (`face_yolov8n`, `hand_yolov8n`, `person_yolov8n`, …) — fast detectors. The `n`/`s`/`m` suffix is size; `n` is fastest, larger is more accurate.
 - **Segmentation vs box** — segmentation models give a precise mask shape; box-only models give a rectangle. You can force the rectangle with *Use bbox as mask* (see Mask preprocessing).
 - **Multi-class models** — a model that knows several classes (e.g. a person/face/hand model, or a custom one) shows the **CLASSES** dropdown so you can pick which parts to detail.
-- **MediaPipe** — `mediapipe_face_mesh` and `..._eyes_only` detect faces/eyes by landmarks, without a model file.
+- **MediaPipe** — `mediapipe_face_mesh` and `..._eyes_only` detect faces/eyes by landmarks. They need no `.pt` model, but MediaPipe's own small model files (`face_landmarker.task` for these two) are downloaded into `adetailer/_mediapipe_models/` on first use; on an offline machine, place them there by hand (the console names each missing file and its URL).
 - **MediaPipe face features (new)** — `mediapipe_face_features` treats the face as classes **eyes, mouth, nose, eyebrows, face**; pick all, some, or just one in the CLASSES dropdown.
 - **YOLO-World (`…-world`)** — open vocabulary: type comma-separated words in the classes field to detect almost anything you can name.
 - **Custom models** — drop a `.pt` into your ADetailer models folder. If its classes don't appear, add a sidecar file `<model>.names.json` shaped like `{"names": {"0": "face", "1": "hand"}}`.
@@ -209,7 +214,7 @@ _GUIDE_SECTIONS: list[tuple[str, str]] = [
         "🎯 Detection settings",
         """
 - **Detection model confidence threshold** — how sure the detector must be. Lower finds more (and more false) detections.
-- **Detection resolution (0 = default) (new)** — run the detector at a higher internal resolution (e.g. 1024 instead of the default 640) to catch **small or distant** parts. Higher finds more but uses more VRAM and time. The single-tab *Detection preview* honours it too.
+- **Detection resolution (0 = default) (new)** — run the detector at a higher internal resolution to catch **small or distant** parts. 0 keeps the detector's own size, the one it was trained at: 640 for the bundled models, 1024 for some others. Only a value above that size helps (e.g. 1024 for a 640 model); a lower one can miss parts. Higher finds more but uses more VRAM and time. The single-tab *Detection preview* honours it too.
 - **ADetailer detector CLASSES** — for multi-class models, choose which parts to detail. Empty = all of them.
 - **Exclude selected (NOT)** — invert the choice: detail everything **except** the selected classes.
 - **Process classes sequentially** — one detect+inpaint pass per selected class, in the order you clicked them. Required for per-class prompts.
@@ -222,7 +227,7 @@ _GUIDE_SECTIONS: list[tuple[str, str]] = [
 - **Use bbox as mask (segmentation models)** — inpaint the rectangle instead of the tight segmentation shape, giving the region more room to blend. No effect on box-only detectors.
 - **Mask erosion (−) / dilation (+)** — shrink or grow the detected mask.
 - **Mask x / y offset** — nudge the mask left/right or up/down.
-- **Mask merge mode** — None, Merge, or Merge and Invert: combine overlapping masks, optionally inverting what gets inpainted.
+- **Mask merge mode** — None: inpaint each mask separately; Merge: merge all masks into one and inpaint it as a single region, also when they do not touch; Merge and Invert: merge all masks, invert, then inpaint the area outside the detections (skipped when the detections cover the whole image).
 """,
     ),
     (
@@ -260,27 +265,27 @@ Use different settings **only** for the detail pass; each is off (inherits the m
     (
         "🧰 Preview & run-on-image tools",
         """
-Two sibling tools live inside each tab's **Detection** section (roughly the middle of the tab, above Mask preprocessing):
+Two sibling tools sit right after each tab's **Detection** section (roughly the middle of the tab, above Mask preprocessing and Inpainting):
 - **Detection preview** — drop an image to see what the detector would find (boxes), without generating. The single-tab preview honours this tab's **Detection resolution**. **Combine all tabs** overlays every tab's detector at once (that combined view stays at the default resolution).
 - **Run ADetailer on an image** — drop a finished image and run the full detect + inpaint pass on it, without regenerating. Optional **Save result to outputs** writes to a dedicated `ADetailer-Inpaint` folder; click the result to enlarge it.
-- **Batch a whole folder (new)** — paste a **folder path** in that same tool to detail every image inside it in one go; each result is always saved to the `ADetailer-Inpaint` folder. A folder path takes priority over a single dropped image.
+- **Batch a whole folder (new)** — paste a **folder path** in that same tool to detail every image inside it in one go; each result is always saved: to the `ADetailer-Inpaint` folder or, with **📁 Save results in the source folder instead** ticked, beside each source image as `name-ad` (a new file — originals are never overwritten; `name-ad-1`, `name-ad-2`… if the name is taken). A folder path takes priority over a single dropped image.
 """,
     ),
     (
         "💾 Presets, copy/paste & saving",
         """
-- **Preset library** — save / load / rename / delete a whole tab's settings by name; **export / import** the library as a file to move it between machines.
+- **Preset library** — save / load / rename / delete a whole tab's settings by name; **export / import** the library as a file to move it between machines (on WebUIs that ship Gradio 3, such as AUTOMATIC1111 and reForge's main branch, Export cannot download a file: back up `user_presets.json` from the extension folder instead; Import works everywhere).
 - **Copy settings / Paste settings** — clone one tab's settings into another.
 - **Remember last-used settings between restarts** (`Settings → ADetailer`) — restore your last setup after a restart.
 - **Reset ADetailer settings** (`Settings → ADetailer`) — restore factory defaults.
-- **Where files go** — intermediate step/preview files land in an `adetailer-steps/` sub-folder; the standalone *Run/Batch* results go in a top-level `ADetailer-Inpaint/` folder next to your normal outputs.
+- **Where files go** — intermediate step/preview files land in an `adetailer-steps/` sub-folder; the standalone *Run/Batch* results go in a top-level `ADetailer-Inpaint/` folder next to your normal outputs, unless a folder batch uses *Save results in the source folder instead*, which writes beside each source image.
 """,
     ),
     (
         "🛠️ Fixing common problems",
         """
 - **The wrong thing gets regenerated** (e.g. one part redrawn as another) — keep denoise low and turn on **Auto class-guard**, or write **per-class prompts** / **inline `[CLASS=]`** so each class stays itself.
-- **Small or distant faces are missed** — raise **Detection resolution** (e.g. 1024), and/or lower the confidence threshold.
+- **Small or distant faces are missed** — raise **Detection resolution** above the detector's own size (e.g. 1024 for the bundled 640 models), and/or lower the confidence threshold.
 - **The face no longer looks like the character** — lower **Inpaint denoising strength**.
 - **A style LoRA bleeds onto the detailed region** — turn on **Strip LoRAs from the detailer prompt**.
 - **The mask is too tight / edges show** — use **bbox as mask** or **dilation**, and increase **mask blur**.
@@ -443,12 +448,14 @@ def on_generate_click(
     # pair scopes the persisted state by pipeline so txt2img and img2img
     # don't overwrite each other. Never raise — see adetailer.persistence
     # for the swallowed-error policy.
-    save_tab_state(mode, tab_index, state)
+    written = save_tab_state(mode, tab_index, state)
     # Diagnostic log (console) — show exactly what each active tab persisted on
     # this Generate, so saved settings are visible/auditable in the log (paired
-    # with the restore log in one_ui_group). Only logs tabs with a real
-    # detector to avoid noise. Plain print → index-safe.
-    if state.get("ad_model") and state.get("ad_model") != "None":
+    # with the restore log in one_ui_group). Only logs tabs really written (not
+    # with "Remember last-used settings" off or a failed save) with a real
+    # detector, to avoid noise. Plain print → index-safe. !a writes any
+    # non-ASCII character as an escape, so a console in any code page prints it.
+    if written and state.get("ad_model") and state.get("ad_model") != "None":
         _cls = (
             state.get("ad_model_classes_excluded")
             if state.get("ad_model_classes_exclude")
@@ -456,8 +463,8 @@ def on_generate_click(
         )
         _mode_word = "NOT/exclude" if state.get("ad_model_classes_exclude") else "include"
         print(
-            f"[-] ADetailer: saved tab {tab_index + 1} ({mode}) — "
-            f"detector={state.get('ad_model')!r}, classes[{_mode_word}]={_cls!r}"
+            f"[-] ADetailer: saved tab {tab_index + 1} ({mode}) - "
+            f"detector={state.get('ad_model')!a}, classes[{_mode_word}]={_cls!a}"
         )
     return state
 
@@ -471,18 +478,26 @@ def on_ad_model_update(
     model: str,
     current_selection: list | None = None,
     model_mapping: dict[str, str] | None = None,
+    *,
+    current_include: str | None = None,
+    current_exclude: bool = False,
+    current_excluded: str | None = None,
 ):
     """Return updates for (textbox, dropdown, exclude-checkbox, excluded-textbox).
 
-    The dropdown and exclude checkbox stay always visible so the layout is
+    The dropdown and exclude checkbox stay visible so the layout is
     predictable across model changes. They're populated with the model's
     class names when applicable, empty otherwise.
 
-    - YOLO-World: ALSO shows the free-text textbox (open-vocabulary).
+    - YOLO-World: ALSO shows the free-text textbox (open-vocabulary),
+      preserving values restored by presets or PNG infotext. The exclude
+      checkbox is hidden and off and its excluded list is emptied: World
+      always detects the typed classes.
     - Other multiclass YOLO: dropdown populated from model.names. Any
       current selections that are still valid in the new model are
       preserved — this is what lets Copy/Paste between tabs keep the
-      class-filter state when the detector matches.
+      class-filter state when the detector matches. Include/exclude mode
+      and its backing CSV are preserved on programmatic detector changes.
     - MediaPipe / None: dropdown shown but empty.
     """
     if (
@@ -504,39 +519,266 @@ def on_ad_model_update(
         return (
             gr.update(
                 visible=True,
-                value="",
+                value=current_include or "",
                 placeholder="Comma separated class names to detect, ex: 'person,cat'. default: COCO 80 classes",
             ),
             gr.update(visible=True, choices=[], value=[]),
-            gr.update(visible=True, value=False),
+            gr.update(visible=False, value=False),
             gr.update(value=""),
         )
 
     mapping = model_mapping or {}
-    path = mapping.get(model, "")
+    path = (
+        model if model == MEDIAPIPE_FACE_FEATURES_MODEL else mapping.get(model, "")
+    )
     names = get_model_class_names(path) if path else []
-    # Preserve selections that still exist in the new model's class list.
-    preserved = [s for s in (current_selection or []) if s in names]
+    # Presets/PNG infotext update the backing fields directly; the old UI-only
+    # dropdown may still describe a different detector. Read the active CSV
+    # when supplied, using the selection only for older callers.
+    csv = current_excluded if current_exclude else current_include
+    requested = (
+        [s.strip() for s in csv.split(",") if s.strip()]
+        if csv is not None
+        else (current_selection or [])
+    )
+    # Preserve requested values if metadata could not be read; silently
+    # erasing the filter would mean "detect every class". A name in another
+    # case maps to the model's own name, as in resolve_class_ids (an exact
+    # match wins; a name matching several classes is dropped). A class id
+    # ("1") detection accepts is kept as written; the MediaPipe face features
+    # match names only. A number that cannot be converted is dropped like
+    # any unknown name.
+    folded = [n.casefold() for n in names]
+
+    def _is_id(s: str) -> bool:
+        if model == MEDIAPIPE_FACE_FEATURES_MODEL or not s.isdecimal():
+            return False
+        try:
+            return int(s) < len(names)
+        except ValueError:  # not a usable number
+            return False
+
+    preserved = list(
+        dict.fromkeys(
+            s
+            if not names or s in names or _is_id(s)
+            else names[folded.index(s.casefold())]
+            for s in requested
+            if not names or s in names or _is_id(s) or folded.count(s.casefold()) == 1
+        )
+    )
     # Also feed the preserved classes into the hidden backing textbox.
-    # Programmatic dropdown updates don't fire `.change`, so without this the
+    # Keep the backing field in the same response as the dropdown so it
+    # does not have to wait for a subsequent `.change` callback. Without this the
     # textbox would stay empty even though the dropdown shows the preserved
     # tokens (e.g. after Copy/Paste or re-selecting the same model), desyncing
-    # the filter. Checkbox is reset to include-mode here, so the value goes to
-    # ad_model_classes (not ad_model_classes_excluded).
+    # the filter. Respect the current NOT toggle when choosing its CSV field.
+    csv = ",".join(preserved)
     return (
-        gr.update(visible=False, value=",".join(preserved)),
-        gr.update(visible=True, choices=names, value=preserved),
-        gr.update(visible=True, value=False),
-        gr.update(value=""),
+        gr.update(visible=False, value="" if current_exclude else csv),
+        gr.update(
+            visible=True, choices=list(dict.fromkeys([*names, *preserved])), value=preserved
+        ),
+        gr.update(visible=True, value=current_exclude),
+        gr.update(value=csv if current_exclude else ""),
     )
 
 
-def on_cn_model_update(cn_model_name: str):
-    cn_model_name = cn_model_name.replace("inpaint_depth", "depth")
+def _restored_tab_updates(
+    state: dict[str, Any], attrs: list[str], model_mapping: dict[str, str] | None = None
+) -> list:
+    """Restore a snapshot together with its detector's class UI.
+
+    The visible class selection and its choices travel alongside
+    the saved values in the same Load/Paste/Reset response.
+    """
+    updates = {
+        attr: gr.update(value=state[attr]) if attr in state else gr.update()
+        for attr in attrs
+    }
+    dropdown_update = gr.update()
+    if "ad_model" in state:
+        model = state.get("ad_model") or "None"
+        world = "-world" in model
+        exclude = bool(state.get("ad_model_classes_exclude", False))
+        csv = state.get(
+            "ad_model_classes_excluded" if exclude else "ad_model_classes", ""
+        ) or ""
+        selected = list(dict.fromkeys(c.strip() for c in csv.split(",") if c.strip()))
+        path = (
+            model
+            if model == MEDIAPIPE_FACE_FEATURES_MODEL
+            else (model_mapping or {}).get(model, "")
+        )
+        names = get_model_class_names(path) if path and not world else []
+        if world or model == "None" or (
+            model.lower().startswith("mediapipe")
+            and model != MEDIAPIPE_FACE_FEATURES_MODEL
+        ):
+            selected = []
+            names = []
+        dropdown_update = gr.update(
+            choices=list(dict.fromkeys([*names, *selected])),
+            value=selected,
+            visible=True,
+        )
+        # Preserve unknown saved tokens if a model's metadata is unavailable;
+        # silently erasing them would turn a narrow filter into "all classes".
+        updates["ad_model_classes"] = gr.update(
+            value=state.get("ad_model_classes", ""), visible=world
+        )
+        # YOLO-World has no NOT mode: keep its checkbox hidden and off.
+        updates["ad_model_classes_exclude"] = gr.update(
+            value=exclude and not world, visible=not world
+        )
+        updates["ad_model_classes_excluded"] = gr.update(
+            value="" if world else state.get("ad_model_classes_excluded", "")
+        )
+    return [*(updates[attr] for attr in attrs), dropdown_update]
+
+
+_CLASS_FILTER_DEFAULTS = {
+    "ad_model_classes": "",
+    "ad_model_classes_exclude": False,
+    "ad_model_classes_excluded": "",
+}
+
+
+def _skipped_infotext_keys() -> set[str]:
+    """Keys the user asked the WebUI to disregard when pasting infotext.
+
+    The WebUI drops them before paste handlers run, so a missing key can
+    also mean "leave this field alone".
+    """
+    try:
+        from modules import shared
+
+        return set(getattr(shared.opts, "infotext_skip_pasting", None) or [])
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _class_filter_infotext_fields(
+    w: Widgets, n: int, model_mapping: dict[str, str] | None = None
+) -> list[tuple[Any, Any]]:
+    """Paste handlers for tab `n`'s class filter, including its selection.
+
+    Infotext leaves out class-filter keys that hold their defaults, and the
+    WebUI keeps a field unchanged when its key is missing, so a pasted image
+    could inherit the tab's previous filter. When the tab's detector is in
+    the infotext, a missing key means its default. The UI-only selection is
+    pasted from the same values: the detector may not change, and then
+    nothing else would update it.
+    """
+    names = dict(ALL_ARGS)
+    model_key = names["ad_model"] + suffix(n)
+
+    def read(params: dict[str, Any]) -> dict[str, Any] | None:
+        if model_key not in params:
+            return None
+        skipped = _skipped_infotext_keys()
+        state = {"ad_model": str(params[model_key])}
+        for attr, default in _CLASS_FILTER_DEFAULTS.items():
+            key = names[attr] + suffix(n)
+            if key in skipped:
+                state[attr] = None  # leave the field as it is
+                continue
+            value = params.get(key, default)
+            if attr == "ad_model_classes_exclude":
+                # YOLO-World has no NOT mode: its checkbox stays off.
+                value = str(value).strip().lower() == "true" and (
+                    "-world" not in state["ad_model"]
+                )
+            elif attr == "ad_model_classes_excluded" and (
+                "-world" in state["ad_model"]
+            ):
+                value = ""  # nor an excluded list
+            state[attr] = value
+        return state
+
+    def field(attr: str):
+        def paste(params: dict[str, Any]):
+            state = read(params)
+            return None if state is None else state[attr]
+
+        return paste
+
+    def selection(params: dict[str, Any]):
+        state = read(params)
+        if state is None or None in state.values():
+            return None
+        return _restored_tab_updates(state, [], model_mapping)[-1]
+
+    return [
+        *((getattr(w, attr), field(attr)) for attr in _CLASS_FILTER_DEFAULTS),
+        (w.ad_model_classes_dropdown, selection),
+    ]
+
+
+_TAB_PASTE_ATTRS = ("ad_tab_enable", "ad_inpaint_indices")
+
+
+def _tab_infotext_fields(w: Widgets, n: int) -> list[tuple[Any, Any]]:
+    """Paste handlers for tab `n`'s enable flag and detection numbers.
+
+    Infotext never writes "ADetailer tab enable" (it only lists enabled tabs)
+    and leaves out empty inpaint indices, and the WebUI keeps a field
+    unchanged when its key is missing. Extra tabs start disabled, so a pasted
+    tab stayed off and an old detection-number filter stayed in place. When
+    the tab's detector is in the infotext, the tab was enabled and a missing
+    indices key means empty. An image made with ADetailer lists the detector
+    of every tab that ran, so a tab missing from it is switched off.
+    """
+    names = dict(ALL_ARGS)
+    model_key = names["ad_model"] + suffix(n)
+
+    def pasted(params: dict[str, Any], attr: str) -> bool:
+        return (
+            model_key in params
+            and str(params[model_key]) != "None"
+            and names[attr] + suffix(n) not in _skipped_infotext_keys()
+        )
+
+    def enable(params: dict[str, Any]):
+        if pasted(params, "ad_tab_enable"):
+            return True
+        if (
+            "ADetailer version" in params
+            and model_key not in params
+            and not {model_key, names["ad_tab_enable"] + suffix(n)}
+            & _skipped_infotext_keys()
+        ):
+            return False  # this tab did not run for the pasted image
+        return None
+
+    def indices(params: dict[str, Any]):
+        if not pasted(params, "ad_inpaint_indices"):
+            return None  # leave the field as it is
+        return str(params.get(names["ad_inpaint_indices"] + suffix(n), ""))
+
+    return [(w.ad_tab_enable, enable), (w.ad_inpaint_indices, indices)]
+
+
+def _sync_class_dropdown(selected: list[str] | None, exclude: bool, model: str):
+    # World classes live in a separate free-text field. Loading/resetting its
+    # empty fixed-class dropdown must never erase that open vocabulary.
+    if model and "-world" in model:
+        return gr.update(), gr.update()
+    csv = ",".join(selected or [])
+    return ("" if exclude else csv), (csv if exclude else "")
+
+
+def on_cn_model_update(cn_model_name: str, current_module: str | None = None):
+    # The model list matches its type in any case (OpenPoseXL2): so does this.
+    cn_model_name = cn_model_name.lower().replace("inpaint_depth", "depth")
     for t in cn_module_choices:
         if t in cn_model_name:
             choices = cn_module_choices[t]
-            return gr.update(visible=True, choices=choices, value=choices[0])
+            # Keep a module that fits the model: Load, Paste and infotext
+            # paste set the model and its module together, and this handler
+            # runs after them.
+            value = current_module if current_module in choices else choices[0]
+            return gr.update(visible=True, choices=choices, value=value)
     return gr.update(visible=False, choices=["None"], value="None")
 
 
@@ -575,11 +817,10 @@ def adui(
         # Version "about" badge — CSS pulls it out of normal flow and overlays
         # it onto the accordion header. Lives inside the accordion content so
         # it's automatically hidden when the accordion is collapsed.
-        # Format (since 2026-05-16): brand prefix + locked __version__ +
-        # current git short-hash. The hash gives a live, auto-updating
-        # indicator of "which commit is installed" — refreshes every time
-        # adui() rebuilds the panel after a `git pull`. Locked __version__
-        # is left alone per the no-auto-bump rule.
+        # Format: brand prefix + __version__ + current git short-hash.
+        # Increment the plus revision with each improvement round. The hash
+        # identifies the installed commit and
+        # refreshes whenever adui() rebuilds the panel after a `git pull`.
         gr.Markdown(
             _build_overlay_text(),
             elem_id=eid("ad_version"),
@@ -636,14 +877,36 @@ def adui(
         # update their labels when ANY tab does a copy, so this can't be done
         # inside one_ui_group.
         _wire_copy_paste(
-            all_widgets, all_copy_btns, all_paste_btns, clipboard_state, num_models
+            all_widgets, all_copy_btns, all_paste_btns, clipboard_state, num_models,
+            model_mapping=webui_info.model_mapping,
         )
+        try:
+            _cn_models = get_cn_models()
+        except Exception:  # noqa: BLE001 — never break the UI build
+            _cn_models = None
         _wire_presets(
             all_widgets,
             all_presets,
             all_paste_btns,
             clipboard_state,
             num_models,
+            model_mapping=webui_info.model_mapping,
+            # What a fresh build shows (sampler_names[1] in inpainting()).
+            first_sampler=(
+                webui_info.sampler_names[0] if webui_info.sampler_names else None
+            ),
+            sampler_names=webui_info.sampler_names,
+            scheduler_names=webui_info.scheduler_names,
+            # The endings the WebUI takes off a sampler name, per scheduler.
+            scheduler_endings=[
+                [x.label, getattr(x, "name", None), *(getattr(x, "aliases", None) or ())]
+                for x in schedulers
+            ],
+            # What the override dropdowns offer (inpainting(), controlnet()).
+            checkpoint_names=webui_info.checkpoints_list,
+            vae_names=webui_info.vae_list,
+            text_encoder_names=webui_info.text_encoders_list,
+            cn_model_names=_cn_models,
         )
         # Cross-tab Detection-preview wiring (also a post-loop "second pass"):
         # lets each tab's "Combine all tabs" checkbox run every tab's detector.
@@ -667,11 +930,84 @@ def adui(
     return components, infotext_fields
 
 
-def _draw_detection_numbers(img, bboxes):
+def _chip_spot(first, box, size, image_size, taken):
+    """Top-left corner (x, y) for a ``size`` (w, h) label chip of ``box``
+    (x1, y1, x2, y2) that keeps it clear of the chips already drawn: ``taken``
+    holds their [x0, y0, x1, y1] and gets this chip's too. ``first`` is the
+    chip's usual spot and is kept whenever it is free and inside the image, so
+    a preview without crowded boxes is drawn as before. Otherwise the chip takes
+    the first free spot next to the box: above it, inside one of its corners,
+    below it, beside it, or above or below it just past a chip in the way; when
+    no spot is free, the one that covers the least of the other chips. Every
+    spot is moved inside the image. Only the chips near the box are compared,
+    and with more than 40 of them (hundreds of boxes, as at a confidence near
+    0) the chip keeps its usual spot, so such a preview stays quick. Plain
+    arithmetic, no fonts."""
+    w, h = size
+    img_w, img_h = image_size
+    x1, y1, x2, y2 = box
+
+    def inside(sx, sy):
+        # Inside the image; a chip larger than the image still starts in it.
+        return (
+            max(0, min(sx, img_w - w if w <= img_w else img_w - 1)),
+            max(0, min(sy, img_h - h if h <= img_h else img_h - 1)),
+        )
+
+    fixed = (
+        first,
+        (x1, y1 - h), (x1 + 2, y1 + 2), (x1 + 2, y2 - h - 2), (x1, y2 + 2),
+        (x2 - w - 2, y1 + 2), (x2 - w, y1 - h), (x2 - w, y2 + 2),
+        (x1 - w - 2, y1), (x2 + 2, y1),
+    )
+    # Every spot, before and after it is moved inside the image, lies in the
+    # area these fixed spots span: a chip that does not touch that area can be
+    # neither in the way of a spot nor the chip a spot slides past.
+    corners = fixed + tuple(inside(*s) for s in fixed)
+    left, right = min(c[0] for c in corners), max(c[0] for c in corners) + w
+    top, bottom = min(c[1] for c in corners), max(c[1] for c in corners) + h
+    near = [
+        r for r in taken
+        if r[0] <= right and left <= r[2] and r[1] <= bottom and top <= r[3]
+    ]
+
+    def spots():
+        yield from fixed
+        for y in (y1 - h, y2 + 2):
+            for r in near:
+                if r[1] < y + h and y < r[3]:
+                    yield from (
+                        (x, y) for x in (r[2] + 1, r[0] - w - 1) if x1 - w < x < x2
+                    )
+
+    if len(near) > 40:
+        x, y = inside(*first)
+    else:
+        best = None
+        for sx, sy in spots():
+            x, y = inside(sx, sy)
+            cover = sum(
+                max(0, min(x + w, r[2]) - max(x, r[0]))
+                * max(0, min(y + h, r[3]) - max(y, r[1]))
+                for r in near
+            )
+            if best is None or cover < best[0]:
+                best = (cover, x, y)
+            if not cover:
+                break
+        _cover, x, y = best
+    taken.append([x, y, x + w, y + h])
+    return x, y
+
+
+def _draw_detection_numbers(img, bboxes, class_names=None):
     """Overlay a bold 1-based ordinal (#1, #2, …) on each detection box, in RAW
     detector order — the same order the ``ad_inpaint_indices`` filter uses — so a
     user can read a number off the single-tab Detection preview and type it to
-    keep only that region. Cosmetic and fully guarded: any failure (bad font,
+    keep only that region. With ``class_names`` (parallel to ``bboxes``) the
+    chip also names the class ("#1 eyes"): it sits where a MediaPipe plot writes
+    its label, and hides it. A chip that would cover an earlier one moves next
+    to its box (see _chip_spot). Cosmetic and fully guarded: any failure (bad font,
     bad box) returns the image unchanged rather than breaking the preview."""
     try:
         from PIL import ImageDraw, ImageFont
@@ -691,18 +1027,32 @@ def _draw_detection_numbers(img, bboxes):
                 font = ImageFont.load_default(size=fsize)  # Pillow >= 10.1
             except Exception:  # noqa: BLE001
                 font = ImageFont.load_default()
+        taken = []  # the chips drawn so far, kept clear of each other
         for j, box in enumerate(bboxes):
             try:
-                x1, y1 = int(box[0]), int(box[1])
+                x1, y1, x2, y2 = (int(v) for v in box[:4])
             except Exception:  # noqa: BLE001
                 continue
             label = f"#{j + 1}"
-            tb = draw.textbbox((0, 0), label, font=font)
+            if class_names and j < len(class_names) and class_names[j]:
+                label += f" {class_names[j]}"
+            try:
+                tb = draw.textbbox((0, 0), label, font=font)
+            except Exception:  # noqa: BLE001
+                # The bitmap fallback font (Pillow < 10.1, no TrueType font
+                # found) is Latin-1 only: keep the number, drop the name.
+                label = f"#{j + 1}"
+                tb = draw.textbbox((0, 0), label, font=font)
             tw, th = tb[2] - tb[0], tb[3] - tb[1]
-            lx, ly = x1 + 2, y1 + 2  # just inside the box's top-left corner
+            # Just inside the box's top-left corner, unless a chip is there.
+            lx, ly = _chip_spot(
+                (x1 + 2, y1 + 2), (x1, y1, x2, y2), (tw + 8, th + 7), out.size, taken
+            )
             # Solid dark chip + bright number so it reads over any preview colour.
             draw.rectangle([lx, ly, lx + tw + 8, ly + th + 7], fill=(0, 0, 0))
-            draw.text((lx + 4, ly + 3), label, fill=(255, 255, 0), font=font)
+            # A font draws its text tb[0] right of and tb[1] below the point it
+            # is given, more at a larger size: start it 4 and 3 px inside the chip.
+            draw.text((lx + 4 - tb[0], ly + 3 - tb[1]), label, fill=(255, 255, 0), font=font)
         return out
     except Exception:  # noqa: BLE001
         return img
@@ -734,7 +1084,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         image, model_name, classes_csv, exclude_csv, exclude_mode, confidence, imgsz=0
     ):
         """Run one detector. Returns (PredictOutput | None, error_str | None).
-        `imgsz` (0 = default 640) is the optional HD detection resolution; it
+        `imgsz` (0 = the detector's own size) is the optional HD detection resolution; it
         only affects ultralytics models — mediapipe ignores it."""
         if not model_name or model_name == "None":
             return None, "no model"
@@ -770,7 +1120,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     path,
                     image=image,
                     confidence=float(confidence),
-                    device="",
+                    # The script's detector device, as the real pass uses:
+                    # "cpu" for --use-cpu adetailer / --lowvram / --medvram.
+                    device=getattr(script, "ultralytics_device", "") or "",
                     classes=classes_csv or "",
                     exclude_classes=(exclude_csv if exclude_mode and exclude_csv else ""),
                     imgsz=int(imgsz or 0),
@@ -809,7 +1161,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     return None, f"⚠️ Couldn't read this tab's settings: {e}"
                 if not args_obj.ad_model or args_obj.ad_model == "None":
                     return None, "⚠️ Pick a detector model first."
-                return script.run_detailer_on_image(image, args_obj, save=save)
+                return script.run_detailer_on_image(
+                    image, args_obj, save=save, tab=tab_idx
+                )
 
             # Single-tab: reuse the rich ultralytics/mediapipe plot (class
             # labels + confidence baked in by the detector's own plotter).
@@ -821,7 +1175,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     return None, "⚠️ Pick a detector model first."
                 # HD preview: honour THIS tab's "Detection resolution" so the
                 # single-tab preview reflects what the real pass will detect.
-                # Combine-all-tabs stays at the default 640 — it only has the 5
+                # Combine-all-tabs stays at each detector's own size — it only has the 5
                 # detector fields per tab, not each tab's full args. 0 = default.
                 imgsz = 0
                 try:
@@ -843,7 +1197,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 if _preview is not None and pred and pred.bboxes:
                     # Number each box (#1, #2, …) so the user can pick which to
                     # inpaint via the "Inpaint only these detections" field.
-                    _preview = _draw_detection_numbers(_preview, pred.bboxes)
+                    _preview = _draw_detection_numbers(
+                        _preview, pred.bboxes, getattr(pred, "class_names", None)
+                    )
                 return _preview, f"✅ {n} detection(s)."
 
             # Combined: overlay every configured tab's detections on one
@@ -870,7 +1226,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     image, model_name, classes_csv, exclude_csv, exclude_mode, confidence
                 )
                 if err:
-                    summary.append(f"Tab{i + 1}: ERR")
+                    summary.append(f"Tab{i + 1}: ERR ({err})")
                     continue
                 bboxes = (pred.bboxes if pred else None) or []
                 results.append(
@@ -886,6 +1242,10 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 total += len(bboxes)
                 summary.append(f"Tab{i + 1}: {len(bboxes)}")
 
+            # Every detector failed: that is not "no detections" (as with a
+            # single tab, report the failure and its reason).
+            if not results:
+                return None, "⚠️ Preview failed — " + " | ".join(summary)
             if total == 0:
                 return (
                     image.convert("RGB"),
@@ -909,7 +1269,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                         continue
             canvas = canvas.convert("RGB")
 
-            # Pass 2: box outline + readable label on top of the tints.
+            # Pass 2: box outlines, then readable labels on top of the tints.
             draw = ImageDraw.Draw(canvas)
             fsize = max(15, canvas.height // 45)
             line_w = max(3, canvas.height // 320)
@@ -926,10 +1286,16 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 except Exception:  # noqa: BLE001
                     font = ImageFont.load_default()
 
+            # Every outline first, then every label: drawn together, the
+            # outline of a later box (3 px or wider) ran across earlier labels.
+            for _i, color, bboxes, _cf, _nm, _masks in results:
+                for box in bboxes:
+                    x1, y1, x2, y2 = [int(v) for v in box[:4]]
+                    draw.rectangle([x1, y1, x2, y2], outline=color, width=line_w)
+            taken = []  # the labels drawn so far, kept clear of each other
             for i, color, bboxes, confs, names, _masks in results:
                 for j, box in enumerate(bboxes):
                     x1, y1, x2, y2 = [int(v) for v in box[:4]]
-                    draw.rectangle([x1, y1, x2, y2], outline=color, width=line_w)
                     cls = names[j] if j < len(names) else f"T{i + 1}"
                     c = confs[j] if j < len(confs) else None
                     # "#<det> <tab>:<class> <conf>" — the leading #N is this tab's
@@ -938,11 +1304,24 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     label = f"#{j + 1} {i + 1}:{cls}" + (
                         f" {c:.2f}" if c is not None else ""
                     )
-                    tb = draw.textbbox((0, 0), label, font=font)
+                    try:
+                        tb = draw.textbbox((0, 0), label, font=font)
+                    except Exception:  # noqa: BLE001
+                        # The bitmap fallback font (Pillow < 10.1, no TrueType
+                        # font found) is Latin-1 only: keep the numbers, drop
+                        # the name.
+                        label = f"#{j + 1} {i + 1}" + (
+                            f" {c:.2f}" if c is not None else ""
+                        )
+                        tb = draw.textbbox((0, 0), label, font=font)
                     tw, th = tb[2] - tb[0], tb[3] - tb[1]
                     ly = y1 - th - 7 if (y1 - th - 7) >= 0 else y1 + 2
-                    draw.rectangle([x1, ly, x1 + tw + 8, ly + th + 7], fill=color)
-                    draw.text((x1 + 4, ly + 3), label, fill=(255, 255, 255), font=font)
+                    lx, ly = _chip_spot(
+                        (x1, ly), (x1, y1, x2, y2), (tw + 8, th + 7), canvas.size, taken
+                    )
+                    draw.rectangle([lx, ly, lx + tw + 8, ly + th + 7], fill=color)
+                    # The text inside the chip, as for the single-tab numbers.
+                    draw.text((lx + 4 - tb[0], ly + 3 - tb[1]), label, fill=(255, 255, 255), font=font)
 
             return (
                 canvas,
@@ -983,20 +1362,30 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             if not is_dir:
                 return None, f"⚠️ Folder not found: {folder}"
 
-            exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+            exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
             try:
-                files = sorted(
+                images = sorted(
                     f
                     for f in base.iterdir()
-                    if f.is_file()
-                    and f.suffix.lower() in exts
-                    # In same-folder mode our own outputs land here as name-ad /
-                    # name-ad-N; skip them so a re-run doesn't reprocess them.
-                    and not (same_folder and _AD_OUT_RE.search(f.stem))
+                    if f.is_file() and f.suffix.lower() in exts
                 )
+                # In same-folder mode our own outputs land here as name-ad /
+                # name-ad-N; skip them so a re-run doesn't reprocess them, and
+                # count them so the status says why they were left out.
+                files = [
+                    f for f in images if not (same_folder and _AD_OUT_RE.search(f.stem))
+                ]
             except Exception as e:  # noqa: BLE001
                 return None, f"⚠️ Couldn't read the folder: {e}"
+            earlier = len(images) - len(files)
             if not files:
+                if earlier:
+                    # Shown as Markdown: no angle brackets in these texts.
+                    return None, (
+                        f"ℹ️ No images to detail: the {earlier} image(s) in that "
+                        "folder end in -ad, -ad-1, -ad-2… like earlier results, "
+                        "so they were skipped."
+                    )
                 return None, "ℹ️ No images found in that folder."
 
             from PIL import Image as _PILImage
@@ -1012,20 +1401,58 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 except Exception:  # noqa: BLE001
                     pass
 
+            def _webp_lossless(path):
+                # Pillow does not report it, so read the source's RIFF chunks:
+                # the image chunk is "VP8L" (lossless) or "VP8 " (lossy); an
+                # extended file puts VP8X / ICCP / ALPH chunks before it.
+                try:
+                    with open(path, "rb") as fh:
+                        head = fh.read(12)
+                        if head[:4] != b"RIFF" or head[8:12] != b"WEBP":
+                            return False
+                        while True:
+                            chunk = fh.read(8)
+                            if len(chunk) < 8 or chunk[:4] in (b"VP8 ", b"ANMF"):
+                                return False
+                            if chunk[:4] == b"VP8L":
+                                return True
+                            size = int.from_bytes(chunk[4:8], "little")
+                            fh.seek(size + (size & 1), 1)
+                except OSError:
+                    return False
+
             gallery = []
             saved = 0
             unchanged = 0
+            cancelled = 0
             not_saved = 0
             failed = 0
+            run_failed = 0
+            first_error = ""
             interrupted = False
+            # _run's answers that depend only on the tab's settings, so they
+            # are the same for every file: report them instead of a batch.
+            settings_errors = (
+                "⚠️ ADetailer run isn't available",
+                "⚠️ Couldn't read this tab's settings",
+                "⚠️ Pick a detector",
+            )
             for f in files:
-                # Honour the WebUI Interrupt/Skip button between files. Each image's
-                # run_detailer_on_image clears these flags at its start, so a click
-                # during one image survives to this top-of-loop check for the next.
+                # The whole folder runs as one host job. Its wrapper clears
+                # stale flags once before entering this loop; an Interrupt/Skip
+                # during any image remains visible to the next iteration.
                 try:
                     from modules import shared as _sh
 
-                    if _sh.state.interrupted or _sh.state.skipped:
+                    # AUTOMATIC1111's Interrupt sets only stopping_generation
+                    # ("stop after the current image") when job_count > 1 and its
+                    # default "interrupt after current" option is on. Honour it
+                    # between files as well.
+                    if (
+                        _sh.state.interrupted
+                        or _sh.state.skipped
+                        or getattr(_sh.state, "stopping_generation", False)
+                    ):
                         interrupted = True
                         break
                 except Exception:  # noqa: BLE001
@@ -1035,17 +1462,36 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                         # Opened straight from disk (not via Gradio), so honour
                         # the EXIF orientation ourselves or a rotated photo won't
                         # be detected.
-                        im = _apply_exif_orientation(_im).convert("RGB")
+                        im = _apply_exif_orientation(_im)
+                        # Keep transparency: the pass fills it with the WebUI's
+                        # img2img background colour (a plain RGB convert
+                        # turned it black).
+                        im = im.convert(
+                            "RGBA"
+                            if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+                            else "RGB"
+                        )
+                        # Keep the source's colour profile for a copy saved
+                        # beside it. Only an RGB profile matches the RGB result.
+                        _icc = _im.info.get("icc_profile")
+                        if not (isinstance(_icc, bytes) and _icc[16:20] == b"RGB "):
+                            _icc = None
                     if same_folder:
                         # Detail WITHOUT the built-in ADetailer-Inpaint save
                         # (save=False), then write the result beside the source as
                         # <name>-ad.<ext> — originals are kept.
                         img, st = _run(im, False, True, False, *flat)
                         if img is None:
-                            failed += 1
+                            st = st if isinstance(st, str) else ""
+                            if st.startswith(settings_errors):
+                                return (gallery or None), st
+                            run_failed += 1
+                            first_error = first_error or st
                             continue
                         st = st if isinstance(st, str) else ""
-                        if st.startswith("ℹ️"):  # nothing detected -> not written
+                        if st.startswith("ℹ️ Cancelled"):  # cancelled -> not written
+                            cancelled += 1
+                        elif st.startswith("ℹ️"):  # nothing detected -> not written
                             unchanged += 1
                         else:
                             # NEVER overwrite an existing file — an original in
@@ -1057,17 +1503,102 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                             while dst.exists() and _n <= 9999:
                                 dst = f.with_name(f"{f.stem}-ad-{_n}{f.suffix}")
                                 _n += 1
+                            # Console lines in ASCII (as in adetailer/classes.py):
+                            # a path a legacy code page lacks would make print
+                            # raise and count the file again as unreadable.
                             if dst.exists():
                                 not_saved += 1  # gave up finding a free name
+                                msg = (
+                                    f"[-] ADetailer: couldn't save the result for "
+                                    f"{f.name}: no free '-ad' file name left."
+                                )
+                                print(msg.encode("ascii", "backslashreplace").decode("ascii"))
                             else:
+                                # The pass's parameters, the tab's ADetailer keys
+                                # included, which the WebUI puts on the result
+                                # only with "Write infotext to metadata" on. They
+                                # are written as the WebUI writes its own: a PNG
+                                # text chunk, the EXIF comment of a JPEG or WebP,
+                                # nothing for BMP and TIFF.
+                                _info = (getattr(img, "info", None) or {}).get("parameters")
+                                if not isinstance(_info, str) or not _info:
+                                    _info = None
                                 try:
+                                    from modules import shared as _host
+
+                                    if not getattr(_host.opts, "enable_pnginfo", True):
+                                        _info = None
+                                except Exception:  # noqa: BLE001 — no setting: the result decides
+                                    pass
+                                _ext = f.suffix.lower()
+                                try:
+                                    _kw = {"icc_profile": _icc} if _icc else {}
                                     if f.suffix.lower() in {".jpg", ".jpeg"}:
-                                        img.save(dst, quality=95, subsampling=0)
+                                        img.save(dst, quality=95, subsampling=0, **_kw)
+                                    elif f.suffix.lower() == ".webp":
+                                        # Pillow's default is lossy at quality 80:
+                                        # a lossless source stays lossless, a
+                                        # lossy one gets the JPEG copy's 95.
+                                        _q = (
+                                            {"lossless": True}
+                                            if _webp_lossless(f)
+                                            else {"quality": 95}
+                                        )
+                                        img.save(dst, **_q, **_kw)
                                     else:
-                                        img.save(dst)
+                                        if _info and _ext == ".png":
+                                            from PIL import PngImagePlugin
+
+                                            _kw["pnginfo"] = PngImagePlugin.PngInfo()
+                                            _kw["pnginfo"].add_text("parameters", _info)
+                                        img.save(dst, **_kw)
                                     saved += 1
-                                except Exception:  # noqa: BLE001 — keep the result
+                                    if _info and _ext in {".jpg", ".jpeg", ".webp"}:
+                                        # The WebUI's own way (piexif, which it
+                                        # ships): the copy is written first and
+                                        # only a complete new file replaces it (a
+                                        # rewrite in place would empty it), so a
+                                        # failure here only leaves it without them.
+                                        _tmp = dst.with_name(dst.name + ".tmp")
+                                        _made = False
+                                        try:
+                                            import io as _io
+
+                                            import piexif
+                                            import piexif.helper
+
+                                            _with = _io.BytesIO()
+                                            piexif.insert(
+                                                piexif.dump({
+                                                    "Exif": {
+                                                        piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
+                                                            _info, encoding="unicode"
+                                                        )
+                                                    }
+                                                }),
+                                                dst.read_bytes(),
+                                                _with,
+                                            )
+                                            # "x": never over a file already there.
+                                            with open(_tmp, "xb") as _fh:
+                                                _made = True
+                                                _fh.write(_with.getvalue())
+                                            _tmp.replace(dst)
+                                        except Exception as e:  # noqa: BLE001 — keep the copy
+                                            if _made:
+                                                try:
+                                                    _tmp.unlink()
+                                                except OSError:
+                                                    pass
+                                            msg = (
+                                                f"[-] ADetailer: saved {dst.name} without "
+                                                f"its parameters ({e})."
+                                            )
+                                            print(msg.encode("ascii", "backslashreplace").decode("ascii"))
+                                except Exception as e:  # noqa: BLE001 — keep the result
                                     not_saved += 1
+                                    msg = f"[-] ADetailer: couldn't save {dst} ({e})."
+                                    print(msg.encode("ascii", "backslashreplace").decode("ascii"))
                         if len(gallery) < _batch_gallery_cap:
                             gallery.append(img)
                         continue
@@ -1076,7 +1607,11 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     # guarded end-to-end and never raises.
                     img, st = _run(im, False, True, True, *flat)
                     if img is None:
-                        failed += 1
+                        st = st if isinstance(st, str) else ""
+                        if st.startswith(settings_errors):
+                            return (gallery or None), st
+                        run_failed += 1
+                        first_error = first_error or st
                         continue
                     st = st if isinstance(st, str) else ""
                     # run_detailer_on_image reports "ℹ️ …unchanged" when nothing
@@ -1084,7 +1619,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     # detailed the image but the disk write failed; a plain "✅ …"
                     # when it was detailed AND written. Categorise by that so the
                     # summary is honest about what actually hit disk.
-                    if st.startswith("ℹ️"):
+                    if st.startswith("ℹ️ Cancelled"):
+                        cancelled += 1
+                    elif st.startswith("ℹ️"):
                         unchanged += 1
                     elif "couldn't save" in st:
                         not_saved += 1
@@ -1099,24 +1636,45 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
 
             # "ADetailer-Inpaint" mirrors AD_APPLY_SUBDIR in scripts/!adetailer.py
             # (that file isn't importable here — its name starts with "!").
-            have = saved + unchanged + not_saved
+            have = saved + unchanged + not_saved + cancelled
             dest_txt = (
                 "beside each source file as name-ad"
                 if same_folder
                 else "saved to the 'ADetailer-Inpaint' folder"
             )
-            head = "⏹️ Batch interrupted" if interrupted else "✅ Batch done"
-            scope = f"{have}/{len(files)}" if interrupted else f"{len(files)}"
+            # A cancel during the last file ends the loop before its stop check.
+            interrupted = interrupted or bool(cancelled)
+            if interrupted:
+                head = "⏹️ Batch interrupted"
+            elif not saved and (not_saved or run_failed or (failed and not unchanged)):
+                # Nothing was written: every file that needed work failed or
+                # could not be saved, also beside files left unchanged.
+                # Unreadable files count only when none was left unchanged.
+                head = "⚠️ Batch failed"
+            else:
+                head = "✅ Batch done"
+            attempted = have + run_failed + failed
+            scope = f"{attempted}/{len(files)}" if interrupted else f"{len(files)}"
             status = (
                 f"{head} — {scope} image(s): {saved} detailed and "
                 f"{dest_txt}"
             )
             if unchanged:
-                status += f", {unchanged} left unchanged (nothing detected)"
+                status += f", {unchanged} left unchanged (nothing to inpaint)"
+            if cancelled:
+                status += f", {cancelled} cancelled (left unchanged)"
             if not_saved:
                 status += f", {not_saved} detailed but not saved (see console)"
+            if run_failed:
+                reason = first_error.removeprefix("⚠️").strip().rstrip(".")
+                status += f", {run_failed} failed ({reason} — see console)"
             if failed:
                 status += f", {failed} skipped (unreadable)"
+            if earlier:
+                status += (
+                    f", {earlier} skipped as earlier results"
+                    " (name ending in -ad, -ad-1, -ad-2…)"
+                )
             if have > len(gallery):
                 status += f" — showing the first {len(gallery)} in the gallery"
             status += "."
@@ -1154,15 +1712,16 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         # One dedicated button per sub-accordion. Two per-tab .click handlers are
         # index-safe: the host gallery's send-to buttons don't depend on
         # ADetailer's listener count (which already scales 1-15x with the "max
-        # models" slider). The checkboxes stay listener-free.
+        # models" slider). The checkboxes stay listener-free. No `queue=`: they
+        # follow the app's queue, which is on by default everywhere; a forced
+        # queue=True stops a Gradio 3 WebUI started with --no-gradio-queue.
         w.ad_preview_btn.click(
-            fn=detect_fn,
+            fn=wrap_adetailer_detection(detect_fn),
             inputs=[w.ad_preview_input, w.ad_preview_all_tabs, *tail],
             outputs=[w.ad_preview_output, w.ad_preview_status],
-            queue=True,
         )
         w.ad_apply_btn.click(
-            fn=apply_fn,
+            fn=wrap_adetailer_job(apply_fn),
             inputs=[
                 w.ad_apply_input,
                 w.ad_apply_folder,
@@ -1171,7 +1730,6 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 *tail,
             ],
             outputs=[w.ad_apply_output, w.ad_apply_status],
-            queue=True,
         )
 
 
@@ -1185,6 +1743,32 @@ _COPY_EXCLUDE_ATTRS: frozenset[str] = frozenset()
 # losing the saved presets.
 PRESET_NONE = "(none)"
 
+# Every preset dropdown built in this process (txt2img and img2img), as weak
+# references so that a rebuilt UI does not keep the old one alive.
+_PRESET_DROPDOWNS: list = []
+
+
+def _sync_preset_choices(names: list[str]) -> None:
+    # A browser reload is served the page config Gradio built at startup, which
+    # holds each dropdown's own choices list: update those lists in place so a
+    # reload lists every saved preset. Gradio 3 keeps plain strings, Gradio 4
+    # (label, value) pairs. Best effort: a failure keeps the old list.
+    for ref in list(_PRESET_DROPDOWNS):
+        try:
+            dd = ref()
+            if dd is None:
+                _PRESET_DROPDOWNS.remove(ref)
+                continue
+            cur = dd.choices
+            if isinstance(cur, list) and cur:
+                cur[:] = (
+                    [(n, n) for n in names]
+                    if isinstance(cur[0], (tuple, list))
+                    else list(names)
+                )
+        except Exception:  # noqa: BLE001 — never cost the action its result
+            pass
+
 
 def _copyable_attrs() -> list[str]:
     return [a for a in ALL_ARGS.attrs if a not in _COPY_EXCLUDE_ATTRS]
@@ -1196,6 +1780,7 @@ def _wire_copy_paste(
     all_paste_btns: list[gr.Button],
     clipboard_state: gr.State,
     num_models: int,
+    model_mapping: dict[str, str] | None = None,
 ) -> None:
     attrs = _copyable_attrs()
 
@@ -1239,12 +1824,8 @@ def _wire_copy_paste(
     # Wire each Paste button: read clipboard_state and apply to this tab's
     # widgets. No-op if clipboard is empty or paste is on the source tab.
     # The UI-only ad_model_classes_dropdown isn't part of ALL_ARGS, so we
-    # explicitly compute its new value from the pasted ad_model_classes CSV
-    # and append it to the outputs.
-    try:
-        _classes_attr_idx = attrs.index("ad_model_classes")
-    except ValueError:
-        _classes_attr_idx = -1
+    # restore its detector-specific choices and include/exclude selection
+    # explicitly and append it to the outputs.
 
     for dst_idx in range(num_models):
         dst_widget_refs = [getattr(all_widgets[dst_idx], a) for a in attrs]
@@ -1259,12 +1840,7 @@ def _wire_copy_paste(
                     or len(values) != n_attrs
                 ):
                     return [gr.update() for _ in range(n_attrs)] + [gr.update()]
-                # Parse the pasted CSV into a multi-select value list for
-                # the class dropdown. on_ad_model_update will filter any
-                # entries that aren't valid for the destination's detector.
-                csv = values[_classes_attr_idx] if _classes_attr_idx >= 0 else ""
-                selected = [c.strip() for c in (csv or "").split(",") if c.strip()]
-                return list(values) + [gr.update(value=selected)]
+                return _restored_tab_updates(dict(zip(attrs, values)), attrs, model_mapping)
 
             return _paste_fn
 
@@ -1282,15 +1858,25 @@ def _wire_presets(
     all_paste_btns: list[gr.Button],
     clipboard_state: gr.State,
     num_models: int,
+    model_mapping: dict[str, str] | None = None,
+    first_sampler: str | None = None,
+    sampler_names: list[str] | None = None,
+    scheduler_names: list[str] | None = None,
+    checkpoint_names: list[str] | None = None,
+    vae_names: list[str] | None = None,
+    text_encoder_names: list[str] | None = None,
+    cn_model_names: list[str] | None = None,
+    scheduler_endings: list[list[str | None]] | None = None,
 ) -> None:
     """Wire each tab's preset Load/Save/Delete/Rename/Reset buttons.
 
-    Layout reminder — each entry of `all_presets` is the 9-tuple returned
+    Layout reminder — each entry of `all_presets` is the 10-tuple returned
     from one_ui_group: (dropdown, load_btn, rename_btn, delete_btn,
-    name_box, save_btn, reset_btn, status_md, reset_all_cb).
+    name_box, save_btn, reset_btn, status_md, reset_all_cb, preview_md).
 
     Saving / deleting / renaming from any tab refreshes ALL tabs'
-    dropdown choices. Load applies a saved preset to THIS tab's widgets
+    dropdown choices; each other tab keeps its selection.
+    Load applies a saved preset to THIS tab's widgets
     (including the UI-only classes dropdown). Reset rolls widgets back to
     their pydantic defaults AND clears the preset+clipboard state for a
     fresh start — for this tab alone, or for every tab when that tab's
@@ -1300,11 +1886,16 @@ def _wire_presets(
 
     attrs = list(ALL_ARGS.attrs)
     all_dropdowns = [p[0] for p in all_presets]
+    try:
+        _PRESET_DROPDOWNS.extend(weakref.ref(d) for d in all_dropdowns)
+    except TypeError:  # cannot be weakly referenced: no reload refresh
+        pass
     # Cross-tab refs for the "Reset every tab" scope. Reset is the only handler
     # that can reach outside its own tab, so these are built once here and used
     # as its static output list; per-tab wiring below still uses the narrow refs.
     all_name_boxes = [p[4] for p in all_presets]
     all_status_mds = [p[7] for p in all_presets]
+    all_previews = [p[9] for p in all_presets]
     all_classes_dds = [_w.ad_model_classes_dropdown for _w in all_widgets]
     all_widget_refs = [
         getattr(all_widgets[i], a) for i in range(num_models) for a in attrs
@@ -1319,20 +1910,67 @@ def _wire_presets(
         if a in ADetailerArgs.__fields__
     }
 
-    def _refresh_dropdowns_update(selected: str | None = None) -> list:
+    def _refresh_dropdowns_update(
+        current: list,
+        idx: int | None = None,
+        selected: str | None = None,
+        renamed: tuple[str, str] | None = None,
+    ) -> list:
         # PRESET_NONE is always the first entry so the user has a no-op
         # option to switch the dropdown back to "nothing selected".
+        # Every tab gets the new choices but keeps its own selection (`current`,
+        # one value per tab): only the acting tab `idx` takes `selected`, a tab
+        # showing a renamed preset follows its new name, and a preset that no
+        # longer exists falls back to PRESET_NONE.
         names = [PRESET_NONE] + get_preset_names()
-        return [
-            gr.update(
-                choices=names,
-                value=(selected if selected in names else PRESET_NONE),
+        _sync_preset_choices(names)
+        updates = []
+        for i, value in enumerate(current):
+            if renamed and value == renamed[0]:
+                value = renamed[1]
+            if i == idx and selected is not None:
+                value = selected
+            updates.append(
+                gr.update(choices=names, value=(value if value in names else PRESET_NONE))
             )
-            for _ in range(num_models)
-        ]
+        return updates
 
     def _is_none(selected: str | None) -> bool:
         return not selected or selected == PRESET_NONE
+
+    # The choices of the override dropdowns, as the UI build makes them
+    # (inpainting(), controlnet()); a list that is not given is not checked.
+    # A scheduler list is empty on a WebUI without schedulers (dropdown hidden).
+    _override_choices = [
+        (attr, label, [*head, *names], by_name)
+        for attr, label, head, names, by_name in (
+            ("ad_checkpoint", "checkpoint", ["Use same checkpoint"], checkpoint_names, True),
+            ("ad_vae", "VAE", ["Use same VAE"], vae_names, False),
+            (
+                "ad_text_encoder", "text encoder",
+                ["Use same text encoder", "None (use detailer checkpoint's own)"],
+                text_encoder_names, False,
+            ),
+            ("ad_scheduler", "scheduler", ["Use same scheduler"], scheduler_names or None, False),
+            ("ad_controlnet_model", "ControlNet model", ["None", "Passthrough"], cn_model_names, True),
+        )
+        if names is not None
+    ]
+
+    def _without_hash(name: str) -> str:
+        head, sep, tail = name.rpartition(" [")
+        if sep and len(tail) > 1 and tail.endswith("]") and all(
+            c in "0123456789abcdefABCDEF" for c in tail[:-1]
+        ):
+            return head
+        return name
+
+    def _same_model(a: str, b: str) -> bool:
+        # A checkpoint's short name gains " [hash]" once the WebUI first loads
+        # it, and ControlNet names carry it on some WebUIs only: a name
+        # without its hash is the same model. Two different hashes are not.
+        bare = _without_hash(a)
+        return bare == _without_hash(b) and (bare == a or _without_hash(b) == b)
 
     for idx in range(num_models):
         (
@@ -1345,6 +1983,7 @@ def _wire_presets(
             reset_btn,
             status_md,
             reset_all_cb,
+            _preview_md,
         ) = all_presets[idx]
         widget_refs = [getattr(all_widgets[idx], a) for a in attrs]
 
@@ -1365,17 +2004,130 @@ def _wire_presets(
                         *(gr.update() for _ in range(n_attrs)),
                         gr.update(),
                     ]
-                widget_updates = [
-                    gr.update(value=preset[a]) if a in preset else gr.update()
-                    for a in attrs
-                ]
-                # Parse the saved CSV into the multi-select dropdown.
-                csv = preset.get("ad_model_classes", "") or ""
-                selected_classes = [c.strip() for c in csv.split(",") if c.strip()]
+                # A preset saved by an older version lacks the settings added
+                # since: those take their defaults instead of keeping the tab's
+                # current values. "Enable this tab" is left as it is, and so are
+                # the override dropdowns whose default is None (not one of their
+                # choices): their "Use separate …" checkbox still resets. The
+                # sampler's schema default is not one of its choices either: a
+                # missing sampler takes the first sampler, as on a fresh build.
+                filled = {
+                    a: v
+                    for a, v in _defaults.items()
+                    if a != "ad_tab_enable" and v is not None
+                }
+                if first_sampler:
+                    filled["ad_sampler"] = first_sampler
+                # A preset saved right after an older Reset holds the schema
+                # defaults that Reset set: None in the override dropdowns and a
+                # sampler that is not one of the choices ("DPM++ 2M Karras").
+                # They show as on a fresh build. With "Use separate sampler"
+                # ticked the name is split the way the WebUI runs it, into a
+                # sampler plus its scheduler ("DPM++ 2M" and "Karras"); a name
+                # that does not split into two choices takes the first sampler
+                # below.
+                state = {**filled, **preset}
+                for attr, same in (
+                    ("ad_checkpoint", "Use same checkpoint"),
+                    ("ad_vae", "Use same VAE"),
+                    ("ad_text_encoder", "Use same text encoder"),
+                ):
+                    if attr in state and state[attr] is None:
+                        state[attr] = same
+                _name = state.get("ad_sampler")
+                if (
+                    state.get("ad_use_sampler")
+                    and sampler_names
+                    and isinstance(_name, str)
+                    and _name not in ("Use same sampler", *sampler_names)
+                ):
+                    # As the WebUI does at Generate: the name loses each
+                    # scheduler it ends with (label, name or alias, in the
+                    # WebUI's order), the last one lost is the scheduler, and
+                    # the rest must be the exact name of one of its samplers.
+                    _sampler, _scheduler = _name, None
+                    for _endings in scheduler_endings or [[x] for x in scheduler_names or ()]:
+                        for _ending in _endings:
+                            if _ending and _sampler.endswith(" " + _ending):
+                                _sampler = _sampler[: -len(_ending) - 1]
+                                _scheduler = _endings[0]
+                                break
+                    if _scheduler:
+                        state["ad_scheduler"] = _scheduler
+                    if _sampler in sampler_names:
+                        state["ad_sampler"] = _sampler
+                # A ticked sampler this WebUI does not have (another WebUI's
+                # sampler, an alias, a name that does not split) ran as the
+                # first sampler at Generate, with only a console warning, while
+                # the image's parameters named it: it takes the first sampler
+                # and the status says so. Without a scheduler list the names
+                # the WebUI splits are not known, so a ticked one is kept.
+                _lost_sampler = None
+                if (
+                    first_sampler
+                    and sampler_names
+                    and (scheduler_names is not None or not state.get("ad_use_sampler"))
+                    and state.get("ad_sampler") not in ("Use same sampler", *sampler_names)
+                ):
+                    if state.get("ad_use_sampler"):
+                        _lost_sampler = f"sampler '{_name}'"
+                    state["ad_sampler"] = first_sampler
+                # A checkpoint, VAE, text encoder, scheduler or ControlNet
+                # model this WebUI does not have (a preset moved with
+                # Export/Import, a file deleted or renamed) looked empty on
+                # Gradio 4 and was swapped by the WebUI at Generate, while the
+                # image's parameters named it: it takes the dropdown's first
+                # choice ("Use same …", "None"), as after a restart.
+                _missing = [_lost_sampler] if _lost_sampler else []
+                for attr, label, choices, by_name in _override_choices:
+                    _value = state.get(attr)
+                    if attr not in state or _value in choices:
+                        continue
+                    _found = [
+                        c for c in choices
+                        if by_name and isinstance(_value, str) and _same_model(_value, c)
+                    ]
+                    if len(_found) == 1:
+                        state[attr] = _found[0]
+                    elif not _found:
+                        _missing.append(f"{label} '{_value}'")
+                        state[attr] = choices[0]
+                        if attr == "ad_controlnet_model":
+                            state["ad_controlnet_module"] = "None"
+                status = f"✅ Loaded '{selected}'."
+                # A detector that is not installed here (a preset moved with
+                # Export/Import, a model deleted or renamed) would fail the
+                # pass: the tab keeps its detector and class filter instead.
+                _model = state.get("ad_model")
+                if model_mapping and (
+                    not isinstance(_model, str)
+                    or (_model != "None" and _model not in model_mapping)
+                ):
+                    for attr in ("ad_model", *_CLASS_FILTER_DEFAULTS):
+                        state.pop(attr, None)
+                    status = (
+                        f"⚠️ Loaded '{selected}', but its detector '{_model}' is "
+                        "not installed: the tab keeps its detector and classes."
+                    )
+                if _missing:
+                    _uses = "\"Use same …\" or \"None\""
+                    if _lost_sampler:
+                        _uses = (
+                            f"\"{first_sampler}\", {_uses}" if len(_missing) > 1
+                            else f"\"{first_sampler}\""
+                        )
+                    _note = (
+                        f"does not have its {', '.join(_missing)}: the tab uses "
+                        f"{_uses} there instead."
+                    )
+                    status = (
+                        f"{status} This WebUI also {_note}"
+                        if status.startswith("⚠️")
+                        else f"⚠️ Loaded '{selected}', but this WebUI {_note}"
+                    )
                 return [
-                    f"✅ Loaded '{selected}'.",
-                    *widget_updates,
-                    gr.update(value=selected_classes),
+                    status,
+                    *_restored_tab_updates(state, attrs, model_mapping),
                 ]
 
             return _load
@@ -1388,92 +2140,119 @@ def _wire_presets(
         )
 
         # SAVE: capture current widget values and write a new preset. Refresh
-        # every tab's dropdown so the preset becomes selectable everywhere.
+        # every tab's dropdown so the preset becomes selectable everywhere; the
+        # other tabs keep their selection (every dropdown is also an input).
+        # A preset saved over the one a tab shows keeps that tab's dropdown
+        # value, so its .change never fires: refresh those previews here.
         def _make_save(idx: int):
             def _save(name: str, *values):
+                values, current = values[: len(attrs)], values[len(attrs) :]
+                keep_previews = [gr.update() for _ in all_previews]
                 name = (name or "").strip()
                 if not name:
-                    return ["⚠️ Enter a preset name first.", *_refresh_dropdowns_update()]
-                state_dict = {a: v for a, v in zip(attrs, values)}
-                ok = save_preset(name, state_dict)
-                if not ok:
+                    return [
+                        "⚠️ Enter a preset name first.",
+                        *_refresh_dropdowns_update(current),
+                        *keep_previews,
+                    ]
+                if not is_valid_name(name):
                     return [
                         f"⚠️ Invalid preset name '{name}'.",
-                        *_refresh_dropdowns_update(),
+                        *_refresh_dropdowns_update(current),
+                        *keep_previews,
                     ]
+                state_dict = {a: v for a, v in zip(attrs, values)}
+                ok = save_preset(name, state_dict)
+                note = take_recovery_note()
+                if not ok:
+                    return [
+                        f"⚠️ Could not save preset '{name}'. Check disk space and folder permissions."
+                        + (f" {note}" if note else ""),
+                        *_refresh_dropdowns_update(current),
+                        *keep_previews,
+                    ]
+                dd_updates = _refresh_dropdowns_update(current, idx, selected=name)
                 return [
-                    f"✅ Saved preset '{name}'.",
-                    *_refresh_dropdowns_update(selected=name),
+                    f"✅ Saved preset '{name}'." + (f" ⚠️ {note}" if note else ""),
+                    *dd_updates,
+                    # One fresh update per tab: Gradio 4 pops "value" out of
+                    # an update dict in place, so tabs cannot share one.
+                    *(
+                        _format_preset_preview(name) if u["value"] == name else gr.update()
+                        for u in dd_updates
+                    ),
                 ]
 
             return _save
 
         save_btn.click(
             fn=_make_save(idx),
-            inputs=[name_box, *widget_refs],
-            outputs=[status_md, *all_dropdowns],
+            inputs=[name_box, *widget_refs, *all_dropdowns],
+            outputs=[status_md, *all_dropdowns, *all_previews],
             queue=False,
         )
 
-        # DELETE: remove the selected preset; refresh dropdowns.
-        def _make_delete():
-            def _delete(selected: str | None):
+        # DELETE: remove this tab's selected preset; refresh dropdowns.
+        def _make_delete(idx: int):
+            def _delete(*current):
+                selected = current[idx]
                 if _is_none(selected):
-                    return ["⚠️ Pick a preset first.", *_refresh_dropdowns_update()]
+                    return ["⚠️ Pick a preset first.", *_refresh_dropdowns_update(current)]
                 selected = selected.strip()
                 ok = delete_preset(selected)
                 if not ok:
                     return [
-                        f"⚠️ Preset '{selected}' not found.",
-                        *_refresh_dropdowns_update(),
+                        f"⚠️ Could not delete preset '{selected}'. It may be missing or the preset file is not writable.",
+                        *_refresh_dropdowns_update(current),
                     ]
                 return [
                     f"\U0001F5D1 Deleted '{selected}'.",
-                    *_refresh_dropdowns_update(),
+                    *_refresh_dropdowns_update(current, idx, selected=PRESET_NONE),
                 ]
 
             return _delete
 
         delete_btn.click(
-            fn=_make_delete(),
-            inputs=dropdown,
+            fn=_make_delete(idx),
+            inputs=all_dropdowns,
             outputs=[status_md, *all_dropdowns],
             queue=False,
         )
 
-        # RENAME: take the currently-selected preset and the value of
+        # RENAME: take this tab's selected preset and the value of
         # the 'Preset name to save' textbox; rename the preset on disk
-        # to the new name and refresh every tab's dropdown so it points
-        # at the renamed entry.
-        def _make_rename():
-            def _rename(selected: str | None, new_name: str):
+        # to the new name and refresh every tab's dropdown so each tab
+        # that showed the old name points at the renamed entry.
+        def _make_rename(idx: int):
+            def _rename(new_name: str, *current):
+                selected = current[idx]
                 if _is_none(selected):
                     return [
                         "⚠️ Pick a preset first.",
-                        *_refresh_dropdowns_update(),
+                        *_refresh_dropdowns_update(current),
                     ]
                 new_name = (new_name or "").strip()
                 if not new_name:
                     return [
                         "⚠️ Enter the new name in the 'Preset name to save' box first.",
-                        *_refresh_dropdowns_update(selected=selected),
+                        *_refresh_dropdowns_update(current),
                     ]
                 ok, msg = rename_preset(selected, new_name)
                 if not ok:
                     return [
                         f"⚠️ Rename failed: {msg}.",
-                        *_refresh_dropdowns_update(selected=selected),
+                        *_refresh_dropdowns_update(current),
                     ]
                 return [
                     f"✏️ Renamed '{selected}' → '{new_name}'.",
-                    *_refresh_dropdowns_update(selected=new_name),
+                    *_refresh_dropdowns_update(current, renamed=(selected, new_name)),
                 ]
 
             return _rename
 
         rename_btn.click(
-            fn=_make_rename(),
-            inputs=[dropdown, name_box],
+            fn=_make_rename(idx),
+            inputs=[name_box, *all_dropdowns],
             outputs=[status_md, *all_dropdowns],
             queue=False,
         )
@@ -1513,18 +2292,38 @@ def _wire_presets(
                     gr.update(value="\U0001F4E5 Paste settings", interactive=False)
                     for _ in range(num_models)
                 ]
-                # Flattened tab-major to match all_widget_refs exactly.
-                widget_updates = [
-                    gr.update(value=_defaults.get(a))
-                    if (i in targets and a in _defaults)
-                    else gr.update()
-                    for i in range(num_models)
-                    for a in attrs
-                ]
-                classes_updates = [
-                    gr.update(value=[]) if i in targets else gr.update()
-                    for i in range(num_models)
-                ]
+                # Flattened tab-major to match all_widget_refs exactly. Build the
+                # restored updates separately for EACH target tab: Gradio 4 pops
+                # "value" out of an update dict in place while post-processing
+                # it, so one set of dicts shared by several tabs reaches every
+                # tab after the first without a value and leaves it unchanged.
+                # "Enable this tab" follows the build default (only the first
+                # tab on), not the schema default, as on a fresh setup. So do
+                # the override dropdowns: their schema default None is not one
+                # of their choices and would blank them; a fresh build shows
+                # their first choice. The sampler's schema default is not one
+                # of its choices either: a fresh build shows the first sampler.
+                widget_updates = []
+                classes_updates = []
+                for i in range(num_models):
+                    if i in targets:
+                        restored = _restored_tab_updates(
+                            {
+                                **_defaults,
+                                "ad_checkpoint": "Use same checkpoint",
+                                "ad_vae": "Use same VAE",
+                                "ad_text_encoder": "Use same text encoder",
+                                "ad_sampler": first_sampler or _defaults.get("ad_sampler"),
+                                "ad_tab_enable": i == 0,
+                            },
+                            attrs,
+                            model_mapping,
+                        )
+                        widget_updates.extend(restored[:-1])
+                        classes_updates.append(restored[-1])
+                    else:
+                        widget_updates.extend(gr.update() for _ in attrs)
+                        classes_updates.append(gr.update())
                 return [
                     *status_updates,
                     *dd_updates,
@@ -1551,6 +2350,19 @@ def _wire_presets(
             ],
             queue=False,
         )
+
+
+# Gradio 4's DownloadButton downloads the value it holds when it is clicked,
+# before the server has written this click's file: the first Export got
+# nothing and later ones the previous file. Download the file this click
+# wrote, then clear the value so the button itself never serves an old one.
+# a['click']() is the anchor's click(), spelled so that grepping this file
+# for event registrations still counts only real ones.
+_EXPORT_JS = (
+    "(f) => { if (f && f.url) { const a = document.createElement('a'); "
+    "a.href = f.url; a.download = f.orig_name || 'adetailer-ultimate-presets.json'; "
+    "document.body.appendChild(a); a['click'](); a.remove(); } return null; }"
+)
 
 
 def one_ui_group(
@@ -1608,8 +2420,9 @@ def one_ui_group(
             # ships Gradio 3, which lacks it — a hard reference crashed the whole
             # ADetailer tab at build there (#2). Fall back to a plain Button so the
             # tab still loads; preset export just isn't one-click-downloadable on
-            # Gradio 3 (everything else, incl. Import, works). The .click wiring
-            # below is harmless on a Button.
+            # Gradio 3 (everything else, incl. Import, works). A Button would
+            # show a returned path as its label, so the export handlers below
+            # only explain the limit there.
             _DownloadButton = getattr(gr, "DownloadButton", None)
             if _DownloadButton is not None:
                 preset_export_btn = _DownloadButton(
@@ -1627,6 +2440,9 @@ def one_ui_group(
                 preset_export_btn = gr.Button(
                     value="\U0001F4E4 Esport",
                     elem_id=eid("ad_preset_export_btn"),
+                    # Marks the fallback for its tooltip
+                    # (javascript/button-tooltips.js).
+                    elem_classes=["ad-export-unavailable"],
                     scale=0,
                     min_width=160,
                 )
@@ -1775,37 +2591,57 @@ def one_ui_group(
     )
 
     # Wire Export (DownloadButton) and Import (UploadButton) locally.
-    # DownloadButton: click handler returns a file path; Gradio triggers the
-    # download automatically and updates the button's `value` so subsequent
-    # clicks re-serve the file. UploadButton: upload event yields the path
-    # of the uploaded file via the button's `inputs` value.
-    def _do_export() -> str:
+    # DownloadButton: click handler returns a file path as the button's
+    # `value`; the front-end step after it (_EXPORT_JS) downloads that file.
+    # UploadButton: upload event yields the path of the uploaded file via
+    # the button's `inputs` value.
+    def _do_export() -> Any:
         """Click handler for the export DownloadButton. Writes the current
-        preset library to a temp file and returns its path so Gradio can
-        serve the download. Also updates the status line side-effect-free
-        via a separate output target."""
+        preset library to a temp file and returns its path, for the
+        download, together with the status line."""
         import tempfile
         from pathlib import Path
 
+        if _DownloadButton is None:
+            # Gradio 3 fallback Button: a path would become its label and
+            # nothing would download. Leave the button as it is.
+            return gr.update(), _do_export_status()
         payload = export_presets_json()
         tmp_dir = Path(tempfile.gettempdir())
         out = tmp_dir / "adetailer-ultimate-presets.json"
         out.write_text(payload, encoding="utf-8")
-        return str(out)
+        return str(out), _do_export_status()
 
     def _do_export_status() -> str:
+        if _DownloadButton is None:
+            return (
+                "⚠️ Export as a download needs Gradio 4 (Forge / Forge Neo). "
+                "On this WebUI, back up user_presets.json from the extension "
+                "folder instead."
+            )
         return f"✅ Exported **{len(get_preset_names())}** preset(s)."
 
-    def _do_import(uploaded_path: str | None, overwrite: bool) -> tuple[Any, str]:
-        """Upload handler. `uploaded_path` is the local filesystem path of
-        the file the user dropped on the UploadButton."""
+    def _do_import(
+        uploaded_path: Any, overwrite: bool, selected: str | None = None
+    ) -> tuple[Any, str, Any]:
+        """Accept Gradio 4 paths and Gradio 3 temporary-file wrappers.
+
+        Also refreshes the preview of the selected preset, which an import
+        may have replaced without changing the dropdown's value."""
         if not uploaded_path:
-            return gr.update(), "_no file received._"
+            return gr.update(), "_no file received._", gr.update()
+        if not isinstance(uploaded_path, (str, Path)):
+            uploaded_path = getattr(uploaded_path, "name", uploaded_path)
+        import json
+
         try:
-            with open(uploaded_path, "r", encoding="utf-8") as f:
-                payload = f.read()
-        except OSError as e:
-            return gr.update(), f"_could not read file: {e}_"
+            # Decoded as the library file itself is (adetailer/json_file.py):
+            # UTF-8 with or without a byte-order mark, or UTF-16/32.
+            with open(uploaded_path, "rb") as f:
+                raw = f.read()
+            payload = raw.decode(json.detect_encoding(raw))
+        except (OSError, UnicodeError, TypeError) as e:
+            return gr.update(), f"_could not read file: {e}_", gr.update()
         added, replaced, skipped = import_presets_json(
             payload, overwrite=overwrite
         )
@@ -1816,34 +2652,49 @@ def one_ui_group(
             parts.append(f"\U0001F501 **{replaced}** replaced")
         if skipped:
             parts.append(
-                f"⏭ **{len(skipped)}** skipped (already present; tick 'Overwrite' to replace)"
+                f"⏭ **{len(skipped)}** not imported (name conflict, invalid name, or file not writable)"
             )
         if not parts:
             msg = "_no presets imported (file empty, invalid, or all names skipped)._"
         else:
             msg = " · ".join(parts)
+        note = take_recovery_note()
+        if note:
+            msg += f" · ⚠️ {note}"
         names = [PRESET_NONE] + get_preset_names()
-        return gr.update(choices=names), msg
+        _sync_preset_choices(names)
+        try:
+            preview = _format_preset_preview(selected)
+        except Exception:  # noqa: BLE001 — a malformed preset must not cost the status
+            preview = gr.update()
+        return gr.update(choices=names), msg, preview
 
-    # DownloadButton wiring: the click both refreshes the button's `value`
-    # (triggering the download) AND updates the status line.
+    # DownloadButton wiring: the click refreshes the button's `value` AND the
+    # status line; the front-end-only step then downloads that value. Gradio 3
+    # names the parameter `_js` and has no file to download: a no-op step
+    # there keeps the same two registrations (index-safe).
+    _export_then = (
+        {
+            "fn": None,
+            "inputs": preset_export_btn,
+            "outputs": preset_export_btn,
+            "js": _EXPORT_JS,
+        }
+        if _DownloadButton is not None
+        else {"fn": None}
+    )
     preset_export_btn.click(
         fn=_do_export,
         inputs=None,
-        outputs=preset_export_btn,
+        outputs=[preset_export_btn, preset_io_status],
         queue=False,
-    ).then(
-        fn=_do_export_status,
-        inputs=None,
-        outputs=preset_io_status,
-        queue=False,
-    )
+    ).then(queue=False, **_export_then)
     # UploadButton fires `.upload` when the user picks/drops a file; the
     # button's value (the upload path) is included in `inputs`.
     preset_import_btn.upload(
         fn=_do_import,
-        inputs=[preset_import_btn, preset_import_overwrite],
-        outputs=[preset_dropdown, preset_io_status],
+        inputs=[preset_import_btn, preset_import_overwrite, preset_dropdown],
+        outputs=[preset_dropdown, preset_io_status, preset_preview],
         queue=False,
     )
 
@@ -1955,19 +2806,29 @@ def one_ui_group(
             # user_state.json. Confirms persistence is working and, crucially,
             # flags when a SAVED detector is no longer present in the current
             # model list (so it fell back to the default) — the usual reason a
-            # tab "resets" on restart. Plain print → index-safe.
+            # tab "resets" on restart. Plain print → index-safe. ASCII only (!a),
+            # or a console in a legacy code page could not build the panel.
+            # The class filter is named as the saved-tab line names it: NOT
+            # mode is marked, and a YOLO-World tab, which has no NOT mode,
+            # shows the classes typed in its free-text box.
             _saved_model_raw = saved.get("ad_model")
             if _saved_model_raw and _saved_model_raw != _saved_model:
+                _mode_word = "NOT/exclude" if _saved_exclude else "include"
                 print(
-                    f"[-] ADetailer: tab {n + 1} — saved detector "
-                    f"{_saved_model_raw!r} is NOT in the current model list; "
-                    f"fell back to {_saved_model!r}. (saved classes: "
-                    f"{_wanted_classes!r})"
+                    f"[-] ADetailer: tab {n + 1} - saved detector "
+                    f"{_saved_model_raw!a} is NOT in the current model list; "
+                    f"fell back to {_saved_model!a}. (saved classes[{_mode_word}]: "
+                    f"{_wanted_classes!a})"
                 )
             elif _saved_model_raw and _saved_model_raw != "None":
+                _not = _saved_exclude and not _is_world_saved  # as the checkbox
+                _mode_word = "NOT/exclude" if _not else "include"
+                _restored_classes = (
+                    sv("ad_model_classes", "") if _is_world_saved else _dd_value
+                )
                 print(
-                    f"[-] ADetailer: tab {n + 1} restored — detector="
-                    f"{_saved_model!r}, classes={_dd_value!r}"
+                    f"[-] ADetailer: tab {n + 1} restored - detector="
+                    f"{_saved_model!a}, classes[{_mode_word}]={_restored_classes!a}"
                 )
 
             # UI-only dropdown: not in ALL_ARGS. It syncs into ad_model_classes
@@ -1988,10 +2849,12 @@ def one_ui_group(
             )
 
         with gr.Row(variant="compact", elem_classes=["ad-2up-row"]):
+            # Hidden and off for a saved YOLO-World detector, which has no NOT
+            # mode (mirrors on_ad_model_update's world branch).
             w.ad_model_classes_exclude = gr.Checkbox(
                 label="Exclude selected (NOT)" + suffix(n),
-                value=sv("ad_model_classes_exclude", False),
-                visible=True,
+                value=sv("ad_model_classes_exclude", False) and not _is_world_saved,
+                visible=not _is_world_saved,
                 elem_id=eid("ad_model_classes_exclude"),
             )
             w.ad_classes_sequential = gr.Checkbox(
@@ -2001,19 +2864,30 @@ def one_ui_group(
                 elem_id=eid("ad_classes_sequential"),
             )
             # Mirror of the dropdown when exclude=True; hidden, used as the
-            # backing arg in ALL_ARGS.
+            # backing arg in ALL_ARGS. Empty for a saved YOLO-World detector,
+            # like its NOT checkbox above.
             w.ad_model_classes_excluded = gr.Textbox(
-                value=sv("ad_model_classes_excluded", ""),
+                value="" if _is_world_saved else sv("ad_model_classes_excluded", ""),
                 visible=False,
                 elem_id=eid("ad_model_classes_excluded"),
             )
 
-        _on_ad_model_update = partial(
-            on_ad_model_update, model_mapping=webui_info.model_mapping
-        )
+        def _on_ad_model_update(model, selected, include, exclude, excluded):
+            return on_ad_model_update(
+                model, selected, webui_info.model_mapping,
+                current_include=include, current_exclude=exclude,
+                current_excluded=excluded,
+            )
+
+        # .change also covers PNG infotext/Send-to and preset updates. Include
+        # the backing CSVs so those restored values cannot be replaced by an
+        # old dropdown selection or a forced switch out of NOT mode.
         w.ad_model.change(
             _on_ad_model_update,
-            inputs=[w.ad_model, w.ad_model_classes_dropdown],
+            inputs=[
+                w.ad_model, w.ad_model_classes_dropdown, w.ad_model_classes,
+                w.ad_model_classes_exclude, w.ad_model_classes_excluded,
+            ],
             outputs=[
                 w.ad_model_classes,
                 w.ad_model_classes_dropdown,
@@ -2022,10 +2896,6 @@ def one_ui_group(
             ],
             queue=False,
         )
-
-        def _sync_dropdown(selected: list[str] | None, exclude: bool):
-            csv = ",".join(selected or [])
-            return ("" if exclude else csv), (csv if exclude else "")
 
         # NOTE: deliberately NOT queue=False here. With queue=False each
         # selection fires an independent, unordered request; selecting two
@@ -2046,13 +2916,13 @@ def one_ui_group(
         # fields client-side, instantly, which removes the race outright; these
         # two handlers stay as the backstop, computing the identical CSV.
         w.ad_model_classes_dropdown.change(
-            _sync_dropdown,
-            inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude],
+            _sync_class_dropdown,
+            inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude, w.ad_model],
             outputs=[w.ad_model_classes, w.ad_model_classes_excluded],
         )
         w.ad_model_classes_exclude.change(
-            _sync_dropdown,
-            inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude],
+            _sync_class_dropdown,
+            inputs=[w.ad_model_classes_dropdown, w.ad_model_classes_exclude, w.ad_model],
             outputs=[w.ad_model_classes, w.ad_model_classes_excluded],
         )
 
@@ -2203,7 +3073,7 @@ def one_ui_group(
         with gr.Row(variant="compact"):
             w.ad_apply_on_hires_only = gr.Checkbox(
                 label="Apply only on hires.fix" + suffix(n),
-                info="Skip the lowres pre-hires call; run ADetailer only on the upscale output. Has no effect in img2img or when hires.fix is off.",
+                info="Run this tab only when hires.fix is on, on the upscaled image. With hires.fix off this tab is skipped. No effect in img2img.",
                 value=sv("ad_apply_on_hires_only", False),
                 visible=not is_img2img,
                 elem_id=eid("ad_apply_on_hires_only"),
@@ -2288,9 +3158,12 @@ def one_ui_group(
                     elem_classes=["ad-preview-hint"],
                 )
                 with gr.Row():
+                    # RGBA keeps a cut-out's transparency for the pass, which
+                    # fills it like the WebUI's img2img (RGB turned it black).
                     w.ad_apply_input = gr.Image(
                         label="Input",
                         type="pil",
+                        image_mode="RGBA",
                         interactive=True,
                         elem_id=eid("ad_apply_input"),
                     )
@@ -2325,6 +3198,14 @@ def one_ui_group(
                         interactive=True,
                         elem_id=eid("ad_apply_folder"),
                     )
+                    # A one-off path, not a setting: keep the host WebUI's
+                    # ui-config.json (Settings -> Defaults -> Apply) from freezing
+                    # it as a startup default, which would turn every single-image
+                    # run into a folder batch. Plain attribute set -> index-safe.
+                    try:
+                        w.ad_apply_folder.do_not_save_to_config = True
+                    except Exception:  # noqa: BLE001 — never break UI build over a flag
+                        pass
                     # Batch-only save destination toggle: write each result NEXT TO
                     # its source file as name-ad instead of the ADetailer-Inpaint
                     # folder. Listener-free input (no .change), read by the same Run
@@ -2332,7 +3213,7 @@ def one_ui_group(
                     w.ad_apply_same_folder = gr.Checkbox(
                         label="📁 Save results in the source folder instead",
                         value=False,
-                        info="Batch only: write each result beside its source file as name-ad (a new file), instead of the ADetailer-Inpaint folder. Existing files are NEVER overwritten — if the name is taken it uses name-ad-1, name-ad-2, and so on — so your originals are always kept. Files already ending in -ad are skipped, so re-runs don't reprocess earlier results.",
+                        info="Batch only: write each result beside its source file as name-ad (a new file), instead of the ADetailer-Inpaint folder. Existing files are NEVER overwritten — if the name is taken it uses name-ad-1, name-ad-2, and so on — so your originals are always kept. Files already ending in -ad, -ad-1, -ad-2 and so on are skipped (the status counts them), so re-runs don't reprocess earlier results.",
                         elem_id=eid("ad_apply_same_folder"),
                     )
                 with gr.Row():
@@ -2404,6 +3285,13 @@ def one_ui_group(
     # scales 1-15x with the max-models slider).
 
     state = gr.State(lambda: state_init(w))
+    # The host's API takes each script input's .value, read once at startup,
+    # as the default for a tab a request leaves out: keep the remembered
+    # settings out of it, as on a fresh setup (only the 1st tab on, with the
+    # first detector). A page load still fills the UI's state from the restored
+    # widgets through the lambda. Attribute only: no Gradio listener is added.
+    if saved:
+        state.value = {"ad_model": model_choices[0], "ad_tab_enable": n == 0}
 
     for attr in ALL_ARGS.attrs:
         widget = getattr(w, attr)
@@ -2423,7 +3311,15 @@ def one_ui_group(
         queue=False,
     )
 
-    infotext_fields = [(getattr(w, attr), name + suffix(n)) for attr, name in ALL_ARGS]
+    infotext_fields = [
+        (getattr(w, attr), name + suffix(n))
+        for attr, name in ALL_ARGS
+        if attr not in _CLASS_FILTER_DEFAULTS and attr not in _TAB_PASTE_ATTRS
+    ]
+    infotext_fields.extend(
+        _class_filter_infotext_fields(w, n, webui_info.model_mapping)
+    )
+    infotext_fields.extend(_tab_infotext_fields(w, n))
 
     preset_widgets = (
         preset_dropdown,
@@ -2435,6 +3331,7 @@ def one_ui_group(
         preset_reset_btn,
         preset_status,
         preset_reset_all,
+        preset_preview,
     )
     return w, copy_btn, paste_btn, preset_widgets, state, infotext_fields
 
@@ -2459,9 +3356,11 @@ def detection(
             w.ad_detection_resolution = gr.Slider(
                 label="Detection resolution (0 = default)" + suffix(n),
                 info=(
-                    "Detector inference resolution. 0 keeps the default (640); "
-                    "higher (e.g. 1024) finds smaller or more distant parts but "
-                    "uses more VRAM and time."
+                    "Detector inference resolution. 0 keeps the detector's own "
+                    "size, the one it was trained at (640 for the bundled models, "
+                    "1024 for some others). A value above that size finds smaller "
+                    "or more distant parts but uses more VRAM and time; a lower "
+                    "value can miss parts."
                 ),
                 minimum=0,
                 maximum=1536,
@@ -2856,6 +3755,24 @@ def inpainting(  # noqa: PLR0915
                 *webui_info.sampler_names,
             ]
             _saved_sampler = sv("ad_sampler", sampler_names[1])
+            # A ticked old name such as "DPM++ 2M Karras" is split by the
+            # scheduler's label, into the sampler plus the scheduler the WebUI
+            # ran it with; the fallback below would silently drop the
+            # scheduler. Unlike Load, a scheduler's other names ("karras") are
+            # not split here, and a name whose sampler is missing ("Foo
+            # Karras") falls back without its scheduler.
+            _split_scheduler = None
+            if (
+                sv("ad_use_sampler", False)
+                and isinstance(_saved_sampler, str)
+                and _saved_sampler not in sampler_names
+            ):
+                for label in webui_info.scheduler_names or ():
+                    if label and _saved_sampler.endswith(" " + label):
+                        if _saved_sampler[: -len(label) - 1] in webui_info.sampler_names:
+                            _split_scheduler = label
+                            _saved_sampler = _saved_sampler[: -len(label) - 1]
+                        break
             if _saved_sampler not in sampler_names:
                 _saved_sampler = sampler_names[1]
 
@@ -2872,7 +3789,7 @@ def inpainting(  # noqa: PLR0915
                     "Use same scheduler",
                     *webui_info.scheduler_names,
                 ]
-                _saved_scheduler = sv("ad_scheduler", scheduler_names[0])
+                _saved_scheduler = _split_scheduler or sv("ad_scheduler", scheduler_names[0])
                 if _saved_scheduler not in scheduler_names:
                     _saved_scheduler = scheduler_names[0]
 
@@ -2959,6 +3876,16 @@ def controlnet(
     _saved_cn = sv("ad_controlnet_model", "None")
     if _saved_cn not in cn_models:
         _saved_cn = "None"
+    # .change does not fire at the first render, so show a restored model's
+    # module dropdown with its choices here, as on_cn_model_update would.
+    _saved_module = sv("ad_controlnet_module", "None")
+    _module_init = {"visible": False, "choices": ["None"], "value": _saved_module}
+    try:
+        _upd = on_cn_model_update(_saved_cn, _saved_module)
+        if _upd.get("visible"):
+            _module_init = {k: _upd[k] for k in ("visible", "choices", "value")}
+    except Exception:  # noqa: BLE001 — never break the UI build
+        pass
 
     # `ad-cn-row` class added 2026-05-18 — user reported the stacked
     # dropdowns/sliders inside the two columns were visually stuck
@@ -2978,9 +3905,9 @@ def controlnet(
 
             w.ad_controlnet_module = gr.Dropdown(
                 label="ControlNet module" + suffix(n),
-                choices=["None"],
-                value=sv("ad_controlnet_module", "None"),
-                visible=False,
+                choices=_module_init["choices"],
+                value=_module_init["value"],
+                visible=_module_init["visible"],
                 type="value",
                 interactive=controlnet_exists,
                 elem_id=eid("ad_controlnet_module"),
@@ -2999,7 +3926,7 @@ def controlnet(
 
             w.ad_controlnet_model.change(
                 on_cn_model_update,
-                inputs=w.ad_controlnet_model,
+                inputs=[w.ad_controlnet_model, w.ad_controlnet_module],
                 outputs=w.ad_controlnet_module,
                 queue=False,
             )

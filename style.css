@@ -12,8 +12,8 @@
  * Why override `min_width`: the Python widgets ship hard-coded
  * `min_width=90` / `110` / `130` / `160` values that were tuned for the
  * English labels ("Load", "Reset", "Save preset", "Copy settings", …).
- * Non-English locales have longer words ("Carica", "Ripristina",
- * "Incolla impostazioni", …) which get clipped or padded asymmetrically
+ * Non-English locales have longer words ("Réinitialiser",
+ * "Einstellungen einfügen", …) which get clipped or padded asymmetrically
  * inside the fixed pixel widths.
  *
  * `min-width: auto !important` lets each button grow only as wide as its
@@ -52,7 +52,7 @@ button[id*="adetailer_ad_preset_import_btn"] {
     padding-right: 12px !important;
 }
 
-/* ---------- Section labels — bright white, small uppercase ---------- */
+/* ---------- Section labels — small uppercase, bright white in dark mode ---------- */
 .ad-section-label,
 .ad-section-label p {
     margin: 6px 0 2px 0 !important;
@@ -61,13 +61,19 @@ button[id*="adetailer_ad_preset_import_btn"] {
     font-weight: 600 !important;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: #ffffff !important;
     opacity: 1 !important;
 }
 
-/* ---------- Brighten placeholder text in our textboxes ---------- */
-[id*="adetailer_ad_preset_name"] textarea::placeholder,
-.ad-prompt-row textarea::placeholder {
+/* White only on the dark theme (Gradio 3 and 4 set .dark there): on the light
+ * theme it was white on white, so the theme's own colours apply instead. */
+.dark .ad-section-label,
+.dark .ad-section-label p {
+    color: #ffffff !important;
+}
+
+/* ---------- Brighten placeholder text in our textboxes (dark theme) ---------- */
+.dark [id*="adetailer_ad_preset_name"] textarea::placeholder,
+.dark .ad-prompt-row textarea::placeholder {
     color: rgba(255, 255, 255, 0.78) !important;
     opacity: 1 !important;
 }
@@ -95,6 +101,11 @@ div.block.ad-preview-status:has(.md:empty) {
     display: none !important;
 }
 
+/* A preset / IO status hidden by preset-status-fade.js after ~4 s. */
+div.block.ad-preset-status.ad-status-faded {
+    display: none !important;
+}
+
 /* "Run detection preview" status line. Uses its own class (rather than
  * the dim `.ad-preset-status` styling) because the messages here are
  * user-facing warnings ("Pick a detector first.", "Drop an image
@@ -118,7 +129,7 @@ div.block.ad-preview-status {
     margin: 0 0 0 10px !important;
     /* Asymmetric horizontal padding: bigger left inset so the text
      * doesn't hug the amber border-left bar. User-reported 2026-05-18
-     * "il testo spostalo leggermente a destra" — bumped left padding
+     * "move the text slightly to the right" — bumped left padding
      * from 12px to 18px (+6px) for breathing room from the border. */
     padding: 6px 12px 6px 18px !important;
     background: rgba(251, 191, 36, 0.08) !important;
@@ -137,12 +148,18 @@ div.block.ad-preview-status {
     font-size: 12px !important;
     line-height: 1.4 !important;
     opacity: 1 !important;
+}
+
+/* Amber text only on the dark theme: on the light theme's near-white pill it
+ * was about 1.6:1, barely readable, so the theme's own text colour applies
+ * there. The amber bar on the left still marks the pill. */
+.dark .ad-preview-status p {
     color: #fbbf24 !important;
 }
 
 /* "Combine all tabs" checkbox sits on the same row as the Run button;
  * detach it a bit so the two aren't glued together (user-requested
- * 2026-06-04 "staccandolo un po' dal tasto"). */
+ * 2026-06-04 "detach it a little from the button"). */
 .ad-preview-combine {
     margin-left: 28px !important;
 }
@@ -215,8 +232,8 @@ div.block.ad-preview-status {
 }
 
 /* General breathing room for the two-up rows in Detection / Mask
- * Preprocessing / Inpainting (user-requested 2026-06-05 "spazia tutto un
- * po"). `ad-2col-row` = rows built from two compact gr.Column; `ad-2up-row`
+ * Preprocessing / Inpainting (user-requested 2026-06-05 "space everything
+ * out a bit"). `ad-2col-row` = rows built from two compact gr.Column; `ad-2up-row`
  * = rows with two widgets placed directly (mask-blur/denoising,
  * sampler/scheduler). Both get a horizontal gap between the two halves plus
  * a little space below; the column variant also gets a vertical gap between
@@ -298,6 +315,11 @@ div[id*="adetailer_ad_version"].ad-version-overlay {
     /* Was 360px; widened to fit the injected "📖 Guide · " prefix (see
      * javascript/guide-button.js) without clipping the version text. */
     max-width: 460px !important;
+    /* Never wider than the room the title, the Enable checkbox and the
+     * "Nx Tabs" pill leave on the header, or a narrow panel (half a screen)
+     * slid the badge over them; the text ends in an ellipsis instead. The
+     * line above stays as the fallback for browsers without min(). */
+    max-width: min(460px, calc(100% - 240px)) !important;
     z-index: 5;
     pointer-events: none;
     margin: 0 !important;
@@ -306,28 +328,59 @@ div[id*="adetailer_ad_version"].ad-version-overlay {
     background: transparent !important;
 }
 
+/* Gradio 3 (AUTOMATIC1111) repeats elem_id/elem_classes on the inner .prose
+ * div. Keep that copy in normal flow so the badge is offset only once; offset
+ * twice, it sat above the header (clipped, or over the control above). Gradio
+ * 4's inner div has no id, so this matches nothing there. */
+div.prose[id*="adetailer_ad_version"].ad-version-overlay {
+    position: static !important;
+    top: auto !important;
+    right: auto !important;
+    /* Fill the capped outer badge; its own copy of the cap would count the
+     * 240px again against the badge's width. */
+    max-width: 100% !important;
+}
+
 div[id*="adetailer_ad_version"].ad-version-overlay p {
     margin: 0 !important;
     padding: 0 !important;
     font-size: 11px !important;
-    opacity: 0.55 !important;
+    /* Dimmed by colour, not opacity, on the light theme: a child cannot undo
+     * its parent's opacity, and the Guide link below needs full strength
+     * there. The text looks as it did with a 0.55 opacity. */
+    color: var(--body-text-color-subdued) !important;
+    color: color-mix(in srgb, var(--body-text-color) 55%, transparent) !important;
     white-space: nowrap;
     text-align: right;
+    /* On a narrow panel the end (version, hash) is cut; the Guide link at
+     * the start stays visible. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* The dark theme keeps its 0.55 opacity (Gradio 3 and 4 set .dark there). */
+.dark div[id*="adetailer_ad_version"].ad-version-overlay p {
+    color: var(--body-text-color) !important;
+    opacity: 0.55 !important;
 }
 
 /* The "📖 Guide" quick-link injected into the header version overlay
  * (javascript/guide-button.js). The overlay is pointer-events:none so header
  * clicks still toggle the accordion; re-enable pointer events on the link only.
- * The link shares the overlay <p>'s 0.55 opacity, so the accent colour + bold
- * are what keep it distinguishable from the grey version text (clearly legible
- * on the dark default theme). */
+ * The accent colour + bold are what keep it distinguishable from the grey
+ * version text. On the light theme the light-blue accent, dimmed with the
+ * version text, was about 1.6:1 on white, so it uses a darker blue there. */
 div[id*="adetailer_ad_version"].ad-version-overlay .ad-guide-open {
     pointer-events: auto !important;
     cursor: pointer !important;
     font-weight: 600 !important;
-    color: #6ea8fe !important;
+    color: #2563eb !important;
     text-decoration: none !important;
     white-space: nowrap;
+}
+/* On the dark theme the link shares the <p>'s 0.55 opacity. */
+.dark div[id*="adetailer_ad_version"].ad-version-overlay .ad-guide-open {
+    color: #6ea8fe !important;
 }
 div[id*="adetailer_ad_version"].ad-version-overlay .ad-guide-open:hover {
     text-decoration: underline !important;

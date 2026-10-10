@@ -1,0 +1,203 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+
+import pytest
+
+from adetailer import persistence
+
+
+@pytest.fixture
+def state_file(tmp_path, monkeypatch):
+    path = tmp_path / "user_state.json"
+    monkeypatch.setattr(persistence, "_STATE_FILE", path)
+    monkeypatch.setattr(persistence, "_enabled", lambda: True)
+    return path
+
+
+def test_simultaneous_tab_saves_preserve_both_tabs(state_file, monkeypatch):
+    first_read = Event()
+    second_read = Event()
+    original_load = persistence._read_raw
+
+    def overlapping_load():
+        current = original_load()
+        if not first_read.is_set():
+            first_read.set()
+            # Without the transaction lock both callbacks read the same file.
+            # With it, the second callback waits outside _load_raw instead.
+            second_read.wait(timeout=0.2)
+        else:
+            second_read.set()
+        return current
+
+    monkeypatch.setattr(persistence, "_read_raw", overlapping_load)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            persistence.save_tab_state, "txt2img", 0, {"ad_prompt": "face"}
+        )
+        assert first_read.wait(timeout=2)
+        second = pool.submit(
+            persistence.save_tab_state, "txt2img", 1, {"ad_prompt": "hands"}
+        )
+        first.result(timeout=2)
+        second.result(timeout=2)
+
+    assert persistence.load_state() == {
+        "0": {"ad_prompt": "face"},
+        "1": {"ad_prompt": "hands"},
+    }
+
+
+def test_scoped_state_and_legacy_fallback_survive_saving(state_file):
+    state_file.write_text('{"0": {"ad_prompt": "legacy"}}', encoding="utf-8")
+    persistence.save_tab_state(
+        "img2img", 0, {"ad_prompt": "new", "is_api": ()}
+    )
+    assert persistence.load_state("txt2img") == {"0": {"ad_prompt": "legacy"}}
+    assert persistence.load_state("img2img") == {"0": {"ad_prompt": "new"}}
+
+
+def test_unreadable_encoding_does_not_break_ui_startup(state_file):
+    state_file.write_bytes('{"txt2img:1": {"ad_prompt": "caf\xe9"}}'.encode("cp1252"))
+    assert persistence.load_state() == {}
+
+
+def test_failed_replace_preserves_previous_state(state_file, monkeypatch):
+    persistence.save_tab_state("txt2img", 0, {"ad_prompt": "original"})
+
+    def fail_replace(*args):
+        raise OSError
+
+    monkeypatch.setattr(persistence.os, "replace", fail_replace)
+    persistence.save_tab_state("txt2img", 0, {"ad_prompt": "new"})
+    assert persistence.load_state() == {"0": {"ad_prompt": "original"}}
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        '{"txt2img:1": {"ad_prompt": "caf\xe9"}}'.encode("cp1252"),
+        b'{"txt2img:1": {"ad_prompt": "hands"},}',
+    ],
+    ids=["cp1252", "trailing-comma"],
+)
+def test_unreadable_state_is_kept_aside_before_a_save(state_file, original):
+    state_file.write_bytes(original)
+    persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
+    assert persistence.load_state() == {"0": {"ad_prompt": "face"}}
+    backups = list(state_file.parent.glob("user_state.unreadable-*.json"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+
+
+def test_state_with_byte_order_mark_is_read(state_file):
+    state_file.write_bytes(b'\xef\xbb\xbf{"txt2img:1": {"ad_prompt": "hands"}}')
+    persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
+    assert persistence.load_state() == {
+        "0": {"ad_prompt": "face"},
+        "1": {"ad_prompt": "hands"},
+    }
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-be", "utf-32"])
+def test_state_saved_as_utf16_is_read(state_file, encoding):
+    # Re-saved as UTF-16 (Windows PowerShell 5.1, Notepad's "Unicode"), the
+    # remembered settings were treated as damaged and set aside at the next
+    # Generate, dropping every other tab's settings.
+    state_file.write_bytes('{"txt2img:1": {"ad_prompt": "hands"}}'.encode(encoding))
+    assert persistence.load_state() == {"1": {"ad_prompt": "hands"}}
+    persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
+    assert persistence.load_state() == {
+        "0": {"ad_prompt": "face"},
+        "1": {"ad_prompt": "hands"},
+    }
+    assert not list(state_file.parent.glob("user_state.unreadable-*"))
+
+
+def test_state_that_cannot_be_read_right_now_is_not_replaced(
+    state_file, monkeypatch
+):
+    persistence.save_tab_state("txt2img", 1, {"ad_prompt": "hands"})
+    original = state_file.read_bytes()
+
+    def locked(*_args, **_kwargs):
+        raise PermissionError("file in use")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(type(state_file), "read_bytes", locked)
+        persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
+    assert state_file.read_bytes() == original
+    assert not list(state_file.parent.glob("user_state.unreadable-*"))
+
+
+def test_state_is_on_disk_before_it_replaces_the_old_one(state_file, monkeypatch):
+    # Every Generate click rewrites this file. Closing it does not put it on
+    # disk: after a power cut every remembered setting could be gone.
+    events = []
+    real_fsync, real_replace = persistence.os.fsync, persistence.os.replace
+
+    def fsync(fd):
+        events.append(("fsync", persistence.os.fstat(fd).st_size))
+        real_fsync(fd)
+
+    def replace(src, dst):
+        events.append(("replace", str(src), str(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(persistence.os, "fsync", fsync)
+    monkeypatch.setattr(persistence.os, "replace", replace)
+    persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
+
+    tmp = state_file.with_suffix(".json.tmp")
+    assert events == [
+        ("fsync", state_file.stat().st_size),
+        ("replace", str(tmp), str(state_file)),
+    ]
+    assert persistence.load_state() == {"0": {"ad_prompt": "face"}}
+
+
+def test_state_saves_where_the_file_system_cannot_sync(state_file, monkeypatch):
+    def fail_fsync(_fd):
+        raise OSError
+
+    monkeypatch.setattr(persistence.os, "fsync", fail_fsync)
+    persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
+    assert persistence.load_state() == {"0": {"ad_prompt": "face"}}
+    assert not state_file.with_suffix(".json.tmp").exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "written", "damaged, set aside", "off", "replace fails", "locked",
+        "damaged, not set aside",
+    ],
+)
+def test_save_tab_state_says_whether_it_wrote_the_file(state_file, monkeypatch, case):
+    # Generate prints "saved tab N" only when this returns True. It returned
+    # None in every case, so the line could not tell a skipped or failed save
+    # (the option off, the file in use, a full disk) from a real one.
+    if case.startswith("damaged"):
+        state_file.write_bytes(b'{"txt2img:1": ')
+    else:
+        persistence.save_tab_state("txt2img", 1, {"ad_prompt": "hands"})
+    before = state_file.read_bytes()
+
+    def fail(*_args, **_kwargs):
+        msg = "file in use"
+        raise PermissionError(msg)
+
+    with monkeypatch.context() as patched:
+        if case == "off":
+            patched.setattr(persistence, "_enabled", lambda: False)
+        elif case == "replace fails":
+            patched.setattr(persistence.os, "replace", fail)
+        elif case == "locked":
+            patched.setattr(type(state_file), "read_bytes", fail)
+        elif case == "damaged, not set aside":
+            patched.setattr(persistence, "set_aside", lambda _path: None)
+        written = persistence.save_tab_state("txt2img", 0, {"ad_prompt": "face"})
+
+    expected = case in {"written", "damaged, set aside"}
+    assert written is expected
+    assert (state_file.read_bytes() != before) is expected

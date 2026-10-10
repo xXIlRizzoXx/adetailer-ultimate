@@ -27,11 +27,17 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from threading import RLock
 from typing import Any
+
+from adetailer.json_file import read_json_object, set_aside
 
 # extension_root = parent of the `adetailer/` package this file lives in.
 _EXT_ROOT = Path(__file__).resolve().parent.parent
 _STATE_FILE = _EXT_ROOT / "user_state.json"
+# Generate dispatches one unqueued callback per tab. Protect the entire
+# read/modify/replace transaction so those callbacks cannot drop each other.
+_STATE_LOCK = RLock()
 
 
 def _enabled() -> bool:
@@ -47,16 +53,13 @@ def _enabled() -> bool:
     return bool(opts.data.get("ad_remember_last_settings", True))
 
 
+def _read_raw() -> tuple[dict[str, Any] | None, bool]:
+    return read_json_object(_STATE_FILE)
+
+
 def _load_raw() -> dict[str, Any]:
-    if not _STATE_FILE.is_file():
-        return {}
-    try:
-        data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except (json.JSONDecodeError, OSError):
-        pass
-    return {}
+    data, _damaged = _read_raw()
+    return {} if data is None else data
 
 
 def _state_key(mode: str, tab_index: int) -> str:
@@ -104,26 +107,45 @@ def load_state(mode: str = "txt2img") -> dict[str, dict[str, Any]]:
 
 def save_tab_state(
     mode: str, tab_index: int, state: dict[str, Any]
-) -> None:
+) -> bool:
     """Persist a single tab's state to disk under the scoped key
     `"<mode>:<tab_index>"`.
 
-    No-op if the user disabled the feature in Settings > ADetailer.
+    Returns True only when the file was written. Nothing is written, and
+    False is returned, when the user disabled the feature in Settings >
+    ADetailer, the file cannot be read right now, a damaged file cannot be
+    set aside, or the write fails.
     Writes the full file atomically: read existing -> mutate -> tmp file ->
     rename. Drops `is_api` (it's transient, tuple-vs-bool serialization
     causes infotext quirks).
     """
     if not _enabled():
-        return
-    try:
-        current = _load_raw()
-        cleaned = {k: v for k, v in state.items() if k != "is_api"}
-        current[_state_key(mode, tab_index)] = cleaned
+        return False
+    with _STATE_LOCK:
+        try:
+            current, damaged = _read_raw()
+            if current is None:
+                # Unreadable right now: skip this save. Damaged: keep the old
+                # file under a new name rather than overwrite every other tab.
+                if not damaged or set_aside(_STATE_FILE) is None:
+                    return False
+                current = {}
+            cleaned = {k: v for k, v in state.items() if k != "is_api"}
+            current[_state_key(mode, tab_index)] = cleaned
 
-        tmp = _STATE_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(current, indent=2, default=str), encoding="utf-8")
-        os.replace(tmp, _STATE_FILE)
-    except OSError:
-        # Disk full / permission denied / network drive flaked / ... — we
-        # don't want a save failure to break the user's generation.
-        pass
+            tmp = _STATE_FILE.with_suffix(".json.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                f.write(json.dumps(current, indent=2, default=str))
+                # On disk before the rename: after a power cut the file is
+                # then the old or the new one, never a file of zero bytes.
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass  # best effort: some file systems cannot sync
+            os.replace(tmp, _STATE_FILE)
+        except OSError:
+            # Disk full / permission denied / network drive flaked / ... — we
+            # don't want a save failure to break the user's generation.
+            return False
+    return True

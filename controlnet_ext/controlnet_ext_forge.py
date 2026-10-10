@@ -60,7 +60,14 @@ class ControlNetExt:
         image = np.asarray(p.init_images[0])
         mask = np.full_like(image, fill_value=255)
 
-        cnet_image = {"image": image, "mask": mask}
+        # The Gradio 4 ControlNet (classic Forge since mid-2024, reForge's
+        # Gradio 4 branches, Forge Neo; its unit has image_fg) reads image and
+        # mask_image as separate arrays; the older one (older Forge, reForge's
+        # main branch) reads only the {"image", "mask"} dict.
+        if "image_fg" in getattr(ControlNetUnit, "__dataclass_fields__", {}):
+            image_kwargs = {"image": image, "mask_image": mask}
+        else:
+            image_kwargs = {"image": {"image": image, "mask": mask}}
 
         pres = external_code.pixel_perfect_resolution(
             image,
@@ -75,7 +82,7 @@ class ControlNetExt:
             [
                 ControlNetUnit(
                     enabled=True,
-                    image=cnet_image,
+                    **image_kwargs,
                     model=model,
                     module=module,
                     weight=weight,

@@ -26,7 +26,7 @@
     const TOOLTIPS = {
         // Top-of-tab clipboard
         adetailer_ad_copy_settings:
-            "Copy this tab's processing settings to the clipboard. Detector, class filter and per-tab enable are excluded so each tab can target a different region.",
+            "Copy all of this tab's settings to the clipboard, including its detector, class filter and enabled state.",
         adetailer_ad_paste_settings:
             "Paste the clipboard's settings into this tab. Only enabled after a Copy has been done on a different tab.",
 
@@ -40,7 +40,7 @@
         adetailer_ad_preset_save:
             "Save the current tab's full widget state as a named preset using the name in the textbox to the left.",
         adetailer_ad_preset_reset:
-            "Reset this tab's widgets to the pydantic defaults. Preset selection and clipboard state are not touched.",
+            "Reset this tab's widgets and preset selection to defaults, and clear the shared clipboard. Saved presets are kept.",
 
         // Preset library export / import
         adetailer_ad_preset_export_btn:
@@ -57,6 +57,12 @@
             "Run the full ADetailer detect + inpaint pass on the input image, using this tab's detector / detailer checkpoint / prompt / LoRAs — without regenerating the base image. Tick 'Save result to outputs' to also write it to your outputs folder.",
     };
 
+    // Gradio 3 (AUTOMATIC1111) has no download button: Export is then a plain
+    // button that cannot download a file (aaaaaa/ui.py gives it this class).
+    const EXPORT_UNAVAILABLE_CLASS = "ad-export-unavailable";
+    const EXPORT_UNAVAILABLE =
+        "Export as a download needs Gradio 4 (Forge / Forge Neo). On this WebUI, back up user_presets.json from the extension folder instead.";
+
     function applyTooltips() {
         for (const [idFragment, tooltipText] of Object.entries(TOOLTIPS)) {
             // Match any element whose id contains the fragment — covers
@@ -66,13 +72,31 @@
             const candidates = document.querySelectorAll(
                 `[id*="${idFragment}"]`
             );
+            // The id must END with the fragment plus an optional tab suffix
+            // (_2nd, _3rd, _11th, …): "..._ad_preset_reset" must not also
+            // match the "Reset every tab" checkbox "..._ad_preset_reset_all".
+            const exactId = new RegExp(idFragment + "(_\\d+(st|nd|rd|th))?$");
             for (const el of candidates) {
+                if (!exactId.test(el.id)) continue;
                 // Prefer the inner <button> if the matched element is a
                 // wrapper (cases where Gradio nests the actual click target).
                 const target =
                     el.tagName === "BUTTON" ? el : el.querySelector("button") || el;
                 if (!target.title) {
-                    target.title = tooltipText;
+                    const text =
+                        el.classList.contains(EXPORT_UNAVAILABLE_CLASS) ||
+                        target.classList.contains(EXPORT_UNAVAILABLE_CLASS)
+                            ? EXPORT_UNAVAILABLE
+                            : tooltipText;
+                    // The WebUI's localizer translates a title only when the
+                    // node is added, before this runs: look it up here, as
+                    // the WebUI's own hints.js does for its tooltips.
+                    const l10n = window.localization;
+                    const translated = l10n && l10n[text];
+                    target.title =
+                        typeof translated === "string" && translated
+                            ? translated
+                            : text;
                 }
             }
         }

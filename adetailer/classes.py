@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -76,8 +75,56 @@ def _names_from_json(data: Any) -> list[str]:
     return result
 
 
-@lru_cache(maxsize=32)
+def _host_refuses_unpickle() -> bool:
+    """True when the WebUI would refuse to read the detector file at this
+    point; the class names then come only from a sidecar JSON. False
+    otherwise, and outside a WebUI."""
+    try:
+        from modules import shared
+
+        if getattr(shared.cmd_opts, "disable_safe_unpickle", True) is not False:
+            return False
+        import torch
+        from modules import safe
+
+        return torch.load is getattr(safe, "load", None)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Class names read successfully, per model path, kept for the session.
+_RESOLVED_NAMES: dict[str, list[str]] = {}
+
+
 def get_model_class_names(model_path: str) -> list[str]:
+    """Resolve class names for a YOLO model (see _read_class_names).
+
+    Only names that were found are cached. Where the WebUI does not let the UI
+    read the detector file, the UI's lookup of a .pt without a sidecar comes
+    back empty; detection's own lookup must still read the real names instead
+    of reusing that empty result (which would silently ignore a class filter).
+    Names found once are then reused everywhere.
+    """
+    names = _RESOLVED_NAMES.get(model_path)
+    if names:
+        return names
+    # Where the WebUI would refuse the .pt here (and print an error report for
+    # it), only a sidecar is read.
+    names = _read_class_names(model_path, load_pt=not _host_refuses_unpickle())
+    if names:
+        _RESOLVED_NAMES[model_path] = names
+    return names
+
+
+def _clear_class_name_cache() -> None:
+    _RESOLVED_NAMES.clear()
+
+
+# Keeps the reset hook of the lru_cache this replaced.
+get_model_class_names.cache_clear = _clear_class_name_cache  # type: ignore[attr-defined]
+
+
+def _read_class_names(model_path: str, load_pt: bool = True) -> list[str]:
     """Resolve class names for a YOLO model.
 
     Resolution order:
@@ -85,9 +132,10 @@ def get_model_class_names(model_path: str) -> list[str]:
          class-names format. Two names are tried, in order:
            a. <model>.names.json  — a DEDICATED file that never collides with
               civitai_helper / Stability Matrix metadata (which claims the plain
-              <model>.json). This is the escape hatch for models whose .pt a
-              WebUI's safe-unpickle refuses to read (e.g. non-standard
-              segmentation models -> otherwise-empty class dropdown).
+              <model>.json). It is the first file tried, and a sidecar is the
+              only source of names where the WebUI does not let the panel read
+              the .pt (the class dropdown would otherwise be empty until a
+              detection).
            b. <model>.json        — legacy/plain sidecar; unrelated JSONs (e.g.
               civitai_helper metadata) don't match the format and are ignored.
       2. model.names from a transient YOLO() load.
@@ -112,13 +160,19 @@ def get_model_class_names(model_path: str) -> list[str]:
         if not sidecar.is_file():
             continue
         try:
-            data = json.loads(sidecar.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            # Bytes let json detect UTF-8 (with or without a byte-order mark)
+            # and UTF-16/32, as Windows editors and PowerShell write them. An
+            # undecodable file falls through like a malformed one.
+            data = json.loads(sidecar.read_bytes())
+        except (ValueError, OSError):
             data = None
         if data is not None:
             names = _names_from_json(data)
             if names:
                 return names
+
+    if not load_pt:
+        return []
 
     try:
         from ultralytics import YOLO
@@ -133,18 +187,42 @@ def get_model_class_names(model_path: str) -> list[str]:
 
 def resolve_class_ids(model_path: str, requested: list[str]) -> list[int]:
     """Convert user-provided class names (or numeric ids as strings) to int ids.
-    Unknown entries are silently dropped — matches uddetailer's behavior.
+    Without an exact match a name matches case-insensitively, as an API call or
+    an old preset may send "Face" for "face". Unknown entries are dropped —
+    matches uddetailer's behavior — and named in the console when the model's
+    class names are known.
     """
     names = get_model_class_names(model_path)
+    folded = [n.casefold() for n in names]
     out: list[int] = []
+    unknown: list[str] = []
     for token in requested:
-        if token.isdigit():
-            i = int(token)
+        # Not isdigit(): it is also true for "²" or "①", which int() rejects.
+        if token.isdecimal():
+            try:
+                i = int(token)
+            except ValueError:  # not a usable number
+                i = -1
             if 0 <= i < max(1, len(names) or 10_000):
                 out.append(i)
+            else:
+                unknown.append(token)
             continue
         if token in names:
             out.append(names.index(token))
+        elif folded.count(token.casefold()) == 1:
+            out.append(folded.index(token.casefold()))
+        else:
+            unknown.append(token)
+    if unknown and names:
+        msg = (
+            f"[-] ADetailer: class not found in {Path(model_path).name}, ignored:"
+            f" {', '.join(unknown)}"
+        )
+        # ASCII only (other characters escaped), so a console pipe in any
+        # legacy code page can print it instead of raising and stopping
+        # ADetailer for the image.
+        print(msg.encode("ascii", "backslashreplace").decode("ascii"))
     return out
 
 

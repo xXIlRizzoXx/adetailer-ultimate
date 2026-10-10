@@ -10,7 +10,9 @@ from adetailer.mask import (
     is_all_black,
     mask_invert,
     mask_merge,
+    mask_preprocess,
     offset,
+    parse_indices,
 )
 
 
@@ -69,6 +71,159 @@ def test_offset():
         dtype=np.uint8,
     )
     assert np.array_equal(np.array(result), expect)
+
+
+@pytest.mark.parametrize(
+    ("bbox", "x", "y", "expected"),
+    [
+        ((7, 4, 9, 5), 2, 0, (9, 4, 10, 6)),
+        ((0, 4, 2, 5), -2, 0, (0, 4, 1, 6)),
+        ((4, 0, 5, 2), 0, 2, (4, 0, 6, 1)),
+        ((4, 7, 5, 9), 0, -2, (4, 9, 6, 10)),
+        ((4, 4, 5, 5), 10, 0, None),
+        ((4, 4, 5, 5), 0, -10, None),
+    ],
+)
+def test_offset_clips_at_image_edges(bbox, x, y, expected):
+    mask = Image.new("L", (10, 10), 0)
+    ImageDraw.Draw(mask).rectangle(bbox, fill=255)
+
+    shifted = offset(mask, x=x, y=y)
+
+    assert shifted.getbbox() == expected
+    assert mask.getbbox() == (bbox[0], bbox[1], bbox[2] + 1, bbox[3] + 1)
+
+
+@pytest.mark.parametrize("merge_invert", ["None", "Merge", "Merge and Invert"])
+def test_offset_drops_off_canvas_masks_and_keeps_source_indices(merge_invert):
+    masks = [Image.new("L", (10, 10), 0) for _ in range(2)]
+    ImageDraw.Draw(masks[0]).rectangle((8, 4, 9, 5), fill=255)
+    ImageDraw.Draw(masks[1]).rectangle((3, 4, 4, 5), fill=255)
+
+    processed, groups = mask_preprocess(
+        masks, x_offset=2, merge_invert=merge_invert
+    )
+
+    assert len(processed) == 1
+    assert groups == [[1]]
+
+
+def test_offset_drops_all_off_canvas_masks():
+    mask = Image.new("L", (10, 10), 255)
+
+    assert mask_preprocess([mask], x_offset=10) == ([], [])
+
+
+def _box_mask(box):
+    mask = Image.new("L", (10, 10), 0)
+    ImageDraw.Draw(mask).rectangle(box, fill=255)
+    return mask
+
+
+@pytest.mark.parametrize(
+    ("boxes", "kernel"),
+    [
+        ([(0, 0, 9, 9)], 4),  # a box clamped to the whole frame
+        ([(0, 0, 9, 9)], 0),
+        ([(1, 1, 8, 8)], 4),  # dilation fills the last pixels
+        ([(0, 0, 4, 9), (5, 0, 9, 9)], 0),  # two halves cover the frame
+    ],
+)
+def test_merge_invert_of_detections_filling_the_frame_inpaints_nothing(
+    boxes, kernel
+):
+    # The inverted mask would be blank, and the host repaints the whole image
+    # for a blank mask instead of nothing.
+    masks = [_box_mask(box) for box in boxes]
+
+    assert mask_preprocess(
+        masks, kernel=kernel, merge_invert="Merge and Invert"
+    ) == ([], [])
+
+
+def test_merge_invert_keeps_the_background_around_detections():
+    masks = [_box_mask((0, 0, 4, 9)), _box_mask((5, 0, 8, 9))]
+
+    processed, groups = mask_preprocess(masks, merge_invert="Merge and Invert")
+
+    assert len(processed) == 1
+    assert processed[0].getbbox() == (9, 0, 10, 10)
+    assert groups == [[0, 1]]
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ("1,3;2,2", [0, 1, 2]),
+        ("3-1", [0, 1, 2]),
+        ("0-2", [0, 1]),
+        ("4-7", []),
+        ("-2,0", []),
+        ("bad,1-x", None),
+        ("", None),
+        # The Detection preview labels boxes "#1", "#2", ...: typing the label,
+        # or separating numbers with spaces, must select those detections
+        # instead of silently keeping every one of them.
+        ("#2", [1]),
+        ("#1,#3", [0, 2]),
+        ("2 3", [1, 2]),
+        ("1, #3", [0, 2]),
+        ("#1-#2", [0, 1]),
+        (" #2 ", [1]),
+        # A spaced range stays a range (not the two numbers 1 and 3).
+        ("1 - 3", [0, 1, 2]),
+        ("1 -3", [0, 1, 2]),
+        ("#", None),
+        # A Chinese or Japanese IME types full-width or CJK commas, dashes and
+        # digits: they select those detections instead of keeping every one.
+        ("1\uff0c3", [0, 2]),
+        ("1\u30013", [0, 2]),
+        ("\uff11\uff0c\uff13", [0, 2]),
+        ("2\uff1b3", [1, 2]),
+        ("\uff032", [1]),
+        ("1\uff5e3", [0, 1, 2]),
+        ("1\u301c3", [0, 1, 2]),
+        ("1\u20133", [0, 1, 2]),
+        ("1\uff0d3", [0, 1, 2]),
+        ("1 \u2014 3", [0, 1, 2]),
+        # The Japanese long-vowel mark (the minus key in Japanese mode) and the
+        # middle dot, full-width or half-width, work like "-" and ",".
+        ("1\u30fc3", [0, 1, 2]),
+        ("\uff11\u30fc\uff13", [0, 1, 2]),
+        ("1\uff703", [0, 1, 2]),
+        ("1\u30fb3", [0, 2]),
+        ("1\uff653", [0, 2]),
+        ("\u30fc2", []),
+        # A doubled dash (a Chinese IME types two em dashes for Shift and
+        # minus) is still a range, instead of silently keeping only the first
+        # number, or a detection before it.
+        ("1\u2014\u20143", [0, 1, 2]),
+        ("1\uff0d\uff0d3", [0, 1, 2]),
+        ("1--3", [0, 1, 2]),
+        ("2\u2014\u20143", [1, 2]),
+        ("1 - - 3", [0, 1, 2]),
+        ("1\u30fc\u30fc3", [0, 1, 2]),
+        ("3--1", [0, 1, 2]),
+        ("1--", None),
+    ],
+)
+def test_parse_indices_preserves_selection_rules(spec, expected):
+    assert parse_indices(spec, 3) == expected
+
+
+@pytest.mark.parametrize(
+    "spec", ["1-999999999999", "999999999999-1", "1--999999999999"]
+)
+def test_parse_indices_bounds_range_before_iteration(monkeypatch, spec):
+    import adetailer.mask as mask_module
+
+    def bounded_range(start, stop):
+        # Fail immediately on the regression; never really iterate a huge range.
+        assert stop - start <= 3
+        return range(start, stop)
+
+    monkeypatch.setattr(mask_module, "range", bounded_range, raising=False)
+    assert parse_indices(spec, 3) == [0, 1, 2]
 
 
 class TestIsAllBlack:
