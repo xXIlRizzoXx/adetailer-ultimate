@@ -1,6 +1,13 @@
 # ADetailer Ultimate
 
-[![Stable release](https://img.shields.io/github/v/release/xXIlRizzoXx/adetailer-ultimate?label=stable)](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases/latest) [![Beta pre-release](https://img.shields.io/github/v/release/xXIlRizzoXx/adetailer-ultimate?include_prereleases&sort=date&label=beta)](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases) [![WebUI: AUTOMATIC1111, Forge, Forge Neo, reForge](https://img.shields.io/badge/WebUI-AUTOMATIC1111%20%7C%20Forge%20%7C%20Forge%20Neo%20%7C%20reForge-blue)](#compatibility) [![License](https://img.shields.io/github/license/xXIlRizzoXx/adetailer-ultimate)](LICENSE.md)
+<div align="center">
+  <img src="docs/img/cover.jpg" alt="ADetailer Ultimate: finds faces, hands and other parts in your pictures and redraws them with more detail, for AUTOMATIC1111, Forge, Forge Neo and reForge" width="100%" />
+
+  <br /><br />
+
+  [![Stable release](https://img.shields.io/github/v/release/xXIlRizzoXx/adetailer-ultimate?label=stable)](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases/latest) [![Beta pre-release](https://img.shields.io/github/v/release/xXIlRizzoXx/adetailer-ultimate?include_prereleases&sort=date&label=beta)](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases) [![WebUI: AUTOMATIC1111, Forge, Forge Neo, reForge](https://img.shields.io/badge/WebUI-AUTOMATIC1111%20%7C%20Forge%20%7C%20Forge%20Neo%20%7C%20reForge-blue)](#compatibility) [![License](https://img.shields.io/github/license/xXIlRizzoXx/adetailer-ultimate)](LICENSE.md)
+
+</div>
 
 > **Unofficial fork of [Bing-su/adetailer](https://github.com/Bing-su/adetailer), the extension that finds faces, hands and other parts in your pictures and redraws them with more detail. Everything ADetailer does, plus class filters, presets, remembered settings and more.**
 >
@@ -11,6 +18,28 @@
 **New here?** [Install](#install), then the three-step [Quick start](#quick-start). **Already using the original ADetailer?** Read [Coming from the original ADetailer?](#coming-from-the-original-adetailer) first.
 
 🟢 **The plus.8 reliability update is out** as the stable release v26.2.0+plus.8. The sections you leave open are remembered, a tab's separate VAE and CLIP skip are always switched back, Styles are applied only once, API requests no longer use your remembered UI settings for the tabs they leave out, a preset or pasted parameters naming a detector you do not have no longer make Generate fail, and "Run ADetailer on an image" results paste back the tab's settings; it also brings the smaller fixes of its three betas. → [What is new in plus.8](#what-is-new-in-plus8)
+
+## ✨ What it does
+
+<img src="docs/img/01-panel.jpg" alt="One panel: every detailer pass in its own tab, with a counter of the enabled tabs and settings remembered between restarts" width="100%" />
+
+<img src="docs/img/02-classes.jpg" alt="Class filter: detail only the classes you pick, or all but some, and one pass per class in your order" width="100%" />
+
+<img src="docs/img/03-presets.jpg" alt="Presets and tabs: named presets, copy and paste between tabs, reset one tab or every tab" width="100%" />
+
+<img src="docs/img/04-prompts.jpg" alt="Prompts: a prompt for each class with [CLASS] blocks, Auto class-guard and LoRA controls" width="100%" />
+
+<img src="docs/img/05-detection.jpg" alt="Detection: detection resolution per tab and inpaint only the detections you choose by number" width="100%" />
+
+<img src="docs/img/06-combine.jpg" alt="Combine all tabs: the Detection preview runs the detectors of every tab at once, one colour per tab" width="100%" />
+
+<img src="docs/img/07-run-on-image.jpg" alt="Run ADetailer on an image: detail a finished picture or a whole folder without generating it again" width="100%" />
+
+<img src="docs/img/08-inpainting.jpg" alt="Inpainting: dynamic denoise per tab, inpaint size scaled to the box, separate checkpoint, VAE and (on Forge) text encoder" width="100%" />
+
+<img src="docs/img/09-settings.jpg" alt="Settings: manual mode, verbose diagnostic log and a reset of the ADetailer settings" width="100%" />
+
+<sub>Screenshots taken on AUTOMATIC1111 1.10. "Exclusive" marks what neither the original ADetailer nor any other fork we know of offers.</sub>
 
 ## Contents
 
