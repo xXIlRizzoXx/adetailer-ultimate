@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from itertools import chain
 
 import numpy as np
 from lib_controlnet import external_code, global_state
@@ -9,7 +10,7 @@ from lib_controlnet.external_code import ControlNetUnit
 from modules import scripts
 from modules.processing import StableDiffusionProcessing
 
-from .common import cn_model_regex
+from .common import cn_model_regex, default_cn_module
 
 controlnet_exists = True
 controlnet_type = "forge"
@@ -37,6 +38,38 @@ def add_forge_script_to_adetailer_run(
     p.script_args_value.extend(script_args)
 
 
+# The preprocessor tags the ADetailer module dropdown lists for each model type.
+_CN_TYPE_TAGS = {
+    "inpaint": "Inpaint",
+    "lineart": "Lineart",
+    "openpose": "OpenPose",
+    "tile": "Tile",
+    "scribble": "Scribble",
+    "depth": "Depth",
+}
+
+
+def default_module(model: str) -> str:
+    """The preprocessor the module dropdown would pick for `model`.
+
+    For a request (API) that names no preprocessor: Forge reads a missing one
+    as "None" and ran the model on the raw crop. "None" when unknown.
+    """
+    try:
+        by_type = {
+            t: list(global_state.get_filtered_preprocessors(tag))
+            for t, tag in _CN_TYPE_TAGS.items()
+        }
+        by_type["union"] = list(chain.from_iterable(by_type.values()))
+        name = model.lower().replace("inpaint_depth", "depth")
+        for t, choices in by_type.items():
+            if t in name:
+                return default_cn_module(t, choices)
+    except Exception:  # noqa: BLE001 - a different Forge: run as before
+        pass
+    return "None"
+
+
 class ControlNetExt:
     def __init__(self):
         self.cn_available = False
@@ -56,6 +89,9 @@ class ControlNetExt:
     ):
         if (not self.cn_available) or model == "None":
             return
+
+        if module is None:
+            module = default_module(model)
 
         image = np.asarray(p.init_images[0])
         mask = np.full_like(image, fill_value=255)

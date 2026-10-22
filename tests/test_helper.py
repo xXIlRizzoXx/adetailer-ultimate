@@ -222,3 +222,25 @@ def test_pause_total_tqdm_lets_forge_put_the_module_list_back():
     with _pause_total_tqdm(data, _DEFAULTS)():
         data["forge_additional_modules"] = ["/models/VAE/picked.vae"]
     assert data == {"multiple_tqdm": True, "forge_additional_modules": ["/models/VAE/picked.vae"]}
+
+
+@pytest.mark.parametrize(("default", "saved"), [(None, False), ("None", False), (None, True)])
+def test_pause_total_tqdm_puts_the_webui_upscaler_back_after_the_pass(default, saved):
+    # Settings > ADetailer "Upscaler for ADetailer's inpaint area" sets the host's
+    # "Upscaler for img2img" for the pass. The host puts an option back only
+    # if it was in opts.data, and AUTOMATIC1111's default is None: never
+    # saved, the chosen upscaler stayed the WebUI's one after the pass.
+    key = "upscaler_for_img2img"
+    data = {"multiple_tqdm": True}
+    if saved:
+        data[key] = "Lanczos"
+    pause = _pause_total_tqdm(data, {key: default})
+    pause.__wrapped__.__globals__["opts"].data_labels = {key: object()}
+    with pause():
+        stored = {k: data[k] for k in (key,) if k in data}
+        data[key] = "R-ESRGAN 4x+"  # the pass
+        assert data[key] == "R-ESRGAN 4x+"
+        data.update(stored)  # the host after the pass
+        # Between passes, the WebUI's own value is back.
+        assert data[key] == ("Lanczos" if saved else default)
+    assert data == ({"multiple_tqdm": True, key: "Lanczos"} if saved else {"multiple_tqdm": True})

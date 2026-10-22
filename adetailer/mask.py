@@ -350,6 +350,56 @@ def filter_by_indices(pred: PredictOutput[T], spec: str) -> PredictOutput[T]:
     return pred
 
 
+def bbox_iou(a: list[T], b: list[T]) -> float:
+    """Intersection over union of two [x1, y1, x2, y2] boxes (0.0 to 1.0)."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    inter = w * h
+    union = bbox_area(a) + bbox_area(b) - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def filter_overlapping(pred: PredictOutput[T], max_overlap: float) -> PredictOutput[T]:
+    """Drop a detection whose box overlaps a more confident one of the same
+    class by MORE than ``max_overlap`` (intersection over union), so the same
+    face found twice is inpainted once. ``0`` (or less) turns it off.
+
+    Intersection over union, not "share of the smaller box": eyes inside a
+    face cover a small part of the face box, so they are kept. Only boxes of
+    the same class are compared, because two classes the user asked for (a
+    face and a hand on it) are different regions with their own prompts; a
+    detector without class names (MediaPipe) counts as one class. Without
+    usable confidences, or on a tie, the earlier detection wins. The kept
+    detections stay in detector order and every parallel list stays aligned.
+    """
+    n = len(pred.bboxes)
+    if max_overlap <= 0 or n <= 1:
+        return pred
+    confs = pred.confidences if len(pred.confidences) == n else None
+    classes = pred.class_names if len(pred.class_names) == n else None
+    order = sorted(range(n), key=lambda i: -confs[i]) if confs else range(n)
+    kept: list[int] = []
+    for i in order:
+        if not any(
+            (classes is None or classes[i] == classes[k])
+            and bbox_iou(pred.bboxes[i], pred.bboxes[k]) > max_overlap
+            for k in kept
+        ):
+            kept.append(i)
+    if len(kept) == n:
+        return pred
+    keep = sorted(kept)
+    pred.bboxes = [pred.bboxes[i] for i in keep]
+    pred.masks = [pred.masks[i] for i in keep]
+    if confs:
+        pred.confidences = [confs[i] for i in keep]
+    if classes:
+        pred.class_names = [classes[i] for i in keep]
+    return pred
+
+
 def filter_k_largest(pred: PredictOutput[T], k: int = 0) -> PredictOutput[T]:
     if not pred.bboxes or k == 0:
         return pred

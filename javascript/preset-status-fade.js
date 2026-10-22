@@ -45,6 +45,9 @@
 
     const FADE_DELAY_MS = 4000;
     const ARM_MS = 300;
+    // How long a Paste click keeps the end of its request from showing an
+    // old message again: Gradio 4 often shows no end at all.
+    const QUIET_MS = 3000;
     const WATCH_CLASS = "ad-preset-status";
     const FADED_CLASS = "ad-status-faded";
     // "<prefix>_ad_preset_<action>[_2nd …]" writes "<prefix>_ad_preset_status"
@@ -52,6 +55,11 @@
     // every tab" checkbox (…_ad_preset_reset_all) does not match.
     const ACTION_RE =
         /^(.*)_ad_preset_(load|save|rename|delete|reset|export_btn)((?:_\d+(?:st|nd|rd|th))?)$/;
+    // "<prefix>_ad_paste_settings[_2nd …]" writes "<prefix>_ad_preset_status"
+    // only with its "Swap with the copied tab" (_ad_paste_swap) or "Paste
+    // into every tab" (_ad_paste_all) checkbox ticked; a plain Paste leaves
+    // the status alone, so arming it would bring back an old message.
+    const PASTE_RE = /^(.*)_ad_paste_settings((?:_\d+(?:st|nd|rd|th))?)$/;
     // "<prefix>_ad_preset_import_btn[_2nd …]" writes "<prefix>_ad_preset_io_status".
     const IMPORT_RE = /^(.*)_ad_preset_import_btn((?:_\d+(?:st|nd|rd|th))?)$/;
 
@@ -76,6 +84,9 @@
         let timer = null;
         let lastSeen = "";
         let armed = null;
+        // Set by a Paste click: the end of its request is not an answer here.
+        let quiet = false;
+        let quietTimer = null;
 
         const tick = (records) => {
             // Any change inside the block (our own fade class aside): the
@@ -87,7 +98,10 @@
             const md = statusEl.querySelector(".md");
             if (!md) return;
             const text = (md.textContent || "").trim();
-            if (text && (text !== lastSeen || answered(records, statusEl))) {
+            const done = answered(records, statusEl);
+            const reshow = done && !quiet;
+            if (done) quiet = false;
+            if (text && (text !== lastSeen || reshow)) {
                 lastSeen = text;
                 statusEl.classList.remove(FADED_CLASS);
                 if (timer) clearTimeout(timer);
@@ -113,9 +127,20 @@
             }
         };
 
+        statusEl.__adStatusQuiet = () => {
+            quiet = true;
+            if (quietTimer) clearTimeout(quietTimer);
+            quietTimer = setTimeout(() => {
+                quietTimer = null;
+                quiet = false;
+            }, QUIET_MS);
+        };
+
         // A click on this status's own action button: nothing changed at
         // all ARM_MS later means the same message came back unseen.
         statusEl.__adStatusArm = () => {
+            // A click on its own button: the next answer is a real one.
+            quiet = false;
             if (armed) clearTimeout(armed);
             armed = setTimeout(() => {
                 armed = null;
@@ -145,10 +170,33 @@
             .forEach((el) => setupWatcher(el));
     }
 
+    function ticked(id) {
+        const el = document.getElementById(id);
+        const box = el && (el.tagName === "INPUT" ? el : el.querySelector("input"));
+        return !!(box && box.checked);
+    }
+
     // Walk up from the click: on Gradio 4 the Export button's id sits on a
     // wrapper around the real button.
     function onAction(e) {
         for (let n = e.target; n && n.nodeType === 1; n = n.parentElement) {
+            const p = PASTE_RE.exec(n.id || "");
+            if (p) {
+                const scoped =
+                    ticked(p[1] + "_ad_paste_swap" + p[2]) || ticked(p[1] + "_ad_paste_all" + p[2]);
+                const own = document.getElementById(p[1] + "_ad_preset_status" + p[2]);
+                // Paste lists the status of every tab of the panel among its
+                // outputs, and most get no new message: on Gradio 3 the end of
+                // its request (`pending` going away) brought their old message
+                // back. A message that does change still shows.
+                document.querySelectorAll("." + WATCH_CLASS).forEach((el) => {
+                    if (!(el.id || "").startsWith(p[1] + "_ad_preset_status")) return;
+                    if (scoped && el === own) return;
+                    if (el.__adStatusQuiet) el.__adStatusQuiet();
+                });
+                if (scoped && own && own.__adStatusArm) own.__adStatusArm();
+                return;
+            }
             const m = ACTION_RE.exec(n.id || "");
             if (!m) continue;
             const kind = m[2] === "export_btn" ? "_ad_preset_io_status" : "_ad_preset_status";

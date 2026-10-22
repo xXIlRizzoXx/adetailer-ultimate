@@ -306,6 +306,98 @@ def test_a_digit_that_int_rejects_does_not_stop_the_class_filter(
     assert exclude.class_names == ["face", "hand"]
 
 
+_NEWER_LAYER = (
+    "Can't get attribute 'C3k2' on <module 'ultralytics.nn.modules.block'"
+    " from 'site-packages/ultralytics/nn/modules/block.py'>"
+)
+
+
+def _yolo_that_fails(monkeypatch, error):
+    """Fake Ultralytics whose model load raises `error`, as torch.load does
+    when the checkpoint needs a layer class this Ultralytics does not have."""
+    module = ModuleType("ultralytics")
+
+    class YOLO:
+        def __init__(self, path):
+            raise error
+
+    module.YOLO = YOLO
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+    import importlib.metadata
+
+    real_version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: "8.3.75" if name == "ultralytics" else real_version(name),
+    )
+
+
+def _load_error_from_a_wrapper():
+    try:
+        raise AttributeError(
+            "Can't get attribute 'Segment26' on <module 'ultralytics.nn.modules.head'>"
+        )
+    except AttributeError as inner:
+        try:
+            raise RuntimeError("model load failed") from inner
+        except RuntimeError as outer:
+            return outer
+
+
+@pytest.mark.parametrize(
+    "error",
+    [AttributeError(_NEWER_LAYER), _load_error_from_a_wrapper()],
+    ids=["unpickle-error", "wrapped"],
+)
+def test_detector_from_a_newer_ultralytics_gets_a_clear_message(
+    tmp_path, monkeypatch, capsys, error
+):
+    # A YOLO11 / YOLO26 detector loaded by an older Ultralytics used to fail
+    # with only "Can't get attribute 'C3k2' on <module ...>".
+    from adetailer.ultralytics import UltralyticsTooOldError
+
+    _yolo_that_fails(monkeypatch, error)
+    model = tmp_path / "face_yolo26n-ü.pt"
+
+    with pytest.raises(UltralyticsTooOldError) as info:
+        ultralytics_predict(str(model), Image.new("RGB", (4, 4)))
+
+    msg = str(info.value)
+    assert "face_yolo26n-" in msg
+    assert "newer Ultralytics than Ultralytics 8.3.75" in msg
+    assert "Can't get attribute" in msg
+    assert "site-packages" not in msg
+    # Still an AttributeError, chained to the original error.
+    assert isinstance(info.value, AttributeError)
+    assert info.value.__cause__ is error
+    err = capsys.readouterr().err
+    assert "newer Ultralytics than Ultralytics 8.3.75" in err
+    assert "face_yolo26n-\\xfc.pt" in err
+    assert err.isascii()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AttributeError("'NoneType' object has no attribute 'names'"),
+        AttributeError("Can't get attribute 'Thing' on <module 'otherlib.layers'>"),
+        FileNotFoundError("face.pt does not exist"),
+    ],
+    ids=["other-attribute-error", "other-library", "other-error"],
+)
+def test_other_detector_load_errors_are_raised_unchanged(
+    tmp_path, monkeypatch, capsys, error
+):
+    _yolo_that_fails(monkeypatch, error)
+
+    with pytest.raises(type(error)) as info:
+        ultralytics_predict(str(tmp_path / "face.pt"), Image.new("RGB", (4, 4)))
+
+    assert info.value is error
+    assert "newer Ultralytics" not in capsys.readouterr().err
+
+
 class TestMaskToPil:
     @pytest.mark.parametrize(
         ("content_size", "padding", "output_size"),
@@ -365,3 +457,73 @@ class TestMaskToPil:
 
         expected = np.array([[0, 255], [0, 255]], dtype=np.uint8)
         np.testing.assert_array_equal(arr, expected)
+
+
+class _FakeEvents:
+    """Stand-in for Ultralytics' usage-analytics object (`events`)."""
+
+    def __init__(self):
+        self.enabled = True
+
+
+def _fake_events_module(monkeypatch, name, events):
+    module = ModuleType(name)
+    if events is not None:
+        module.events = events
+    monkeypatch.setitem(sys.modules, name, module)
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["ultralytics.utils.events", "ultralytics.hub.utils"],
+    ids=["new-layout", "old-layout"],
+)
+def test_detection_switches_off_ultralytics_usage_analytics(
+    tmp_path, monkeypatch, layout
+):
+    # Ultralytics sends anonymous usage analytics on every predict while its
+    # `sync` setting is on (the default). ADetailer switches the in-memory
+    # object off, in both module layouts, and never writes its settings.
+    _fake_yolo(monkeypatch, [0.0], {0: "face"})
+    settings = {"sync": True}
+    sys.modules["ultralytics"].SETTINGS = settings
+    events = _FakeEvents()
+    if layout == "ultralytics.hub.utils":
+        # Older Ultralytics: no ultralytics.utils.events module at all.
+        monkeypatch.setitem(sys.modules, "ultralytics.utils.events", None)
+    else:
+        _fake_events_module(monkeypatch, "ultralytics.hub.utils", None)
+    _fake_events_module(monkeypatch, layout, events)
+
+    result = ultralytics_predict(str(tmp_path / "face.pt"), Image.new("RGB", (4, 4)))
+
+    assert events.enabled is False
+    assert settings == {"sync": True}
+    assert len(result.bboxes) == 1
+
+
+@pytest.mark.parametrize("case", ["no-module", "no-attribute", "broken-object"])
+def test_detection_works_when_ultralytics_analytics_cannot_be_found(
+    tmp_path, monkeypatch, case
+):
+    _fake_yolo(monkeypatch, [0.0], {0: "face"})
+    if case == "no-module":
+        monkeypatch.setitem(sys.modules, "ultralytics.utils.events", None)
+        monkeypatch.setitem(sys.modules, "ultralytics.hub.utils", None)
+    elif case == "no-attribute":
+        _fake_events_module(monkeypatch, "ultralytics.utils.events", object())
+        _fake_events_module(monkeypatch, "ultralytics.hub.utils", None)
+    else:
+
+        class _ReadOnly:
+            enabled = True
+
+            def __setattr__(self, key, value):
+                raise RuntimeError("read-only")
+
+        _fake_events_module(monkeypatch, "ultralytics.utils.events", _ReadOnly())
+        _fake_events_module(monkeypatch, "ultralytics.hub.utils", None)
+
+    result = ultralytics_predict(str(tmp_path / "face.pt"), Image.new("RGB", (4, 4)))
+
+    assert len(result.bboxes) == 1

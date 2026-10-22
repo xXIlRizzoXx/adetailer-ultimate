@@ -205,7 +205,9 @@ def test_the_readme_says_only_automatic1111_waits_for_the_first_detection():
     # The README sentence saying that the CLASSES dropdown lists a .pt's
     # class names only after the first detection is about AUTOMATIC1111: it
     # must not follow the classic Forge / Forge Neo sentence, where it read
-    # as if those hosts, which list them straight away, waited too.
+    # as if those hosts, which list them straight away, waited too. From
+    # plus.9 beta 1 AUTOMATIC1111 lists them straight away as well, which the
+    # same sentence says, keeping the wait for plus.8.
     import re
     from pathlib import Path
 
@@ -220,6 +222,9 @@ def test_the_readme_says_only_automatic1111_waits_for_the_first_detection():
     hosts = re.findall(r"AUTOMATIC1111|classic Forge|Forge Neo|reForge", before, re.I)
     assert hosts
     assert hosts[-1] == "AUTOMATIC1111", hosts
+    after = paragraph[paragraph.index("after its first detection"):]
+    assert "in plus.8" in after.split(",", 1)[0]
+    assert "from plus.9 beta 1 it lists them straight away" in after
 
 
 def test_sidecar_added_after_names_were_found_waits_for_a_restart(
@@ -361,3 +366,200 @@ def test_class_not_found_line_prints_on_a_legacy_code_page(tmp_path, monkeypatch
     printed = out.buffer.getvalue()
     assert b"class not found in x.pt, ignored: \\u9854" in printed
     assert b"class not found in x\\u9854.pt, ignored: hands" in printed
+
+
+# --- Class names read from a checkpoint's metadata (AUTOMATIC1111) ---------
+
+_RAN: list = []
+
+
+def _side_effect(*args):
+    """Stands for code a pickle could name: reading the names must never call
+    it."""
+    _RAN.append(args)
+    return args
+
+
+def _fake_checkpoint(path, monkeypatch, *, names, ema=False, old_format=False):
+    """Write a .pt laid out like torch.save's zip: <dir>/data.pkl, the weights
+    in <dir>/data/<n> (referenced by persistent id), and a version entry. The
+    pickle names a model class of a module only present while it is written,
+    a tensor rebuild function, and a function that must never run."""
+    import pickle
+    import zipfile
+
+    tasks = ModuleType("ultralytics.nn.tasks")
+    rebuild = ModuleType("torch_like._utils")
+    side = ModuleType("side_effects")
+    side.run = _side_effect
+
+    class DetectionModel:
+        pass
+
+    class Storage:
+        pass
+
+    def _rebuild_tensor(*args):
+        return args
+
+    DetectionModel.__module__ = tasks.__name__
+    DetectionModel.__qualname__ = "DetectionModel"
+    tasks.DetectionModel = DetectionModel
+    Storage.__module__ = rebuild.__name__
+    Storage.__qualname__ = "FloatStorage"
+    rebuild.FloatStorage = Storage
+    _rebuild_tensor.__module__ = rebuild.__name__
+    _rebuild_tensor.__qualname__ = "_rebuild_tensor_v2"
+    rebuild._rebuild_tensor_v2 = _rebuild_tensor
+
+    class Tensor:
+        def __init__(self, key):
+            self.key = key
+
+        def __reduce__(self):
+            return (_rebuild_tensor, (Storage(), 0, (2,), (1,)))
+
+    class Hook:
+        def __reduce__(self):
+            return (_side_effect, ("ran",))
+
+    def model(n):
+        m = DetectionModel.__new__(DetectionModel)
+        m.__dict__.update({
+            "training": False,
+            "_parameters": {"w": Tensor(n)},
+            "names": names,
+            "yaml": {"nc": len(names) if names else 0},
+            "hook": Hook(),
+        })
+        return m
+
+    class Pickler(pickle.Pickler):
+        def persistent_id(self, obj):
+            if isinstance(obj, Storage):
+                return ("storage", Storage, "0", "cpu", 2)
+            return None
+
+    _side_effect.__module__ = side.__name__
+    _side_effect.__qualname__ = "run"
+    for name, module in [
+        ("ultralytics", ModuleType("ultralytics")),
+        ("ultralytics.nn", ModuleType("ultralytics.nn")),
+        (tasks.__name__, tasks),
+        ("torch_like", ModuleType("torch_like")),
+        (rebuild.__name__, rebuild),
+        (side.__name__, side),
+    ]:
+        monkeypatch.setitem(sys.modules, name, module)
+
+    ckpt = {
+        "date": "2024-01-01",
+        "version": "8.0.0",
+        "model": model(0),
+        "ema": model(1) if ema else None,
+        "train_args": {"imgsz": 640},
+    }
+    if ema:
+        ckpt["model"].names = ["wrong"]
+    buf = io.BytesIO()
+    Pickler(buf, protocol=2).dump(ckpt)
+    if old_format:
+        path.write_bytes(buf.getvalue())
+        return
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("multi/data.pkl", buf.getvalue())
+        z.writestr("multi/data/0", b"\0" * 8)
+        z.writestr("multi/version", b"3\n")
+
+
+@pytest.mark.parametrize(
+    ("names", "ema"),
+    [
+        ({0: "face", 1: "hand"}, False),
+        ({"0": "face", "1": "hand"}, True),
+        (["face", "hand"], False),
+    ],
+    ids=["dict", "ema-string-keys", "list"],
+)
+def test_ui_reads_class_names_from_the_checkpoint_on_automatic1111(
+    tmp_path, monkeypatch, names, ema
+):
+    # AUTOMATIC1111: the panel cannot load a .pt without a sidecar (the host
+    # refuses it and prints "Error verifying pickled file ... may be
+    # malicious"), so the CLASSES dropdown stayed empty until a detection. The
+    # names are now read from the checkpoint's metadata, and neither the host's
+    # torch.load nor Ultralytics is called, nor anything the file names.
+    import torch
+
+    pt = tmp_path / "multi.pt"
+    _fake_checkpoint(pt, monkeypatch, names=names, ema=ema)
+    _fake_host(monkeypatch)
+
+    def refused(*args, **kwargs):
+        raise AssertionError("the host would print its error report")
+
+    monkeypatch.setattr(torch, "load", refused)
+    sys.modules["modules.safe"].load = refused
+    fake = _fake_ultralytics(monkeypatch, refused)
+    _RAN.clear()
+
+    assert get_model_class_names(str(pt)) == ["face", "hand"]
+    assert resolve_class_ids(str(pt), ["hand"]) == [1]
+    assert fake.calls == []
+    assert _RAN == []
+
+    # The file does name code that an ordinary unpickling would run.
+    import pickle
+    import zipfile
+
+    class Plain(pickle.Unpickler):
+        def persistent_load(self, pid):
+            return None
+
+    with zipfile.ZipFile(pt) as z, z.open("multi/data.pkl") as f:
+        Plain(f).load()
+    assert _RAN
+
+
+@pytest.mark.parametrize(
+    "case", ["no-names", "gap-in-ids", "old-format", "not-a-zip", "too-big"]
+)
+def test_checkpoint_without_usable_names_gives_none(tmp_path, monkeypatch, case):
+    # Anything the reader does not recognize gives no names (as before, the
+    # dropdown then fills after the first detection), never an error.
+    from adetailer import classes
+
+    pt = tmp_path / "multi.pt"
+    if case == "not-a-zip":
+        pt.write_bytes(b"not a checkpoint")
+    else:
+        _fake_checkpoint(
+            pt, monkeypatch,
+            names={0: "face", 2: "hand"} if case == "gap-in-ids"
+            else None if case == "no-names" else {0: "face"},
+            old_format=case == "old-format",
+        )
+    if case == "too-big":
+        monkeypatch.setattr(classes, "_MAX_CHECKPOINT_PICKLE", 16)
+    _fake_host(monkeypatch)
+    fake = _fake_ultralytics(monkeypatch, _unreadable)
+    _RAN.clear()
+
+    assert get_model_class_names(str(pt)) == []
+    assert fake.calls == []
+    assert _RAN == []
+
+
+def test_ui_still_loads_the_pt_where_the_webui_allows_it(tmp_path, monkeypatch):
+    # Elsewhere (Forge Neo, classic Forge) the names keep coming from
+    # Ultralytics, as before: the checkpoint reader is only the fallback.
+    pt = tmp_path / "multi.pt"
+    _fake_checkpoint(pt, monkeypatch, names={0: "class0", 1: "class1"})
+    modules = ModuleType("modules")
+    modules.shared = SimpleNamespace(cmd_opts=SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "modules", modules)
+    monkeypatch.setitem(sys.modules, "modules.shared", modules.shared)
+    fake = _fake_ultralytics(monkeypatch, lambda path: {0: "face", 1: "hand"})
+
+    assert get_model_class_names(str(pt)) == ["face", "hand"]
+    assert len(fake.calls) == 1

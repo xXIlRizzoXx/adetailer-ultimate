@@ -5,7 +5,9 @@ from PIL import Image, ImageDraw
 
 from adetailer.mask import (
     bbox_area,
+    bbox_iou,
     dilate_erode,
+    filter_overlapping,
     has_intersection,
     is_all_black,
     mask_invert,
@@ -389,3 +391,106 @@ def test_mask_invert():
     draw.rectangle((3, 3, 5, 5), fill="black")
 
     assert np.array_equal(np.array(inverted[0]), np.array(expect))
+
+
+def _overlap_pred(bboxes, confidences=None, class_names=None):
+    from adetailer.common import PredictOutput
+
+    masks = []
+    for box in bboxes:
+        mask = Image.new("L", (512, 512), 0)
+        mask.paste(255, tuple(int(v) for v in box))
+        masks.append(mask)
+    return PredictOutput(
+        bboxes=[list(b) for b in bboxes],
+        masks=masks,
+        confidences=list(confidences or []),
+        preview=Image.new("RGB", (512, 512)),
+        class_names=list(class_names or []),
+    )
+
+
+def test_bbox_iou():
+    assert bbox_iou([0, 0, 10, 10], [0, 0, 10, 10]) == 1.0
+    assert bbox_iou([0, 0, 10, 10], [20, 20, 30, 30]) == 0.0
+    assert bbox_iou([0, 0, 10, 10], [10, 0, 20, 10]) == 0.0  # touching edges
+    assert bbox_iou([0, 0, 10, 10], [5, 0, 15, 10]) == pytest.approx(50 / 150)
+    assert bbox_iou([0, 0, 0, 0], [0, 0, 0, 0]) == 0.0  # empty boxes
+
+
+def test_filter_overlapping_keeps_the_more_confident_duplicate():
+    # One face found twice (boxes almost the same) plus a second face.
+    face = [100, 100, 200, 200]
+    twin = [104, 102, 204, 202]
+    other = [300, 100, 400, 200]
+    pred = _overlap_pred([face, twin, other], confidences=[0.6, 0.9, 0.8])
+    twin_mask = pred.masks[1]
+
+    out = filter_overlapping(pred, 0.6)
+
+    # Detector order is kept; every parallel list stays aligned.
+    assert out.bboxes == [twin, other]
+    assert out.confidences == [0.9, 0.8]
+    assert out.masks[0] is twin_mask
+    assert len(out.masks) == 2
+
+
+@pytest.mark.parametrize("max_overlap", [0, 0.0, -1])
+def test_filter_overlapping_off_changes_nothing(max_overlap):
+    pred = _overlap_pred([[0, 0, 100, 100], [0, 0, 100, 100]], [0.5, 0.9])
+    before = (list(pred.bboxes), list(pred.masks), list(pred.confidences))
+    out = filter_overlapping(pred, max_overlap)
+    assert (out.bboxes, out.masks, out.confidences) == before
+
+
+def test_filter_overlapping_keeps_small_boxes_inside_a_big_one():
+    # Eyes inside a face cover only a small part of it: the IoU stays low.
+    face = [100, 100, 300, 300]
+    eye_l = [140, 160, 180, 190]
+    eye_r = [220, 160, 260, 190]
+    pred = _overlap_pred([face, eye_l, eye_r], [0.9, 0.8, 0.7])
+    out = filter_overlapping(pred, 0.3)
+    assert out.bboxes == [face, eye_l, eye_r]
+
+
+def test_filter_overlapping_compares_only_the_same_class():
+    box = [100, 100, 200, 200]
+    near = [102, 100, 202, 200]
+    pred = _overlap_pred(
+        [box, near, box], [0.9, 0.95, 0.5], class_names=["face", "hand", "face"]
+    )
+    out = filter_overlapping(pred, 0.5)
+    # The hand stays (another class); the weaker second face goes.
+    assert out.bboxes == [box, near]
+    assert out.class_names == ["face", "hand"]
+    assert out.confidences == [0.9, 0.95]
+
+
+@pytest.mark.parametrize("confidences", [None, [1.0, 1.0, 1.0]])
+def test_filter_overlapping_without_or_with_equal_confidences(confidences):
+    # MediaPipe may report no score (1.0 for all): the earlier box wins.
+    a = [10, 10, 110, 110]
+    b = [12, 10, 112, 110]
+    c = [14, 10, 114, 110]
+    pred = _overlap_pred([a, b, c], confidences)
+    out = filter_overlapping(pred, 0.5)
+    assert out.bboxes == [a]
+    assert out.confidences == ([] if confidences is None else [1.0])
+    assert len(out.masks) == 1
+
+
+def test_filter_overlapping_one_or_no_detection():
+    from adetailer.common import PredictOutput
+
+    empty = PredictOutput()
+    assert filter_overlapping(empty, 0.5) is empty
+    one = _overlap_pred([[0, 0, 10, 10]], [0.9])
+    assert filter_overlapping(one, 0.5).bboxes == [[0, 0, 10, 10]]
+
+
+def test_filter_overlapping_threshold_is_strict():
+    # IoU exactly 1/3: dropped only when it is MORE than the setting.
+    a = [0, 0, 10, 10]
+    b = [5, 0, 15, 10]
+    assert len(filter_overlapping(_overlap_pred([a, b], [0.9, 0.8]), 0.4).bboxes) == 2
+    assert len(filter_overlapping(_overlap_pred([a, b], [0.9, 0.8]), 0.3).bboxes) == 1

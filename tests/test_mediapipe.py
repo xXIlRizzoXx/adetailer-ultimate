@@ -44,6 +44,18 @@ def test_mediapipe(sample_image2: Image.Image, model_name: str):
         ("darwin", "1.0.0", False),
         ("darwin", "1.0.1", True),
         ("darwin", "1.1.0", True),
+        # Pre/post/dev suffixes must not be glued onto the last number:
+        # "1.0.0rc1" used to parse as (1, 0, 1) and wrongly disable MediaPipe.
+        ("darwin", "1.0.0rc1", False),
+        ("darwin", "1.0.0a1", False),
+        ("darwin", "1.0.0b2", False),
+        ("darwin", "1.0.0.dev3", False),
+        ("darwin", "1.0.0.post1", False),
+        ("darwin", "0.10.35rc9", False),
+        ("darwin", "1.0", False),
+        ("darwin", "1.0.1rc1", True),
+        ("darwin", "1.0.1.post1", True),
+        ("darwin", "not-a-version", False),
         ("win32", "1.0.1", False),
         ("linux", "1.0.1", False),
     ],
@@ -545,3 +557,96 @@ def test_face_in_a_gif_or_grayscale_image_is_detected(monkeypatch, mode):
     assert result.bboxes == [[40, 50, 100, 110]]
     assert result.confidences == [0.8]
     assert result.preview is not None
+
+
+# MediaPipe's audio tasks import `sounddevice` when it is installed, and that
+# import starts PortAudio: on Windows it interrupted audio in other programs
+# and listed python.exe as using the microphone (upstream issue #508).
+_MEDIAPIPE_INIT = """
+try:
+    import sounddevice
+except ImportError:  # what MediaPipe's audio recorder does
+    sounddevice = None
+{extra}
+"""
+
+
+@pytest.fixture
+def audio_packages(tmp_path, monkeypatch):
+    """A fake `mediapipe` that imports `sounddevice` like the real one, and a
+    fake `sounddevice`, both importable from tmp_path; any loaded copy is
+    hidden for the test and put back afterwards."""
+    names = ("mediapipe", "sounddevice")
+    saved = {
+        k: v
+        for k, v in sys.modules.items()
+        if any(k == n or k.startswith(n + ".") for n in names)
+    }
+    for k in saved:
+        del sys.modules[k]
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _fresh_detectors(monkeypatch)
+    monkeypatch.setattr(
+        detector, "_ensure_model", Mock(side_effect=AssertionError("no download"))
+    )
+    (tmp_path / "sounddevice.py").write_text("PORTAUDIO_STARTED = True\n")
+
+    def write_mediapipe(extra=""):
+        (tmp_path / "mediapipe").mkdir(exist_ok=True)
+        (tmp_path / "mediapipe" / "__init__.py").write_text(
+            _MEDIAPIPE_INIT.format(extra=extra)
+        )
+
+    yield write_mediapipe
+    for k in [
+        k for k in sys.modules if any(k == n or k.startswith(n + ".") for n in names)
+    ]:
+        del sys.modules[k]
+    sys.modules.update(saved)
+
+
+@pytest.mark.parametrize("model", ["mediapipe_face_short", "mediapipe_face_mesh"])
+def test_mediapipe_is_imported_without_starting_sounddevice(audio_packages, model):
+    audio_packages()
+
+    mediapipe_predict(model, Image.new("RGB", (8, 8)))
+
+    assert "mediapipe" in sys.modules
+    assert sys.modules["mediapipe"].sounddevice is None
+    assert "sounddevice" not in sys.modules
+    # Not left blocked: another extension can still import it afterwards.
+    import sounddevice
+
+    assert sounddevice.PORTAUDIO_STARTED
+
+
+def test_sounddevice_already_imported_by_another_extension_is_left_alone(
+    audio_packages,
+):
+    audio_packages()
+    import sounddevice
+
+    mediapipe_predict("mediapipe_face_short", Image.new("RGB", (8, 8)))
+
+    assert sys.modules["sounddevice"] is sounddevice
+    assert sys.modules["mediapipe"].sounddevice is sounddevice
+
+
+def test_mediapipe_that_fails_to_import_does_not_leave_sounddevice_blocked(
+    audio_packages, capsys
+):
+    audio_packages(extra="raise RuntimeError('broken mediapipe')")
+
+    # The error is left to the detectors, which report it.
+    detector._import_mediapipe_without_sounddevice()
+
+    assert "mediapipe" not in sys.modules
+    assert "sounddevice" not in sys.modules
+    import sounddevice
+
+    assert sounddevice.PORTAUDIO_STARTED
+    # The whole detector still finds nothing and says why, as before.
+    del sys.modules["sounddevice"]
+    result = mediapipe_predict("mediapipe_face_short", Image.new("RGB", (8, 8)))
+    assert result.bboxes == []
+    assert "broken mediapipe" in capsys.readouterr().err

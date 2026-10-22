@@ -53,6 +53,15 @@ class _PlainUnit:
         self.__dict__.update(kwargs)
 
 
+# Forge Neo's lists: "None" first, then by name.
+_PREPROCESSORS = {
+    "Inpaint": ["None", "inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"],
+    "OpenPose": ["None", "dw_openpose_full", "openpose", "openpose_full"],
+    "Scribble": ["None", "scribble_hed", "scribble_pidinet"],
+    "Depth": ["None", "depth_anything", "depth_midas"],
+}
+
+
 def _load_backend(monkeypatch, unit_class):
     external_code = ModuleType("lib_controlnet.external_code")
     external_code.ControlNetUnit = unit_class
@@ -60,6 +69,9 @@ def _load_backend(monkeypatch, unit_class):
     external_code.resize_mode_from_value = lambda value: value
     global_state = ModuleType("lib_controlnet.global_state")
     global_state.get_all_controlnet_names = lambda: []
+    global_state.get_filtered_preprocessors = lambda tag: {
+        name: None for name in _PREPROCESSORS.get(tag, ["None"])
+    }
     lib = ModuleType("lib_controlnet")
     lib.external_code, lib.global_state = external_code, global_state
 
@@ -144,3 +156,45 @@ def test_an_older_forge_controlnet_still_gets_the_image_dict(monkeypatch, unit_c
     assert np.array_equal(unit.image["image"], image)
     assert (unit.image["mask"] == 255).all()
     assert unit.mask_image is None
+
+
+@pytest.mark.parametrize(
+    ("model", "module", "expected"),
+    [
+        # An API request without a preprocessor: the module dropdown's pick.
+        ("control_v11p_sd15_openpose", None, "openpose_full"),
+        ("control_v11f1p_sd15_depth", None, "depth_midas"),
+        ("control_v11p_sd15_inpaint", None, "inpaint_global_harmonious"),
+        ("control_sd15_inpaint_depth_hand_fp16", None, "depth_midas"),
+        # No usual one in the list: the first real preprocessor.
+        ("control_v11p_sd15_scribble", None, "scribble_hed"),
+        ("controlnet_union_sdxl", None, "inpaint_global_harmonious"),
+        # A type this Forge lists nothing for: no preprocessor, as before.
+        ("control_v11p_sd15_lineart", None, "None"),
+        # Chosen on purpose: kept.
+        ("control_v11p_sd15_openpose", "None", "None"),
+        ("control_v11p_sd15_openpose", "openpose", "openpose"),
+    ],
+)
+def test_a_forge_unit_without_a_preprocessor_gets_the_models_default(
+    monkeypatch, model, module, expected
+):
+    # Forge reads a missing preprocessor as "None", the picture as it is.
+    backend = _load_backend(monkeypatch, _Gradio4Unit)
+    ext = backend.ControlNetExt()
+    ext.init_controlnet()
+    p = SimpleNamespace(
+        init_images=[Image.new("RGB", (64, 48))], width=512, height=512, resize_mode=0,
+    )
+
+    ext.update_scripts_args(p, model, module, 1.0, 0.0, 1.0)
+
+    (unit,) = p.script_args_value
+    assert unit.module == expected
+
+
+def test_a_forge_without_the_preprocessor_lists_runs_as_before(monkeypatch):
+    backend = _load_backend(monkeypatch, _Gradio4Unit)
+    del sys.modules["lib_controlnet.global_state"].get_filtered_preprocessors
+
+    assert backend.default_module("control_v11p_sd15_openpose") == "None"

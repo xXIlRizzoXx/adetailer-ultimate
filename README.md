@@ -1,43 +1,81 @@
 # ADetailer Ultimate
 
-[![Stable release](https://img.shields.io/github/v/release/xXIlRizzoXx/adetailer-ultimate?label=stable)](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases/latest) [![Beta pre-release](https://img.shields.io/github/v/release/xXIlRizzoXx/adetailer-ultimate?include_prereleases&sort=date&label=beta)](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases) [![WebUI: AUTOMATIC1111, Forge, Forge Neo, reForge](https://img.shields.io/badge/WebUI-AUTOMATIC1111%20%7C%20Forge%20%7C%20Forge%20Neo%20%7C%20reForge-blue)](#compatibility) [![License](https://img.shields.io/github/license/xXIlRizzoXx/adetailer-ultimate)](LICENSE.md)
+<div align="center">
+  <img src="docs/img/cover-beta.jpg" alt="What's new in the beta v26.2.0+plus.9.beta.1: click to choose detections, X/Y/Z axes for every tab, tooltips on every option, match the colors, region opacity, inpaint area upscaler, swap tabs and paste into all, drop duplicate detections, save inpaint masks, enable at startup, higher slider limits, new guides, and fixes" width="100%" />
+
+  <br /><br />
+
+  <img src="docs/img/cover.jpg" alt="ADetailer Ultimate: finds faces, hands and other parts in your pictures and redraws them with more detail, for AUTOMATIC1111, Forge, Forge Neo and reForge" width="100%" />
+
+  <br /><br />
+
+  [![Stable release](https://img.shields.io/github/v/release/xXIlRizzoXx/adetailer-ultimate?label=stable)](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases/latest) [![Beta pre-release](https://img.shields.io/github/v/release/xXIlRizzoXx/adetailer-ultimate?include_prereleases&sort=date&label=beta)](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases) [![WebUI: AUTOMATIC1111, Forge, Forge Neo, reForge](https://img.shields.io/badge/WebUI-AUTOMATIC1111%20%7C%20Forge%20%7C%20Forge%20Neo%20%7C%20reForge-blue)](#compatibility) [![License](https://img.shields.io/github/license/xXIlRizzoXx/adetailer-ultimate)](LICENSE.md)
+
+</div>
 
 > **Unofficial fork of [Bing-su/adetailer](https://github.com/Bing-su/adetailer), the extension that finds faces, hands and other parts in your pictures and redraws them with more detail. Everything ADetailer does, plus class filters, presets, remembered settings and more.**
 >
-> For AUTOMATIC1111, Forge, Forge Neo and reForge (tested live on AUTOMATIC1111 and Forge Neo). Stable [v26.2.0+plus.8](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases/latest) · No beta in testing right now ([switch to the beta and back](#switch-to-the-beta-and-back)).
+> For AUTOMATIC1111, Forge, Forge Neo and reForge (tested live on AUTOMATIC1111 and Forge Neo). Stable [v26.2.0+plus.8](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases/latest) · Beta [v26.2.0+plus.9.beta.1](#beta-in-testing) (pre-release).
 >
 > This project is **not affiliated with or endorsed by Bing-su**, the author of the original ADetailer. For the official ADetailer, go to [Bing-su/adetailer](https://github.com/Bing-su/adetailer). All credit for the original ADetailer goes to Bing-su: this fork extends that work, it does not replace it. Licensed under AGPL-3.0, the same license as the original ([LICENSE.md](LICENSE.md)), with the original author's credits kept. Who made what: [Credits](#credits).
 
 **New here?** [Install](#install), then the three-step [Quick start](#quick-start). **Already using the original ADetailer?** Read [Coming from the original ADetailer?](#coming-from-the-original-adetailer) first.
 
-🟢 **The plus.8 reliability update is out** as the stable release v26.2.0+plus.8. The sections you leave open are remembered, a tab's separate VAE and CLIP skip are always switched back, Styles are applied only once, API requests no longer use your remembered UI settings for the tabs they leave out, a preset or pasted parameters naming a detector you do not have no longer make Generate fail, and "Run ADetailer on an image" results paste back the tab's settings; it also brings the smaller fixes of its three betas. → [What is new in plus.8](#what-is-new-in-plus8)
+🟡 **The first beta of plus.9 is out** as a pre-release (v26.2.0+plus.9.beta.1). With it you can click the boxes of the Detection preview to choose which detections to inpaint, save the masks ADetailer inpaints with, use X/Y/Z axes for every tab and an Enable axis, and set larger values on the mask sliders. It also lists the LoRAs and embeddings of the ADetailer prompts for sites such as Civitai, explains why a detector made with a newer Ultralytics does not load, and keeps MediaPipe from starting the audio system. A new setting starts ADetailer already switched on, its detections no longer send Ultralytics' usage analytics, and Export downloads the preset library on AUTOMATIC1111 too. It also fixes the known issues of plus.8 about ControlNet preprocessors, prompt comments, Skip img2img, pasted samplers and "Overlay original for inpaint". The stable release is still v26.2.0+plus.8. → [Beta in testing](#beta-in-testing)
+
+## ✨ What it does
+
+<img src="docs/img/01-panel.jpg" alt="One panel: every detailer pass in its own tab, with a counter of the enabled tabs and settings remembered between restarts" width="100%" />
+
+<img src="docs/img/02-classes.jpg" alt="Class filter: detail only the classes you pick, or all but some, and one pass per class in your order" width="100%" />
+
+<img src="docs/img/03-presets.jpg" alt="Presets and tabs: named presets, copy and paste between tabs, reset one tab or every tab" width="100%" />
+
+<img src="docs/img/04-prompts.jpg" alt="Prompts: a prompt for each class with [CLASS] blocks, Auto class-guard and LoRA controls" width="100%" />
+
+<img src="docs/img/05-detection.jpg" alt="Detection: detection resolution per tab and inpaint only the detections you choose by number" width="100%" />
+
+<img src="docs/img/06-combine.jpg" alt="Combine all tabs: the Detection preview runs the detectors of every tab at once, one colour per tab" width="100%" />
+
+<img src="docs/img/10-click-preview.jpg" alt="Plus.9 beta, Detection preview: click the numbered boxes to choose which detections to inpaint" width="100%" />
+
+<img src="docs/img/07-run-on-image.jpg" alt="Run ADetailer on an image: detail a finished picture or a whole folder without generating it again" width="100%" />
+
+<img src="docs/img/08-inpainting.jpg" alt="Inpainting: dynamic denoise per tab, inpaint size scaled to the box, separate checkpoint, VAE and (on Forge) text encoder" width="100%" />
+
+<img src="docs/img/09-settings.jpg" alt="Settings: manual mode, verbose diagnostic log and a reset of the ADetailer settings" width="100%" />
+
+<img src="docs/img/11-xyz.jpg" alt="Plus.9 beta, X/Y/Z plot: every tab gets its own axes, and an Enable axis compares pictures with and without ADetailer" width="100%" />
+
+<sub>Screenshots taken on AUTOMATIC1111 1.10. "Exclusive" marks what neither the original ADetailer nor any other fork we know of offers.</sub>
 
 ## Contents
 
 1. [Main features](#-main-features)
 2. [More features](#more-features)
 3. [Requested by users](#-requested-by-users)
-4. [What is new in plus.8](#what-is-new-in-plus8): [new and fixed](#new-and-fixed), [fixed in beta 1](#fixed-in-beta-1), [known issues](#known-issues)
-5. [Install](#install): [coming from the original ADetailer?](#coming-from-the-original-adetailer), [update](#update), [switch to the beta and back](#switch-to-the-beta-and-back)
-6. [Quick start](#quick-start)
-7. [Using each feature](#using-each-feature)
-8. [Settings](#settings)
-9. [Upstream options](#upstream-options)
-10. [Models](#models)
-11. [Problems and fixes](#problems-and-fixes)
-12. [FAQ](#faq)
-13. [Compatibility](#compatibility)
-14. [Roadmap](#roadmap)
-15. [For developers](#for-developers)
-16. [License](#license), [Credits](#credits) and [See also](#see-also)
+4. [Beta in testing](#beta-in-testing): [new in plus.9 beta 1](#new-in-plus9-beta-1), [notes on plus.9 beta 1](#notes-on-plus9-beta-1)
+5. [What is new in plus.8](#what-is-new-in-plus8): [new and fixed](#new-and-fixed), [fixed in beta 1](#fixed-in-beta-1), [known issues](#known-issues)
+6. [Install](#install): [coming from the original ADetailer?](#coming-from-the-original-adetailer), [update](#update), [switch to the beta and back](#switch-to-the-beta-and-back)
+7. [Quick start](#quick-start)
+8. [Using each feature](#using-each-feature)
+9. [Settings](#settings)
+10. [Upstream options](#upstream-options)
+11. [Models](#models)
+12. [Problems and fixes](#problems-and-fixes)
+13. [FAQ](#faq)
+14. [Compatibility](#compatibility)
+15. [Roadmap](#roadmap)
+16. [For developers](#for-developers)
+17. [License](#license), [Credits](#credits) and [See also](#see-also)
 
 ## ⭐ Main features
 
-🟢 available in the stable release · 🟡 in testing in a beta (none right now). What the latest release changed is in [What is new in plus.8](#what-is-new-in-plus8).
+🟢 available in the stable release · 🟡 new in the beta, in testing. What the beta adds is in [Beta in testing](#beta-in-testing), and what the stable release changed in [What is new in plus.8](#what-is-new-in-plus8).
 
 1. 🟢 **Class filter** — detail only the classes you pick from a multi-class detector, for example only face and hand, or all but some with "Exclude selected (NOT)". [How to use it](#class-filter)
 2. 🟢 **Run ADetailer on a finished image or a whole folder** — detail pictures you already have with the tab's own settings, without generating them again; originals are never overwritten. [How to use it](#run-adetailer-on-an-image)
-3. 🟢 **Detection preview, then pick which detections to inpaint** — see numbered boxes of what the detector finds, without generating anything, then type the numbers you want, such as `1,3`. From plus.8 it also names the class next to each number. [How to use it](#detection-preview)
+3. 🟢 **Detection preview, then pick which detections to inpaint** — see numbered boxes of what the detector finds, without generating anything, then type the numbers you want, such as `1,3`. From plus.8 it also names the class next to each number. 🟡 From plus.9 beta 1 you can also click the boxes instead of typing. [How to use it](#detection-preview)
 4. 🟢 **Named presets** — save a tab's whole setup under a name, load it in any tab, and export or import the whole library. From plus.8 it also says what a preset from another WebUI needs that this one does not have. [How to use it](#preset-library)
 5. 🟢 **Your tabs come back as you last generated with them** — each tab's settings return at the next WebUI start. From plus.8 it also reopens the sections you left open. [How to use it](#remember-last-used-settings)
 6. 🟢 **Copy, paste and reset tabs** — copy a tab's setup into any other tab of the same panel, or put one tab or every tab back to its defaults. [How to use it](#copy-settings-between-tabs)
@@ -62,7 +100,7 @@ Everything else the original ADetailer does is still here, some of it with the f
 
 Everything else this fork adds, grouped by area, in a short entry each. Smaller fixes are in [CHANGELOG.md](CHANGELOG.md).
 
-🟢 available in the stable release · 🟡 in testing in a beta (none right now)
+🟢 available in the stable release · 🟡 new in the beta, in testing
 
 Some 🟢 entries came with plus.8 and are not in v26.3.0+plus.7.4: [What is new in plus.8](#what-is-new-in-plus8) lists them.
 
@@ -80,6 +118,7 @@ Some 🟢 entries came with plus.8 and are not in v26.3.0+plus.7.4: [What is new
 - 🟢 **More ways to type detection numbers** — "Inpaint only these detections" also reads the Japanese long-vowel mark and middle dot (`1ー3`, `1・3`) and a doubled dash (`1——3`, `1--3`).
 - 🟢 **Better boxes for faces cut by the edge** — with `mediapipe_face_short` or `mediapipe_face_full`, a face cut off by the left or top edge gets a box that fits the visible face.
 - 🟢 **Odd digits in a class filter** — a class written with a character such as `²` or `①` (from the API, a preset or pasted parameters) is ignored and named in the console, like any name the detector does not have, instead of stopping ADetailer for the image.
+- 🟡 **Click the boxes to choose detections** — after a single-tab Detection preview, a click on a numbered box adds its number to "Inpaint only these detections" and a second click takes it out; the chosen boxes are marked in green, also when you type the numbers. See [Detection preview](#detection-preview).
 
 ### Prompts
 
@@ -90,6 +129,7 @@ Some 🟢 entries came with plus.8 and are not in v26.3.0+plus.7.4: [What is new
 - 🟢 **No doubled LoRAs** — "Use LoRAs from main prompt" leaves out a LoRA that the tab prompt already names, so the tab's own weight is used.
 - 🟢 **Styles applied once** — with Styles selected and a blank or `[PROMPT]` ADetailer prompt, the detailer pass gets the styles once instead of twice, also when the main prompt holds comments (not yet when another extension, such as Dynamic Prompts with wildcards, rewrites the main prompts, or when a Style adds its text on the line of a comment). With "Use LoRAs from main prompt" on, a LoRA that a selected Style adds is used once too, and with "Strip LoRAs from the detailer prompt" on, the styles' LoRAs are removed.
 - 🟢 **Spaces count as blank** — an ADetailer prompt that holds only spaces or line breaks now uses the main prompt instead of an empty one.
+- 🟡 **Comments left out of the ADetailer prompts** — comments typed in a tab's prompt, negative prompt and append boxes (`#`, and on Forge Neo also `//` and `/* */`) are removed before the detailer pass, as the WebUI removes them from the main prompt, also with "Apply only selected scripts to ADetailer" on. A box that holds only a comment counts as blank. In plus.8 they reach the model: see [Known issues](#known-issues).
 - 🟢 **Per-class prompts with class numbers** — in sequential mode, a class filter given as numbers (for example from an API request) uses the per-class prompt lines written with the class names, and the Auto class-guard stays on when none of the selected class names exists in the detector. A line written for a class number, such as `0: …`, takes the place of the Auto class-guard in its pass, as a line written with the class name does.
 
 ### Inpainting
@@ -103,11 +143,13 @@ Some 🟢 entries came with plus.8 and are not in v26.3.0+plus.7.4: [What is new
 - 🟢 **Image size kept when the whole picture is inpainted** — with "Inpaint only masked" off, a hires.fix image is no longer shrunk back to its first-pass size, and with Skip img2img the image keeps its own size (rounded down to a multiple of 8) instead of taking the size of the width and height sliders.
 - 🟢 **Skip img2img uses your real settings** — "Use same sampler" uses your sampler, and the saved image records your real steps, sampler and size instead of placeholder values (img2img only).
 - 🟢 **Merge and Invert safeguard** — with the "Merge and Invert" mask mode, when the detections cover the whole picture there is nothing left to inpaint, so the pass is skipped instead of repainting the whole picture.
-- 🟢 **"Inpaint only masked" always pastes back** — with the WebUI's "Overlay original for inpaint" setting off, each region is still pasted back into the picture, instead of the region's crop replacing the whole picture. Two limits remain (a settings save during the pass, and frozen settings): see [Known issues](#known-issues).
+- 🟢 **"Inpaint only masked" always pastes back** — with the WebUI's "Overlay original for inpaint" setting off, each region is still pasted back into the picture, instead of the region's crop replacing the whole picture. 🟡 From plus.9 beta 1 this no longer turns that setting on during the pass, so a settings save during the pass no longer stores it as on and frozen settings no longer stop ADetailer; in plus.8 these two limits remain: see [Known issues](#known-issues).
 - 🟢 **Transparent input images** — with Skip img2img, the transparent parts of an input image get the WebUI's img2img background colour instead of turning black.
 - 🟢 **Separate steps and sampler always used** — with "Apply only selected scripts to ADetailer" turned off in Settings → ADetailer (it is on by default), or with `sampler` added to "Script names to apply to ADetailer", "Use separate steps" and "Use separate sampler" now apply, also through the API, instead of being replaced by the main ones.
 - 🟢 **Masks drawn on a transparent layer** — in img2img inpainting, a mask that holds the painted area in its transparency (from the Inpaint upload tab, an inpaint Batch mask folder or the API) is read as the WebUI reads it, also with Soft inpainting on, so ADetailer no longer switches itself off or details faces outside the painted area.
 - 🟢 **ControlNet models in any letter case** — a ControlNet model whose file name writes its type with capitals, such as `OpenPoseXL2`, gets its preprocessor like the others.
+- 🟡 **Larger mask sliders** — for large pictures, "Mask x(→) offset" and "Mask y(↑) offset" go from -512 to 512, "Mask erosion (-) / dilation (+)" from -256 to 256, "Inpaint mask blur" up to 256 and "Inpaint only masked padding, pixels" up to 512. The defaults are unchanged.
+- 🟡 **ControlNet models start with their preprocessor on Forge** — on Forge, Forge Neo and reForge, choosing a ControlNet model selects its default preprocessor, such as `openpose_full` or `depth_midas`, as AUTOMATIC1111 does, instead of "None". In plus.8 it sets "None": see [Known issues](#known-issues).
 
 ### Working on existing images
 
@@ -125,10 +167,11 @@ Some 🟢 entries came with plus.8 and are not in v26.3.0+plus.7.4: [What is new
 - 🟢 **Class names on the preview numbers** — the numbers of the single-tab Detection preview also name the class, such as `#1 eyes`, so they no longer hide the part names of `mediapipe_face_features`. When the preview's font cannot draw a class name, as can happen with Chinese or Japanese names on some systems, the number stays plain, and the combined preview leaves the name out of its label instead of failing. On other systems, such as Windows, the font has no Chinese or Japanese letters, so such a class name shows as empty boxes after the number; the number itself is always readable.
 - 🟢 **Transparency and colours kept** — "Run ADetailer on an image" and folder runs fill the transparent parts of a picture, such as a cut-out PNG, with the WebUI's img2img background colour instead of black. A copy saved next to its source keeps the source's colour profile, and a lossless WebP gives a lossless copy.
 - 🟢 **Saved results keep their parameters** — results saved to the ADetailer-Inpaint folder record the detailer pass's settings, which PNG Info and Send to read, instead of the word "None". From plus.8 they also record the tab's ADetailer settings, and the PNG, JPEG and WebP copies a folder run saves next to their sources record the same parameters.
+- 🟡 **Extra files keep their parameters** — the mask previews, step images and masks that "Run ADetailer on an image" and folder runs save record their parameters, and the console no longer prints "create_infotext failed" for each one. A `[user]` or `[denoising]` token in the WebUI's file or folder name pattern no longer prints a traceback for these files and for the results saved to `ADetailer-Inpaint`.
 
 ### Presets and tabs
 
-- 🟢 **Complete paste from PNG Info** — PNG Info and Send to txt2img/img2img restore the ADetailer setup more completely than the original: they switch ADetailer and the tabs the image used on, switch the other tabs off (for an image made with ADetailer), and put the settings the image left at their defaults back to those defaults instead of keeping the tab's old values. "Skip img2img" is not restored, and fields listed in "Disregard fields from pasted infotext" are left alone. From plus.8, a tab whose detector is not installed here keeps its own detector and is switched off, instead of making Generate fail, and an old sampler name such as "DPM++ 2M SDE Karras" is split into the sampler and its scheduler.
+- 🟢 **Complete paste from PNG Info** — PNG Info and Send to txt2img/img2img restore the ADetailer setup more completely than the original: they switch ADetailer and the tabs the image used on, switch the other tabs off (for an image made with ADetailer), and put the settings the image left at their defaults back to those defaults instead of keeping the tab's old values. Fields listed in "Disregard fields from pasted infotext" are left alone. From plus.8, a tab whose detector is not installed here keeps its own detector and is switched off, instead of making Generate fail, and an old sampler name such as "DPM++ 2M SDE Karras" is split into the sampler and its scheduler. 🟡 From plus.9 beta 1, "Skip img2img" is restored too, for images made with this beta or later, and a separate sampler this WebUI does not have becomes the first sampler with a console message; in plus.8, "Skip img2img" is not restored.
 - 🟢 **ControlNet preprocessor kept** — loading a preset, pasting a tab or pasting parameters keeps a ControlNet preprocessor that fits the model instead of resetting it, and a restored ControlNet model shows its preprocessor after a restart.
 - 🟢 **Only the first tab starts on** — on a fresh setup, "Enable this tab" starts unticked in tabs 2 and later, so the tab counter reads 1x Tab. When you pick a detector in another tab, tick its "Enable this tab" too.
 - 🟢 **Safe preset and settings files** — saves from different tabs no longer overwrite each other, and a damaged file is set aside instead of being overwritten.
@@ -139,6 +182,8 @@ Some 🟢 entries came with plus.8 and are not in v26.3.0+plus.7.4: [What is new
 - 🟢 **Presets saved right after a Reset load cleanly** — a preset saved just after a Reset in an earlier release shows "Use same …" in the separate checkpoint, VAE and text encoder lists, instead of empty lists, and the first sampler or, with "Use separate sampler" ticked, the sampler and scheduler that the WebUI ran it with.
 - 🟢 **Presets from another WebUI** — when a preset names a detector that is not installed here, Load keeps the tab's detector and class filter and loads the rest. A separate checkpoint, VAE, text encoder, scheduler or ControlNet model that this WebUI does not have is set to "Use same …" or "None", and, with "Use separate sampler" ticked, a missing sampler becomes the first sampler. The status says what was missing, so Generate no longer fails or quietly uses something else.
 - 🟢 **Damaged preset files refused cleanly** — Import reports a damaged file as not imported, instead of failing without a message or emptying the preset lists.
+- 🟡 **Export downloads on AUTOMATIC1111 too** — on AUTOMATIC1111 and other WebUIs with Gradio 3, such as reForge's main branch, Export now downloads `adetailer-ultimate-presets.json`, as on Forge and Forge Neo. In plus.8 it cannot download a file there: see [Known issues](#known-issues).
+- 🟡 **Missing samplers named after a restart or a paste** — with "Use separate sampler" ticked, a sampler this WebUI does not have becomes the first sampler, after a restart and after pasting parameters, and the console says so; old names that end with a scheduler are split as Load splits them.
 
 ### Settings and output files
 
@@ -151,6 +196,9 @@ Some 🟢 entries came with plus.8 and are not in v26.3.0+plus.7.4: [What is new
 - 🟢 **Manual mode changes wait for the next generation** — ticking Manual mode while an image is being made now applies from the next generation, instead of saving Skip img2img images at 128x128 or leaving other scripts such as ControlNet stopped.
 - 🟢 **Verbose log complete in a log file** — when the WebUI's console output goes to a log file or another program on Windows, the Verbose diagnostic log keeps all its lines instead of losing the ones with characters the file cannot show.
 - 🟢 **Quieter manual mode again** — as in plus.7.4, the console says that ADetailer was skipped only for a generation it would otherwise have detailed; beta 1 also said it with ADetailer switched off.
+- 🟡 **Save inpaint masks** — an option in Settings → ADetailer that saves the black-and-white mask each region is inpainted with, as a PNG in the `adetailer-steps` sub-folder. See [Save inpaint masks](#save-inpaint-masks).
+- 🟡 **Enable ADetailer at startup** — an option in Settings → ADetailer (Off, txt2img, img2img or Both) that starts the ADetailer panel already switched on in the chosen tabs, after a UI reload. See [Settings](#settings).
+- 🟡 **Match the colors of each inpainted region** — an option in Settings → ADetailer (off by default) that matches the colors of each inpainted region to the picture, so a face no longer comes out with another tint. See [Settings](#settings).
 
 ### Interface
 
@@ -158,6 +206,7 @@ Some 🟢 entries came with plus.8 and are not in v26.3.0+plus.7.4: [What is new
 - 🟢 **Translated interface** — with the companion [Language Diffusion](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion) extension, the fork's labels, buttons and hints can be shown in 10 languages. Options added in recent versions still show in English until the translations are updated.
 - 🟢 **Active tabs counter** — a green pill next to the ADetailer title (for example "2x Tabs") shows how many tabs are enabled, even with the panel closed.
 - 🟢 **Version badge** — the version label sits on the ADetailer header and also shows the installed build, so you can tell at a glance which ADetailer Ultimate you have.
+- 🟡 **Tooltips on every option** — hover over an option of a tab, such as "Mask min area ratio" or "Use separate checkpoint", for about a second to see what it does. The options with a help line under them keep it.
 - 🟢 **Interface polish** — tooltips on the fork's buttons, status messages that fade after a few seconds, same-size buttons and readable text on the light theme.
 - 🟢 **Open sections are remembered** — the sections you leave open in each tab (Detection, Inpainting, Detection preview and the others) open again after a reload or restart. This is stored in your browser, so another browser starts with them closed ([issue #6](https://github.com/xXIlRizzoXx/adetailer-ultimate/issues/6)).
 - 🟢 **Version badge fits a narrow panel** — in a narrow window the version badge no longer covers the ADetailer title and the tab counter; it shortens its text instead.
@@ -180,7 +229,7 @@ Some 🟢 entries came with plus.8 and are not in v26.3.0+plus.7.4: [What is new
 - 🟢 **API requests no longer use your remembered UI settings for the tabs they leave out** — with "Remember last-used settings" on, a tab that an API request leaves out now gets a fresh setup's settings, as in the original ADetailer (only the 1st tab on, with the first detector), instead of the settings remembered in the UI.
 - 🟢 **Separate CLIP skip, VAE and text encoder always switched back** — after every pass, your main Clip skip, VAE and (on Forge and Forge Neo) text encoder come back, also on a fresh install and after "Run ADetailer on an image", so a tab's own choice no longer reaches the next tabs or later images. On Forge Neo, "Use separate VAE" also works before the VAE / Text Encoder selector at the top of the page has ever been used.
 - 🟢 **MediaPipe problems reported** — if MediaPipe is missing or broken, the console says so once, instead of every MediaPipe detector quietly finding nothing.
-- 🟢 **Quieter start on AUTOMATIC1111** — a detector without a `<model>.names.json` file no longer fills the console with a long error report at startup. Its CLASSES list shows the classes once a generation or a Detection preview has found something with it and you switch to another detector and back, or straight away with a `<model>.names.json` file. Classic Forge (checked in its code) and Forge Neo list the classes straight away.
+- 🟢 **Quieter start on AUTOMATIC1111** — a detector without a `<model>.names.json` file no longer fills the console with a long error report at startup. 🟡 From plus.9 beta 1 its CLASSES list shows the classes straight away, read from the detector file without loading it; in plus.8 it shows them once a generation or a Detection preview has found something with it and you switch to another detector and back, or straight away with a `<model>.names.json` file. Classic Forge (checked in its code) and Forge Neo list the classes straight away.
 - 🟢 **Names and prompts in other alphabets no longer stop ADetailer** — on Windows, when the WebUI's console output is saved to a log file, a detector, class, folder or file name, or a prompt, with characters of another alphabet (for example Chinese or Cyrillic) or an emoji no longer makes ADetailer fail or keeps its panel from appearing.
 - 🟢 **Prompt S/R images paste back correctly** — images from an X/Y/Z "[ADetailer] Prompt S/R" cell paste back the same ADetailer prompts in every tab, the per-class prompt lines of a sequential tab included, and each image records its own prompt, also with wildcards. The "(AD 1st and main prompt)" axis no longer replaces twice in the main prompt that a blank or `[PROMPT]` ADetailer prompt stands for.
 - 🟢 **Dynamic Prompts templates kept** — with Dynamic Prompts' "Save template to metadata" on, the saved image parameters keep the wildcard template instead of the first image's resolved prompt.
@@ -188,6 +237,14 @@ Some 🟢 entries came with plus.8 and are not in v26.3.0+plus.7.4: [What is new
 - 🟢 **X/Y/Z detector axis on an empty tab** — an "[ADetailer] ADetailer model 1st" axis also runs a cell whose 1st tab is left on "None" in the panel.
 - 🟢 **Starts with `--no-gradio-queue`** — AUTOMATIC1111 and other WebUIs with Gradio 3 start when launched with `--no-gradio-queue`, instead of stopping with a queue error.
 - 🟢 **ControlNet preview shown once** — on Forge and Forge Neo, with ControlNet on, its preview appears once in the results instead of once more for every batch.
+- 🟡 **X/Y/Z axes for every tab** — the 2nd and later tabs get X/Y/Z axes for their model, prompts, confidence, erosion / dilation, mask blur, denoising strength, padding, CFG scale and steps; the 1st tab gets confidence, mask blur and steps axes too; and "[ADetailer] Enable" switches ADetailer on or off for each cell. A CFG scale or Steps axis also ticks the tab's "Use separate CFG scale" or "Use separate steps" in each cell, so the cells differ. See [New in plus.9 beta 1](#new-in-plus9-beta-1).
+- 🟡 **LoRAs and embeddings of the ADetailer prompts in the image parameters** — a LoRA or an embedding used only in an ADetailer prompt is listed in "Lora hashes" and "TI hashes" with those of the main prompt, so sites such as Civitai recognise it (a WebUI without "TI hashes", such as Forge Neo, lists only the LoRAs). Idea from the [diffus-me/adetailer](https://github.com/diffus-me/adetailer) fork.
+- 🟡 **Detectors made with a newer Ultralytics explained** — a detector that the installed Ultralytics cannot load because it is too old, such as a recent YOLO12 or YOLO26 model, is named in the console and in the Detection preview status, with the installed version, instead of only "Can't get attribute '…'".
+- 🟡 **`.zip` files in the detector folders pointed out** — at startup the console names up to 5 `.zip` files found in the detector folders and asks you to extract the `.pt` file, since ADetailer reads only `.pt` files.
+- 🟡 **MediaPipe leaves your audio alone** — with the `sounddevice` package installed, MediaPipe no longer starts the audio system, which on Windows could stop the sound of other programs and list Python as using the microphone ([Bing-su/adetailer#508](https://github.com/Bing-su/adetailer/issues/508)).
+- 🟡 **reForge's Advanced Model Sampling kept** — on reForge, the Advanced Model Sampling scripts always run in the detailer pass, so v-prediction and flow models are detailed correctly also with "Apply only selected scripts to ADetailer" on (checked in reForge's code).
+- 🟡 **No Ultralytics usage analytics** — ADetailer switches off Ultralytics' anonymous usage analytics before its detections, in memory only: the Ultralytics settings file, which other programs share, is never written.
+- 🟡 **MediaPipe pre-releases read correctly** — the macOS safety check no longer takes a MediaPipe pre-release such as 1.0.0rc1 for 1.0.1.
 
 How to use each feature is explained in [Using each feature](#using-each-feature). Every change, version by version, is in [CHANGELOG.md](CHANGELOG.md).
 
@@ -195,7 +252,7 @@ How to use each feature is explained in [Using each feature](#using-each-feature
 
 Thank you to everyone who opened an issue, tried a beta and reported back: these requests shaped ADetailer Ultimate.
 
-🟢 available in the stable release · 🟡 in testing in a beta (none right now)
+🟢 available in the stable release · 🟡 new in the beta, in testing
 
 | Request | Asked by | Status | Where to find it |
 | --- | --- | --- | --- |
@@ -210,7 +267,7 @@ Thank you to everyone who opened an issue, tried a beta and reported back: these
 
 ### Also solved: requests from users of the original ADetailer
 
-Requests and reports from users of the original ADetailer, on its tracker and on the tracker of an extension used with it, that ADetailer Ultimate answers:
+Requests and reports from users of the original ADetailer, on its tracker and on the trackers of a WebUI and an extension used with it, that ADetailer Ultimate answers:
 
 - 🟢 **Save the settings as presets** — asked in [Bing-su/adetailer#108](https://github.com/Bing-su/adetailer/issues/108) and [discussion #530](https://github.com/Bing-su/adetailer/discussions/530). Save a tab's setup under a name and load it in any tab: [Preset Library](#preset-library).
 - 🟢 **Save and load a tab's setup, to reuse it or change the order of the tabs** — asked in [discussion #743](https://github.com/Bing-su/adetailer/discussions/743). Copy one tab and paste it into others, or save each tab as a preset and load them back in the order you want: [Copy Settings Between Tabs](#copy-settings-between-tabs).
@@ -220,14 +277,130 @@ Requests and reports from users of the original ADetailer, on its tracker and on
 - 🟢 **"Use separate steps" ignored** — reported for API requests in [Bing-su/adetailer#795](https://github.com/Bing-su/adetailer/issues/795). With "Apply only selected scripts to ADetailer" off, "Use separate steps" and "Use separate sampler" now work, in the UI and through the API, instead of being replaced by the WebUI's own sampler settings: [Upstream options](#upstream-options).
 - 🟢 **Dynamic Prompts' template lost from the saved image** — reported in [adieyal/sd-dynamic-prompts#730](https://github.com/adieyal/sd-dynamic-prompts/issues/730) and [#703](https://github.com/adieyal/sd-dynamic-prompts/issues/703). With Dynamic Prompts' "Save template to metadata" on, the image parameters keep the template with its wildcards instead of the prompt already filled in: [What is new in plus.8](#what-is-new-in-plus8).
 - 🟢 **ADetailer's ControlNet on the current classic Forge** — proposed in the upstream pull request [Bing-su/adetailer#745](https://github.com/Bing-su/adetailer/pull/745), not merged there because older Forge versions need the old format. The detailer's ControlNet model works again on classic Forge, and older Forge versions keep working; classic Forge and reForge were checked in their code only, not tested live: [Upstream options](#upstream-options).
+- 🟡 **Count the faces and choose which to detail** — asked in [Bing-su/adetailer#635](https://github.com/Bing-su/adetailer/issues/635). Run the Detection preview, then click the numbered boxes to choose: [Detection preview](#detection-preview).
+- 🟡 **Larger values for the mask offset and erosion / dilation sliders** — asked in [Bing-su/adetailer#111](https://github.com/Bing-su/adetailer/issues/111). They go from -512 to 512 and from -256 to 256: [Upstream options](#upstream-options).
+- 🟡 **Save the masks** — asked in [Bing-su/adetailer#406](https://github.com/Bing-su/adetailer/issues/406). "Save inpaint masks" saves the mask each region is inpainted with: [Save inpaint masks](#save-inpaint-masks).
+- 🟡 **Switch ADetailer on and off in an X/Y/Z grid** — asked in [Bing-su/adetailer#251](https://github.com/Bing-su/adetailer/issues/251). The "[ADetailer] Enable" axis does it, and the 2nd and later tabs get axes too: [New in plus.9 beta 1](#new-in-plus9-beta-1).
+- 🟡 **Sound cuts out in other programs when MediaPipe starts** — reported in [Bing-su/adetailer#508](https://github.com/Bing-su/adetailer/issues/508). MediaPipe no longer starts the audio system: [Install and startup](#install-and-startup).
+- 🟡 **reForge's Advanced Model Sampling in the detailer pass** — proposed in the upstream pull request [Bing-su/adetailer#818](https://github.com/Bing-su/adetailer/pull/818). It now always runs there: [Settings](#settings).
+- 🟡 **Start with ADetailer switched on** — asked in [lllyasviel/stable-diffusion-webui-forge#1833](https://github.com/lllyasviel/stable-diffusion-webui-forge/issues/1833). Settings → ADetailer → "Enable ADetailer at startup": [Settings](#settings).
+- 🟡 **Blend the detailed region with the original** — asked in [Bing-su/adetailer discussion #293](https://github.com/Bing-su/adetailer/discussions/293). Settings → ADetailer → "Detailed region opacity": [Settings](#settings).
+- 🟡 **A real upscaler for the detailed region** — asked in [Bing-su/adetailer#711](https://github.com/Bing-su/adetailer/issues/711). Settings → ADetailer → "Upscaler for ADetailer's inpaint area": [Settings](#settings).
+- 🟡 **The same face inpainted twice** — reported in [Bing-su/adetailer#669](https://github.com/Bing-su/adetailer/issues/669). Settings → ADetailer → "Drop overlapping detections (max overlap, 0 = off)": [Settings](#settings).
+- 🟡 **Swap two tabs, or apply one tab to all** — asked in [Bing-su/adetailer#297](https://github.com/Bing-su/adetailer/issues/297) and [#320](https://github.com/Bing-su/adetailer/issues/320): [Copy Settings Between Tabs](#copy-settings-between-tabs).
+- 🟡 **ADetailer runs once more than the tabs of an API request** — reported in [Bing-su/adetailer#485](https://github.com/Bing-su/adetailer/issues/485). A request that sends only the tabs now runs one pass per tab: [Does it work with the WebUI's API?](#does-it-work-with-the-webuis-api).
+- 🟡 **A color correction option** — asked in [Bing-su/adetailer#731](https://github.com/Bing-su/adetailer/issues/731). Settings → ADetailer → "Match the colors of each inpainted region to the picture" matches each region to the picture: [Settings](#settings).
+- 🟡 **Explain what each option does** — asked in [Bing-su/adetailer#23](https://github.com/Bing-su/adetailer/issues/23). Hover over an option of a tab to see a short explanation: [Interface](#interface).
+- 🟡 **No Ultralytics usage analytics** — asked in [Bing-su/adetailer#613](https://github.com/Bing-su/adetailer/issues/613). ADetailer switches them off before its detections, without writing Ultralytics' settings file: [Compatibility](#compatibility).
 
 **Missing something?** [Open an issue](https://github.com/xXIlRizzoXx/adetailer-ultimate/issues/new) and describe what you would like to do. Ideas already being considered are in the [Roadmap](#roadmap).
 
-<a id="beta-in-testing"></a>
+## Beta in testing
+
+The published beta is **v26.2.0+plus.9.beta.1**, released on 2026-10-22 as a pre-release on the [Releases page](https://github.com/xXIlRizzoXx/adetailer-ultimate/releases): the first beta of plus.9. It adds clickable boxes to the Detection preview, X/Y/Z axes for every tab, tooltips on every option, swapping and pasting tabs, new settings for the colors, the opacity and the upscaler of the inpainted regions, for duplicate detections, inpaint masks and starting ADetailer switched on, higher limits for the mask sliders and two new guides, and it fixes some problems with detectors, MediaPipe, reForge, ControlNet, prompts, Export and saved and pasted parameters. The stable version is still v26.2.0+plus.8: what it changed is in [What is new in plus.8](#what-is-new-in-plus8).
+
+**Beta 1** (v26.2.0+plus.9.beta.1) is on the Releases page and the `beta` branch. Its changes are listed at the top of [CHANGELOG.md](CHANGELOG.md); with them, all 1278 offline regression tests pass on AUTOMATIC1111 and Forge Neo. Forge and reForge are supported and checked in the code. Please report any problem in the [Issues](https://github.com/xXIlRizzoXx/adetailer-ultimate/issues).
+
+**To try the beta**, follow [Switch to the beta and back](#switch-to-the-beta-and-back): two commands in a terminal, then a restart. The version badge in the ADetailer panel then shows `v26.2.0+plus.9.beta.1`. The beta adds no tab setting (only "Enable ADetailer at startup", "Save inpaint masks", "Match the colors of each inpainted region to the picture", "Detailed region opacity", "Drop overlapping detections" and "Upscaler for ADetailer's inpaint area" in Settings → ADetailer), so your presets and remembered settings work in both versions, and switching does not touch them (see [Your data](#your-data)).
+
+### New in plus.9 beta 1
+
+🟢 available in the stable release · 🟡 new in the beta, in testing
+
+> [!NOTE]
+> **plus.9 beta 1 in short:**
+>
+> - 🟡 **Click to choose detections:** click the numbered boxes of the Detection preview to choose which detections to inpaint, instead of typing their numbers.
+> - 🟡 **Save inpaint masks:** a new option saves the black-and-white mask each region is inpainted with.
+> - 🟡 **X/Y/Z axes for every tab:** the 2nd and later tabs get their own axes, the 1st tab gets three more, and an "[ADetailer] Enable" axis compares pictures with and without ADetailer.
+> - 🟡 **Higher slider limits:** the mask offset, erosion / dilation, mask blur and padding sliders go further, for large pictures.
+> - 🟡 **Clearer messages:** a detector made with a newer Ultralytics, or left in a `.zip` file, is explained in the console.
+> - 🟡 **Works better with other tools:** the LoRAs and embeddings of the ADetailer prompts are listed in the image parameters for sites such as Civitai, reForge's Advanced Model Sampling stays on in the detailer pass, and MediaPipe no longer starts the audio system.
+> - 🟡 **Extra files with their parameters:** the mask previews, step images and masks of "Run ADetailer on an image" record their parameters.
+> - 🟡 **Match the colors of each region:** a new setting matches the colors of each inpainted region to the picture, so a face no longer comes out with another tint.
+> - 🟡 **New guides:** how to give each face its own prompt or LoRA, and where to find more detectors.
+> - 🟡 **Region opacity and upscaler:** two new settings blend each inpainted region with the original and pick the upscaler that enlarges it.
+> - 🟡 **Duplicate detections dropped:** a new setting inpaints a face found twice only once.
+> - 🟡 **Swap tabs or paste into every tab:** two checkboxes next to Paste settings.
+> - 🟡 **Sturdier passes:** an error in one region no longer stops the others, and a short API request no longer runs an extra pass.
+> - 🟡 **Tooltips on the options:** hover over an option of a tab to see what it does.
+> - 🟡 **Enable ADetailer at startup:** a new setting starts the ADetailer panel already switched on in txt2img, img2img or both.
+> - 🟡 **No Ultralytics usage analytics:** ADetailer's detections no longer send Ultralytics' anonymous usage analytics.
+> - 🟡 **Known issues of plus.8 fixed:** Export downloads on AUTOMATIC1111, a detector without a class-name file lists its classes straight away there, ControlNet models get their default preprocessor on Forge, comments typed in the ADetailer prompts are removed, pasted parameters restore "Skip img2img" and name a missing sampler, and "Inpaint only masked" no longer changes the WebUI's "Overlay original for inpaint" setting.
+
+The details are in the v26.2.0+plus.9.beta.1 section of [CHANGELOG.md](CHANGELOG.md).
+
+#### New
+
+- 🟡 **Click the boxes of the Detection preview** — after a single-tab preview, a click on a numbered box adds its number to "Inpaint only these detections", a second click takes it out, and the chosen boxes are marked in green; numbers typed by hand mark their boxes too. Not with "🔁 Combine all tabs". Asked for upstream in [Bing-su/adetailer#635](https://github.com/Bing-su/adetailer/issues/635). Details: [Detection preview](#detection-preview).
+- 🟡 **Save inpaint masks** — Settings → ADetailer → "Save inpaint masks" (off by default) saves, for every region inpainted, the black-and-white mask img2img gets, as a PNG ending in `-ad-mask-N-K` (tab N, region K) in the `adetailer-steps` folder. Asked for upstream in [Bing-su/adetailer#406](https://github.com/Bing-su/adetailer/issues/406). Details: [Save inpaint masks](#save-inpaint-masks).
+- 🟡 **X/Y/Z axes for every tab** — the 2nd and later tabs, up to "Max tabs", get axes for ADetailer model, ADetailer prompt, ADetailer negative prompt, Detection confidence threshold, Mask erosion / dilation, Inpaint mask blur, Inpaint denoising strength, Inpaint only masked padding, CFG scale and Steps, such as "[ADetailer] Inpaint denoising strength 2nd". The 1st tab gets "[ADetailer] Detection confidence threshold 1st", "[ADetailer] Inpaint mask blur 1st" and "[ADetailer] Steps 1st". A tab's axes apply when its "Enable this tab" is ticked. The axes that existed before keep their names. Asked for upstream in [Bing-su/adetailer#251](https://github.com/Bing-su/adetailer/issues/251).
+- 🟡 **"[ADetailer] Enable" axis** — False or True switches ADetailer off or on for each cell of an X/Y/Z grid, whatever "Enable ADetailer" says, so one grid compares pictures with and without it. The tabs run as set in the panel.
+- 🟡 **Higher limits for the mask sliders** — "Mask x(→) offset" and "Mask y(↑) offset" go from -512 to 512, "Mask erosion (-) / dilation (+)" from -256 to 256, "Inpaint mask blur" up to 256 and "Inpaint only masked padding, pixels" up to 512. The defaults are unchanged. Asked for upstream in [Bing-su/adetailer#111](https://github.com/Bing-su/adetailer/issues/111). Details: [Upstream options](#upstream-options).
+- 🟡 **Match the colors of each inpainted region** — Settings → ADetailer → "Match the colors of each inpainted region to the picture" (off by default) matches the colors of each region, with a little of its surroundings, to the same area of the picture before the pass, with the WebUI's own color correction, and blends the edge with "Inpaint mask blur". It is the WebUI's "Apply color correction to img2img results" for ADetailer's regions only. On AUTOMATIC1111 the WebUI's correction fixes the tint and keeps the brightness of the inpainted region; on Forge Neo it matches the brightness too. Asked for upstream in [Bing-su/adetailer#731](https://github.com/Bing-su/adetailer/issues/731).
+- 🟡 **Detailed region opacity** — Settings → ADetailer → "Detailed region opacity" (100 by default, as before) blends each inpainted region with the picture before it: 50 keeps half of the change. Asked for in [Bing-su/adetailer discussion #293](https://github.com/Bing-su/adetailer/discussions/293).
+- 🟡 **Upscaler for the inpaint area** — Settings → ADetailer → "Upscaler for ADetailer's inpaint area" picks an installed upscaler, such as an ESRGAN one, to enlarge the area ADetailer inpaints, and with "Inpaint only masked" the result back when the crop is bigger than the inpaint size; the first choice keeps the WebUI's "Upscaler for img2img", as before. Asked for upstream in [Bing-su/adetailer#711](https://github.com/Bing-su/adetailer/issues/711).
+- 🟡 **Drop overlapping detections** — Settings → ADetailer → "Drop overlapping detections (max overlap, 0 = off)" (off by default) inpaints only the more confident of two detections of the same class that overlap, so a face found twice is inpainted once; the much smaller eyes inside a face are kept. Asked for upstream in [Bing-su/adetailer#669](https://github.com/Bing-su/adetailer/issues/669).
+- 🟡 **Swap tabs or paste into every tab** — tick "Swap with the copied tab" or "Paste into every tab" next to "📥 Paste settings" before you click it. Asked for upstream in [Bing-su/adetailer#297](https://github.com/Bing-su/adetailer/issues/297) and [#320](https://github.com/Bing-su/adetailer/issues/320).
+- 🟡 **Tooltips on the options** — hovering over an option of a tab, such as "Detection model confidence threshold" or "Inpaint mask blur", shows a short explanation, as the fork's buttons already did. Every option without a help line under it gets one, in every tab; the layout of the panel is unchanged. Asked for upstream in [Bing-su/adetailer#23](https://github.com/Bing-su/adetailer/issues/23).
+- 🟡 **Enable ADetailer at startup** — a new option in Settings → ADetailer (Off, txt2img, img2img or Both; Off by default; it needs a UI reload) starts the ADetailer panel already switched on in the chosen tabs. With Off, the WebUI's Settings → Defaults decide as before; any other choice wins over Defaults for the on or off state of those tabs. API requests are not affected, and "Remember last-used settings" does not store the on or off state. Asked for upstream in [lllyasviel/stable-diffusion-webui-forge#1833](https://github.com/lllyasviel/stable-diffusion-webui-forge/issues/1833). Details: [Settings](#settings).
+- 🟡 **No Ultralytics usage analytics** — ADetailer switches off Ultralytics' anonymous usage analytics before its detections, in memory only. The shared Ultralytics settings file is never written, and in the same WebUI session the analytics stay off for other extensions that use Ultralytics. Asked for upstream in [Bing-su/adetailer#613](https://github.com/Bing-su/adetailer/issues/613).
+
+#### Fixed
+
+**Detectors and MediaPipe**
+
+- 🟡 On AUTOMATIC1111, a detector without a `<model>.names.json` now lists its classes straight away, as on Forge and Forge Neo. The names are read from the detector file's metadata without loading it: nothing in the file is run, and AUTOMATIC1111's safe-unpickle check stays on. In plus.8 the list stays empty until the first detection (see [Known issues](#known-issues)).
+- 🟡 The MediaPipe safety check for macOS no longer takes a pre-release build such as 1.0.0rc1 for 1.0.1.
+
+- 🟡 A detector made with a newer Ultralytics than the one in your WebUI, such as a recent YOLO12 or YOLO26 model, failed with only a message such as "Can't get attribute '…'". The console and the Detection preview status now say that the detector needs a newer Ultralytics, with the file name and the installed version (see [Nothing runs or nothing is detected](#nothing-runs-or-nothing-is-detected)).
+- 🟡 A detector left in a `.zip` file, as many detectors on Civitai download, never showed up in the list and nothing said why. At startup, the console now names up to 5 `.zip` files in the detector folders and asks you to extract the `.pt` file (see [Install and startup](#install-and-startup)).
+- 🟡 With the `sounddevice` package installed, the first MediaPipe detection started the audio system: on Windows, sound in other programs could stop, and Python was listed as using the microphone. ADetailer now loads MediaPipe without `sounddevice`, which detection does not need. Reported upstream in [Bing-su/adetailer#508](https://github.com/Bing-su/adetailer/issues/508).
+
+**Saved parameters and X/Y/Z**
+
+- 🟡 A LoRA or an embedding used only in an ADetailer prompt is now listed in the image's "Lora hashes" and "TI hashes", next to those of the main prompt and without doubles, so sites such as Civitai recognise it. Each image of a batch and each X/Y/Z cell lists only its own. A WebUI that writes no "TI hashes", such as Forge Neo, lists only the LoRAs.
+- 🟡 An X/Y/Z "CFG scale" or "Steps" axis, the existing "[ADetailer] CFG scale 1st" included, also ticks the tab's "Use separate CFG scale" or "Use separate steps" in each cell. Before, without that box ticked, every cell came out the same (in plus.8, tick it in the tab before you start the grid).
+- 🟡 With "Save mask previews", "Save intermediate step images" or "Save inpaint masks" on, the extra files of "Run ADetailer on an image" and folder runs record their parameters (the detailer pass, the loaded checkpoint and VAE, and the tab's ADetailer settings), and the console no longer prints "create_infotext failed" for each one.
+- 🟡 A `[user]` or `[denoising]` token in the WebUI's file or folder name pattern no longer prints a traceback for each extra file and each result saved to `ADetailer-Inpaint` by "Run ADetailer on an image" and folder runs.
+- 🟡 Pasted parameters (PNG Info, Send to, the paste button) and a restart now split a ticked separate sampler name the way Load and the WebUI do. A sampler this WebUI does not have, such as Res Multistep from Forge Neo on AUTOMATIC1111, becomes the first sampler, and the console says so, instead of the dropdown showing it blank (in plus.8, check "ADetailer sampler" and "ADetailer scheduler" after a restart or a paste).
+- 🟡 img2img pictures now record "ADetailer skip img2img" (True or False), so PNG Info and Send to tick or untick the box as the picture was made. txt2img pictures and older images without the key leave it as it is (in plus.8, set it by hand).
+
+**Prompts and ControlNet**
+
+- 🟡 Comments typed in the ADetailer prompt, negative prompt and append boxes (`#`, and on Forge Neo also `//` and `/* */`) are now removed before the detailer pass, following the WebUI's own comment setting, also with "Apply only selected scripts to ADetailer" on. A box that holds only a comment counts as blank and takes the main prompt (in plus.8, leave comments out of those boxes).
+- 🟡 On Forge, Forge Neo and reForge, choosing a ControlNet model now selects its default preprocessor, for example `openpose_full` or `depth_midas`, as AUTOMATIC1111 does, instead of "None". Picking "None" afterwards keeps it, and a saved "None" survives a restart; loading a preset or pasting parameters that change the model gives the model's default. An API request without `ad_controlnet_module` also uses the default (in plus.8, pick the preprocessor yourself).
+
+**Inpainting**
+
+- 🟡 "Inpaint only masked" no longer turns on the WebUI's "Overlay original for inpaint" setting to paste each region back. It now gives the pass the WebUI's own overlay, so the setting is no longer saved as on when the WebUI saves its settings during the pass, and frozen settings no longer stop ADetailer. The pasted result is unchanged (in plus.8, keep that setting on, or untick "Inpaint only masked").
+
+**Presets and interface**
+
+- 🟡 On AUTOMATIC1111 and other WebUIs with Gradio 3, such as reForge's main branch, Export now downloads `adetailer-ultimate-presets.json`, as on Forge. The browser saves the file itself, and no new event handler is added (in plus.8, back up `user_presets.json` by hand).
+- 🟡 The preset export button reads "📤 Export"; before, its English label had a typo. With Language Diffusion, the button stays in English until its dictionaries are updated for the new label.
+
+**reForge**
+
+- 🟡 With "Apply only selected scripts to ADetailer" on (the default), reForge's Advanced Model Sampling was left out of the detailer pass, so the detailed regions of a v-prediction or flow model came out broken. It now always runs there, like Soft Inpainting and HyperTile, and so does the reForge-RescaleCFG extension, whose script file has the same name as one of Advanced Model Sampling's scripts. Checked in reForge's code. Idea from [Anzhc/aadetailer-reforge](https://github.com/Anzhc/aadetailer-reforge), also proposed upstream in [Bing-su/adetailer#818](https://github.com/Bing-su/adetailer/pull/818). In plus.8, add `advanced_model_sampling_script` (and, where reForge has it, `advanced_model_sampling_script_backported`) to "Script names to apply to ADetailer".
+
+### Notes on plus.9 beta 1
+
+- **X/Y/Z plot requests through the API:** a request picks an X/Y/Z axis by its position in the list. The new ADetailer axes move the axes of the extensions loaded after ADetailer further down, and their position also changes with "Max tabs". Look up the position from the axis name before a request instead of keeping a fixed number. ADetailer's own axes that existed before keep their positions, and the X/Y/Z plot in the browser is not affected.
+- **The message for a detector made with a newer Ultralytics can appear twice in the console:** once as its own line and once in the error report that follows it.
+- **Going back to plus.8:** its mask sliders do not go as far. If a tab or a preset uses a value above plus.8's limits (for example a padding of 300), check those sliders after switching back.
+- **MediaPipe on Linux aarch64:** MediaPipe 0.10.x has Linux aarch64 wheels only up to 0.10.18 (Python 3.9 to 3.12), so those systems get 0.10.18; on Python 3.13 there is no supported MediaPipe wheel for aarch64, and the MediaPipe detectors cannot be used there; the other packages are still installed, so the YOLO detectors work.
+- **The export button in English on a translated interface:** with Language Diffusion, "📤 Export" stays in English until its dictionaries have the new label.
+- **The tooltips of the options in English on a translated interface:** with Language Diffusion, they stay in English until its dictionaries have them, and so do the new checkboxes next to Paste settings.
+- **"Detailed region opacity" with a high denoising strength** can show a faint double outline: test it on your own pictures.
+- **"Upscaler for ADetailer's inpaint area" is set for the pass only:** a settings save during a pass stores it as "Upscaler for img2img", as for the separate CLIP skip, checkpoint and VAE.
+- **A pasted ControlNet preprocessor "None" on Forge, Forge Neo and reForge:** when PNG Info, Send to, Load or Paste settings also change the ControlNet model, the model's default preprocessor is chosen instead of "None". Pick "None" again after pasting, if you want it.
+- **"Enable ADetailer at startup" needs a UI reload** to apply, and it does not change API requests.
+- The known issues of v26.2.0+plus.8 still apply, except those this beta fixes (Export on AUTOMATIC1111, the classes of a detector without a class-name file on AUTOMATIC1111, "Skip img2img" and samplers in pasted parameters, prompt comments, the ControlNet preprocessor "None" on Forge, and the two about "Overlay original for inpaint"): see [Known issues](#known-issues).
 
 ## What is new in plus.8
 
-**v26.2.0+plus.8**, released on 2026-10-10, is the stable release of the plus.8 reliability update: no new buttons, but the existing ones now do what you asked, keep your settings and report what really happened, and the sections you leave open are remembered. It was tested in three betas, each listed with its changes in the [CHANGELOG](CHANGELOG.md): beta 1 (v26.2.0+plus.8.beta.1, 2026-09-23), beta 2 (v26.2.0+plus.8.beta.2, 2026-10-01) and beta 3 (v26.2.0+plus.8.beta.3, 2026-10-08). The stable release is beta 3 with one more fix. The previous stable release is v26.3.0+plus.7.4, called plus.7.4 below.
+**v26.2.0+plus.8**, released on 2026-10-10, is the stable release of the plus.8 reliability update: no new buttons, but the existing ones now do what you asked, keep your settings and report what really happened, and the sections you leave open are remembered. It was tested in three betas, each listed with its changes in the [CHANGELOG](CHANGELOG.md): beta 1 (v26.2.0+plus.8.beta.1, 2026-09-23), beta 2 (v26.2.0+plus.8.beta.2, 2026-10-01) and beta 3 (v26.2.0+plus.8.beta.3, 2026-10-08). The stable release is beta 3 with one more fix. The previous stable release is v26.3.0+plus.7.4, called plus.7.4 below. In this section and elsewhere in this README, "beta 1", "beta 2" and "beta 3" without a version mean the betas of plus.8.
 
 All 1014 offline regression tests pass on AUTOMATIC1111 and Forge Neo, and the betas were also tested live in the browser on both (see [Testing](#testing)). Forge and reForge are supported and checked in the code, but not tested live. Please report any problem in the [Issues](https://github.com/xXIlRizzoXx/adetailer-ultimate/issues).
 
@@ -239,7 +412,7 @@ Why the smaller number: version numbers now start with the version of the origin
 
 ### New and fixed
 
-🟢 available in the stable release · 🟡 in testing in a beta (none right now)
+🟢 available in the stable release · 🟡 new in the beta, in testing
 
 > [!NOTE]
 > **plus.8 in short:**
@@ -424,20 +597,20 @@ Every fix of beta 1, with the details, is in the v26.2.0+plus.8.beta.1 section o
 
 ### Known issues
 
-Still open in v26.2.0+plus.8, with what to do meanwhile. The four known issues listed in the beta 1 notes (at the end of the beta 1 section in [CHANGELOG.md](CHANGELOG.md)) are fixed: see the lines of [New and fixed](#new-and-fixed) that say what to do in plus.7.4 and beta 1. Unless an issue says otherwise, it also affects plus.7.4 and the betas; the two at the end come with plus.8 (from beta 2).
+Still open in v26.2.0+plus.8, with what to do meanwhile. The four known issues listed in the beta 1 notes (at the end of the beta 1 section in [CHANGELOG.md](CHANGELOG.md)) are fixed: see the lines of [New and fixed](#new-and-fixed) that say what to do in plus.7.4 and beta 1. Unless an issue says otherwise, it also affects plus.7.4 and the betas; the two at the end come with plus.8 (from beta 2). 🟡 The issues marked "fixed in plus.9 beta 1" are fixed in that beta; in plus.8 they still apply as described.
 
-- **Export does not download a file on AUTOMATIC1111** (and on other WebUIs with Gradio 3, such as reForge's main branch). Back up `user_presets.json` from the extension's folder by hand; Import works on every WebUI from plus.8 on (in plus.7.4 it stops with an error there, so copy the file by hand to restore it too).
-- **On AUTOMATIC1111, a detector without a `<model>.names.json` shows no classes until its first detection** (Forge Neo lists the classes straight away, and so does classic Forge, checked in its code; reForge is not tested). From plus.8, run a generation or a Detection preview with it that finds something, then switch to another detector and back, or add that file to see the classes straight away. In plus.7.4 the list stays empty for the whole session, even after a detection, and a class filter for such a detector is ignored (see [Fixed in beta 1](#fixed-in-beta-1)): add the file and restart the WebUI.
+- **Export does not download a file on AUTOMATIC1111** (and on other WebUIs with Gradio 3, such as reForge's main branch). 🟡 Fixed in plus.9 beta 1: Export downloads the file there too. In plus.8, back up `user_presets.json` from the extension's folder by hand; Import works on every WebUI from plus.8 on (in plus.7.4 it stops with an error there, so copy the file by hand to restore it too).
+- **On AUTOMATIC1111, a detector without a `<model>.names.json` shows no classes until its first detection** (Forge Neo lists the classes straight away, and so does classic Forge, checked in its code; reForge is not tested). 🟡 Fixed in plus.9 beta 1: the classes are listed straight away, read from the detector file without loading it. In plus.8, run a generation or a Detection preview with it that finds something, then switch to another detector and back, or add that file to see the classes straight away. In plus.7.4 the list stays empty for the whole session, even after a detection, and a class filter for such a detector is ignored (see [Fixed in beta 1](#fixed-in-beta-1)): add the file and restart the WebUI.
 - **Newer options are in English on a translated interface.** The options added since plus.7, and some reworded tooltips and help texts, stay in English until the Language Diffusion dictionaries are updated (see [Translations](#translations)). From plus.8 this includes the reworded help text of **🔄 Reset ADetailer settings to defaults** on the Settings page; the "📥 Paste from Nth tab" label that the other tabs show after a Copy stays English too.
-- **Pasted parameters do not restore "Skip img2img".** Tick it again by hand after PNG Info or Send to img2img.
-- **The export button's label will be renamed.** Its English label has a typo. It stays as it is for now, because the Language Diffusion dictionaries translate the button by that label: it will be renamed together with them. The button works normally.
-- **Prompt comments typed in the ADetailer prompts reach the model.** The WebUI removes comments (`#`, and on Forge Neo also `//` and `/* */`) from the main prompt, and a blank or `[PROMPT]` ADetailer prompt takes the main prompt without them. Comments typed in a tab's own prompt boxes are not removed while "Apply only selected scripts to ADetailer" is on (the default), so their text is used as prompt text. Leave comments out of the ADetailer prompts. Adding `comments` to Settings → ADetailer → "Script names to apply to ADetailer" removes them, but a comment on the last line of a typed prompt then also removes what ADetailer adds after it: the append text, the main prompt's LoRAs and what the selected Styles add.
-- **On Forge, Forge Neo and reForge, choosing a ControlNet model sets its preprocessor to "None".** There the preprocessor list starts with "None", which hands the picture to ControlNet as it is, and a new model keeps the tab's preprocessor only when it fits. For pose, depth, lineart, scribble and inpaint models, pick the preprocessor in "ControlNet module" yourself, for example `openpose_full`, `depth_midas`, `lineart_coarse` or `inpaint_global_harmonious`. An API request that leaves the preprocessor out also runs without one there; AUTOMATIC1111, whose lists have no "None", uses the model's default.
-- **A restart or pasted parameters do not warn about a separate sampler this WebUI does not have.** With "Use separate sampler" ticked, such a sampler, for example Res Multistep, which Forge Neo has and AUTOMATIC1111 does not, runs as the WebUI's first sampler. After a restart the "ADetailer sampler" list shows the first sampler; after pasting, it shows the missing name (empty on Forge and Forge Neo), and Generate runs the first sampler with only a console warning. From plus.8, a restart and pasting split an old name made of a sampler of this WebUI and a scheduler's label, such as "DPM++ 2M Karras", into the sampler and the scheduler. A restart and pasting do not split other spellings of a scheduler, such as "DPM++ 2M karras" or "Euler a SGMUniform", nor a name whose sampler part this WebUI does not have, such as "DPM++ 2M SDE Heun Karras" on Forge Neo: pasting keeps such a name, and a restart shows the first sampler with the saved scheduler. After a restart or a paste, check "ADetailer sampler" and "ADetailer scheduler" and pick them again if needed. From plus.8, loading a preset names such a sampler in its status.
+- **Pasted parameters do not restore "Skip img2img".** Tick it again by hand after PNG Info or Send to img2img. 🟡 Fixed in plus.9 beta 1 for img2img pictures: they record "ADetailer skip img2img" (True or False), which PNG Info and Send to read.
+- **The export button's label will be renamed.** Its English label has a typo. It stays as it is for now, because the Language Diffusion dictionaries translate the button by that label: it will be renamed together with them. The button works normally. 🟡 Fixed in plus.9 beta 1: the button reads "📤 Export" (in English until the dictionaries have the new label).
+- **Prompt comments typed in the ADetailer prompts reach the model.** 🟡 Fixed in plus.9 beta 1: they are removed before the detailer pass, as the WebUI removes them from the main prompt. In plus.8: the WebUI removes comments (`#`, and on Forge Neo also `//` and `/* */`) from the main prompt, and a blank or `[PROMPT]` ADetailer prompt takes the main prompt without them. Comments typed in a tab's own prompt boxes are not removed while "Apply only selected scripts to ADetailer" is on (the default), so their text is used as prompt text. Leave comments out of the ADetailer prompts. Adding `comments` to Settings → ADetailer → "Script names to apply to ADetailer" removes them, but a comment on the last line of a typed prompt then also removes what ADetailer adds after it: the append text, the main prompt's LoRAs and what the selected Styles add.
+- **On Forge, Forge Neo and reForge, choosing a ControlNet model sets its preprocessor to "None".** 🟡 Fixed in plus.9 beta 1: a new model gets its default preprocessor, as on AUTOMATIC1111, and so does an API request that leaves the preprocessor out. In plus.8: there the preprocessor list starts with "None", which hands the picture to ControlNet as it is, and a new model keeps the tab's preprocessor only when it fits. For pose, depth, lineart, scribble and inpaint models, pick the preprocessor in "ControlNet module" yourself, for example `openpose_full`, `depth_midas`, `lineart_coarse` or `inpaint_global_harmonious`. An API request that leaves the preprocessor out also runs without one there; AUTOMATIC1111, whose lists have no "None", uses the model's default.
+- **A restart or pasted parameters do not warn about a separate sampler this WebUI does not have.** 🟡 Fixed in plus.9 beta 1: a restart and pasting split the name as Load does, and a sampler this WebUI does not have becomes the first sampler with a console message. In plus.8: with "Use separate sampler" ticked, such a sampler, for example Res Multistep, which Forge Neo has and AUTOMATIC1111 does not, runs as the WebUI's first sampler. After a restart the "ADetailer sampler" list shows the first sampler; after pasting, it shows the missing name (empty on Forge and Forge Neo), and Generate runs the first sampler with only a console warning. From plus.8, a restart and pasting split an old name made of a sampler of this WebUI and a scheduler's label, such as "DPM++ 2M Karras", into the sampler and the scheduler. A restart and pasting do not split other spellings of a scheduler, such as "DPM++ 2M karras" or "Euler a SGMUniform", nor a name whose sampler part this WebUI does not have, such as "DPM++ 2M SDE Heun Karras" on Forge Neo: pasting keeps such a name, and a restart shows the first sampler with the saved scheduler. After a restart or a paste, check "ADetailer sampler" and "ADetailer scheduler" and pick them again if needed. From plus.8, loading a preset names such a sampler in its status.
 - **A tab prompt made only of `[CLASS=…]` blocks gives the main prompt to the regions that no block matches** (from plus.8; plus.7.4 gave them an empty prompt). With `[CLASS=face] smiling [/CLASS]` and a detector that finds faces and hands, the hands are redrawn with the main prompt. To leave a class as it is, skip it with `[CLASS=hand] [SKIP] [/CLASS]` or leave it out of the class filter; to give it other text, add a block for it.
 - **Styles can still be applied twice.** With a blank or `[PROMPT]` ADetailer prompt, the styles, their LoRAs included, still reach the detailer pass twice when another extension rewrites the main prompts (for example Dynamic Prompts with wildcards), or when a Style adds its text on the line of a prompt comment. Write the tab's own prompt instead: it gets the styles once.
-- **From plus.8: "Overlay original for inpaint" can be saved as on.** If you turned this setting off (on Forge Neo: "For inpainting, overlay the resulting image back onto the original image"), it can be saved as on when the WebUI saves its settings while an "Inpaint only masked" pass runs: for example when you change a quick setting at the top of the page, such as Clip skip, pick a checkpoint or VAE there on Forge Neo, or an API request changes a setting. Untick it again in Settings.
-- **From plus.8: with the WebUI's settings frozen, "Inpaint only masked" can fail.** When the WebUI is started with a launch option that freezes this setting (`--freeze-settings`, `--freeze-settings-in-sections img2img` or `--freeze-specific-settings overlay_inpaint`) and "Overlay original for inpaint" is off, the first "Inpaint only masked" pass stops ADetailer for that image with the WebUI's frozen-setting error in the console ("changing settings is disabled" with `--freeze-settings`, "not possible to set 'overlay_inpaint' because … frozen …" with the other two): that tab and the later tabs are not detailed, and the earlier tabs keep their result. Keep that setting on when you freeze the settings, or untick "Inpaint only masked" in the tab.
+- **From plus.8: "Overlay original for inpaint" can be saved as on.** 🟡 Fixed in plus.9 beta 1: "Inpaint only masked" no longer changes that setting. In plus.8: if you turned this setting off (on Forge Neo: "For inpainting, overlay the resulting image back onto the original image"), it can be saved as on when the WebUI saves its settings while an "Inpaint only masked" pass runs: for example when you change a quick setting at the top of the page, such as Clip skip, pick a checkpoint or VAE there on Forge Neo, or an API request changes a setting. Untick it again in Settings.
+- **From plus.8: with the WebUI's settings frozen, "Inpaint only masked" can fail.** 🟡 Fixed in plus.9 beta 1: that setting is no longer changed, so frozen settings no longer stop ADetailer. In plus.8: when the WebUI is started with a launch option that freezes this setting (`--freeze-settings`, `--freeze-settings-in-sections img2img` or `--freeze-specific-settings overlay_inpaint`) and "Overlay original for inpaint" is off, the first "Inpaint only masked" pass stops ADetailer for that image with the WebUI's frozen-setting error in the console ("changing settings is disabled" with `--freeze-settings`, "not possible to set 'overlay_inpaint' because … frozen …" with the other two): that tab and the later tabs are not detailed, and the earlier tabs keep their result. Keep that setting on when you freeze the settings, or untick "Inpaint only masked" in the tab.
 
 More symptoms, with what to do, are in [Problems and fixes](#problems-and-fixes).
 
@@ -476,7 +649,7 @@ More symptoms, with what to do, are in [Problems and fixes](#problems-and-fixes)
 4. Wait until you see the message "Installed into stable-diffusion-webui\extensions\adetailer-ultimate. Use Installed tab to restart." (the start of the path is your own WebUI folder). ADetailer installs the Python packages it needs at this point, so on a WebUI that does not have them yet this can take a few minutes.
 5. Restart the WebUI completely: close it, including its console window or launcher, and start it again. If you are not sure how, restart your computer.
 
-These steps install the stable release (v26.2.0+plus.8). To try a beta when one is in testing, see [Switch to the beta and back](#switch-to-the-beta-and-back).
+These steps install the stable release (v26.2.0+plus.8). To try the beta, v26.2.0+plus.9.beta.1, see [Switch to the beta and back](#switch-to-the-beta-and-back).
 
 ![The Install from URL tab of the Extensions tab](https://i.imgur.com/qaXtoI6.png)
 
@@ -501,7 +674,7 @@ Updating keeps your presets and remembered settings (see [Your data](#your-data)
 
 ### Switch to the beta and back
 
-The beta is the next version while it is being tested. Right now no beta is in testing: the `beta` branch holds the same version as the stable release, v26.2.0+plus.8, until the next beta starts there. Switching uses git, the same tool the WebUI uses to install extensions. It works for a copy installed with **Install from URL** or `git clone`, not for a ZIP file downloaded from the Releases page, and it needs a terminal where the `git` command works.
+The beta is the next version while it is being tested. Right now the `beta` branch holds the first beta of plus.9, v26.2.0+plus.9.beta.1 (see [Beta in testing](#beta-in-testing)), and the stable release is v26.2.0+plus.8. Switching uses git, the same tool the WebUI uses to install extensions. It works for a copy installed with **Install from URL** or `git clone`, not for a ZIP file downloaded from the Releases page, and it needs a terminal where the `git` command works.
 
 1. Open a terminal in the extension's folder: the folder you installed it in, usually `extensions/adetailer-ultimate` inside your WebUI folder. On Windows: open the folder in File Explorer, click the address bar, type `cmd` and press Enter.
 2. Run these two commands:
@@ -520,7 +693,7 @@ git fetch origin
 git checkout -B main origin/main
 ```
 
-The `-B` in the commands makes them work also when your copy already has an older beta from an earlier try. Your presets and remembered settings stay as they are in both directions. A beta in testing is also on the Releases page, marked as a pre-release; the `beta` branch can be ahead of it.
+The `-B` in the commands makes them work also when your copy already has an older beta from an earlier try. Your presets and remembered settings stay as they are in both directions. 🟡 The plus.9 beta lets some mask sliders go further than plus.8 does: after going back, check those sliders in a tab or preset where you used such a value. A beta in testing is also on the Releases page, marked as a pre-release; the `beta` branch can be ahead of it.
 
 ### Uninstall
 
@@ -548,7 +721,7 @@ Your presets and remembered tab settings are two files in the extension's folder
 
 - **The two files are yours.** They are not part of the download, so updating and switching between stable and beta leave them as they are. Deleting the extension's folder deletes them too, so copy them first.
 - **Back them up** by copying `user_presets.json` and `user_state.json` somewhere safe. To restore them, close the WebUI, put the copies back in the extension's folder and start the WebUI.
-- **Move presets to another computer** with Export and Import (see [Export and import presets](#export-and-import-presets)), or copy `user_presets.json`. On AUTOMATIC1111, and other WebUIs with Gradio 3 such as reForge's main branch, the export button cannot download a file, so copying the file is the way there.
+- **Move presets to another computer** with Export and Import (see [Export and import presets](#export-and-import-presets)), or copy `user_presets.json`. 🟡 From plus.9 beta 1 the export button downloads the file on every WebUI; in plus.8, on AUTOMATIC1111 and other WebUIs with Gradio 3 such as reForge's main branch, it cannot download a file, so copying the file is the way there.
 - 🟢 **A damaged file is never overwritten** (from plus.8). If one of the two files cannot be read, for example after a hand edit that broke it, ADetailer keeps it under a new name, such as `user_presets.unreadable-<date>.json` or `user_state.unreadable-<date>.json`, before it saves a new one. Files saved as UTF-8 are read, and from plus.8 also files saved as UTF-16, as Notepad's "Unicode" option saves them.
 - 🟢 **Saves are safe.** A crash during a save leaves the old or the new file, not an empty one, and from plus.8 so does a power cut or system crash right after a save, on drives that support it.
 
@@ -573,7 +746,7 @@ If a fixed face looks too different from the rest of the picture, lower "Inpaint
 
 ## Using each feature
 
-Every option below sits in each ADetailer tab, in both txt2img and img2img, unless it says otherwise. All of it is in the stable release; a line marked 🟡 would be new in a beta, in testing (there is none right now).
+Every option below sits in each ADetailer tab, in both txt2img and img2img, unless it says otherwise. A line marked 🟡 is new in the beta, v26.2.0+plus.9.beta.1, in testing; everything else is in the stable release.
 
 ### Class filter
 
@@ -590,7 +763,7 @@ Picks which classes of a multi-class detector get detailed, for example only `fa
 **Good to know:**
 
 - The classes you pick are used even if you press Generate straight away, or while another job is still running. One exception: if a UI translation shows a class in the list under another name, your pick reaches ADetailer only after the current job ends, so wait for that job to finish before you press Generate.
-- On AUTOMATIC1111, a detector without a `<model>.names.json` file (or the older `<model>.json`) lists its classes only after its first detection in each session, in a generation or a Detection preview: then switch to another detector and back. Add that file (see [Custom class names via sidecar JSON](#custom-class-names-via-sidecar-json)) to see them straight away. A filter that comes from a preset, pasted parameters or the API works on such a detector anyway. Forge Neo lists the classes at once, and so does classic Forge, checked in its code; reForge is not tested. This is so from plus.8 on: in v26.3.0+plus.7.4 the list stays empty for the whole session, even after a detection, and the class filter of such a detector is ignored, so every class is detailed. There, add the file and restart the WebUI.
+- 🟡 From plus.9 beta 1, on AUTOMATIC1111 too, a detector without a `<model>.names.json` file lists its classes straight away, read from the detector file without loading it. In plus.8, on AUTOMATIC1111, a detector without a `<model>.names.json` file (or the older `<model>.json`) lists its classes only after its first detection in each session, in a generation or a Detection preview: then switch to another detector and back. Add that file (see [Custom class names via sidecar JSON](#custom-class-names-via-sidecar-json)) to see them straight away. A filter that comes from a preset, pasted parameters or the API works on such a detector anyway. Forge Neo lists the classes at once, and so does classic Forge, checked in its code; reForge is not tested. This is so from plus.8 on: in v26.3.0+plus.7.4 the list stays empty for the whole session, even after a detection, and the class filter of such a detector is ignored, so every class is detailed. There, add the file and restart the WebUI.
 - From plus.8, names from a preset, pasted parameters or the API match regardless of case: `Face` selects `face` (an exact match wins). In plus.7.4 a name must match exactly, or it is ignored.
 - 🟢 A class number from pasted parameters or a preset (for example `1` for the detector's second class) is kept when loading or pasting also changes the detector. In plus.7.4 and beta 1 the filter then went empty and every class was inpainted. (Class numbers sent in an API request always worked.) The face parts detector, `mediapipe_face_features`, matches names only.
 - A name the detector does not have is ignored and named in the console; when none of the names of an include filter is known, every class is inpainted, as with an empty selection. The MediaPipe face features are the exception: a name they do not have is ignored without a console line, and when none of the names matches, nothing is detected.
@@ -684,6 +857,32 @@ Faces get "detailed, smiling" and hands "detailed, five fingers".
 - YOLO-World regions match the names typed in its CLASSES field. With a detector that has no classes (the MediaPipe detectors other than `mediapipe_face_features`), every block applies to every region.
 - With "Mask merge mode" on Merge, a merged region keeps the blocks of every class it holds and is skipped only when all of them are skipped. With Merge and Invert the region is the background, so no block applies to it.
 - A prompt without `[CLASS=` works exactly as before.
+
+### A different prompt or LoRA for each face
+
+Gives each face of a picture, or each hand or person, its own prompt and its own LoRA, with `[SEP]`.
+
+**Where:** the tab's prompt, in the "Inpaint prompts" section, and Settings → ADetailer → "Sort bounding boxes by".
+
+**How to use:**
+
+1. In Settings → ADetailer, set "Sort bounding boxes by" to "Position (left to right)" and click **Apply settings**, so the parts go to the faces from left to right.
+2. In the tab prompt, write one part per face, separated by `[SEP]`:
+
+```text
+smiling woman, red hair <lora:style_a:0.8> [SEP] old man, grey beard [SEP] [SKIP]
+```
+
+The leftmost face gets the first part and its LoRA, the next face the second part, and any other face is left as it is.
+
+**Good to know:**
+
+- Each face is inpainted in a pass of its own, so a LoRA written in one part is used only for that face. "Use LoRAs from main prompt" still adds the main prompt's LoRAs to every part, and "Strip LoRAs from the detailer prompt" removes them all.
+- With more faces than parts, the faces left over get the last part: end with `[SKIP]` to leave them as they are, or with a part that suits them all.
+- The negative prompt can be split with `[SEP]` the same way, and `[PROMPT]` in a part puts the main prompt there.
+- With "Mask merge mode" on Merge, all the faces are inpainted as one region, which gets only the first part; with Merge and Invert the background is inpainted instead, also with the first part.
+- The numbers of the Detection preview (#1, #2, …) follow the detector's own order, not "Sort bounding boxes by", so they can differ from the order of the parts. "Inpaint only these detections" picks faces by those numbers; the faces it keeps are then sorted and get the parts in order.
+- To give different classes of one detector their own text, such as faces and hands, use [`[CLASS=…]` blocks](#inline-class-blocks-and-skip) instead.
 
 ### Auto class-guard
 
@@ -783,7 +982,7 @@ Details only the detections you choose, by the number the Detection preview show
 **How to use:**
 
 1. Drop the picture into the [Detection preview](#detection-preview) and click **🔍 Run detection preview**: each box gets a number (#1, #2, …), from plus.8 followed by its class when the detector has class names (`#1 face`).
-2. Type the numbers to keep: `1,3,5`, `1 3 5` or a range such as `1-3`.
+2. Type the numbers to keep: `1,3,5`, `1 3 5` or a range such as `1-3`. 🟡 From plus.9 beta 1 you can also click the boxes on the preview instead (see [Detection preview](#detection-preview)).
 3. Detail the finished picture with "Run ADetailer on an image", or generate. To use the numbers in a generation, generate the same picture again (same seed and settings); a 2nd or later tab looks at the picture after the earlier tabs have changed it.
 
 **Good to know:**
@@ -794,6 +993,7 @@ Details only the detections you choose, by the number the Detection preview show
 - Not used while "Process classes sequentially" runs its passes (two or more classes selected): each class is then detailed in full.
 - It also reads `#2` as written on the preview, and the full-width digits, commas and dashes that a Chinese or Japanese keyboard types, such as `1，3`, `1、3` or `1～3`.
 - 🟢 It also reads the Japanese long-vowel mark and middle dot (`1ー3`, `1・3`) and a doubled dash (`1——3`, `1--3`). In beta 1, type a range with a single `-` or `～` and separate numbers with commas or spaces; in plus.7.4, use only a plain `-` and commas, such as `1-3,5`.
+- 🟡 A click on a box of the single-tab Detection preview writes the field as a plain list in order, such as `1,3`: a range typed as `1-3` then becomes `1,2,3`.
 
 ### Use bbox as mask
 
@@ -873,9 +1073,11 @@ Copy one tab's whole setup and paste it into other tabs of the same panel, as ma
 
 - Everything in the tab is copied: detector, class filter, prompts, "Enable this tab", "Inpaint only these detections" and every detection, mask, inpainting and ControlNet setting.
 - The copy stays until you copy another tab, press **🆕 Reset** or reload the page, so you can paste it into several tabs. A tab cannot paste onto itself.
+- 🟡 From plus.9 beta 1, tick **Swap with the copied tab** before clicking Paste to swap the two tabs: this tab gets the copied settings and the copied tab gets this tab's, then the copy is emptied. For example, Copy in the 1st tab and Paste with the box ticked in the 3rd swaps the 1st and the 3rd. The copied tab gets this tab's settings as they are; this tab gets the copy made when you clicked Copy.
+- 🟡 Tick **Paste into every tab** before clicking Paste to put the copy into every tab of the panel except the copied one. Tick only one of the two boxes: with both ticked nothing changes. Both start unticked and are never saved.
 - txt2img and img2img each have their own copy. To move a setup from one to the other, save it as a [preset](#preset-library) and load it there.
 - On a translated interface the "📥 Paste from Nth tab" label stays English: it is made when you click Copy and has no dictionary entry.
-- Loading a preset or pasting a tab restores the whole setup, class filter included. Pasting generation parameters (PNG Info, Send to txt2img/img2img, or the WebUI's paste button) also restores the whole ADetailer setup: it switches ADetailer and the tabs the image used on and, for an image made with ADetailer, switches off the tabs it did not use; settings that the image does not record go back to their defaults. Skip img2img is not restored, and fields listed in the WebUI's "Disregard fields from pasted infotext" are left alone. From plus.8, a tab whose detector is not installed in this WebUI keeps its own detector and class filter and is switched off: it no longer switches ADetailer on or makes Generate fail, and the console names the missing detector. Pasting also splits an old sampler name that holds its scheduler, such as "DPM++ 2M SDE Karras", into the sampler and the scheduler; for the names it does not split, see [Known issues](#known-issues).
+- Loading a preset or pasting a tab restores the whole setup, class filter included. Pasting generation parameters (PNG Info, Send to txt2img/img2img, or the WebUI's paste button) also restores the whole ADetailer setup: it switches ADetailer and the tabs the image used on and, for an image made with ADetailer, switches off the tabs it did not use; settings that the image does not record go back to their defaults. Skip img2img is not restored (🟡 from plus.9 beta 1 it is, for images made with that beta or later), and fields listed in the WebUI's "Disregard fields from pasted infotext" are left alone. From plus.8, a tab whose detector is not installed in this WebUI keeps its own detector and class filter and is switched off: it no longer switches ADetailer on or makes Generate fail, and the console names the missing detector. Pasting also splits an old sampler name that holds its scheduler, such as "DPM++ 2M SDE Karras", into the sampler and the scheduler; for the names it does not split, see [Known issues](#known-issues). 🟡 From plus.9 beta 1 pasting splits the name as Load does, and a separate sampler this WebUI does not have becomes the first sampler, with a console message.
 
 ### Preset Library
 
@@ -912,13 +1114,13 @@ Save the whole preset library as a file, to back it up or move it to another com
 
 **How to use:**
 
-- **Export:** click the export button. On Forge and Forge Neo your browser downloads the whole library as `adetailer-ultimate-presets.json`.
+- **Export:** click the export button. On Forge and Forge Neo your browser downloads the whole library as `adetailer-ultimate-presets.json`; 🟡 from plus.9 beta 1, on AUTOMATIC1111 and the other WebUIs with Gradio 3 too.
 - **Import:** click **📥 Import** and choose a preset file, either an exported file or a copy of `user_presets.json`. Presets with a new name are added. When you already have a preset with the same name, yours is kept, unless "Overwrite on conflict" is ticked: then the imported one replaces it.
 
 **Good to know:**
 
 - On Forge and Forge Neo, plus.7.4 downloads nothing on the first click of the export button and the previous click's file after that: click it twice without saving presets in between. This is fixed in plus.8; the fix is not yet tested in a browser.
-- On AUTOMATIC1111, and on other WebUIs with Gradio 3 such as reForge's main branch, the export button cannot download a file. From plus.8 its status line says so; in plus.7.4 it wrongly reports the presets as exported, and the button's label changes to a file path. Back up the library by copying `user_presets.json` from the extension's folder instead. Import works on every WebUI from plus.8 on; in plus.7.4 it stops with an error on those WebUIs, so copy `user_presets.json` by hand there too.
+- On AUTOMATIC1111, and on other WebUIs with Gradio 3 such as reForge's main branch, the export button cannot download a file in plus.8 (🟡 from plus.9 beta 1 it downloads it, as on Forge). In plus.8 its status line says so; in plus.7.4 it wrongly reports the presets as exported, and the button's label changes to a file path. Back up the library by copying `user_presets.json` from the extension's folder instead. Import works on every WebUI from plus.8 on; in plus.7.4 it stops with an error on those WebUIs, so copy `user_presets.json` by hand there too.
 - The status line counts the presets added, replaced and not imported (because of a name conflict, an invalid name, a library that could not be written or, from plus.8, a damaged preset).
 - The tab you import in lists the new presets at once; the other tabs list them after the next Save, Rename or Delete in the same panel (from plus.8: also after a browser reload).
 - Files saved as UTF-8 import fine.
@@ -988,11 +1190,13 @@ See what the tab's detector finds on an image, without generating or changing an
 1. Pick a detector in the tab's "ADetailer detector" list first. The preview uses the tab's detector; without one it only asks you to pick one.
 2. Drop or paste an image into **Input**.
 3. Click **🔍 Run detection preview**. **Detections** shows the image with the box or mask of every region found and its number (#1, #2, …); YOLO detectors also write each box's class and confidence. From plus.8 the number also names the class when the detector has class names, such as `#1 face` or `#1 eyes`. The status line counts the detections.
+4. 🟡 From plus.9 beta 1, click the boxes on **Detections** to choose which ones to inpaint: a click adds the box's number to the tab's "Inpaint only these detections" field, a second click takes it out, and the chosen boxes are marked in green. A smaller box inside a larger one, such as the eyes inside the face, is drawn on top, so it can be clicked too. After a single-tab preview with detections, the status line reads "✅ N detection(s). Click the boxes to choose which to inpaint."
 
 **Good to know:**
 
 - The preview follows the tab's CLASSES, "Exclude selected (NOT)", confidence threshold and "Detection resolution". It shows the detector's raw boxes and masks: mask preprocessing (x/y offset, erosion/dilation, merge mode, Use bbox as mask) and the mask filters (min/max area ratio, top k, Inpaint only these detections) are not applied to it.
 - Type the numbers into "Inpaint only these detections" to detail only those regions. They match the real pass only with the same detector, class filter, confidence and detection resolution.
+- 🟡 Clicking the boxes works with the single-tab preview, not with **🔁 Combine all tabs**. Numbers typed by hand mark their boxes too, and an empty field still means every detection. The boxes belong to the last preview: run it again after you change the picture, the detector, its classes, the confidence threshold or the detection resolution. If the boxes do not respond, for example on a WebUI whose page the script does not recognise, type the numbers as before.
 - **🔁 Combine all tabs** runs the detector of every tab that has one picked, whether or not its "Enable this tab" is ticked, and draws all the results on one image, one colour per tab (the colours repeat after the 6th tab), each labelled with its number, tab, class and confidence. The status line counts the detections of each tab. This combined view always runs each detector at its own size, whatever the tab's "Detection resolution".
 - "Enable ADetailer" and "Enable this tab" do not need to be ticked. If a generation is running, the preview waits for it to finish.
 - 🟢 When the WebUI is started with `--use-cpu adetailer`, or (except on macOS) with `--lowvram`, `--medvram` or `--medvram-sdxl`, the preview runs YOLO detectors on the CPU, as generation does. Of these flags, Forge Neo has only `--lowvram`. In plus.7.4 and beta 1 the preview always uses the graphics card.
@@ -1025,8 +1229,8 @@ Detail a picture you already have with this tab's settings, without generating i
 - From plus.8 the parameters of a result (the file saved to `ADetailer-Inpaint`, the picture downloaded from **Result**, and the PNG, JPEG and WebP copies a folder run saves next to their sources) also record the tab's ADetailer settings under the tab's own number, as a generation in which only that tab runs records them, also when "Enable this tab" is off. PNG Info and Send to then switch ADetailer and that tab on, switch the other tabs off and restore the tab's setup, together with the detailer pass's steps, sampler, seed and size. With the WebUI's "Write infotext to metadata" setting off none of them records parameters (see above), and a copy whose parameters cannot be written is saved without them (see Batch a whole folder, below). In beta 2 the file saved to `ADetailer-Inpaint` and the Result picture record only the detailer pass, so pasting them leaves the ADetailer tabs as they were; in plus.7.4 and beta 1 so does the Result picture of a single run that is not saved, while a saved PNG records the word "None" (see above). In plus.7.4, beta 1 and beta 2 the copies next to their sources record no parameters at all (see Batch a whole folder, below).
 - It works while [Manual mode](#manual-mode) is on. If a generation is running, the run waits for it.
 - **To stop a run:** the WebUI shows its Interrupt and Skip buttons only while its own Generate runs, so they stay hidden here. Press **Alt+Enter**, the WebUI's Skip shortcut, with the txt2img or img2img tab open: the region being redrawn is thrown away and the picture comes back unchanged ("Cancelled — image unchanged."), and a folder run stops before the next file. Esc does nothing here. With the WebUI started with `--api`, a request to `/sdapi/v1/interrupt` or `/sdapi/v1/skip` stops it too. Clicking Generate also shows the Interrupt button, but that generation then runs as soon as this job ends.
-- The status line says what happened: done, nothing detected, detections found but none left to inpaint (because of the detection numbers, the mask filters or `[SKIP]`), cancelled, or failed with a NaN error (AUTOMATIC1111, classic Forge and reForge).
-- 🟢 When some regions are detailed and others fail with a NaN error, the status also says how many were left unchanged. A folder run still counts such a file as detailed.
+- The status line says what happened: done, nothing detected, detections found but none left to inpaint (because of the detection numbers, the mask filters or `[SKIP]`), cancelled, failed with a NaN error (AUTOMATIC1111, classic Forge and reForge), or 🟡 from plus.9 beta 1 failed with another error while inpainting, with the reason of the first one.
+- 🟢 When some regions are detailed and others fail with a NaN error (🟡 from plus.9 beta 1, also with another error), the status also says how many were left unchanged. A folder run still counts such a file as detailed.
 - Rotated phone photos are detected upright. For a large picture, the regions are redrawn at a working size of at most 1024 pixels on the longest side, to avoid running out of memory, unless the tab uses "Use separate width/height", or "Inpaint only masked" with "Scale inpaint to bbox" or Settings → ADetailer → "Try to match inpainting size to bounding box size". With "Inpaint only masked" on (the default) the result keeps the picture's full size (in plus.7.4 and beta 1, only while the WebUI's "Overlay original for inpaint" setting is on; from plus.8 the region is pasted back anyway, see [Known issues](#known-issues)); with it off, the result comes back at the smaller working size.
 - The Size in a result's parameters (in the file saved to `ADetailer-Inpaint`, in the picture downloaded from **Result**, or, from plus.8, in a PNG, JPEG or WebP copy saved next to its source) is the working size the regions were redrawn at, not the picture's own size, as the WebUI records the Width and Height of an img2img inpaint: the picture's size, scaled down to 1024 pixels on the longest side when it is larger (keeping its proportions), then rounded down to a multiple of 8, and at least 64. So an 853x480 picture records 848x480; with "Inpaint only masked" on (the default) it keeps its 853x480 pixels, with it off it comes back at 848x480. With "Use separate width/height", or with "Inpaint only masked" on and "Scale inpaint to bbox" or Settings → ADetailer → "Try to match inpainting size to bounding box size", it is the size that option gives instead. With several regions, the Size, prompt, seed and denoising strength are those of the last region redrawn. Pasting the parameters into txt2img puts that size into Width and Height. From plus.8 the working size of a larger picture is exactly 1024 pixels on its longest side, so a 1288x966 picture records 1024x768; in plus.7.4, beta 1 and beta 2 it is 1016 for some sizes, such as 1016x768 for that picture.
 - 🟢 The transparent parts of a picture, such as a cut-out PNG, are filled with the WebUI's "img2img background colour" setting (white on AUTOMATIC1111 and grey on Forge Neo by default) before the pass, as img2img does, also in a folder batch. In plus.7.4 and beta 1 they turn black, or the colour they hold.
@@ -1093,6 +1297,25 @@ Keep a copy of the picture after each ADetailer pass, so you can go back when a 
 - If you press Skip or Interrupt during a sequential tab, the step files of the classes already done stay on disk, while the final picture goes back to how it was before that tab.
 - With Skip img2img, the before image is not saved, as it would be the input picture itself. From plus.8 the step images are saved there too; in plus.7.4 and beta 1 they are not.
 
+### Save inpaint masks
+
+🟡 New in plus.9 beta 1. Keep the black-and-white mask each region is inpainted with, to check what ADetailer redrew or to use the mask elsewhere.
+
+**Where:** Settings → ADetailer → "Save inpaint masks" (off by default).
+
+**How it works:**
+
+- One PNG file per region inpainted, in the `adetailer-steps` sub-folder (see [Output folders](#output-folders)), whatever image format the WebUI saves in: a lossy format would blur the mask's edges.
+- The files end in `-ad-mask-N-K`: N is the tab and K the region's number in that pass, counted in the order the regions are inpainted, for example `…-ad-mask-1-1` and `…-ad-mask-1-2` for two faces found by the 1st tab. K can differ from the numbers of the Detection preview.
+- In a tab with "Process classes sequentially", each class pass names its masks like its mask preview, for example `…-ad-mask-1-1-face-1`.
+
+**Good to know:**
+
+- The mask is the one img2img gets: after the mask offset, erosion / dilation, merge mode and the mask filters, at the size of the picture the pass works on. "Inpaint mask blur" is added later by img2img, so it is not in the file.
+- A region that is skipped (for example with `[SKIP]`), fails or is cancelled saves no mask, so its number is missing.
+- "Run ADetailer on an image" and folder runs save the masks too, numbered with the tab they were started from.
+- Each file records the parameters of its picture, like the step images. If a mask cannot be saved, the console says so and the pass goes on.
+
 ### Output folders
 
 Where the files ADetailer saves end up.
@@ -1100,7 +1323,7 @@ Where the files ADetailer saves end up.
 | Files | Saved when | Folder |
 | --- | --- | --- |
 | Final pictures | always, by the WebUI | the WebUI's usual output folder, unchanged |
-| Step images (`-ad-step`), mask previews (`-ad-preview`), before images (`-ad-before`) | the matching option in Settings → ADetailer is on | an `adetailer-steps` sub-folder inside the folder of the final picture, for example `txt2img-images/2026-06-03/adetailer-steps/` (for "Run ADetailer on an image", see below) |
+| Step images (`-ad-step`), mask previews (`-ad-preview`), before images (`-ad-before`), 🟡 inpaint masks (`-ad-mask`, from plus.9 beta 1) | the matching option in Settings → ADetailer is on | an `adetailer-steps` sub-folder inside the folder of the final picture, for example `txt2img-images/2026-06-03/adetailer-steps/` (for "Run ADetailer on an image", see below) |
 | Results of "Run ADetailer on an image" | "💾 Save result to outputs" is ticked | an `ADetailer-Inpaint` folder next to the img2img output folder (by default beside `txt2img-images` and `img2img-images`), in a date sub-folder when the WebUI saves images to sub-folders |
 | Results of a folder batch | for every picture that was detailed | `ADetailer-Inpaint`, or next to each source with "📁 Save results in the source folder instead" |
 
@@ -1111,6 +1334,7 @@ Where the files ADetailer saves end up.
 - If `adetailer-steps` cannot be created (for example because a file with that name is already there), the files are saved in the folder above it and the console says so.
 - The final picture never moves, whatever the ADetailer options.
 - 🟢 From plus.8, the results in `ADetailer-Inpaint` record the detailer pass's parameters, so PNG Info and Send to read them; their Size is the size the regions were redrawn at, not the picture's (see [Run ADetailer on an image](#run-adetailer-on-an-image)). From plus.8 they also record the tab's ADetailer settings, and PNG, JPEG and WebP copies saved next to their sources record the same parameters.
+- 🟡 From plus.9 beta 1, the mask previews, step images and masks of "Run ADetailer on an image" and folder runs record their parameters too (the detailer pass, the loaded checkpoint and VAE, and the tab's ADetailer settings); in plus.8 they record none, and the console prints "create_infotext failed" for each one. A `[user]` or `[denoising]` token in the WebUI's pattern for file or folder names no longer prints a traceback for these files and for the results in `ADetailer-Inpaint`.
 
 ### ADetailer Guide tab
 
@@ -1136,7 +1360,7 @@ Small things you see in the ADetailer panel.
 - **Tab counter:** a green pill next to the ADetailer title, for example "2x Tabs", counts the tabs with "Enable this tab" ticked. It shows even when the panel is closed and hides at 0; txt2img and img2img count separately. It counts the ticked boxes only: a tab whose detector is `None` is counted but does nothing. On Forge and Forge Neo it also follows Paste settings, Load and Reset from plus.8; before, a fast answer there could leave the old count until something else changed on the page.
 - **Only the 1st tab starts on:** on a fresh setup, "Enable this tab" is ticked only in the 1st tab, so one detailing pass runs by default. When you pick a detector in another tab, tick its "Enable this tab" too.
 - **Tab layout:** each tab starts with "Enable this tab", then the collapsed "Preset library export / import" section, the preset rows and the Copy and Paste buttons, then the detector with its classes, followed by the sections Inpaint prompts, Detection, Detection preview, Run ADetailer on an image, Mask Preprocessing and Inpainting, and the ControlNet settings.
-- **Tooltips and status messages:** hover over the fork's buttons for a short explanation. The messages under the preset and export / import buttons fade after about 4 seconds; those of the Detection preview and "Run ADetailer on an image" stay until the next run. Repeating an action shows its message again (on Forge and Forge Neo, from plus.8 also after a very fast answer, and after an Import).
+- **Tooltips and status messages:** hover over the fork's buttons, and over the options of a tab, for a short explanation. The messages under the preset and export / import buttons fade after about 4 seconds; those of the Detection preview and "Run ADetailer on an image" stay until the next run. Repeating an action shows its message again (on Forge and Forge Neo, from plus.8 also after a very fast answer, and after an Import).
 - **Themes:** labels, hints and messages are readable on both the dark and the light theme.
 - **Translations:** with the companion [Language Diffusion](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion) extension the interface can be shown in 10 languages; the options added in recent versions still show in English until the dictionaries are updated, and, from plus.8, on Forge and Forge Neo the translated "Use same …" values of the dropdowns stay translated after a change. See [Translations](#translations).
 
@@ -1152,18 +1376,24 @@ Options marked *(fork)* are added by ADetailer Ultimate; the others come from th
 | Show the ADetailer Guide tab (top tab bar) *(fork)* | Adds an "ADetailer Guide" tab next to Settings, with a plain-language guide to the main options and to common problems (in English), and a "📖 Guide" link in the ADetailer header that opens it. Click Reload UI after changing it. See [ADetailer Guide tab](#adetailer-guide-tab). | Off |
 | Verbose diagnostic log *(fork)* | Prints a detailed report to the console for every pass: each active tab's settings, what was detected (class, confidence, mask size), the prompt used for each region, and the time and VRAM each step took. It never changes the result. Useful when you report a problem. From plus.8, when the console output goes to a log file or to another program on Windows, the report is no longer lost; before, whole blocks (often the header and every tab's settings) were dropped when they held a character the log could not store. | Off |
 | Extra paths to scan adetailer models separated by vertical bars(\|) | More folders where ADetailer looks for detector models (`.pt` files), besides the WebUI's `models/adetailer` folder. Separate the folders with `\|`. Click Reload UI after changing it. A model file can contain code, so put there only files from sources you trust. | Empty |
-| Output directory for adetailer images | The folder for the extra images of the three options below (mask previews, images before ADetailer, step images). Empty means the WebUI's usual txt2img or img2img output folder. This fork puts these images in an `adetailer-steps` sub-folder there, so the main folder holds only final images (see [Output folders](#output-folders)). | Empty |
+| Output directory for adetailer images | The folder for the extra images of the options below (mask previews, 🟡 inpaint masks, images before ADetailer, step images). Empty means the WebUI's usual txt2img or img2img output folder. This fork puts these images in an `adetailer-steps` sub-folder there, so the main folder holds only final images (see [Output folders](#output-folders)). | Empty |
 | Save mask previews | Also saves a copy of each image with the detected regions drawn on it (file name ending in `-ad-preview-1` for the 1st tab, `-ad-preview-2` for the 2nd, …; the original names them `-ad-preview`, `-ad-preview-2nd`, …). In sequential mode this fork saves one per class pass, named after the class, such as `-ad-preview-1-1-face`. | Off |
+| 🟡 Save inpaint masks *(fork, from plus.9 beta 1)* | Also saves, as a PNG, the black-and-white mask each region is inpainted with (file name ending in `-ad-mask-N-K`: tab N, K-th region inpainted; in sequential mode `-ad-mask-1-1-face-1` and so on). No file for a region that is skipped, fails or is cancelled. See [Save inpaint masks](#save-inpaint-masks). | Off |
+| 🟡 Match the colors of each inpainted region to the picture *(fork, from plus.9 beta 1)* | After each region is inpainted, matches the colors of its box, with the "Inpaint only masked padding, pixels" around it, to the same area of the picture before the pass, with the WebUI's own color correction, and puts the result back only inside the mask, its edge softened by "Inpaint mask blur". It is the WebUI's "Apply color correction to img2img results to match original colors" for ADetailer only: with that WebUI setting on, the regions are already corrected and this option adds nothing. On AUTOMATIC1111 the WebUI's correction fixes the tint and keeps the brightness of the inpainted region; on Forge Neo it matches the brightness too. Being a setting, it is not written into the image parameters. | Off |
+| 🟡 Detailed region opacity *(fork, from plus.9 beta 1)* | How much of each inpainted region is kept, from 0 to 100. Below 100, each region is blended with the picture as it was before that region (50 keeps exactly half of the change); at 100 the picture is not touched. Written into the image parameters as "ADetailer region opacity" only when below 100; pasted parameters do not set it. With a high denoising strength a faint double outline can show. | 100 |
 | Save images before ADetailer | Also saves each image as it was before ADetailer (file name ending in `-ad-before`). | Off |
 | Save intermediate step images (one per tab pass) *(fork)* | Also saves the image after each tab's pass (`-ad-step-1`, `-ad-step-2`, …) and, in sequential mode, after each class pass (`-ad-step-1-1-face`, `-ad-step-1-2-hand`, …). If a later pass spoils something, the earlier step is still on disk. From plus.8 also with Skip img2img; before, not with it. See [Save intermediate step images](#save-intermediate-step-images). | Off |
 | Manual mode — don't auto-run ADetailer after generation *(fork)* | ADetailer no longer runs after each generation, but every tab keeps its settings. Handy for making many drafts quickly: detail the ones you keep with "Run ADetailer on an image", which works while this option is on, or turn the option off and generate again. See [Manual mode](#manual-mode). | Off |
-| Apply only selected scripts to ADetailer | On: the detailer pass runs only the scripts listed in the next option, plus the WebUI's own Soft Inpainting and HyperTile, and ControlNet when the tab uses it. Off: every script active in your generation also runs in the detailer pass. From plus.8, with it off, a tab's "Use separate steps" and "Use separate sampler" still apply; before, the detailer pass took the main generation's steps, sampler and scheduler. | On |
-| Script names to apply to ADetailer (separated by comma) | The scripts (from other extensions) that also run in the detailer pass while the option above is on, as a comma-separated list of script names. Adding `comments` also removes the prompt comments typed in the ADetailer prompts, with a limit (see [Known issues](#known-issues)). | `dynamic_prompting,dynamic_thresholding,lora_block_weight,negpip,wildcard_recursive,wildcards` |
+| Apply only selected scripts to ADetailer | On: the detailer pass runs only the scripts listed in the next option, plus the WebUI's own Soft Inpainting and HyperTile, and ControlNet when the tab uses it. 🟡 From plus.9 beta 1, reForge's Advanced Model Sampling scripts always run there too (needed by v-prediction and flow models), and so does the reForge-RescaleCFG extension, whose script file has the same name as one of these scripts; in plus.8, add `advanced_model_sampling_script` (and `advanced_model_sampling_script_backported` where reForge has it) to the next option. Off: every script active in your generation also runs in the detailer pass. From plus.8, with it off, a tab's "Use separate steps" and "Use separate sampler" still apply; before, the detailer pass took the main generation's steps, sampler and scheduler. | On |
+| Script names to apply to ADetailer (separated by comma) | The scripts (from other extensions) that also run in the detailer pass while the option above is on, as a comma-separated list of script names. In plus.8, adding `comments` also removes the prompt comments typed in the ADetailer prompts, with a limit (see [Known issues](#known-issues)); 🟡 from plus.9 beta 1 they are removed without it. | `dynamic_prompting,dynamic_thresholding,lora_block_weight,negpip,wildcard_recursive,wildcards` |
 | Sort bounding boxes by | The order in which the detected regions are detailed: None (the detector's own order), Position (left to right), Position (center to edge) or Area (large to small). With `[SEP]` in the prompt, it also sets which region gets which part of the prompt. The numbers of the Detection preview and of "Inpaint only these detections" always follow the detector's own order. | None |
+| 🟡 Drop overlapping detections (max overlap, 0 = off) *(fork, from plus.9 beta 1)* | When two detections of the same class overlap more than this (intersection over union, 0 to 0.95), only the more confident one is inpainted, so a face found twice is inpainted once. A much smaller box inside a bigger one, such as the eyes in a face, is kept (of two boxes one inside the other, the less confident one drops when the smaller's area is more than this share of the bigger one's), and detections of different classes never drop each other (when the detector has class names). It applies after "Inpaint only these detections", so the numbers of the Detection preview keep working; the preview itself still shows every detection. About 0.4 to 0.6 works well: the built-in YOLO detectors already drop boxes of the same class that overlap more than 0.7. | 0 |
 | Use same seed for each tab in adetailer | On: every detected region is redrawn with the image's seed. Off: each region gets its own seed, counting up from the image's seed. | Off |
 | Power scaling for dynamic denoise strength based on bounding box size | With a value above 0, smaller regions get more denoising and larger ones less, and the tab's "Inpaint denoising strength" is the most any region gets. 0 = off, 1 = linear, 2 to 4 recommended. A tab's own "Dynamic denoise by area" slider *(fork)* is used instead when it is not 0. | 0 |
 | Try to match inpainting size to bounding box size, if 'Use separate width/height' is not set | Sets each region's inpaint size from the shape of its box. Off; Strict (SDXL only), which uses the sizes SDXL was trained on; or Free, for any model and any size. With this fork (from plus.8) it works only with "Inpaint only masked" on, and a tab's "Scale inpaint to bbox" *(fork)* takes its place when that is ticked. | Off |
+| 🟡 Upscaler for ADetailer's inpaint area *(fork, from plus.9 beta 1)* | The upscaler that enlarges the area ADetailer inpaints when it is smaller than the inpaint size: the crop of "Inpaint only masked", or the whole picture with a larger "Use separate width/height". With "Inpaint only masked", it also enlarges the result back to the crop's size when the crop is bigger than the inpaint size; in "Run ADetailer on an image" and folder runs with the WebUI's "Overlay original for inpaint" off, that last step uses the WebUI's own upscaler. The first choice uses the WebUI's "Upscaler for img2img", as before; another choice uses that upscaler for ADetailer only, and the WebUI's setting comes back after each pass. Left out when the upscaler is no longer installed or the settings are frozen. If the WebUI saves its settings during a pass, the chosen upscaler is saved as "Upscaler for img2img" (the separate CLIP skip, checkpoint and VAE have the same limit). 🟡 From plus.9 beta 1, with frozen settings (`--freeze-settings` and the like) the tab's own CLIP skip, checkpoint and VAE are left out too, with a console message, instead of stopping ADetailer for the image. | Use the WebUI's img2img upscaler |
 | Remember last-used settings between restarts *(fork)* | Saves each tab's settings every time you click Generate, separately for txt2img and img2img, and brings them back at the next start (file `user_state.json` in the extension's folder, see [Your data](#your-data)). A change you never generate with is not saved. Off: tabs start with the defaults, and the saved file is kept for when you turn it on again. See [Remember last-used settings](#remember-last-used-settings). | On |
+| 🟡 Enable ADetailer at startup *(fork, from plus.9 beta 1)* | Starts the ADetailer panel already switched on in the chosen tabs: Off, txt2img, img2img or Both. Click Reload UI after changing it. With Off, the WebUI's Settings → Defaults decide as before (see [Startup defaults for the panel's checkboxes](#startup-defaults-for-the-panels-checkboxes)); any other choice wins over Defaults for the on or off state of those tabs. API requests are not affected, and "Remember last-used settings between restarts" does not store the on or off state. | Off |
 | 🔄 Reset ADetailer settings to defaults *(fork)* | A button at the bottom of the page. After you confirm, it puts every option on this page back to its default and reloads the page; from plus.8, Cancel changes nothing (in plus.7.4, Cancel still resets and saves every option). Max tabs, the Guide tab and the extra model folders change only after you click Reload UI. See [Reset](#reset). | – |
 
 Good to know:
@@ -1183,6 +1413,7 @@ Good to know:
 
 - Each mode keeps one value for all its tabs, taken from the 1st tab.
 - With "Enable ADetailer" on by default, the ADetailer panel starts open and ADetailer runs on every generation.
+- 🟡 From plus.9 beta 1, Settings → ADetailer → "Enable ADetailer at startup" does the same for "Enable ADetailer" without Settings → Defaults: set it to txt2img, img2img or Both and reload the UI. Any choice but Off wins over the value kept here for those tabs.
 - 🟢 From plus.8, a folder path typed in "Or batch a whole folder" is never saved as a startup default. Before, it could be, and every single-image run of "Run ADetailer on an image" then detailed the whole folder.
 
 ## Upstream options
@@ -1212,7 +1443,7 @@ Good to know about Skip img2img (apart from the one-step pass and the last point
 
 Three special words work in these prompts: `[SEP]` splits the prompt so the 1st, 2nd, … region each get their own part; `[SKIP]` skips a region; `[PROMPT]` puts the main prompt at that spot. See the original ADetailer's [Advanced wiki page](https://github.com/Bing-su/adetailer/wiki/Advanced). A request example for the WebUI's API is on its [REST API wiki page](https://github.com/Bing-su/adetailer/wiki/REST-API).
 
-Prompt comments (`#`, and on Forge Neo also `//` and `/* */`), which the WebUI removes from the main prompt, are left out of a blank or `[PROMPT]` ADetailer prompt too, because that takes the main prompt. Comments typed in the ADetailer prompt boxes themselves are not removed: with "Apply only selected scripts to ADetailer" on (the default) the detailer pass runs without the WebUI's comment removal, so their text reaches the model. Adding `comments` to "Script names to apply to ADetailer" removes them, but a comment on the last line of a typed prompt then also removes what is added after it on that line: the append text, the main prompt's LoRAs and what the selected Styles add after the prompt. See [Known issues](#known-issues).
+Prompt comments (`#`, and on Forge Neo also `//` and `/* */`), which the WebUI removes from the main prompt, are left out of a blank or `[PROMPT]` ADetailer prompt too, because that takes the main prompt. 🟡 From plus.9 beta 1, comments typed in the ADetailer prompt, negative prompt and append boxes are removed too, before the detailer pass, following the WebUI's own comment setting, also with "Apply only selected scripts to ADetailer" on; a box that holds only a comment counts as blank and takes the main prompt. In plus.8, comments typed in the ADetailer prompt boxes themselves are not removed: with "Apply only selected scripts to ADetailer" on (the default) the detailer pass runs without the WebUI's comment removal, so their text reaches the model. Adding `comments` to "Script names to apply to ADetailer" removes them, but a comment on the last line of a typed prompt then also removes what is added after it on that line: the append text, the main prompt's LoRAs and what the selected Styles add after the prompt. See [Known issues](#known-issues).
 
 **Detection**
 
@@ -1227,11 +1458,13 @@ Prompt comments (`#`, and on Forge Neo also `//` and `/* */`), which the WebUI r
 
 | Option | What it does | Default |
 | --- | --- | --- |
-| Mask x(→) offset, Mask y(↑) offset | Moves the mask sideways and up or down, in pixels. With this fork (from plus.8) a moved mask stops at the image border instead of wrapping round to the other side. | 0 |
-| Mask erosion (-) / dilation (+) | Shrinks (negative values) or grows (positive values) the mask. | 4 |
+| Mask x(→) offset, Mask y(↑) offset | Moves the mask sideways and up or down, in pixels, from -200 to 200 (🟡 from plus.9 beta 1, from -512 to 512). With this fork (from plus.8) a moved mask stops at the image border instead of wrapping round to the other side. | 0 |
+| Mask erosion (-) / dilation (+) | Shrinks (negative values) or grows (positive values) the mask, from -128 to 128 (🟡 from plus.9 beta 1, from -256 to 256). | 4 |
 | Mask merge mode | None: each mask is inpainted on its own. Merge: all masks are joined and inpainted once. Merge and Invert: all masks are joined and everything else is inpainted; with this fork (from plus.8) the pass is skipped when the detections cover the whole image, since nothing is left to inpaint. | None |
 
 They are applied in this order: offset, then erosion or dilation, then merge mode.
+
+🟡 From plus.9 beta 1 these sliders, and "Inpaint mask blur" and "Inpaint only masked padding, pixels" below, go further, for large pictures ([Bing-su/adetailer#111](https://github.com/Bing-su/adetailer/issues/111)). The defaults are unchanged, and presets, pasted parameters, remembered settings and API requests already accepted such values.
 
 **Inpainting**
 
@@ -1239,9 +1472,9 @@ These work like the options of the same name in img2img's Inpaint tab.
 
 | Option | What it does | Default |
 | --- | --- | --- |
-| Inpaint mask blur | Softens the edge of the mask, for smoother blending. | 4 |
+| Inpaint mask blur | Softens the edge of the mask, for smoother blending, up to 64 (🟡 from plus.9 beta 1, up to 256). | 4 |
 | Inpaint denoising strength | How much the region changes: lower keeps more of the original, higher redraws more. About 0.3 to 0.5 is typical. | 0.4 |
-| Inpaint only masked, Inpaint only masked padding, pixels | On: only the region is redrawn, at full resolution, with this many pixels of surroundings, and then pasted back into the picture. Off: the whole picture is inpainted, and with this fork (from plus.8) it keeps its size, also after hires.fix. From plus.8, the region is always pasted back, also when the WebUI's "Overlay original for inpaint" setting is off (two limits: see [Known issues](#known-issues)). | On, 32 |
+| Inpaint only masked, Inpaint only masked padding, pixels | On: only the region is redrawn, at full resolution, with this many pixels of surroundings (up to 256; 🟡 from plus.9 beta 1, up to 512), and then pasted back into the picture. Off: the whole picture is inpainted, and with this fork (from plus.8) it keeps its size, also after hires.fix. From plus.8, the region is always pasted back, also when the WebUI's "Overlay original for inpaint" setting is off (two limits: see [Known issues](#known-issues)). | On, 32 |
 | Use separate width/height (inpaint width, inpaint height) | The resolution the region is redrawn at. | Off, 512 x 512 |
 | Use separate steps, Use separate CFG scale | Steps and CFG scale for the detailer pass only. From plus.8, the separate steps apply also with Settings → ADetailer → "Apply only selected scripts to ADetailer" off. | Off (28 steps, CFG 7) |
 | Use separate checkpoint, Use separate VAE | Another checkpoint or VAE for the detailer pass only. On Forge and Forge Neo, "Use separate VAE" works with this fork (it had no effect there in the original). | Off |
@@ -1261,11 +1494,11 @@ These need ControlNet installed, with ControlNet models; without ControlNet the 
 | Option | What it does | Default |
 | --- | --- | --- |
 | ControlNet model | A ControlNet model for the detailer pass. Models whose name contains inpaint, scribble, lineart, openpose, tile, depth or union, in any letter case, are listed. Passthrough uses the ControlNet settings you made outside ADetailer. From plus.8, on classic Forge the model works with its current built-in ControlNet; before, every region printed a ControlNet error and was detailed without ControlNet (checked in classic Forge's code, not tested live). | None |
-| ControlNet module | The preprocessor. Choosing a model lists the preprocessors that fit it and picks the first, unless the tab's preprocessor fits the new model; on Forge, Forge Neo and reForge that first one is "None" (see below). With this fork (from plus.8) a saved preprocessor that fits the model is kept when you load a preset or paste settings, and a restored model shows its preprocessor after a restart. From plus.8, a model whose file name writes its type with capitals, such as `OpenPoseXL2`, gets its preprocessors too; before, it got none. | Set by the model |
+| ControlNet module | The preprocessor. Choosing a model lists the preprocessors that fit it and picks the first, unless the tab's preprocessor fits the new model; on Forge, Forge Neo and reForge that first one is "None" in plus.8 (see below), and 🟡 from plus.9 beta 1 the model's default preprocessor is picked there instead. With this fork (from plus.8) a saved preprocessor that fits the model is kept when you load a preset or paste settings, and a restored model shows its preprocessor after a restart. From plus.8, a model whose file name writes its type with capitals, such as `OpenPoseXL2`, gets its preprocessors too; before, it got none. | Set by the model |
 | ControlNet weight | How strongly ControlNet guides the pass. | 1.0 |
 | ControlNet guidance start, ControlNet guidance end | When ControlNet starts and stops guiding, as a share of the steps. | 0 and 1 |
 
-On Forge, Forge Neo and reForge the preprocessor list starts with "None", which hands the picture to ControlNet as it is: for pose, depth, lineart, scribble and inpaint models, pick the preprocessor yourself there, for example `openpose_full`, `depth_midas`, `lineart_coarse` or `inpaint_global_harmonious`. An API request that leaves the preprocessor out also runs without one there, while AUTOMATIC1111, whose lists have no "None", uses the model's default preprocessor.
+On Forge, Forge Neo and reForge the preprocessor list starts with "None", which hands the picture to ControlNet as it is. 🟡 From plus.9 beta 1, choosing a ControlNet model there selects its default preprocessor (for example `openpose_full` or `depth_midas`), as AUTOMATIC1111 does; picking "None" afterwards keeps it, a saved "None" survives a restart, loading a preset or pasting parameters that change the model gives the model's default, and an API request without `ad_controlnet_module` also uses the default. In plus.8, for pose, depth, lineart, scribble and inpaint models, pick the preprocessor yourself there, for example `openpose_full`, `depth_midas`, `lineart_coarse` or `inpaint_global_harmonious`. An API request that leaves the preprocessor out also runs without one there, while AUTOMATIC1111, whose lists have no "None", uses the model's default preprocessor.
 
 ## Models
 
@@ -1304,6 +1537,7 @@ The five `mediapipe_…` detectors need no file in `models/adetailer`.
 - Only `mediapipe_face_features` has classes (eyes, mouth, nose, eyebrows, face). Pick them in the CLASSES list, and use "Process classes sequentially" or per-class prompts with them. The other MediaPipe detectors have no class filter.
 - If MediaPipe is missing or broken, these detectors find nothing, while the other detectors keep working. From plus.8 the console says so once per session, and why (see [Problems and fixes](#install-and-startup)).
 - ADetailer Ultimate keeps MediaPipe on the tested 0.10 versions, because MediaPipe 1.0.1 closes the whole WebUI on macOS.
+- 🟡 From plus.9 beta 1, MediaPipe no longer starts the audio system when the `sounddevice` package is installed, which on Windows could stop the sound of other programs (see [Install and startup](#install-and-startup)).
 
 ### Add your own detectors
 
@@ -1319,6 +1553,19 @@ Good to know:
 - A detector must be an [Ultralytics](https://github.com/ultralytics/ultralytics) YOLO model that finds boxes (detection) or outlines (segmentation), with a file name ending in `.pt`.
 - A detector trained on several classes lists them in the CLASSES list, so you can choose which ones to detail (see [Class names](#class-names)).
 - A detector whose file name contains `-world` is treated as a YOLO-World detector.
+- A detector that downloads as a `.zip` file must be extracted first: ADetailer reads only the `.pt` file. 🟡 From plus.9 beta 1, the console names the `.zip` files it finds in the detector folders at startup.
+- A detector made with a newer Ultralytics than the one in your WebUI, such as a recent YOLO12 or YOLO26 model, does not load until Ultralytics is updated. 🟡 From plus.9 beta 1, the console and the Detection preview say so (see [Nothing runs or nothing is detected](#nothing-runs-or-nothing-is-detected)).
+
+### Find more detectors
+
+The built-in detectors cover faces, hands and people. For other parts of a picture, add a detector file as in [Add your own detectors](#add-your-own-detectors):
+
+- **More from the same page:** the [Bingsu/adetailer](https://huggingface.co/Bingsu/adetailer) page on Hugging Face (Apache-2.0 license), where most of the built-in detectors come from, also has larger face and hand detectors (`face_yolov8m.pt`, `face_yolov9c.pt`, `hand_yolov8s.pt`, `hand_yolov9c.pt`), `person_yolov8m-seg.pt`, and `deepfashion2_yolov8s-seg.pt`, which finds 13 kinds of clothing as separate classes.
+- **Community detectors:** Civitai and Hugging Face host many detectors made for ADetailer, for eyes, hair, feet, clothing and more: search those sites for "ADetailer". Read the page first: prefer a detector with many downloads and reviews, check its license, and look at its classes, which the CLASSES list will show.
+- **Eyes, mouth, nose and eyebrows** need no file: use `mediapipe_face_features` (see [Face parts detector](#face-parts-detector-mediapipe_face_features)).
+- **Anything you can name**, with mixed results: a YOLO-World detector looks for the words you type (see [YOLO-World detectors](#yolo-world-detectors)).
+
+A `.pt` file can contain code, not only data: download detectors only from sources you trust.
 
 ### Class names
 
@@ -1336,7 +1583,7 @@ A detector that does not list its classes, or lists them under names you don't l
 - From plus.8, the file can be saved as UTF-8 (with or without a byte-order mark) or UTF-16, which is what Notepad's "Unicode" option and Windows PowerShell write. In plus.7.4, save it as plain UTF-8 without a byte-order mark (in Notepad: "UTF-8", not "UTF-8 with BOM" or "Unicode"); other encodings do not work there.
 - Other `.json` files next to your detectors, such as the metadata some model managers write, are ignored.
 - Class names are looked up once per session: after they have been found for a detector (from this file or from the model), adding or changing this file needs a restart of the WebUI.
-- On AUTOMATIC1111, a detector without this file lists its classes only after its first detection, in a generation or a Detection preview: then switch to another detector and back. From plus.8, the class filter works in generation either way (in plus.7.4 it is ignored for such a detector until you add the file and restart the WebUI). With the file, the classes are listed straight away, and from plus.8 a file added while the WebUI is running fills an empty CLASSES dropdown without a restart: switch to another detector and back, as long as that detector's CLASSES dropdown is still empty. Classic Forge (checked in its code) and Forge Neo list the classes straight away; reForge is not tested.
+- On AUTOMATIC1111, a detector without this file lists its classes only after its first detection in plus.8, in a generation or a Detection preview: then switch to another detector and back (🟡 from plus.9 beta 1 it lists them straight away, read from the detector file without loading it). From plus.8, the class filter works in generation either way (in plus.7.4 it is ignored for such a detector until you add the file and restart the WebUI). With the file, the classes are listed straight away, and from plus.8 a file added while the WebUI is running fills an empty CLASSES dropdown without a restart: switch to another detector and back, as long as that detector's CLASSES dropdown is still empty. Classic Forge (checked in its code) and Forge Neo list the classes straight away; reForge is not tested.
 
 #### Backwards compatibility
 
@@ -1357,7 +1604,7 @@ A detector that does not list its classes, or lists them under names you don't l
 
 A few of the most common tips are also in the optional ADetailer Guide tab, under "🛠️ Fixing common problems" (turn it on in Settings → ADetailer → "Show the ADetailer Guide tab (top tab bar)", then reload the UI). Problems still open in the current release are listed in [Known issues](#known-issues). If your problem is not here, please open an Issue (see [For developers](#for-developers)).
 
-Entries marked 🟢 "fixed in plus.8" still happen in plus.7.4 and in beta 1: their tip is the workaround there, where there is one.
+Entries marked 🟢 "fixed in plus.8" still happen in plus.7.4 and in beta 1: their tip is the workaround there, where there is one. Entries marked 🟡 "fixed in plus.9 beta 1" still happen in the stable release, v26.2.0+plus.8, in the same way.
 
 ### Install and startup
 
@@ -1383,6 +1630,15 @@ Entries marked 🟢 "fixed in plus.8" still happen in plus.7.4 and in beta 1: th
 **The built-in detectors are missing from the "ADetailer detector" list**
 
 - The first start had no internet or could not reach Hugging Face, or the WebUI was started with the `--ad-no-huggingface` option. Restart the WebUI once with an internet connection and without that option. Your own detectors in `models/adetailer` are listed either way.
+
+**A detector you added is not in the "ADetailer detector" list**
+
+- ADetailer reads only `.pt` files. Many detectors on Civitai download as a `.zip` file: extract the `.pt` file from it into the same folder and restart the WebUI. 🟡 From plus.9 beta 1, the console names up to 5 `.zip` files it finds in the detector folders at startup.
+- The file must be in `models/adetailer`, in one of its sub-folders or in a folder listed in Settings → ADetailer → "Extra paths to scan adetailer models separated by vertical bars(|)", and the WebUI must be restarted after you add it (see [Add your own detectors](#add-your-own-detectors)).
+
+**Sound in other programs stops, or Windows lists Python as using the microphone, when a MediaPipe detector runs (🟡 fixed in plus.9 beta 1)**
+
+- This happens when the `sounddevice` package is installed in the WebUI's Python environment: loading MediaPipe also starts the audio system. In plus.8, use a YOLO face detector instead of the MediaPipe ones if this bothers you. From plus.9 beta 1, ADetailer loads MediaPipe without `sounddevice`, which detection does not need, unless another extension has already loaded MediaPipe or `sounddevice`. Reported upstream in [Bing-su/adetailer#508](https://github.com/Bing-su/adetailer/issues/508).
 
 **AUTOMATIC1111 stops at startup with "The queue is enabled for event … but the queue has not been enabled for the app" (🟢 fixed in plus.8)**
 
@@ -1418,6 +1674,10 @@ Entries marked 🟢 "fixed in plus.8" still happen in plus.7.4 and in beta 1: th
 - Check that the detector fits the picture: the MediaPipe detectors are made for realistic faces, and a hand detector finds no faces.
 - `mediapipe_face_features` finds nothing for class names it does not have. Pick the names from its CLASSES list.
 
+**A detector fails with "Can't get attribute 'C3k2'" or a similar name**
+
+- The detector was made with a newer Ultralytics than the one in your WebUI, as can happen with recent models such as YOLO12 or YOLO26. Update Ultralytics in the WebUI's Python environment, or choose another detector. 🟡 From plus.9 beta 1, the console and the Detection preview status say so, naming the file and the installed Ultralytics version (in the console the message can appear twice).
+
 **Small or distant faces are missed**
 
 - Raise "Detection resolution (0 = default)" in the tab above the detector's own size, for example to 1024 for a built-in detector (they use 640). It works with YOLO detectors and uses more VRAM and time.
@@ -1426,7 +1686,7 @@ Entries marked 🟢 "fixed in plus.8" still happen in plus.7.4 and in beta 1: th
 **The CLASSES list is empty**
 
 - The MediaPipe detectors other than `mediapipe_face_features` have no classes, and YOLO-World uses the text box next to the list.
-- On AUTOMATIC1111, a detector without a `<model>.names.json` file lists its classes only after its first detection: run a generation or a Detection preview with it, then switch to another detector and back. Or add that file (see [Class names](#class-names)). In plus.7.4 the list stays empty even after a detection: add the file and restart the WebUI. Classic Forge (checked in its code) and Forge Neo list them straight away.
+- 🟡 From plus.9 beta 1, a detector without a `<model>.names.json` file lists its classes straight away on AUTOMATIC1111 too. In plus.8, on AUTOMATIC1111, such a detector lists its classes only after its first detection: run a generation or a Detection preview with it, then switch to another detector and back. Or add that file (see [Class names](#class-names)). In plus.7.4 the list stays empty even after a detection: add the file and restart the WebUI. Classic Forge (checked in its code) and Forge Neo list them straight away.
 
 **"Inpaint only these detections" details the wrong regions, or all of them**
 
@@ -1439,7 +1699,7 @@ Entries marked 🟢 "fixed in plus.8" still happen in plus.7.4 and in beta 1: th
 **A detailed face looks pale, washed out, or like someone else**
 
 - Lower "Inpaint denoising strength" (0.4 by default). A lower value keeps more of the original face.
-- If the colours don't match the rest of the picture, turn on the WebUI's "Apply color correction to img2img results to match original colors" setting (in the img2img part of the WebUI's Settings), and raise "Inpaint mask blur" so the edge blends in.
+- If the colours don't match the rest of the picture, turn on Settings → ADetailer → "Match the colors of each inpainted region to the picture" (🟡 from plus.9 beta 1), which corrects only ADetailer's regions, or the WebUI's "Apply color correction to img2img results to match original colors" setting (in the img2img part of the WebUI's Settings), which corrects every img2img result; and raise "Inpaint mask blur" so the edge blends in.
 - With "Use separate VAE" or "Use separate checkpoint", check that they fit your main model: a VAE made for another model family gives wrong or washed-out colours.
 
 **One thing is redrawn as another, for example a face as a hand**
@@ -1462,10 +1722,11 @@ Entries marked 🟢 "fixed in plus.8" still happen in plus.7.4 and in beta 1: th
 
 - Tick "Use bbox as mask (segmentation models)", or raise "Mask erosion (-) / dilation (+)" (4 by default).
 - Raise "Inpaint mask blur" (4 by default) and "Inpaint only masked padding, pixels".
+- If the edge shows because the region came out in other colours, turn on Settings → ADetailer → "Match the colors of each inpainted region to the picture" (🟡 from plus.9 beta 1).
 
 **The result is only a crop of the detailed region (🟢 fixed in plus.8)**
 
-- The WebUI's "Overlay original for inpaint" setting (Settings → img2img; on Forge Neo, "For inpainting, overlay the resulting image back onto the original image") is off, and "Inpaint only masked" then returns only the region. Turn that setting on, or untick "Inpaint only masked". From plus.8 the region is pasted back anyway, with two limits (see [Known issues](#known-issues)).
+- The WebUI's "Overlay original for inpaint" setting (Settings → img2img; on Forge Neo, "For inpainting, overlay the resulting image back onto the original image") is off, and "Inpaint only masked" then returns only the region. Turn that setting on, or untick "Inpaint only masked". From plus.8 the region is pasted back anyway, with two limits in plus.8 (see [Known issues](#known-issues)); 🟡 from plus.9 beta 1 it is pasted back without changing that setting, so those limits are gone.
 
 **"Use separate steps" or "Use separate sampler" has no effect (🟢 fixed in plus.8)**
 
@@ -1483,9 +1744,17 @@ Entries marked 🟢 "fixed in plus.8" still happen in plus.7.4 and in beta 1: th
 
 - Each class pass inverted only its own class, so the face pass also repainted the hands with the face prompt, and the hand pass the faces. Turn "Process classes sequentially" off in a tab that uses Merge and Invert. From plus.8 the tab runs one pass for all the selected classes there.
 
+**On reForge, the detailed regions of a v-prediction or flow model come out broken (🟡 fixed in plus.9 beta 1)**
+
+- With Settings → ADetailer → "Apply only selected scripts to ADetailer" on (the default), plus.8 leaves reForge's Advanced Model Sampling out of the detailer pass. Add `advanced_model_sampling_script` (and `advanced_model_sampling_script_backported`, where reForge has it) to "Script names to apply to ADetailer", or turn "Apply only selected scripts to ADetailer" off. From plus.9 beta 1 these scripts always run in the detailer pass (checked in reForge's code).
+
+**Every cell of an X/Y/Z grid with an "[ADetailer] CFG scale 1st" axis looks the same (🟡 fixed in plus.9 beta 1)**
+
+- The detailer pass uses a tab's own CFG scale only with "Use separate CFG scale" ticked: in plus.8, tick it in the tab before you start the grid. From plus.9 beta 1 a CFG scale or Steps axis ticks "Use separate CFG scale" or "Use separate steps" in each cell.
+
 **ADetailer's ControlNet model has little or no effect**
 
-- On Forge, Forge Neo and reForge, choosing a model sets "ControlNet module" to "None", which hands the picture to ControlNet as it is: pick the preprocessor that fits the model (see [Known issues](#known-issues)).
+- In plus.8, on Forge, Forge Neo and reForge, choosing a model sets "ControlNet module" to "None", which hands the picture to ControlNet as it is: pick the preprocessor that fits the model (see [Known issues](#known-issues)). 🟡 From plus.9 beta 1 the model's default preprocessor is selected there; if "ControlNet module" shows "None", it was picked by hand or restored as saved, so pick the preprocessor again.
 - 🟢 In plus.7.4 and beta 1, a model whose file name writes its type with capitals, such as `OpenPoseXL2`, gets no preprocessor at all: rename the file so that its type is in lower case, such as `openposeXL2`, and restart the WebUI. From plus.8 the type matches in any case.
 
 **CUDA out of memory**
@@ -1523,6 +1792,10 @@ Entries marked 🟢 "fixed in plus.8" still happen in plus.7.4 and in beta 1: th
 
 - In beta 2 the parameters of these results hold only the detailer pass's prompt, steps, sampler, seed and size, with no ADetailer setting, so pasting them leaves the ADetailer tabs as they were. In plus.7.4 and beta 1 so does the picture shown in Result after a single run that is not saved, while a PNG saved to `ADetailer-Inpaint` records the word "None" (see the entry above). In plus.7.4, beta 1 and beta 2 a copy saved next to its source holds no parameters at all. To keep a tab's setup, save it as a preset. With the WebUI's "Write infotext to metadata" setting on, plus.8 records the tab's settings in all of them, except BMP and TIFF copies, which record no parameters, and a copy whose parameters cannot be written (see Batch a whole folder); with the setting off none of them records parameters.
 
+**The console says "create_infotext failed" for each mask preview or step image of "Run ADetailer on an image" (🟡 fixed in plus.9 beta 1)**
+
+- With "Save mask previews" or "Save intermediate step images" on, plus.8 saves these files of "Run ADetailer on an image" and folder runs without parameters and prints this message for each one; the pictures themselves are fine. From plus.9 beta 1 they record their parameters, and so do the masks of "Save inpaint masks".
+
 **A folder run skips files or says "No images found in that folder."**
 
 - The folder box, "Or batch a whole folder (optional)", reads PNG, JPEG, WebP, BMP and TIFF (`.tif` or `.tiff`) files directly in that folder; files in its sub-folders are not read.
@@ -1548,10 +1821,12 @@ Entries marked 🟢 "fixed in plus.8" still happen in plus.7.4 and in beta 1: th
 **ADetailer is on at every start, or another panel checkbox always starts the same way**
 
 - Settings → Defaults has saved a startup default for it. See [Startup defaults for the panel's checkboxes](#startup-defaults-for-the-panels-checkboxes).
+- 🟡 From plus.9 beta 1, Settings → ADetailer → "Enable ADetailer at startup" set to txt2img, img2img or Both also starts ADetailer switched on there, whatever Settings → Defaults says. Set it to Off and reload the UI to let Defaults decide again.
 
 **The export button does not download a file on AUTOMATIC1111**
 
-- WebUIs with Gradio 3 (AUTOMATIC1111, and reForge's main branch) cannot download a file from that button; from plus.8 the status line says so (plus.7.4 wrongly reports the presets as exported). Back up the preset library by copying `user_presets.json` from the extension's folder (for example `extensions/adetailer-ultimate`). Import works on every WebUI from plus.8 on, and from plus.8 Export downloads the file on Forge and Forge Neo.
+- 🟡 Fixed in plus.9 beta 1: Export downloads `adetailer-ultimate-presets.json` on these WebUIs too. If it still does not, check that your browser allows downloads from the WebUI's page.
+- In plus.8, WebUIs with Gradio 3 (AUTOMATIC1111, and reForge's main branch) cannot download a file from that button; from plus.8 the status line says so (plus.7.4 wrongly reports the presets as exported). Back up the preset library by copying `user_presets.json` from the extension's folder (for example `extensions/adetailer-ultimate`). Import works on every WebUI from plus.8 on, and from plus.8 Export downloads the file on Forge and Forge Neo.
 
 **A preset is missing from another tab's list**
 
@@ -1593,7 +1868,7 @@ The original ADetailer has no named presets, so there is nothing to import. Your
 
 ### Can I move my presets to another computer?
 
-Yes. Export the preset library as a file (on Forge and Forge Neo, from plus.8) and import it on the other computer, or copy `user_presets.json` from the extension's folder. On AUTOMATIC1111 and other Gradio 3 WebUIs, copying the file is the only way, because the export button cannot download a file there. From plus.8, loading a preset that names a detector, checkpoint, VAE, text encoder, scheduler, ControlNet model or sampler the other WebUI does not have says so and keeps the tab working; in plus.7.4 and beta 1, check those settings after loading. See [Your data](#your-data).
+Yes. Export the preset library as a file (on Forge and Forge Neo, from plus.8) and import it on the other computer, or copy `user_presets.json` from the extension's folder. 🟡 From plus.9 beta 1, Export downloads the file on AUTOMATIC1111 and other Gradio 3 WebUIs too; in plus.8, copying the file is the only way there, because the export button cannot download a file. From plus.8, loading a preset that names a detector, checkpoint, VAE, text encoder, scheduler, ControlNet model or sampler the other WebUI does not have says so and keeps the tab working; in plus.7.4 and beta 1, check those settings after loading. See [Your data](#your-data).
 
 ### Does ADetailer Ultimate slow generation down?
 
@@ -1601,7 +1876,7 @@ With the same settings it does about the same work as the original ADetailer, an
 
 ### Is it safe to switch to the beta and back?
 
-Yes. Switching changes only the extension's code. Your presets (`user_presets.json`) and remembered settings (`user_state.json`) are not part of that code, so the switch leaves them alone, and the plus.8 betas added no new tab settings, so the stable release and the betas read them. Back them up first anyway. See [Switch to the beta and back](#switch-to-the-beta-and-back) and [Your data](#your-data).
+Yes. Switching changes only the extension's code. Your presets (`user_presets.json`) and remembered settings (`user_state.json`) are not part of that code, so the switch leaves them alone, and neither the plus.8 betas nor the plus.9 beta added new tab settings, so the stable release and the betas read them. Back them up first anyway. After going back from the plus.9 beta, check the mask sliders of a tab or preset where you used a value above plus.8's limits (see [Notes on plus.9 beta 1](#notes-on-plus9-beta-1)). See [Switch to the beta and back](#switch-to-the-beta-and-back) and [Your data](#your-data).
 
 ### Can I keep the original ADetailer installed too?
 
@@ -1609,11 +1884,11 @@ Not at the same time. ADetailer Ultimate replaces it: with two ADetailers the pa
 
 ### Does it work with the WebUI's API?
 
-Yes. API requests work as with the original ADetailer (see its [REST API guide](https://github.com/Bing-su/adetailer/wiki/REST-API)), and every new per-tab option of this fork can be sent too. From plus.8, a tab that a request leaves out gets a fresh setup's settings, not the settings remembered in the UI (in plus.7.4 and beta 1, send every tab in the request, with `"ad_model": "None"` for the tabs you do not want, or turn off "Remember last-used settings between restarts" and restart the WebUI); and with "Apply only selected scripts to ADetailer" off, the detailer pass uses the request's steps, sampler and scheduler (or the tab's separate ones), where before it used the defaults of the WebUI's Sampler section, such as 20 steps. On Forge, Forge Neo and reForge a request that leaves the ControlNet preprocessor out runs without one (see [Known issues](#known-issues)), and from plus.8 an inpaint mask sent with transparency is read as the WebUI reads it.
+Yes. API requests work as with the original ADetailer (see its [REST API guide](https://github.com/Bing-su/adetailer/wiki/REST-API)), and every new per-tab option of this fork can be sent too. 🟡 From plus.9 beta 1, a request in the short form, with only the tabs (`[{...}]`, without the values for "Enable ADetailer" and "Skip img2img"), runs one pass per tab it sends (to be exact in every case, use the full form `[true, false, {...}]`); before, it also ran the WebUI's default 1st tab ([Bing-su/adetailer#485](https://github.com/Bing-su/adetailer/issues/485)). From plus.8, a tab that a request leaves out gets a fresh setup's settings, not the settings remembered in the UI (in plus.7.4 and beta 1, send every tab in the request, with `"ad_model": "None"` for the tabs you do not want, or turn off "Remember last-used settings between restarts" and restart the WebUI); and with "Apply only selected scripts to ADetailer" off, the detailer pass uses the request's steps, sampler and scheduler (or the tab's separate ones), where before it used the defaults of the WebUI's Sampler section, such as 20 steps. On Forge, Forge Neo and reForge a request that leaves the ControlNet preprocessor out runs without one (see [Known issues](#known-issues)), and from plus.8 an inpaint mask sent with transparency is read as the WebUI reads it. 🟡 An X/Y/Z plot request picks its axes by position: from plus.9 beta 1 the axes of the extensions loaded after ADetailer sit further down the list, and their position changes with "Max tabs", so look the position up from the axis name (see [Notes on plus.9 beta 1](#notes-on-plus9-beta-1)).
 
 ### Does it upload my images?
 
-No. ADetailer Ultimate works on your computer and does not upload your images, prompts or settings. It does download files: at every start it checks the built-in detectors on Hugging Face (or on the hf-mirror.com mirror when Hugging Face cannot be reached) and downloads the missing ones, which the `--ad-no-huggingface` option turns off; it installs the Python packages it needs when they are missing; it fetches the two small MediaPipe model files from Google the first time you use a MediaPipe detector; and the first time a YOLO-World detector runs with names you typed, the Ultralytics library downloads the CLIP text model it needs (about 340 MB, from OpenAI) and installs its CLIP package from GitHub if it is missing. Your presets and remembered settings stay in the extension's folder, and from plus.8 the sections you leave open are remembered in your browser. The Ultralytics library, which runs the YOLO detectors, can send anonymous usage statistics of its own; its documentation explains how to turn them off.
+No. ADetailer Ultimate works on your computer and does not upload your images, prompts or settings. It does download files: at every start it checks the built-in detectors on Hugging Face (or on the hf-mirror.com mirror when Hugging Face cannot be reached) and downloads the missing ones, which the `--ad-no-huggingface` option turns off; it installs the Python packages it needs when they are missing; it fetches the two small MediaPipe model files from Google the first time you use a MediaPipe detector; and the first time a YOLO-World detector runs with names you typed, the Ultralytics library downloads the CLIP text model it needs (about 340 MB, from OpenAI) and installs its CLIP package from GitHub if it is missing. Your presets and remembered settings stay in the extension's folder, and from plus.8 the sections you leave open are remembered in your browser. The Ultralytics library, which runs the YOLO detectors, can send anonymous usage analytics of its own: 🟡 from plus.9 beta 1 ADetailer switches them off before its detections (see [Compatibility](#compatibility)); in plus.8, its documentation explains how to turn them off.
 
 ### Why are some labels still in English when I use Language Diffusion?
 
@@ -1627,25 +1902,27 @@ Open the ADetailer panel (this also switches ADetailer on): the badge at the top
 
 | WebUI | Status | Notes |
 | --- | --- | --- |
-| AUTOMATIC1111 1.10 | 🟢 Supported, tested live | Gradio 3: the export button cannot download a file (Import works from plus.8 on). "Use separate text encoder" and the Distilled CFG setting apply only on Forge and Forge Neo. A detector without a `<model>.names.json` file lists its classes after its first detection (from plus.8; in plus.7.4 only with that file). On the Settings page only the thin divider line above **🔄 Reset ADetailer settings to defaults** is missing: the help text, the button and every feature still work. From plus.8 it also starts with the `--no-gradio-queue` option. |
+| AUTOMATIC1111 1.10 | 🟢 Supported, tested live | Gradio 3: in plus.8 the export button cannot download a file (Import works from plus.8 on); 🟡 from plus.9 beta 1 it downloads it. "Use separate text encoder" and the Distilled CFG setting apply only on Forge and Forge Neo. A detector without a `<model>.names.json` file lists its classes after its first detection (from plus.8; in plus.7.4 only with that file); 🟡 from plus.9 beta 1, straight away. On the Settings page only the thin divider line above **🔄 Reset ADetailer settings to defaults** is missing: the help text, the button and every feature still work. From plus.8 it also starts with the `--no-gradio-queue` option. |
 | Forge Neo | 🟢 Supported, tested live | Runs on Python 3.13 with the newer MediaPipe 0.10 builds. "Use separate text encoder (Forge/Forge Neo)" works here. Forge Neo's startup message that suggests another ADetailer is not printed while this fork is installed. |
 | Forge (classic) | 🟢 Supported, not tested live | Its differences are handled in the code. Gradio 4, as on Forge Neo: from plus.8 the export button downloads the file (in plus.7.4 the first click downloads nothing and later clicks the previous click's file). "Use separate text encoder (Forge/Forge Neo)" works here too, and detectors list their classes straight away, also without a `<model>.names.json` file. From plus.8, ADetailer's ControlNet options work with its current built-in ControlNet (checked in its code). |
-| reForge | 🟢 Supported, not tested live | Its differences are handled in the code. On its main branch, which uses Gradio 3, the export button cannot download a file, as on AUTOMATIC1111. |
+| reForge | 🟢 Supported, not tested live | Its differences are handled in the code. On its main branch, which uses Gradio 3, the export button cannot download a file in plus.8, as on AUTOMATIC1111 (🟡 from plus.9 beta 1 it downloads it). 🟡 From plus.9 beta 1, its Advanced Model Sampling scripts always run in the detailer pass, for v-prediction and flow models (checked in its code). |
 
 - **Live tests** (real generations in the browser) run on AUTOMATIC1111 1.10 and Forge Neo, on Windows. Classic Forge and reForge are supported and their differences are handled in the code, but they are not part of the live tests. Other WebUIs built on AUTOMATIC1111 may work, but they are not checked.
 - **When a WebUI lacks a feature,** ADetailer Ultimate keeps working without it instead of stopping with an error.
 - **Python:** from 3.10 (AUTOMATIC1111 1.10) to 3.13 (Forge Neo). The automatic tests on GitHub run on Windows (Python 3.12, offline tests) and on macOS (Python 3.10 to 3.14, also with the real detectors).
 - **Gradio:** Gradio 3 (AUTOMATIC1111, reForge's main branch) and Gradio 4 (Forge, Forge Neo).
-- **Packages:** at every start, unless the WebUI's package installation is turned off, the extension installs what it needs when it is missing or its version is outside the tested range: Ultralytics 8.3.75 or newer, MediaPipe 0.10 (a MediaPipe 1.x is replaced by 0.10) and Rich. On WebUIs that use NumPy 1, such as AUTOMATIC1111, it keeps NumPy 1, so the WebUI's other packages keep working.
+- **Packages:** at every start, unless the WebUI's package installation is turned off, the extension installs what it needs when it is missing or its version is outside the tested range: Ultralytics 8.3.75 or newer, MediaPipe 0.10 (a MediaPipe 1.x is replaced by 0.10) and Rich. On WebUIs that use NumPy 1, such as AUTOMATIC1111, it keeps NumPy 1, so the WebUI's other packages keep working. On Linux aarch64, MediaPipe 0.10.x has wheels only up to 0.10.18 (Python 3.9 to 3.12), so those systems get 0.10.18; on Python 3.13 there is no supported MediaPipe wheel for aarch64, so the MediaPipe detectors are not available there. MediaPipe is installed with a command of its own, so when it cannot be installed the other packages still are.
+- **Ultralytics usage analytics:** 🟡 from plus.9 beta 1, ADetailer switches off Ultralytics' anonymous usage analytics before its detections, in memory only; the shared Ultralytics settings file is never written, and in the same WebUI session the analytics stay off for other extensions that use Ultralytics.
 - **Model families:** ADetailer details whatever checkpoint the WebUI runs. The original ADetailer was made for Stable Diffusion 1.5 and SDXL. On Forge and Forge Neo, a detailer checkpoint of another family can be used with a separate text encoder, and from plus.8 the detailer pass keeps your Distilled CFG Scale / Shift, used by newer model families such as Flux or Z-Image (with a separate checkpoint it uses the WebUI's default, 3.5); these mixed setups are still being checked for a later release.
 
 ### Translations
 
-With the [Language Diffusion](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion) extension installed next to ADetailer Ultimate, the labels, buttons, hints, placeholders and tooltips of the fork's own controls up to plus.6 are translated into 10 locales: Chinese (Simplified), French, German, Italian, Japanese, Korean, Polish, Portuguese (Brazil), Russian and Spanish. The options added since plus.7 stay English until the dictionaries get them: Auto class-guard and Class-guard emphasis, Strip LoRAs from the detailer prompt, Detection resolution, Dynamic denoise by area, Inpaint only these detections, the folder batch of "Run ADetailer on an image" with its help text, Reset every tab, the Guide link and the pointer to the Guide tab, and the Settings options Show the ADetailer Guide tab and Verbose diagnostic log; so do the "(none)" preset entry, the reworded Copy settings and Reset tooltips, the Export tooltip shown on Gradio 3 WebUIs, the reworded help texts of "Reset ADetailer settings", "Apply only on hires.fix" and "Manual mode", and the "📥 Paste from Nth tab" label that the other tabs' Paste settings button shows after a Copy, which is made when you click Copy.
+With the [Language Diffusion](https://github.com/xXIlRizzoXx/sd-webui-language-diffusion) extension installed next to ADetailer Ultimate, the labels, buttons, hints, placeholders and tooltips of the fork's own controls up to plus.6 are translated into 10 locales: Chinese (Simplified), French, German, Italian, Japanese, Korean, Polish, Portuguese (Brazil), Russian and Spanish. The options added since plus.7 stay English until the dictionaries get them: Auto class-guard and Class-guard emphasis, Strip LoRAs from the detailer prompt, Detection resolution, Dynamic denoise by area, Inpaint only these detections, the folder batch of "Run ADetailer on an image" with its help text, Reset every tab, the Guide link and the pointer to the Guide tab, and the Settings options Show the ADetailer Guide tab and Verbose diagnostic log; so do the "(none)" preset entry, the reworded Copy settings and Reset tooltips, the Export tooltip shown on Gradio 3 WebUIs (in plus.8), 🟡 the "📤 Export" label and the "Enable ADetailer at startup" option of plus.9 beta 1, the reworded help texts of "Reset ADetailer settings", "Apply only on hires.fix" and "Manual mode", and the "📥 Paste from Nth tab" label that the other tabs' Paste settings button shows after a Copy, which is made when you click Copy.
 
 - Language Diffusion also adds the language selector at the top of the page.
 - Technical words (ADetailer, LoRA, CFG, VAE, ControlNet, hires.fix, img2img, inpaint, bbox, YOLO, MediaPipe and so on) stay English in every language on purpose, so they match tutorials and model pages.
 - The ADetailer Guide tab is in English only.
+- 🟡 The "Save inpaint masks" option of plus.9 beta 1 and its help text stay English until the dictionaries get them, and so do the tooltips of the options.
 - 🟢 On Forge and Forge Neo, plus.8 keeps the translated "Use same …" values of the ADetailer dropdowns translated after a change; before, they went back to English until the page was reloaded.
 - Corrections by native speakers are welcome in the Language Diffusion repository.
 
@@ -1702,6 +1979,7 @@ This fork is not affiliated with or endorsed by Bing-su. It builds on the work o
 - **[djunk1159/ADetailer_mediapipe_mouth_only](https://github.com/djunk1159/ADetailer_mediapipe_mouth_only)**: the idea behind the `mediapipe_face_features` detector.
 - **[Ultralytics](https://github.com/ultralytics/ultralytics)** and **[MediaPipe](https://github.com/google-ai-edge/mediapipe)**: the detection libraries the detectors run on.
 - 🟢 The plus.8 update fixes problems that others reported or fixed first: [Bing-su/adetailer#795](https://github.com/Bing-su/adetailer/issues/795), upstream pull request [#796](https://github.com/Bing-su/adetailer/pull/796) and [TheLastAncient/adetailer_steps_fix](https://github.com/TheLastAncient/adetailer_steps_fix) (separate steps); [adieyal/sd-dynamic-prompts#703](https://github.com/adieyal/sd-dynamic-prompts/issues/703), [#730](https://github.com/adieyal/sd-dynamic-prompts/issues/730) and [grey-aogames/adetailer](https://github.com/grey-aogames/adetailer) (Dynamic Prompts template); upstream pull request [#745](https://github.com/Bing-su/adetailer/pull/745) (ControlNet image and mask on Forge).
+- 🟡 The plus.9 beta takes up ideas of other forks and requests: [diffus-me/adetailer](https://github.com/diffus-me/adetailer) (LoRA and embedding hashes of the ADetailer prompts), [Anzhc/aadetailer-reforge](https://github.com/Anzhc/aadetailer-reforge) and upstream pull request [#818](https://github.com/Bing-su/adetailer/pull/818) (reForge's Advanced Model Sampling), and upstream requests [#111](https://github.com/Bing-su/adetailer/issues/111), [#251](https://github.com/Bing-su/adetailer/issues/251), [#406](https://github.com/Bing-su/adetailer/issues/406), [#508](https://github.com/Bing-su/adetailer/issues/508) and [#635](https://github.com/Bing-su/adetailer/issues/635).
 - Thanks to everyone who reported problems and tested new features in the Issues, and to the users named in [Requested by users](#-requested-by-users).
 
 The fork is directed by its owner, xXIlRizzoXx, who does not write Python. Its code was written by **[Claude](https://www.anthropic.com/claude)**, Anthropic's coding assistant. The plus.8 reliability update was started with **OpenAI Codex** and reviewed and completed with Claude.

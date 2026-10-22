@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -155,6 +156,24 @@ def _discard_model(path: str) -> None:
         pass
 
 
+def _release_tuple(installed: str) -> tuple[int, int, int]:
+    """The numeric release part of a version string, padded to 3 numbers.
+
+    Only the leading "N.N.N" counts: a pre/post/dev suffix ("1.0.0rc1",
+    "1.0.0b2", "1.0.0.post1", "1.0.0.dev3") must not change the numbers.
+    Gluing the suffix digits onto the last number turned "1.0.0rc1" into
+    (1, 0, 1). A pre-release of 1.0.1 ("1.0.1rc1") gives (1, 0, 1) on purpose:
+    it already carries the 1.0.1 native bridge, so it stays on the safe side.
+    Raises ValueError when the string does not start with a number.
+    """
+    match = re.match(r"\s*v?(\d+(?:\.\d+)*)", installed)
+    if match is None:
+        raise ValueError(f"not a version: {installed!r}")
+    nums = [int(p) for p in match.group(1).split(".")[:3]]
+    nums += [0] * (3 - len(nums))
+    return (nums[0], nums[1], nums[2])
+
+
 @lru_cache(maxsize=1)
 def _tasks_api_aborts() -> bool:
     """True when the installed MediaPipe's `tasks` API is known to ABORT the whole
@@ -179,8 +198,7 @@ def _tasks_api_aborts() -> bool:
         from importlib.metadata import version
 
         installed = version("mediapipe")
-        parts = installed.split(".")[:3]
-        current = tuple(int("".join(c for c in p if c.isdigit()) or 0) for p in parts)
+        current = _release_tuple(installed)
     except Exception:  # noqa: BLE001
         return False
     if current < (1, 0, 1):
@@ -445,6 +463,30 @@ def _hull_polys(points: np.ndarray, feature: str) -> list[list[int]]:
     return out
 
 
+def _import_mediapipe_without_sounddevice() -> None:
+    """Import MediaPipe the first time without its optional `sounddevice` import.
+
+    MediaPipe's audio tasks import `sounddevice` when it is installed, and that
+    import starts PortAudio: on Windows it interrupted audio playing in other
+    programs and listed python.exe as using the microphone (upstream issue
+    #508). ADetailer uses no audio, and MediaPipe handles a missing
+    `sounddevice` (its audio recorder then raises only when used). So it is
+    blocked during this import only, and the previous state is put back at
+    once, so other extensions can still import it afterwards. Nothing changes
+    when MediaPipe or `sounddevice` is already imported. Errors are left to the
+    detectors, which import MediaPipe again and report them."""
+    if "mediapipe" in sys.modules or "sounddevice" in sys.modules:
+        return
+    sys.modules["sounddevice"] = None  # type: ignore[assignment]  # import -> ImportError
+    try:
+        import mediapipe  # noqa: F401
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        if sys.modules.get("sounddevice", False) is None:
+            del sys.modules["sounddevice"]
+
+
 def mediapipe_predict(
     model_type: str,
     image: Image.Image,
@@ -463,6 +505,7 @@ def mediapipe_predict(
     }
     if model_type in mapping:
         try:
+            _import_mediapipe_without_sounddevice()
             # MediaPipe takes RGB data only; Gradio 4 hands a GIF over as a
             # palette or grayscale image, which then found nothing.
             if image.mode != "RGB":

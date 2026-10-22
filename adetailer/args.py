@@ -351,7 +351,18 @@ _script_default = (
 )
 SCRIPT_DEFAULT = ",".join(sorted(_script_default))
 
-_builtin_script = ("soft_inpainting", "hypertile_script")
+# reForge's "Advanced Model Sampling" scripts set the v-prediction / flow
+# sampling of the model: without them the detailer pass of such a model
+# comes out broken. These names come from Anzhc's aadetailer-reforge fork
+# (commit 2d1a12e). WebUIs without these scripts are not affected. The
+# reForge-RescaleCFG extension names its script file the same way, so it
+# also stays on in the detailer pass, as it does in that fork.
+_builtin_script = (
+    "soft_inpainting",
+    "hypertile_script",
+    "advanced_model_sampling_script",
+    "advanced_model_sampling_script_backported",
+)
 BUILTIN_SCRIPT = ",".join(sorted(_builtin_script))
 
 

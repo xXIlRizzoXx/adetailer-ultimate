@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -576,7 +577,7 @@ def test_combined_preview_reports_a_failed_detector(host, monkeypatch, second_ta
         return SimpleNamespace(bboxes=[], confidences=[], masks=[], preview=None)
 
     callback = _wired_preview(monkeypatch, predict)
-    image, status = callback(
+    image, status, _boxes = callback(
         Image.new("RGB", (8, 8), "white"), True,
         "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
     )
@@ -592,6 +593,64 @@ def test_combined_preview_reports_a_failed_detector(host, monkeypatch, second_ta
         assert status.startswith("⚠️ Preview failed")
         assert "Tab2: ERR (simulated detector failure)" in status
         assert "No detections" not in status
+
+
+@pytest.mark.parametrize(
+    ("combine", "found", "fails"),
+    [(True, True, False), (False, False, False), (False, True, True)],
+)
+def test_only_a_single_tab_preview_with_detections_gives_clickable_boxes(
+    host, monkeypatch, combine, found, fails
+):
+    # picker.js makes the boxes clickable from the third output. With "Combine
+    # all tabs" each number belongs to its own tab, so there is nothing to
+    # pick; with no detection or a failed detector there are no boxes. Every
+    # such answer clears the boxes of an earlier preview.
+    def predict(_path, **_kwargs):
+        if fails:
+            msg = "simulated detector failure"
+            raise RuntimeError(msg)
+        boxes = [[1, 2, 5, 6]] if found else []
+        return SimpleNamespace(
+            bboxes=boxes, confidences=[0.9] * len(boxes), masks=[],
+            preview=Image.new("RGB", (8, 8)) if found else None,
+            class_names=["face"] * len(boxes),
+        )
+
+    callback = _wired_preview(monkeypatch, predict)
+    _image, status, boxes = callback(
+        Image.new("RGB", (8, 8), "white"), combine,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert boxes == ""
+    assert "Click the boxes" not in status
+
+
+def test_the_preview_boxes_field_has_no_label_and_no_listener():
+    # The boxes go out as a third output of the preview button's existing
+    # .click, into a field with no listener of its own (fn_index stays put)
+    # and no label, so the WebUI keeps nothing of it in ui-config.json.
+    tree = ast.parse(_UI_PATH.read_text(encoding="utf-8"))
+    made = [
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "attr", None) == "ad_preview_boxes" for t in node.targets)
+    ]
+    assert len(made) == 1
+    assert made[0].func.attr == "Textbox"
+    assert "label" not in {k.arg for k in made[0].keywords}
+    clicks = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "click"
+        and getattr(getattr(node.func, "value", None), "attr", None) == "ad_preview_btn"
+    ]
+    assert len(clicks) == 1
+    outputs = next(k.value for k in clicks[0].keywords if k.arg == "outputs")
+    assert [e.attr for e in outputs.elts] == [
+        "ad_preview_output", "ad_preview_status", "ad_preview_boxes",
+    ]
 
 
 def _load_draw_detection_numbers():
@@ -723,7 +782,7 @@ def test_combined_preview_keeps_its_labels_with_a_bitmap_font(
         )
 
     callback = _wired_preview(monkeypatch, predict)
-    image, status = callback(
+    image, status, _boxes = callback(
         Image.new("RGB", (128, 128), "white"), True,
         "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
     )
@@ -763,7 +822,7 @@ def _two_tab_combined_preview(monkeypatch):
     def run(face_boxes, hand_boxes):
         boxes.update({"models/face.pt": face_boxes, "models/hand.pt": hand_boxes})
         chips.clear()
-        image, status = callback(
+        image, status, _boxes = callback(
             Image.new("RGB", (256, 256), "white"), True,
             "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
         )
@@ -830,13 +889,18 @@ def test_single_tab_preview_chips_get_the_class_names(host, monkeypatch, model):
     callback = _wired_preview(
         monkeypatch, lambda _path, **_kwargs: pred, _draw_detection_numbers=draw
     )
-    _image, status = callback(
+    _image, status, boxes = callback(
         Image.new("RGB", (16, 16), "white"), False,
         model, "", "", False, 0.3, "hand.pt", "", "", False, 0.3, model,
     )
 
-    assert status == "✅ 2 detection(s)."
+    assert status == "✅ 2 detection(s). Click the boxes to choose which to inpaint."
     assert calls == [(pred.bboxes, ["eyes", "nose"])]
+    # The boxes picker.js makes clickable: the picture's size and each box, in
+    # the order of the numbers drawn on it.
+    assert json.loads(boxes) == {
+        "w": 16, "h": 16, "boxes": [[0, 0, 10, 10], [2, 2, 12, 12]],
+    }
 
 
 def test_wired_folder_still_skips_an_unreadable_file(host, monkeypatch, tmp_path):
@@ -1626,7 +1690,7 @@ def test_combined_preview_label_text_sits_inside_its_label(host, monkeypatch, he
         )
 
     callback = _wired_preview(monkeypatch, predict)
-    (image, status), rects, texts = _chips_and_texts(
+    (image, status, _boxes), rects, texts = _chips_and_texts(
         monkeypatch, callback, Image.new("RGB", (640, height), "white"), True,
         "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
     )

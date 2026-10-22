@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import builtins
 import os
+import sys
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, Optional, TypeVar
@@ -11,11 +12,12 @@ from typing import Any, Generic, Optional, TypeVar
 try:
     from huggingface_hub import hf_hub_download
 except Exception:  # offline / stripped venv without huggingface_hub installed
-    # Every call site lives inside `with suppress(Exception)`, so a None here
+    # Every call site lives inside a try/except Exception, so a None here
     # degrades gracefully to "INVALID" instead of crashing at import time.
     hf_hub_download = None
 from PIL import Image, ImageDraw
 from rich import print  # noqa: A004  Shadowing built-in 'print'
+from rich.markup import escape
 from torchvision.transforms.functional import to_pil_image
 
 REPO_ID = "Bingsu/adetailer"
@@ -36,21 +38,50 @@ class PredictOutput(Generic[T]):
     class_names: list[str] = field(default_factory=list)
 
 
-def hf_download(file: str, repo_id: str = REPO_ID, check_remote: bool = True) -> str:
-    if check_remote:
-        with suppress(Exception):
-            return hf_hub_download(repo_id, file, etag_timeout=1)
+def _short_reason(error: BaseException | None) -> str:
+    """The cause of a failed download in one short ASCII line, for the console:
+    the exception name and the first line of its text, cut at 200 characters.
+    Escaped for rich, which would read "[...]" in the text as markup."""
+    if hf_hub_download is None:
+        return "huggingface_hub is not installed"
+    if error is None:
+        return ""
+    lines = str(error).strip().splitlines()
+    text = f"{type(error).__name__}: {lines[0]}" if lines else type(error).__name__
+    text = text.encode("ascii", "backslashreplace").decode("ascii")
+    if len(text) > 200:
+        text = text[:197] + "..."
+    return escape(text)
 
-        with suppress(Exception):
+
+def hf_download(file: str, repo_id: str = REPO_ID, check_remote: bool = True) -> str:
+    # Same three tries as before (Hugging Face, its mirror, the local cache),
+    # but the first remote error is kept, so the console can say WHY the
+    # model could not be loaded (no connection, proxy, SSL, ...).
+    error: BaseException | None = None
+    if check_remote:
+        try:
+            return hf_hub_download(repo_id, file, etag_timeout=1)
+        except Exception as e:  # noqa: BLE001
+            error = e
+
+        try:
             return hf_hub_download(
                 repo_id, file, etag_timeout=1, endpoint="https://hf-mirror.com"
             )
+        except Exception as e:  # noqa: BLE001
+            error = error or e
 
-    with suppress(Exception):
+    try:
         return hf_hub_download(repo_id, file, local_files_only=True)
+    except Exception as e:  # noqa: BLE001
+        error = error or e
 
     if check_remote:
         msg = f"[-] ADetailer: Failed to load model {file!r} from huggingface"
+        reason = _short_reason(error)
+        if reason:
+            msg += f" ({reason})"
         print(msg)
     return "INVALID"
 
@@ -65,6 +96,47 @@ def scan_model_dir(path: Path) -> list[Path]:
     if not path.is_dir():
         return []
     return [p for p in path.rglob("*") if p.is_file() and p.suffix == ".pt"]
+
+
+_ZIP_NAMES_SHOWN = 5
+
+
+def warn_zip_models(*dirs: str | os.PathLike[str]) -> None:
+    """Say once, when the model list is built, that a .zip in the detector
+    folders is not read. Many detectors on Civitai download as a .zip, and the
+    model then simply never showed up in the list. The list itself is
+    unchanged; any error here is ignored."""
+    try:
+        # Keyed by the resolved path: the same folder listed twice (or inside
+        # another listed folder) names each file once.
+        found: dict[str, str] = {}
+        for dir_ in dirs:
+            if not dir_:
+                continue
+            path = Path(dir_)
+            if path.is_dir():
+                for p in sorted(path.rglob("*")):
+                    if p.suffix.lower() == ".zip" and p.is_file():
+                        found.setdefault(str(p.resolve()), p.name)
+        zips = list(found.values())
+        if not zips:
+            return
+        names = ", ".join(zips[:_ZIP_NAMES_SHOWN])
+        if len(zips) > _ZIP_NAMES_SHOWN:
+            names += f" and {len(zips) - _ZIP_NAMES_SHOWN} more"
+        msg = (
+            f"[-] ADetailer: found {len(zips)} .zip file(s) in the detector"
+            f" model folders ({names}). ADetailer only reads .pt files: extract"
+            " the .pt file from the .zip into the same folder and restart the"
+            " WebUI."
+        )
+        # Plain print, not rich (a file name with [brackets] is not markup),
+        # and ASCII only, so a console in a legacy code page can print it.
+        builtins.print(
+            msg.encode("ascii", "backslashreplace").decode("ascii"), file=sys.stderr
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def download_models(*names: str, check_remote: bool = True) -> dict[str, str]:
@@ -96,6 +168,8 @@ def get_models(
         if not dir_:
             continue
         model_paths.extend(scan_model_dir(Path(dir_)))
+
+    warn_zip_models(*dirs)
 
     models = OrderedDict()
     to_download = [

@@ -20,9 +20,17 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageFilter
+
+from aaaaaa.p_method import merge_network_hashes, restore_network_hashes
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "!adetailer.py"
+
+# Pure helpers the script imports: every loaded method may reach them.
+_NETWORK_HASHES = {
+    "merge_network_hashes": merge_network_hashes,
+    "restore_network_hashes": restore_network_hashes,
+}
 
 
 def _load_runtime(**host_globals):
@@ -40,13 +48,14 @@ def _load_runtime(**host_globals):
                 for method in node.body
                 if isinstance(method, ast.FunctionDef)
                 and method.name in {
-                    "process", "set_skip_img2img", "_postprocess_image_inner"
+                    "process", "set_skip_img2img", "_postprocess_image_inner",
+                    "_drop_api_default_tab",
                 }
             ]
             for method in node.body:
                 method.decorator_list = []
             selected.append(node)
-    namespace = {"Path": Path, "sys": sys, **host_globals}
+    namespace = {"Path": Path, "sys": sys, **_NETWORK_HASHES, **host_globals}
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_SCRIPT_PATH), "exec"), namespace)
     return SimpleNamespace(**namespace)
@@ -485,7 +494,8 @@ def test_sequential_pass_honours_stop_after_current_image(stop_at, n_calls, kept
 def test_host_error_after_a_cancel_counts_as_the_cancel(cancel_flag):
     # Forge Neo hands back no latent when a cancel lands before the first
     # sampling step, and then fails on it. That is the user's cancel, not a
-    # failure; any other error must still reach the caller.
+    # failure. Any other error fails only its region: with every region
+    # failed the pass is not kept, and nothing is raised to the caller.
     state = SimpleNamespace(
         interrupted=False, skipped=False, job_count=0,
         assign_current_image=lambda _image: None,
@@ -498,10 +508,6 @@ def test_host_error_after_a_cancel_counts_as_the_cancel(cancel_flag):
         raise TypeError(msg)
 
     run, pp, before = _detailer(state, process_images, n_masks=2)
-    if cancel_flag is None:
-        with pytest.raises(TypeError):
-            run()
-        return
     assert run() is False
     assert pp.image.tobytes() == before.tobytes()
 
@@ -530,6 +536,14 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
     Keeps ``@staticmethod`` (the methods call each other through ``self``)
     and drops the other decorators.
     """
+    # The methods that read the tabs drop the host's default tab of a short
+    # API request through this helper: load it with them.
+    if {"process", "postprocess_image", "is_ad_enabled", "get_args"} & set(methods):
+        methods = {*methods, "_drop_api_default_tab"}
+    # And those that set host options for a pass skip the frozen ones.
+    if "get_override_settings" in methods or "_crop_upscaler_usable" in functions:
+        functions = {*functions, "_setting_frozen"}
+        assigns = {*assigns, "_FROZEN_REPORTED"}
     tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
     selected = ast.parse("from __future__ import annotations").body
     for node in tree.body:
@@ -556,7 +570,7 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
                     if getattr(d, "id", "") == "staticmethod"
                 ]
             selected.append(node)
-    namespace = {"Path": Path, "sys": sys, "re": re, **host_globals}
+    namespace = {"Path": Path, "sys": sys, "re": re, **_NETWORK_HASHES, **host_globals}
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_SCRIPT_PATH), "exec"), namespace)
     return SimpleNamespace(**namespace)
@@ -690,9 +704,63 @@ def test_skip_img2img_keeps_the_users_sampler_and_infotext():
         "Size": f"{p.width}x{p.height}",
         **p.extra_generation_params,
     }
-    assert infotext == {"Steps": 30, "Sampler": "DPM++ 2M", "Size": "1024x768"}
+    # Pasted back, the last key ticks Skip img2img again.
+    assert infotext == {
+        "Steps": 30, "Sampler": "DPM++ 2M", "Size": "1024x768",
+        "ADetailer skip img2img": True,
+    }
     # The throwaway pass, and later batch iterations, keep their values.
     assert (p.steps, p.sampler_name, p.width, p.height) == (1, "Euler", 128, 128)
+
+
+@pytest.mark.parametrize("skip", [True, False])
+def test_pasted_parameters_tick_skip_img2img_again(skip):
+    # PNG Info and Send to left Skip img2img as it was: the infotext never
+    # wrote the key of its paste field.
+    from adetailer.args import SkipImg2ImgOrig
+
+    ui_path = _SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py"
+    fields = {
+        (node.args[0].elts[0].id, node.args[0].elts[1].value)
+        for node in ast.walk(ast.parse(ui_path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "append"
+        and getattr(node.func.value, "id", "") == "infotext_fields"
+        and isinstance(node.args[0], ast.Tuple)
+        and isinstance(node.args[0].elts[0], ast.Name)
+    }
+    key = dict(fields)["ad_skip_img2img"]
+    runtime = _load_script(
+        methods={"process", "set_skip_img2img"},
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        SkipImg2ImgOrig=SkipImg2ImgOrig,
+    )
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: True
+    script.get_args = lambda *_args: []
+    script.extra_params = lambda _args: {"ADetailer model": "face_yolov8n.pt"}
+    p = SimpleNamespace(
+        init_images=[object()], width=1024, height=768, steps=30,
+        sampler_name="DPM++ 2M", extra_generation_params={},
+    )
+
+    script.process(p, True, skip, {})
+
+    written = p.extra_generation_params.get(key)
+    # Also False for an img2img picture made without it: pasting it unticks a
+    # ticked box (only the True case was written, and the box stayed ticked).
+    assert written is skip
+    # The WebUI pastes a checkbox's text "True" / "False" as True / False.
+    assert str(written) == ("True" if skip else "False")
+
+    # A txt2img picture writes no key, so pasting it leaves the box alone.
+    t2i = SimpleNamespace(
+        width=1024, height=768, steps=30,
+        sampler_name="DPM++ 2M", extra_generation_params={},
+    )
+    script.process(t2i, True, False, {})
+    assert key not in t2i.extra_generation_params
 
 
 @pytest.mark.parametrize(
@@ -747,7 +815,10 @@ def test_skip_img2img_records_each_batch_files_own_settings(second_file, expecte
         "Size": f"{p.width}x{p.height}",
         **p.extra_generation_params,
     }
-    assert infotext == {"Steps": steps, "Sampler": sampler, "Size": f"{width}x{height}"}
+    assert infotext == {
+        "Steps": steps, "Sampler": sampler, "Size": f"{width}x{height}",
+        "ADetailer skip img2img": True,
+    }
     assert (p.steps, p.sampler_name, p.width, p.height) == (1, "Euler", 128, 128)
     whole = ADetailerArgs(ad_inpaint_only_masked=False)
     assert script.get_width_height(p, whole) == (width, height)
@@ -861,13 +932,14 @@ _HAND_BOX = (300, 300, 400, 400)
 _CLASS_PROMPT = "detailed, [CLASS=face]smile[/CLASS], [CLASS=hand]five fingers[/CLASS]"
 
 
-def _class_prompt_script():
+def _class_prompt_script(opts_data=None):
     from adetailer.args import BBOX_SORTBY
     from adetailer.classes import _has_token, build_class_guard
     from adetailer.mask import (
         filter_by_indices,
         filter_by_ratio,
         filter_k_by,
+        filter_overlapping,
         mask_preprocess,
         parse_indices,
         sort_bboxes,
@@ -882,10 +954,11 @@ def _class_prompt_script():
             "_parse_class_prompts", "_class_prompt_for", "_resolve_inline_class_prompt"
         },
         assigns={"_INLINE_CLASS_RE"},
-        opts=SimpleNamespace(data={}),
+        opts=SimpleNamespace(data=dict(opts_data or {})),
         BBOX_SORTBY=BBOX_SORTBY,
         filter_by_indices=filter_by_indices,
         filter_by_ratio=filter_by_ratio,
+        filter_overlapping=filter_overlapping,
         filter_k_by=filter_k_by,
         mask_preprocess=mask_preprocess,
         parse_indices=parse_indices,
@@ -990,6 +1063,92 @@ def test_inpaint_indices_accept_preview_labels_and_warn_when_unreadable(
     assert ("has no usable number" in out) is warned
     assert ("matched none" in out) is (kept == [])
     assert out.isascii()
+
+
+def _twice_found_face():
+    # One face found twice (nearly the same box, the copy less confident)
+    # plus another face.
+    from adetailer.common import PredictOutput
+
+    boxes = [(10, 10, 110, 110), (12, 10, 112, 110), (150, 10, 250, 110)]
+    masks = []
+    for box in boxes:
+        mask = Image.new("L", (512, 512), 0)
+        mask.paste(255, box)
+        masks.append(mask)
+    return PredictOutput(
+        bboxes=[list(b) for b in boxes],
+        masks=masks,
+        confidences=[0.9, 0.6, 0.8],
+        preview=Image.new("RGB", (512, 512)),
+        class_names=["face", "face", "face"],
+    )
+
+
+@pytest.mark.parametrize("value", [None, 0, 0.0, "", "not a number", [1]])
+def test_drop_overlapping_detections_off_keeps_every_detection(value, capsys):
+    from adetailer.args import ADetailerArgs
+
+    data = {} if value is None else {"ad_drop_overlapping_detections": value}
+    script = _class_prompt_script(data)
+    pred = _twice_found_face()
+
+    masks = script.pred_preprocessing(SimpleNamespace(), pred, ADetailerArgs())
+
+    assert len(masks) == 3
+    assert len(pred.bboxes) == 3
+    assert "overlapping" not in capsys.readouterr().out
+
+
+def test_drop_overlapping_detections_inpaints_a_face_found_twice_once(capsys):
+    from adetailer.args import ADetailerArgs
+
+    script = _class_prompt_script({"ad_drop_overlapping_detections": 0.6})
+    pred = _twice_found_face()
+
+    masks = script.pred_preprocessing(SimpleNamespace(), pred, ADetailerArgs())
+
+    assert pred.bboxes == [[10, 10, 110, 110], [150, 10, 250, 110]]
+    assert pred.confidences == [0.9, 0.8]
+    assert pred.class_names == ["face", "face"]
+    assert len(masks) == 2
+    out = capsys.readouterr().out
+    assert "dropped 1 overlapping detection(s)" in out
+    assert out.isascii()
+
+
+def test_drop_overlapping_detections_runs_after_the_preview_numbers():
+    # "#2" is the less confident copy on the numbered Detection preview. The
+    # number must still pick that box: the overlap filter runs after it, and
+    # with the stronger copy not picked there is nothing left to drop.
+    from adetailer.args import ADetailerArgs
+
+    script = _class_prompt_script({"ad_drop_overlapping_detections": 0.6})
+    pred = _twice_found_face()
+    args = ADetailerArgs(ad_inpaint_indices="2")
+
+    masks = script.pred_preprocessing(SimpleNamespace(), pred, args)
+
+    assert pred.bboxes == [[12, 10, 112, 110]]
+    assert len(masks) == 1
+
+
+def test_drop_overlapping_detections_is_an_option_off_by_default():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    option = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_drop_overlapping_detections"
+    )
+    info = option.args[1]
+    kwargs = {k.arg: k.value for k in info.func.value.keywords}
+    assert ast.literal_eval(kwargs["default"]) == 0
+    assert ast.unparse(kwargs["section"]) == "section"
+    label = ast.literal_eval(kwargs["label"])
+    for text in (label, ast.literal_eval(info.args[0])):
+        assert not re.search(r"\*|`|\[[^\]]*\]\(|\n", text)
 
 
 def test_console_messages_are_ascii():
@@ -1432,12 +1591,25 @@ def test_pasting_parameters_clears_class_prompts_they_leave_out(
     } == {**params, **added}
 
 
+def _ui_split_sampler_name():
+    ui_path = _SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(ui_path.read_text(encoding="utf-8"))
+    nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "split_sampler_name"
+    ]
+    namespace = {}
+    module = ast.Module(body=[tree.body[0], *nodes], type_ignores=[])
+    exec(compile(module, str(ui_path), "exec"), namespace)
+    return namespace["split_sampler_name"]
+
+
 def _paste_callback(
     skipped=(), schedulers=("Automatic", "Uniform", "Karras", "Exponential"),
-    model_mapping=None,
+    model_mapping=None, samplers=("DPM++ 2M", "DPM++ 2M SDE", "Euler", "Euler a"),
 ):
     return _load_script(
-        functions={"_clear_missing_class_prompts"},
+        functions={"_clear_missing_class_prompts", "_scheduler_endings"},
         assigns={
             "_INFOTEXT_MODEL_KEY",
             "_INFOTEXT_PASTE_DEFAULTS",
@@ -1448,10 +1620,12 @@ def _paste_callback(
         shared=SimpleNamespace(
             opts=SimpleNamespace(infotext_skip_pasting=list(skipped))
         ),
-        all_samplers=[
-            SimpleNamespace(name=n) for n in ("DPM++ 2M", "DPM++ 2M SDE", "Euler", "Euler a")
+        all_samplers=[SimpleNamespace(name=n) for n in samplers],
+        # A label, or a scheduler with its name and aliases too.
+        schedulers=[
+            SimpleNamespace(label=x) if isinstance(x, str) else x for x in schedulers
         ],
-        schedulers=[SimpleNamespace(label=label) for label in schedulers],
+        split_sampler_name=_ui_split_sampler_name(),
     )
 
 
@@ -1621,9 +1795,11 @@ def test_paste_defaults_cover_every_key_the_infotext_leaves_out():
 @pytest.mark.parametrize(
     ("choices", "expected"),
     [
-        # Forge / Forge Neo list "None" first: the image's preprocessor.
+        # Forge / Forge Neo list "None" first: as on AUTOMATIC1111, a model
+        # set with "None" gets its default (the change handler cannot tell a
+        # pasted "None" from the empty tab's).
         (["None", "inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"],
-         "None"),
+         "inpaint_global_harmonious"),
         # AUTOMATIC1111 has no "None": the model's default, as when generating.
         (["inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"],
          "inpaint_global_harmonious"),
@@ -1653,10 +1829,12 @@ def test_pasted_controlnet_module_none_replaces_a_stale_module(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "on_cn_model_update"
     ]
+    common = _SCRIPT_PATH.parents[1] / "controlnet_ext" / "common.py"
     namespace = {
         "gr": SimpleNamespace(update=lambda **kwargs: kwargs),
         "cn_module_choices": {"inpaint": choices},
     }
+    exec(compile(common.read_text(encoding="utf-8"), str(common), "exec"), namespace)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(ui_path), "exec"), namespace)
 
     assert namespace["on_cn_model_update"](_CN_INPAINT, module)["value"] == expected
@@ -1685,6 +1863,93 @@ def test_pasting_parameters_with_a_detector_switches_adetailer_on(
     _paste_callback(skipped)._clear_missing_class_prompts("", pasted)
 
     assert pasted.get("ADetailer enable") == enabled
+
+
+# Schedulers with the name and aliases the WebUI also takes off a sampler name.
+_NAMED_SCHEDULERS = (
+    SimpleNamespace(label="Automatic", name="automatic", aliases=None),
+    SimpleNamespace(label="Karras", name="karras", aliases=None),
+    SimpleNamespace(label="SGM Uniform", name="sgm_uniform", aliases=["SGMUniform"]),
+)
+
+
+def test_pasting_names_a_sampler_this_webui_does_not_have(capsys):
+    # A ticked sampler from another WebUI (Res Multistep from Forge Neo on
+    # AUTOMATIC1111) was pasted as it was: Forge showed the dropdown blank and
+    # Generate ran the first sampler with only a console warning.
+    params = {
+        "ADetailer model": "face_yolov8n.pt",
+        "ADetailer use separate sampler": "True",
+        "ADetailer sampler": "Res Multistep",
+        "ADetailer model 2nd": "hand_yolov8n.pt",
+        "ADetailer use separate sampler 2nd": "True",
+        "ADetailer sampler 2nd": "Euler a",
+    }
+
+    _paste_callback()._clear_missing_class_prompts("", params)
+
+    assert params["ADetailer sampler"] == "DPM++ 2M"
+    assert params["ADetailer sampler 2nd"] == "Euler a"
+    out = capsys.readouterr().out
+    assert out == (
+        "[-] ADetailer: the sampler 'Res Multistep' of the pasted 1st tab is not "
+        "in this WebUI: that tab uses 'DPM++ 2M' instead.\n"
+    )
+    out.encode("ascii")
+    # Unticked, the sampler does not run: nothing is said or changed.
+    params = {
+        "ADetailer model": "face_yolov8n.pt",
+        "ADetailer use separate sampler": "False",
+        "ADetailer sampler": "Res Multistep",
+    }
+    _paste_callback()._clear_missing_class_prompts("", params)
+    assert params["ADetailer sampler"] == "Res Multistep"
+    assert capsys.readouterr().out == ""
+
+
+def test_pasting_splits_a_sampler_name_as_load_does():
+    # Every name: pasted, it shows the sampler and scheduler Load shows.
+    from tests.test_ui_presets import _WEBUI_SAMPLERS, _WEBUI_SCHEDULERS, _webui_runs
+
+    for webui, schedulers in _WEBUI_SCHEDULERS.items():
+        callback = _paste_callback(schedulers=schedulers, samplers=_WEBUI_SAMPLERS)
+        endings = [e for x in schedulers for e in (x.label, x.name, *(x.aliases or ()))]
+        for base in [*_WEBUI_SAMPLERS, "Res Multistep", "Foo", "Euler SGM"]:
+            for tail in [(), *((e,) for e in endings), *((e, f) for e in endings[:6] for f in endings)]:
+                name = " ".join((base, *tail))
+                params = {
+                    "ADetailer model": "face_yolov8n.pt",
+                    "ADetailer use separate sampler": "True",
+                    "ADetailer sampler": name,
+                    "ADetailer scheduler": "Beta",
+                }
+                callback._clear_missing_class_prompts("", params)
+                runs = _webui_runs(name, "Beta", schedulers)
+                shown = (params["ADetailer sampler"], params["ADetailer scheduler"])
+                assert shown == runs[:2], (webui, name)
+
+
+def test_a_restart_is_given_the_endings_the_webui_takes_off_a_sampler_name():
+    # The restart test builds its own WebuiInfo: check that the script hands
+    # it each scheduler's label, name and aliases, as the paste callback uses.
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    call = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "WebuiInfo"
+    )
+    value = next(k.value for k in call.keywords if k.arg == "scheduler_endings")
+    assert ast.unparse(value) == "_scheduler_endings()"
+    runtime = _load_script(
+        functions={"_scheduler_endings"},
+        schedulers=[
+            SimpleNamespace(label="Karras", name="karras", aliases=None),
+            SimpleNamespace(label="SGM Uniform", name="sgm_uniform", aliases=["SGMUniform"]),
+            SimpleNamespace(label="Beta"),
+        ],
+    )
+    assert runtime._scheduler_endings() == [
+        ["Karras", "karras"], ["SGM Uniform", "sgm_uniform", "SGMUniform"], ["Beta", None],
+    ]
 
 
 def test_pasting_splits_an_old_combined_sampler_name():
@@ -1725,12 +1990,20 @@ def test_pasting_splits_an_old_combined_sampler_name():
          ("Use same sampler", "Use same scheduler")),
         (("False", "DPM++ 2M Karras", None), [], None,
          ("DPM++ 2M Karras", "Use same scheduler")),
-        (("True", "Foo Karras", None), [], None, ("Foo Karras", "Use same scheduler")),
-        # Unlike Load, a sampler this WebUI does not have and a scheduler's
-        # other names are kept too (known issues of beta 2).
-        (("True", "Res Multistep", "Karras"), [], None, ("Res Multistep", "Karras")),
-        (("True", "DPM++ 2M karras", None), [], None,
-         ("DPM++ 2M karras", "Use same scheduler")),
+        # As Load: a scheduler's other names are split too.
+        (("True", "DPM++ 2M karras", None), [], _NAMED_SCHEDULERS, ("DPM++ 2M", "Karras")),
+        (("True", "Euler a sgm_uniform", None), [], _NAMED_SCHEDULERS,
+         ("Euler a", "SGM Uniform")),
+        # As Load: a sampler this WebUI does not have takes the first one, and
+        # the scheduler the name ended with is kept.
+        (("True", "Res Multistep", "Karras"), [], None, ("DPM++ 2M", "Karras")),
+        (("True", "Foo Karras", None), [], None, ("DPM++ 2M", "Karras")),
+        (("True", "k_euler_a", None), [], None, ("DPM++ 2M", "Use same scheduler")),
+        (("True", "Res Multistep", "Karras"), ["ADetailer scheduler"], None,
+         ("DPM++ 2M", "Karras")),
+        # Not pasted, so not changed: the WebUI keeps the dropdown as it is.
+        (("True", "Res Multistep", "Karras"), ["ADetailer sampler"], None,
+         ("Res Multistep", "Karras")),
         # Splitting without the scheduler would lose Karras.
         (("True", "DPM++ 2M Karras", None), ["ADetailer scheduler"], None,
          ("DPM++ 2M Karras", None)),
@@ -1747,11 +2020,15 @@ def test_pasting_leaves_other_sampler_names_alone(pasted, skipped, schedulers, e
     }
     if scheduler is not None:
         params["ADetailer scheduler"] = scheduler
-    callback = (
-        _paste_callback(skipped)
-        if schedulers is None
-        else _paste_callback(skipped, schedulers)
-    )
+    if schedulers is None:
+        callback = _paste_callback(skipped)
+    elif schedulers == ():
+        # WebUI < 1.9 lists the combined names as samplers.
+        callback = _paste_callback(
+            skipped, schedulers, samplers=("DPM++ 2M", "DPM++ 2M Karras", "Euler a")
+        )
+    else:
+        callback = _paste_callback(skipped, schedulers)
 
     callback._clear_missing_class_prompts("", params)
 
@@ -1986,6 +2263,7 @@ def test_detailer_pass_keeps_the_distilled_cfg_scale(host, user_value, expected)
         schedulers=None,
         controlnet_type="forge",
         copy_extra_params=dict,
+        opts=SimpleNamespace(),  # the host's own options
     )
     script = runtime.AfterDetailerScript()
     script.get_seed = lambda _p: (1, 1)
@@ -2069,7 +2347,7 @@ _INLINE_PROMPT_METHODS = {
 _INLINE_PROMPT_FUNCTIONS = {
     "_resolve_inline_class_prompt", "_extract_lora_tags", "_extract_lora_triggers",
     "_merge_lora_tags", "_append_lora_triggers", "_strip_lora_tags",
-    "_without_style_loras",
+    "_without_style_loras", "_strip_host_comments",
 }
 _INLINE_PROMPT_ASSIGNS = {"_INLINE_CLASS_RE", "_LORA_TAG_RE", "_LORA_TRIGGER_RE"}
 
@@ -2454,8 +2732,11 @@ def _nan_standalone(tmp_path):
     todo = []
 
     def process_images(_p2):
-        if todo.pop(0) == "nan":
+        outcome = todo.pop(0)
+        if outcome == "nan":
             raise nans("A tensor with NaNs was produced in Unet.")
+        if outcome == "error":
+            raise RuntimeError("CUDA out of memory.")
         return SimpleNamespace(images=[result])
 
     def predict(*_args, **_kwargs):
@@ -2854,9 +3135,12 @@ def test_standalone_run_follows_the_global_output_directory(tmp_path, global_dir
     # the standalone tool still wrote next to the img2img folder.
     img2img_dir = tmp_path / "webui" / "outputs" / "img2img-images"
     override = str(tmp_path / "other-drive" / "images") if global_dir else ""
-    saved, shells = [], []
+    saved, shells, names = [], [], []
     script = _load_script(
-        methods={"run_detailer_on_image", "read_params_txt", "write_params_txt"},
+        methods={
+            "run_detailer_on_image", "read_params_txt", "write_params_txt",
+            "_standalone_infotext_p",
+        },
         paths=SimpleNamespace(data_path=str(tmp_path)),
         PARAMS_TXT="params.txt",
         shared=SimpleNamespace(sd_model=None),
@@ -2868,7 +3152,8 @@ def test_standalone_run_follows_the_global_output_directory(tmp_path, global_dir
         all_samplers=[],
         ensure_pil_image=lambda image, _mode: image,
         images=SimpleNamespace(
-            save_image=lambda _image, path, _basename, **_kwargs: saved.append(path)
+            save_image=lambda _image, path, _basename, **kwargs: saved.append(path)
+            or names.append(kwargs["p"])
         ),
         AD_APPLY_SUBDIR="ADetailer-Inpaint",
         pause_total_tqdm=nullcontext,
@@ -2885,6 +3170,11 @@ def test_standalone_run_follows_the_global_output_directory(tmp_path, global_dir
     )
 
     assert "Saved" in status
+    # The result is named with the completed copy of the shell, as the
+    # previews are: a [user] or [denoising] file-name token printed a
+    # traceback for each result.
+    assert names[0] is not shells[0]
+    assert (names[0].user, names[0].denoising_strength) == (None, None)
     if global_dir:
         assert shells[0].outpath_samples == override
         assert saved == [str(Path(override) / "ADetailer-Inpaint")]
@@ -4373,8 +4663,9 @@ def test_the_readme_says_mediapipe_face_full_uses_the_short_range_model():
         (True, False, {"overlay_inpaint": False}, False),
     ],
 )
+@pytest.mark.parametrize("with_scripts", [True, False])
 def test_an_only_masked_pass_keeps_the_host_overlay_on(
-    only_masked, registered, saved, forced
+    only_masked, registered, saved, forced, with_scripts
 ):
     from adetailer.args import ADetailerArgs
 
@@ -4382,19 +4673,189 @@ def test_an_only_masked_pass_keeps_the_host_overlay_on(
     labels = {"overlay_inpaint": object()} if registered else {}
     script = _i2i_script(
         methods={"get_override_settings"},
+        functions={"_keep_host_overlay"},
         opts=SimpleNamespace(data=data, data_labels=labels),
         _is_forge_modules=lambda: False,
         _forge_wanted_modules=lambda _args: None,
     )
+    host_step = lambda _p, _ppmo: None  # noqa: E731
+    runner = SimpleNamespace(postprocess_maskoverlay=host_step)
+    script.script_filter = lambda *_args: (runner if with_scripts else None, [])
     args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_only_masked=only_masked)
 
     i2i = script.get_i2i_p(_txt2img_p(), args, Image.new("RGB", (512, 768)))
 
-    assert i2i.override_settings.get("overlay_inpaint") is (True if forced else None)
-    # The host puts back after the pass only the options in opts.data; the
-    # user's own setting is not touched here.
-    assert set(i2i.override_settings) <= set(data)
+    # Setting the option for the pass left it on in the settings the WebUI
+    # saved during the pass, and the host's opts.set stopped ADetailer with
+    # frozen settings ("not possible to set 'overlay_inpaint'").
+    assert "overlay_inpaint" not in i2i.override_settings
     assert data == saved
+    # Instead the pass gets the host's overlay: through this pass's script
+    # runner, or pasted back after the pass when it has none.
+    wrapped = runner.postprocess_maskoverlay is not host_step
+    assert wrapped is (forced and with_scripts)
+    assert getattr(i2i, "_ad_paste_back", False) is (forced and not with_scripts)
+
+
+def test_the_overlay_step_adds_the_host_overlay_as_the_option_does():
+    runtime = _load_script(functions={"_keep_host_overlay"})
+    overlay, soft = object(), object()
+    seen = []
+
+    def host_step(p, ppmo):
+        # The scripts run after the host chose the overlay: soft inpainting
+        # puts its own.
+        seen.append(ppmo.overlay_image)
+        if getattr(p, "soft", False):
+            ppmo.overlay_image = soft
+
+    runner = SimpleNamespace(postprocess_maskoverlay=host_step)
+    assert runtime._keep_host_overlay(runner) is True
+    assert runtime._keep_host_overlay(None) is False
+    assert runtime._keep_host_overlay(SimpleNamespace()) is False
+
+    p = SimpleNamespace(overlay_images=[overlay])
+    ppmo = SimpleNamespace(index=0, overlay_image=None)
+    runner.postprocess_maskoverlay(p, ppmo)
+    assert ppmo.overlay_image is overlay
+
+    p.soft = True
+    ppmo = SimpleNamespace(index=0, overlay_image=None)
+    runner.postprocess_maskoverlay(p, ppmo)
+    assert ppmo.overlay_image is soft
+    assert seen == [overlay, overlay]
+
+    # Unchanged: an overlay the host already chose, and a pass with none.
+    chosen = object()
+    ppmo = SimpleNamespace(index=0, overlay_image=chosen)
+    runner.postprocess_maskoverlay(SimpleNamespace(overlay_images=[overlay]), ppmo)
+    assert ppmo.overlay_image is chosen
+    for q, index in ((SimpleNamespace(), 0), (SimpleNamespace(overlay_images=[overlay]), 1)):
+        ppmo = SimpleNamespace(index=index, overlay_image=None)
+        runner.postprocess_maskoverlay(q, ppmo)
+        assert ppmo.overlay_image is None
+
+
+def test_a_pass_without_scripts_pastes_the_region_back(monkeypatch):
+    runtime = _load_script(functions={"_paste_region_back"})
+    full = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    crop = Image.new("RGB", (32, 32), "red")
+    crop.info["parameters"] = "face"
+    calls = []
+
+    def apply_overlay(image, paste_loc, overlay):
+        calls.append((image, paste_loc, overlay))
+        return Image.new("RGB", (overlay.width, overlay.height), "blue"), image
+
+    processing = SimpleNamespace(apply_overlay=apply_overlay)
+    monkeypatch.setitem(sys.modules, "modules.processing", processing)
+    p2 = SimpleNamespace(overlay_images=[full], paste_to=(8, 8, 32, 32))
+
+    pasted = runtime._paste_region_back(p2, crop)
+
+    assert calls == [(crop, (8, 8, 32, 32), full)]
+    assert pasted.size == (64, 64)
+    assert pasted.info["parameters"] == "face"
+    # As it came back without an overlay, or if the host step fails.
+    assert runtime._paste_region_back(SimpleNamespace(), crop) is crop
+
+    def broken(*_args):
+        msg = "shape mismatch"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(processing, "apply_overlay", broken)
+    assert runtime._paste_region_back(p2, crop) is crop
+
+
+def test_each_region_without_scripts_is_pasted_back_into_the_picture(monkeypatch):
+    # "Run ADetailer on an image" has no script runner: with "Overlay
+    # original for inpaint" off the host returned only the region's crop,
+    # which then fed the next region and became the result.
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", (1000, 1000), "white")
+    mask = Image.new("L", (1000, 1000), 0)
+    pred = SimpleNamespace(
+        preview=image,
+        bboxes=[[0, 0, 316, 316], [500, 500, 816, 816]],
+        class_names=[],
+    )
+    inputs = []
+
+    def process_images(p2):
+        inputs.append(p2.init_images[0].size)
+        return SimpleNamespace(images=[Image.new("RGB", (512, 512), "red")])
+
+    def apply_overlay(region, _paste_loc, overlay):
+        return Image.new("RGB", overlay.size, "blue"), region
+
+    monkeypatch.setitem(
+        sys.modules, "modules.processing", SimpleNamespace(apply_overlay=apply_overlay)
+    )
+    runtime = _load_script(
+        methods={
+            "_postprocess_image_inner", "fix_p2", "get_dynamic_denoise_strength",
+            "get_optimal_crop_image_size", "get_seed", "get_each_tab_seed",
+        },
+        functions={"_paste_region_back"},
+        state=state,
+        shared=SimpleNamespace(
+            state=state, opts=SimpleNamespace(data={}), sd_model=None
+        ),
+        opts=SimpleNamespace(
+            data={
+                "ad_dynamic_denoise_power": 0,
+                "ad_match_inpaint_bbox_size": InpaintBBoxMatchMode.OFF.value,
+            }
+        ),
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+        ordinal=str,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[image], prompt="face", negative_prompt="",
+        close=lambda: None, denoising_strength=0.4, width=512, height=512,
+        _ad_paste_back=True, overlay_images=[image], paste_to=(0, 0, 316, 316),
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [mask, mask]
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+    p = SimpleNamespace(
+        extra_generation_params={}, seed=1, subseed=1, all_seeds=[1], all_subseeds=[1]
+    )
+    pp = SimpleNamespace(image=image)
+
+    processed = script._postprocess_image_inner(
+        p, pp, ADetailerArgs(ad_model="face_yolov8n.pt")
+    )
+
+    assert processed is True
+    assert inputs == [(1000, 1000), (1000, 1000)]
+    assert pp.image.size == (1000, 1000)
 
 
 def test_region_after_a_nan_error_gets_its_own_color_correction():
@@ -5182,8 +5643,13 @@ def test_the_docs_quote_each_frozen_settings_error():
     # Only --freeze-settings says "changing settings is disabled": the other
     # two options name the setting. The error stops ADetailer for the image,
     # so its later tabs do not run either, and the earlier tabs are kept.
+    # From plus.9 beta 1 the pass no longer sets that option, so the plus.9
+    # notes say that frozen settings no longer stop ADetailer, and the
+    # README's known issue keeps the quote for plus.8 only.
     docs = _public_docs()
-    beta2 = docs["CHANGELOG.md"].split("## v26.2.0+plus.8.beta.1", 1)[0]
+    changelog = docs["CHANGELOG.md"]
+    plus9, rest = changelog.split("## v26.2.0+plus.8 ", 1)
+    beta2 = rest.split("## v26.2.0+plus.8.beta.1", 1)[0]
     for text in (docs["README.md"], beta2):
         line = next(
             line for line in text.splitlines()
@@ -5192,6 +5658,13 @@ def test_the_docs_quote_each_frozen_settings_error():
         assert "not possible to set 'overlay_inpaint'" in line
         assert "later tabs" in line
         assert "leave the image undetailed" not in line
+        if text is docs["README.md"]:
+            assert "Fixed in plus.9 beta 1" in line
+    fix = next(
+        line for line in plus9.splitlines()
+        if "--freeze-specific-settings overlay_inpaint" in line
+    )
+    assert "the setting is never changed" in fix
 
 
 @pytest.mark.parametrize(
@@ -5715,7 +6188,10 @@ def test_a_saved_standalone_result_records_the_passs_parameters(
     # PNG, and Send to put "None" in the prompt box.
     saved = []
     script = _load_script(
-        methods={"run_detailer_on_image", "read_params_txt", "write_params_txt"},
+        methods={
+            "run_detailer_on_image", "read_params_txt", "write_params_txt",
+            "_standalone_infotext_p",
+        },
         paths=SimpleNamespace(data_path=str(tmp_path)),
         PARAMS_TXT="params.txt",
         shared=SimpleNamespace(sd_model=None),
@@ -5833,7 +6309,10 @@ def test_a_saved_standalone_result_keeps_the_passs_working_size(tmp_path):
     parameters = "detailed face\nSteps: 28, Sampler: DPM++ 2M, Size: 848x480"
     saved = []
     script = _load_script(
-        methods={"run_detailer_on_image", "read_params_txt", "write_params_txt"},
+        methods={
+            "run_detailer_on_image", "read_params_txt", "write_params_txt",
+            "_standalone_infotext_p",
+        },
         paths=SimpleNamespace(data_path=str(tmp_path)),
         PARAMS_TXT="params.txt",
         shared=SimpleNamespace(sd_model=None),
@@ -6667,6 +7146,94 @@ def test_prompt_comments_leave_the_styles_check_alone_without_the_comments_scrip
     assert missing.AfterDetailerScript().get_prompt(p, args)[0] == p.all_prompts
 
 
+@pytest.mark.parametrize(
+    ("strip", "comment"),
+    [(_a1111_strip_comments, "# old idea"), (_neo_strip_comments, "// old idea")],
+)
+def test_comments_typed_in_an_adetailer_prompt_do_not_reach_the_model(strip, comment):
+    # With "Apply only selected scripts to ADetailer" on (the default) the
+    # detailer pass runs without the WebUI's Comments script, so a comment
+    # typed in an ADetailer prompt box reached the model as prompt text.
+    from adetailer.args import ADetailerArgs
+
+    script = _comments_runtime(None, strip).AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="a woman in a park", negative_prompt="ugly", styles=[],
+        all_prompts=["a woman in a park"], all_negative_prompts=["ugly"],
+    )
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt",
+        ad_prompt=f"detailed face {comment}\n[SEP] {comment}\n[SEP] [SKIP] {comment}",
+        ad_negative_prompt=f"blurry {comment}",
+        ad_prompt_append=f"sharp eyes {comment}",
+        ad_negative_prompt_append=f"{comment}",
+    )
+
+    prompts, negatives = script.get_prompt(p, args)
+
+    assert len(prompts) == 3
+    assert all("old idea" not in text for text in [*prompts, *negatives])
+    assert prompts[0].split() == ["detailed", "face,", "sharp", "eyes"]
+    # A segment with only a comment is blank: it takes the main prompt.
+    assert prompts[1] == "a woman in a park, sharp eyes"
+    # [SKIP] with a comment is still the control token.
+    assert prompts[2] == "[SKIP]"
+    assert negatives[0].split() == ["blurry"]
+    # The X/Y/Z record keeps the text as typed.
+    raw, _ = script.get_prompt(p, args, keep_comments=True)
+    assert "old idea" in raw[0]
+
+
+def test_adetailer_prompt_comments_follow_the_webui_option():
+    from adetailer.args import ADetailerArgs
+
+    p = SimpleNamespace(
+        prompt="a woman", negative_prompt="", styles=[],
+        all_prompts=["a woman"], all_negative_prompts=[""],
+    )
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="detailed face # note")
+    # "Enable comments" off, or a WebUI without the Comments script: as typed.
+    off = _comments_runtime(None, _a1111_strip_comments, {"enable_prompt_comments": False})
+    assert off.AfterDetailerScript().get_prompt(p, args)[0] == ["detailed face # note"]
+    missing = _comments_runtime(None, None)
+    assert missing.AfterDetailerScript().get_prompt(p, args)[0] == ["detailed face # note"]
+
+
+@pytest.mark.parametrize(
+    ("tab", "expected"),
+    [
+        # An API request without a preprocessor: the backend picks the default.
+        ({"ad_model": "face_yolov8n.pt", "ad_controlnet_model": "control_openpose"}, None),
+        # "None" sent on purpose (the UI always sends the module) stays.
+        ({"ad_model": "face_yolov8n.pt", "ad_controlnet_model": "control_openpose",
+          "ad_controlnet_module": "None"}, "None"),
+        ({"ad_model": "face_yolov8n.pt", "ad_controlnet_model": "control_openpose",
+          "ad_controlnet_module": "openpose_hand"}, "openpose_hand"),
+    ],
+)
+def test_an_api_request_without_a_controlnet_preprocessor_gets_the_default(tab, expected):
+    # On Forge, Forge Neo and reForge the missing module was read as "None",
+    # so the ControlNet model ran on the raw crop.
+    from adetailer.args import ADetailerArgs
+
+    calls = []
+    runtime = _load_script(methods={"update_controlnet_args"})
+    script = runtime.AfterDetailerScript()
+    script.controlnet_ext = SimpleNamespace(
+        cn_available=True,
+        update_scripts_args=lambda _p, **kwargs: calls.append(kwargs),
+    )
+
+    script.update_controlnet_args(SimpleNamespace(), ADetailerArgs(**tab))
+    # A sequential class pass copies the tab: still a missing module.
+    script.update_controlnet_args(
+        SimpleNamespace(), ADetailerArgs(**tab).copy(update={"ad_model_classes": "face"})
+    )
+
+    assert [c["module"] for c in calls] == [expected, expected]
+    assert calls[0]["model"] == "control_openpose"
+
+
 _INSTALLED = {"face_yolov8n.pt": "face_yolov8n.pt", "hand_yolov8n.pt": "hand_yolov8n.pt"}
 
 
@@ -6747,17 +7314,6 @@ def test_the_readme_says_which_base_settings_a_standalone_run_uses():
         assert f'"{option}"' in section
 
 
-def test_the_readme_says_that_a_forge_controlnet_preprocessor_list_starts_with_none():
-    # On Forge-based WebUIs the list starts with "None" (the image as it is),
-    # which choosing a model keeps or falls back to: the README said the
-    # preprocessor was set automatically everywhere.
-    ui_text = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
-    assert "current_module if current_module in choices else choices[0]" in ui_text
-    section = _readme_section("**ControlNet** (at the bottom of each tab)", "\n## Models")
-    assert 'the preprocessor list starts with "None"' in section
-    assert "pick the preprocessor yourself" in section
-
-
 def test_the_readme_says_when_the_styles_still_reach_the_pass_twice():
     # When another extension rewrites the main prompts (wildcards), the
     # styles do not give them back and the pass keeps the old behaviour,
@@ -6811,6 +7367,9 @@ def test_the_beta_1_notes_name_only_reforges_gradio_4_branches_for_the_reset_reg
 def test_the_readme_says_that_comments_typed_in_an_adetailer_prompt_reach_the_model():
     # The detailer pass keeps only these scripts by default, and not the
     # WebUI's Comments script, which removes the comments of the main prompt.
+    # In plus.8 the comments typed in the ADetailer prompts therefore reached
+    # the model; from plus.9 beta 1 ADetailer removes them itself, and the
+    # README note says both.
     from adetailer.args import BUILTIN_SCRIPT, SCRIPT_DEFAULT
 
     kept = {name.strip() for name in f"{SCRIPT_DEFAULT},{BUILTIN_SCRIPT}".split(",")}
@@ -6820,6 +7379,199 @@ def test_the_readme_says_that_comments_typed_in_an_adetailer_prompt_reach_the_mo
     assert '"Apply only selected scripts to ADetailer"' in note
     assert '"Script names to apply to ADetailer"' in note
     assert "append text" in note
+    fixed, plus8 = note.split("In plus.8,", 1)
+    assert "From plus.9 beta 1, comments typed in the ADetailer prompt" in fixed
+    assert "are removed too" in fixed
+    assert "their text reaches the model" in plus8
+
+
+@pytest.mark.parametrize("saved_names", [None, "dynamic_prompting", ""])
+def test_the_detailer_pass_keeps_reforges_advanced_model_sampling_scripts(saved_names):
+    # With "Apply only selected scripts to ADetailer" on, reForge's Advanced
+    # Model Sampling script was dropped from the detailer pass, so a
+    # v-prediction or flow model came out broken there. It is now always
+    # kept, also when the user saved their own list of script names, and the
+    # other scripts are still filtered as before.
+    from adetailer.args import BUILTIN_SCRIPT, SCRIPT_DEFAULT
+
+    data = {"ad_only_selected_scripts": True}
+    if saved_names is not None:
+        data["ad_script_names"] = saved_names
+    runtime = _load_script(
+        methods={"script_filter", "script_args_copy"},
+        copy=copy,
+        opts=SimpleNamespace(data=data),
+        SCRIPT_DEFAULT=SCRIPT_DEFAULT,
+        BUILTIN_SCRIPT=BUILTIN_SCRIPT,
+    )
+    files = [
+        "ext/reForge-advanced_model_sampling/scripts/advanced_model_sampling_script.py",
+        "ext/reForge-advanced_model_sampling_backported/scripts/"
+        "advanced_model_sampling_script_backported.py",
+        "ext/some-extension/scripts/some_other_script.py",
+        "ext/sd-dynamic-prompts/scripts/dynamic_prompting.py",
+    ]
+    runner = SimpleNamespace(
+        alwayson_scripts=[SimpleNamespace(filename=name) for name in files]
+    )
+    p = SimpleNamespace(scripts=runner, script_args=[])
+    args = SimpleNamespace(ad_controlnet_model="None")
+
+    filtered, _ = runtime.AfterDetailerScript().script_filter(p, args)
+
+    kept = [Path(s.filename).stem for s in filtered.alwayson_scripts]
+    assert "advanced_model_sampling_script" in kept
+    assert "advanced_model_sampling_script_backported" in kept
+    assert "some_other_script" not in kept
+    assert ("dynamic_prompting" in kept) is (saved_names != "")
+    assert len(runner.alwayson_scripts) == len(files)
+
+
+def test_network_hashes_of_a_detailer_pass_join_the_images_without_repeats():
+    params = {"Lora hashes": "style: aaa111, detail: bbb222", "Steps": 20}
+    pass_params = {
+        "Lora hashes": "detail: bbb222, eyes: ccc333",
+        "TI hashes": "bad_hands: ddd444",
+    }
+
+    record = merge_network_hashes(params, pass_params)
+
+    assert params == {
+        "Lora hashes": "style: aaa111, detail: bbb222, eyes: ccc333",
+        "TI hashes": "bad_hands: ddd444",
+        "Steps": 20,
+    }
+    # The same pass again (another region, another tab) adds nothing.
+    record = merge_network_hashes(params, dict(pass_params), record)
+    assert params["Lora hashes"] == "style: aaa111, detail: bbb222, eyes: ccc333"
+    # A pass without hashes, or a WebUI that writes none, changes nothing.
+    before = dict(params)
+    record = merge_network_hashes(params, {"Steps": 30}, record)
+    assert params == before
+
+    # The next image of the batch starts from the host's own hashes again.
+    restore_network_hashes(params, record)
+    assert params == {"Lora hashes": "style: aaa111, detail: bbb222", "Steps": 20}
+
+
+def test_restoring_network_hashes_keeps_what_the_host_wrote_since():
+    params = {"Lora hashes": "style: aaa111"}
+    record = merge_network_hashes(params, {"Lora hashes": "eyes: ccc333"})
+    params["Lora hashes"] = "other: eee555"  # the next batch's own LoRA
+
+    restore_network_hashes(params, record)
+    assert params == {"Lora hashes": "other: eee555"}
+    # A record of another dict (an earlier job) never touches this one.
+    other = {"Lora hashes": "style: aaa111, eyes: ccc333"}
+    restore_network_hashes(other, merge_network_hashes({}, {"Lora hashes": "x: 1"}))
+    assert other == {"Lora hashes": "style: aaa111, eyes: ccc333"}
+
+
+def test_a_lora_used_only_in_the_adetailer_prompt_reaches_the_saved_hashes():
+    # The host lists in "Lora hashes" / "TI hashes" only the networks of the
+    # main prompt, so a LoRA or an embedding used only in an ADetailer prompt
+    # was missing from the saved image and sites such as Civitai did not
+    # recognise it. The detailer pass's own hashes are now added.
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", (1000, 1000), "white")
+    mask = Image.new("L", (1000, 1000), 0)
+    pred = SimpleNamespace(
+        preview=image, bboxes=[[0, 0, 316, 316], [500, 500, 816, 816]],
+        class_names=[],
+    )
+
+    def process_images(p2):
+        # What the host's LoRA and embedding code write for the pass's prompt.
+        p2.extra_generation_params["Lora hashes"] = "eyes: ccc333"
+        p2.extra_generation_params["TI hashes"] = "bad_hands: ddd444"
+        return SimpleNamespace(images=[image])
+
+    runtime = _load_script(
+        methods={
+            "_postprocess_image_inner", "fix_p2", "get_dynamic_denoise_strength",
+            "get_optimal_crop_image_size", "get_seed", "get_each_tab_seed",
+        },
+        state=state,
+        shared=SimpleNamespace(
+            state=state, opts=SimpleNamespace(data={}), sd_model=None
+        ),
+        opts=SimpleNamespace(
+            data={
+                "ad_dynamic_denoise_power": 0,
+                "ad_match_inpaint_bbox_size": InpaintBBoxMatchMode.OFF.value,
+            }
+        ),
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+        ordinal=str,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    p = SimpleNamespace(
+        extra_generation_params={"Lora hashes": "style: aaa111", "Steps": 20},
+        seed=1, subseed=1, all_seeds=[1], all_subseeds=[1],
+    )
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[image], prompt="face", negative_prompt="",
+        close=lambda: None, denoising_strength=0.4, width=512, height=512,
+        extra_generation_params=dict(p.extra_generation_params),
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [mask, mask]
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    processed = script._postprocess_image_inner(
+        p, SimpleNamespace(image=image), ADetailerArgs(ad_model="face_yolov8n.pt")
+    )
+
+    assert processed is True
+    assert p.extra_generation_params == {
+        "Lora hashes": "style: aaa111, eyes: ccc333",
+        "TI hashes": "bad_hands: ddd444",
+        "Steps": 20,
+    }
+
+
+def test_the_next_image_does_not_keep_the_previous_images_detailer_hashes():
+    # The next image of a batch, the next batch and the next X/Y/Z cell share
+    # the dict: one where ADetailer adds nothing (or does not run) must not
+    # keep the LoRA of the previous image's ADetailer prompt.
+    script = _load_script(methods={"postprocess_image"}).AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: False
+    params = {"Lora hashes": "style: aaa111"}
+    script._ad_network_hashes = merge_network_hashes(
+        params, {"Lora hashes": "eyes: ccc333"}
+    )
+    assert params == {"Lora hashes": "style: aaa111, eyes: ccc333"}
+
+    script.postprocess_image(
+        SimpleNamespace(extra_generation_params=params), SimpleNamespace(image=None)
+    )
+
+    assert params == {"Lora hashes": "style: aaa111"}
 
 
 class _HostI2I:
@@ -6928,3 +7680,1307 @@ def test_a_standalone_result_keeps_its_passs_parameters_when_the_tab_cannot_be_r
 
     assert shells == [{}]
     assert "Nothing detected" in status
+
+
+def _mask_run(state, opts_data, process_images, masks, prompts=None):
+    """A `_detailer` runner whose script records every save_image call."""
+    run, pp, before = _detailer(
+        state, process_images, n_masks=len(masks), Image=Image,
+        opts=SimpleNamespace(data=opts_data),
+    )
+    script = _script_of(run)
+    script.pred_preprocessing = lambda *_args: list(masks)
+    if prompts:
+
+        def replace(p2, _pos, _neg, j):
+            p2.prompt = prompts[j]
+
+        script.i2i_prompts_replace = replace
+    saved = []
+    script.extensions = {}
+
+    def save_image(_p, image, *, condition, suffix, extension=None):
+        saved.append((condition, suffix, image))
+        script.extensions[suffix] = extension
+
+    script.save_image = save_image
+    return run, pp, saved
+
+
+def _region_masks(n, size=(8, 8)):
+    masks = []
+    for k in range(n):
+        mask = Image.new("L", size, 0)
+        mask.paste(255, (k, k, k + 3, k + 3))
+        masks.append(mask)
+    return masks
+
+
+def _mask_state():
+    return SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+
+
+def test_save_inpaint_masks_saves_the_mask_each_region_is_inpainted_with():
+    # "Save inpaint masks" saves the black and white mask given to img2img,
+    # one per region inpainted: a [SKIP] region is not inpainted and saves
+    # none, and a mask resized to the whole-picture canvas is saved resized.
+    used = []
+
+    def process_images(p2):
+        used.append(p2.image_mask.copy())
+        # Whole-picture inpaint returns the region at the canvas size.
+        return SimpleNamespace(images=[Image.new("RGB", (16, 16), "red")])
+
+    run, pp, saved = _mask_run(
+        _mask_state(), {"ad_save_inpaint_masks": True}, process_images,
+        _region_masks(3), prompts=["face", "[SKIP]", "face"],
+    )
+
+    assert run() is True
+    masks = [(s, im) for c, s, im in saved if c == "ad_save_inpaint_masks"]
+    assert [s for s, _im in masks] == ["-ad-mask-1-1", "-ad-mask-1-3"]
+    # Premise: the 3rd mask was resized to the canvas before img2img.
+    assert [m.size for m in used] == [(8, 8), (16, 16)]
+    for (_s, image), mask in zip(masks, used):
+        assert image.mode == "L"
+        assert image.size == mask.size
+        assert image.tobytes() == mask.convert("L").tobytes()
+    # The mask preview of the pass is saved as before.
+    assert [s for c, s, _im in saved if c == "ad_save_previews"] == ["-ad-preview-1"]
+
+
+def test_save_inpaint_masks_names_each_sequential_class_pass():
+    # Sequential mode: named like that pass's preview, plus the region.
+    run, _pp, saved = _mask_run(
+        _mask_state(), {"ad_save_inpaint_masks": True},
+        lambda _p2: SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")]),
+        _region_masks(1),
+    )
+
+    assert run(classes="face,hand", sequential=True) is True
+    assert [s for c, s, _im in saved if c == "ad_save_inpaint_masks"] == [
+        "-ad-mask-1-1-face-1", "-ad-mask-1-2-hand-1",
+    ]
+    assert [s for c, s, _im in saved if c == "ad_save_previews"] == [
+        "-ad-preview-1-1-face", "-ad-preview-1-2-hand",
+    ]
+
+
+@pytest.mark.parametrize("tab", [0, 2])
+def test_save_inpaint_masks_names_the_tab(tab):
+    # "Run ADetailer on an image" and folder runs pass the tab they were
+    # started from as n, as a generation does.
+    run, pp, saved = _mask_run(
+        _mask_state(), {"ad_save_inpaint_masks": True},
+        lambda _p2: SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")]),
+        _region_masks(2),
+    )
+    script = _script_of(run)
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+    )
+
+    p = SimpleNamespace(extra_generation_params={}, _ad_standalone=True)
+    assert script._postprocess_image_inner(p, pp, args, n=tab) is True
+    assert [s for c, s, _im in saved if c == "ad_save_inpaint_masks"] == [
+        f"-ad-mask-{tab + 1}-1", f"-ad-mask-{tab + 1}-2",
+    ]
+
+
+def test_save_inpaint_masks_is_off_by_default():
+    run, _pp, saved = _mask_run(
+        _mask_state(), {},
+        lambda _p2: SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")]),
+        _region_masks(2),
+    )
+
+    assert run() is True
+    assert [c for c, _s, _im in saved] == ["ad_save_previews"]
+    # The option is declared off, among ADetailer's settings.
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    option = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_save_inpaint_masks"
+    )
+    info = option.args[1]
+    assert ast.literal_eval(info.args[0]).count("-ad-mask-N-K") == 1
+    kwargs = {k.arg: k.value for k in info.func.value.keywords}
+    assert ast.literal_eval(kwargs["default"]) is False
+    assert ast.literal_eval(kwargs["label"]) == "Save inpaint masks"
+    assert ast.unparse(kwargs["section"]) == "section"
+
+
+def test_a_failed_inpaint_mask_save_never_stops_the_pass(capsys):
+    result = Image.new("RGB", (8, 8), "red")
+    calls = []
+
+    def process_images(p2):
+        calls.append(p2)
+        return SimpleNamespace(images=[result])
+
+    run, pp, saved = _mask_run(
+        _mask_state(), {"ad_save_inpaint_masks": True}, process_images,
+        _region_masks(2),
+    )
+    script = _script_of(run)
+
+    def save_image(_p, _image, *, condition, suffix, extension=None):
+        if condition == "ad_save_inpaint_masks":
+            raise OSError("disk full")
+        saved.append((condition, suffix, _image))
+
+    script.save_image = save_image
+
+    assert run() is True
+    assert len(calls) == 2
+    assert pp.image is result
+    err = capsys.readouterr().err
+    assert err.count("couldn't save the inpaint mask (disk full)") == 2
+
+
+# X/Y/Z axes for every tab and an Enable axis.
+
+
+_OLD_XYZ_LABELS = [
+    "[ADetailer] ADetailer model 1st",
+    "[ADetailer] ADetailer prompt 1st",
+    "[ADetailer] ADetailer negative prompt 1st",
+    "[ADetailer] Prompt S/R (AD 1st)",
+    "[ADetailer] Prompt S/R (AD 1st and main prompt)",
+    "[ADetailer] Mask erosion / dilation 1st",
+    "[ADetailer] Inpaint denoising strength 1st",
+    "[ADetailer] CFG scale 1st",
+    "[ADetailer] Inpaint only masked 1st",
+    "[ADetailer] Inpaint only masked padding 1st",
+    "[ADetailer] ADetailer sampler 1st",
+    "[ADetailer] ADetailer scheduler 1st",
+    "[ADetailer] noise multiplier 1st",
+    "[ADetailer] ControlNet model 1st",
+]
+
+
+def _ui_ordinal():
+    return _ui_suffix().__globals__["ordinal"]
+
+
+def _xyz_runtime(data, with_grid=True):
+    """make_axis_on_xyz_grid with a stand-in for the WebUI's xyz_grid.py."""
+    from functools import partial
+
+    class AxisOption:
+        def __init__(self, label, type, apply, choices=None, **_kwargs):  # noqa: A002
+            self.label, self.type, self.apply, self.choices = label, type, apply, choices
+
+    grid = SimpleNamespace(
+        AxisOption=AxisOption,
+        axis_options=[AxisOption("Nothing", str, lambda *_a: None)],
+    )
+    script_class = type("Script", (), {"__module__": "xyz_grid.py"})
+    scripts_data = [SimpleNamespace(script_class=script_class, module=grid)]
+    runtime = _load_script(
+        functions={
+            "make_axis_on_xyz_grid", "set_value", "set_enable",
+            "search_and_replace_prompt",
+        },
+        scripts=SimpleNamespace(scripts_data=scripts_data if with_grid else []),
+        partial=partial,
+        model_mapping={"face_yolov8n.pt": "face_yolov8n.pt"},
+        all_samplers=[],
+        schedulers=[],
+        get_cn_models=list,
+        opts=SimpleNamespace(data=data),
+        ordinal=_ui_ordinal(),
+    )
+    return runtime, grid
+
+
+@pytest.mark.parametrize(("data", "tabs"), [({"ad_max_models": 3}, 3), ({}, 4)])
+def test_xyz_axes_reach_every_tab_and_keep_the_old_labels(data, tabs):
+    # The X/Y/Z axes reached only the 1st tab, and there was no axis to
+    # compare a grid with and without ADetailer.
+    runtime, grid = _xyz_runtime(data)
+    runtime.make_axis_on_xyz_grid()
+    labels = [x.label for x in grid.axis_options[1:]]
+
+    # The labels saved grids and presets use come first, as they were.
+    assert labels[: len(_OLD_XYZ_LABELS)] == _OLD_XYZ_LABELS
+    assert "[ADetailer] Enable" in labels
+    for name in ("Detection confidence threshold", "Inpaint mask blur", "Steps"):
+        assert f"[ADetailer] {name} 1st" in labels
+    ordinal = _ui_ordinal()
+    for n in range(2, tabs + 1):
+        for name in (
+            "ADetailer model", "ADetailer prompt", "ADetailer negative prompt",
+            "Detection confidence threshold", "Mask erosion / dilation",
+            "Inpaint mask blur", "Inpaint denoising strength",
+            "Inpaint only masked padding", "CFG scale", "Steps",
+        ):
+            assert f"[ADetailer] {name} {ordinal(n)}" in labels
+    assert not [x for x in labels if x.endswith(f" {ordinal(tabs + 1)}")]
+    expected = len(_OLD_XYZ_LABELS) + 1 + 3 + 10 * (tabs - 1)
+    assert len(labels) == len(set(labels)) == expected
+
+    # Called again (a UI reload), it adds nothing twice.
+    runtime.make_axis_on_xyz_grid()
+    assert [x.label for x in grid.axis_options[1:]] == labels
+
+    # The 2nd tab's axes write the 2nd tab's values only.
+    axis = {x.label: x for x in grid.axis_options}
+    pc = SimpleNamespace()
+    axis["[ADetailer] Inpaint denoising strength 2nd"].apply(pc, 0.6, [0.6])
+    axis["[ADetailer] ADetailer model 2nd"].apply(pc, "face_yolov8n.pt", [])
+    assert pc._ad_xyz_tabs == {
+        1: {"ad_denoising_strength": 0.6, "ad_model": "face_yolov8n.pt"}
+    }
+    assert not hasattr(pc, "_ad_xyz")
+    assert "face_yolov8n.pt" in axis["[ADetailer] ADetailer model 3rd"].choices()
+    # Unchanged: the 1st tab's axes.
+    axis["[ADetailer] Inpaint denoising strength 1st"].apply(pc, 0.3, [0.3])
+    assert pc._ad_xyz == {"ad_denoising_strength": 0.3}
+    enable = axis["[ADetailer] Enable"]
+    assert enable.choices() == ["False", "True"]
+    for value, expected_value in (("False", False), ("True", True), ("true", True)):
+        enable.apply(pc, value, ["False", "True"])
+        assert pc._ad_xyz_enable is expected_value
+
+
+def test_xyz_axes_are_skipped_without_the_xyz_script():
+    runtime, grid = _xyz_runtime({}, with_grid=False)
+    runtime.make_axis_on_xyz_grid()
+    assert [x.label for x in grid.axis_options] == ["Nothing"]
+
+
+def _xyz_process_runtime():
+    from adetailer.args import ADetailerArgs, SkipImg2ImgOrig
+
+    return _load_script(
+        methods={
+            "process", "postprocess_image", "is_ad_enabled", "set_skip_img2img",
+            "get_args", "extra_params",
+        },
+        functions={"set_value", "set_enable"},
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        ADetailerArgs=ADetailerArgs,
+        SkipImg2ImgOrig=SkipImg2ImgOrig,
+        suffix=_ui_suffix(),
+        ordinal=_ui_ordinal(),
+        __version__="test",
+    )
+
+
+class _ReachedError(Exception):
+    pass
+
+
+def _reach(*_args):
+    raise _ReachedError
+
+
+def test_an_xyz_axis_for_the_2nd_tab_reaches_only_that_tab():
+    runtime = _xyz_process_runtime()
+    script = runtime.AfterDetailerScript()
+    script.get_i2i_init_image = _reach
+    tabs = (
+        {"ad_model": "face_yolov8n.pt"}, {"ad_model": "None"},
+        {"ad_model": "hand_yolov8n.pt"},
+    )
+    p = SimpleNamespace(
+        prompt="a photo", negative_prompt="", init_images=None,
+        extra_generation_params={},
+    )
+
+    pc = copy(p)
+    runtime.set_value(pc, 0.6, [0.6], field="ad_denoising_strength", tab=1)
+    runtime.set_value(pc, "eyes_yolov8n.pt", [], field="ad_model", tab=1)
+    # A tab this run does not have is left alone.
+    runtime.set_value(pc, 0.2, [0.2], field="ad_denoising_strength", tab=5)
+    args = script.get_args(pc, True, False, *tabs)
+    assert [a.ad_model for a in args] == [
+        "face_yolov8n.pt", "eyes_yolov8n.pt", "hand_yolov8n.pt"
+    ]
+    assert [a.ad_denoising_strength for a in args] == [0.4, 0.6, 0.4]
+
+    # A detector axis runs a 2nd tab left on None, as the 1st tab's does.
+    off = (True, False, {"ad_model": "None"}, {"ad_model": "None"})
+    script.process(pc, *off)
+    assert not getattr(pc, "_ad_disabled", False)
+    assert pc.extra_generation_params["ADetailer model 2nd"] == "eyes_yolov8n.pt"
+    with pytest.raises(_ReachedError):
+        script.postprocess_image(pc, SimpleNamespace(image=None), *off)
+    # The next cell, without it, records nothing of this one.
+    nxt = copy(p)
+    runtime.set_value(nxt, "None", [], field="ad_model", tab=1)
+    script.process(nxt, *off)
+    assert nxt._ad_disabled
+    assert not [k for k in nxt.extra_generation_params if k.startswith("ADetailer ")]
+
+
+def test_a_short_api_request_with_the_enable_axis_does_not_count_the_default_tab():
+    # A short API request [{...}] puts the host's default 1st tab (a face
+    # detector, on) in the 3rd place. With the "[ADetailer] Enable" axis,
+    # process() built its tab list without dropping it: ADetailer counted as
+    # on although every tab the request sent was None.
+    runtime = _xyz_process_runtime()
+    script = runtime.AfterDetailerScript()
+    script.get_i2i_init_image = _reach
+    default = {"ad_model": "face_yolov8n.pt", "ad_tab_enable": True}
+    script._ad_api_default_tab = default
+    p = SimpleNamespace(
+        prompt="a photo", negative_prompt="", init_images=None,
+        extra_generation_params={},
+    )
+    # [{"ad_model": "None"}]: the host fills the 2nd place with Skip img2img
+    # (False) and the 3rd with its default 1st tab.
+    request = ({"ad_model": "None"}, False, dict(default))
+
+    pc = copy(p)
+    runtime.set_enable(pc, "True", ["False", "True"])
+    script.process(pc, *request)
+    assert pc._ad_disabled
+
+
+def test_the_xyz_enable_axis_switches_adetailer_for_the_cell():
+    runtime = _xyz_process_runtime()
+    script = runtime.AfterDetailerScript()
+    script.get_i2i_init_image = _reach
+    tab = {"ad_model": "face_yolov8n.pt"}
+    p = SimpleNamespace(
+        prompt="a photo", negative_prompt="", init_images=None,
+        extra_generation_params={"Hires upscale": 2},
+    )
+
+    for checkbox in (True, False):
+        cells = []
+        for value in ("True", "False"):
+            pc = copy(p)
+            runtime.set_enable(pc, value, ["False", "True"])
+            script.process(pc, checkbox, False, tab)
+            cells.append((pc, dict(pc.extra_generation_params)))
+        (on, on_params), (off, off_params) = cells
+        assert not getattr(on, "_ad_disabled", False)
+        assert on_params["ADetailer model"] == "face_yolov8n.pt"
+        with pytest.raises(_ReachedError):
+            script.postprocess_image(
+                on, SimpleNamespace(image=None), checkbox, False, tab
+            )
+        # The cell without ADetailer keeps nothing of the cell before.
+        assert off._ad_disabled
+        assert not [k for k in off_params if k.startswith("ADetailer ")]
+        assert off_params["Hires upscale"] == 2
+
+    # postprocess_image reads the axis too.
+    pc = copy(p)
+    runtime.set_enable(pc, "False", ["False", "True"])
+    image = SimpleNamespace(image=None)
+    assert script.postprocess_image(pc, image, True, False, tab) is None
+    # Switched on with every tab on None, there is still nothing to run.
+    pc = copy(p)
+    runtime.set_enable(pc, "True", ["False", "True"])
+    script.process(pc, False, False, {"ad_model": "None"})
+    assert pc._ad_disabled
+    # Unchanged without the axis: the checkbox decides.
+    plain = copy(p)
+    script.process(plain, False, False, tab)
+    assert plain._ad_disabled
+
+
+def test_save_inpaint_masks_skips_a_region_that_was_not_inpainted():
+    # The mask was saved before img2img ran: a region cancelled while it was
+    # being inpainted (or one that failed) still left its mask file.
+    state = _mask_state()
+    calls = []
+
+    def process_images(_p2):
+        calls.append(1)
+        if len(calls) == 2:
+            state.interrupted = True
+            msg = "cancelled before the first step"
+            raise RuntimeError(msg)
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")])
+
+    run, _pp, saved = _mask_run(
+        state, {"ad_save_inpaint_masks": True}, process_images, _region_masks(3)
+    )
+
+    assert run() is False
+    assert len(calls) == 2
+    assert [s for c, s, _im in saved if c == "ad_save_inpaint_masks"] == ["-ad-mask-1-1"]
+
+
+def test_a_new_xyz_cell_drops_the_previous_cells_detailer_hashes_before_its_params_txt():
+    # The WebUI writes params.txt for a cell before ADetailer's
+    # postprocess_image runs: the previous cell's ADetailer-only LoRA was still
+    # listed there. process() runs first in every cell and takes it out.
+    script = _load_script(methods={"process"}).AfterDetailerScript()
+    params = {"Lora hashes": "style: aaa111"}
+    script._ad_network_hashes = merge_network_hashes(
+        params, {"Lora hashes": "eyes: ccc333"}
+    )
+
+    script.process(SimpleNamespace(extra_generation_params=params, _ad_disabled=True))
+
+    assert params == {"Lora hashes": "style: aaa111"}
+
+
+
+def test_save_inpaint_masks_saves_png_whatever_the_image_format():
+    # In the Settings' image format (often JPEG) a mask got blurred edges.
+    run, _pp, saved = _mask_run(
+        _mask_state(), {"ad_save_inpaint_masks": True, "ad_save_previews": True},
+        lambda _p2: SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")]),
+        _region_masks(1),
+    )
+
+    assert run() is True
+    extensions = _script_of(run).extensions
+    assert extensions["-ad-mask-1-1"] == "png"
+    # The previews keep the Settings' format.
+    assert extensions["-ad-preview-1"] is None
+
+
+@pytest.mark.parametrize(("tab", "field", "use"), [
+    (0, "ad_cfg_scale", "ad_use_cfg_scale"),
+    (0, "ad_steps", "ad_use_steps"),
+    (2, "ad_steps", "ad_use_steps"),
+    (1, "ad_cfg_scale", "ad_use_cfg_scale"),
+])
+def test_an_xyz_steps_or_cfg_axis_ticks_the_tabs_use_separate_box(tab, field, use):
+    # Without "Use separate steps / CFG scale" ticked in the tab, every cell
+    # of a Steps or CFG scale grid came out the same: the axis ticks it.
+    runtime = _load_script(functions={"set_value"})
+    p = SimpleNamespace()
+
+    runtime.set_value(p, 12, [12, 40], field=field, tab=tab)
+
+    values = p._ad_xyz_tabs[tab] if tab else p._ad_xyz
+    assert values == {field: 12, use: True}
+
+
+def test_other_xyz_axes_tick_nothing_else():
+    runtime = _load_script(functions={"set_value"})
+    p = SimpleNamespace()
+
+    runtime.set_value(p, 0.5, [0.5], field="ad_denoising_strength")
+
+    assert p._ad_xyz == {"ad_denoising_strength": 0.5}
+
+
+# What create_infotext reads straight from p on AUTOMATIC1111 1.10 and Forge
+# Neo 2.30 (modules/processing.py, and sd_samplers_common for "Eta noise seed
+# delta"), besides the lists it is given.
+_INFOTEXT_READS = (
+    "all_negative_prompts", "batch_size", "cfg_scale", "distilled_cfg_scale",
+    "extra_generation_params", "height", "is_using_inpainting_conditioning",
+    "main_negative_prompt", "main_prompt", "restore_faces", "sampler_name",
+    "scheduler", "sd_model", "sd_model_hash", "sd_model_name", "sd_vae_hash",
+    "sd_vae_name", "seed_resize_from_h", "seed_resize_from_w", "steps",
+    "subseed_strength", "tiling", "user", "width", "eta", "sampler",
+)
+
+
+def _standalone_shell():
+    # The keys of run_detailer_on_image's p-shell.
+    return SimpleNamespace(
+        sd_model=None, prompt="", negative_prompt="", all_prompts=[""],
+        all_negative_prompts=[""], seed=1, subseed=2, all_seeds=[1],
+        all_subseeds=[2], subseed_strength=0.0, seed_resize_from_h=0,
+        seed_resize_from_w=0, iteration=0, batch_index=0, batch_size=1, n_iter=1,
+        width=512, height=512, steps=28, cfg_scale=7.0, sampler_name="Euler a",
+        scheduler="Automatic", styles=[], tiling=False, restore_faces=False,
+        outpath_samples="", outpath_grids="",
+        extra_generation_params={"ADetailer model": "face_yolov8n.pt"},
+        scripts=None, script_args=[], override_settings={}, _ad_standalone=True,
+    )
+
+
+def test_standalone_previews_and_masks_get_their_parameters(capsys):
+    # The previews, step images and masks of "Run ADetailer on an image" and
+    # folder runs were saved with no parameters: create_infotext read
+    # p.get_token_merging_ratio and other generation fields the p-shell does
+    # not have, and the console said "create_infotext failed" for each one.
+    def create_infotext(p, *_args):
+        values = {name: getattr(p, name) for name in _INFOTEXT_READS}
+        ratio = p.get_token_merging_ratio()
+        return f"Steps: {values['steps']}, ToMe: {ratio}, " + ", ".join(
+            f"{k}: {v}" for k, v in values["extra_generation_params"].items()
+        )
+
+    script = _load_script(
+        methods={"infotext", "_standalone_infotext_p"},
+        create_infotext=create_infotext, get_i=lambda _p: 0,
+        shared=SimpleNamespace(sd_model=None),
+    ).AfterDetailerScript()
+    shell = _standalone_shell()
+    before = dict(vars(shell))
+
+    info = script.infotext(shell)
+
+    assert info == "Steps: 28, ToMe: 0, ADetailer model: face_yolov8n.pt"
+    assert "create_infotext failed" not in capsys.readouterr().err
+    # The detailer pass reads the shell itself: it is left as it was.
+    assert vars(shell) == before
+
+
+def test_standalone_files_are_named_with_the_completed_shell(tmp_path):
+    # A file-name pattern with [user] or [denoising] read those fields of the
+    # p-shell, which it does not have: the WebUI printed a traceback for each
+    # preview, step image and mask of "Run ADetailer on an image".
+    named = []
+
+    def save_image(*, p, **_kwargs):
+        named.append((p.user, p.denoising_strength))
+
+    script = _load_script(
+        methods={"save_image", "infotext", "_standalone_infotext_p"},
+        create_infotext=lambda *_args: "", get_i=lambda _p: 0,
+        shared=SimpleNamespace(sd_model=None),
+        opts=SimpleNamespace(
+            data={"ad_save_previews": True, "ad_save_images_dir": str(tmp_path)},
+            samples_format="png", save_to_dirs=False,
+        ),
+        images=SimpleNamespace(save_image=save_image),
+        AD_EXTRA_SUBDIR="adetailer-steps",
+    ).AfterDetailerScript()
+    script.get_seed = lambda _p: (1, 2)
+    shell = _standalone_shell()
+    before = dict(vars(shell))
+
+    script.save_image(
+        shell, Image.new("RGB", (4, 4)), condition="ad_save_previews",
+        suffix="-ad-preview-1",
+    )
+
+    assert named == [(None, None)]
+    assert vars(shell) == before
+
+
+
+@pytest.mark.parametrize(("img2img", "base", "expected"), [
+    (0.5, 0.3, 0.5), (0, 0.3, 0.3), (0, 0, 0),
+])
+def test_standalone_preview_parameters_record_the_settings_token_merging(
+    img2img, base, expected
+):
+    # The detailer pass, an img2img pass, uses the Settings' img2img token
+    # merging ratio, else the base one; the parameters of its previews said 0.
+    def create_infotext(p, *_args):
+        return f"ToMe: {p.get_token_merging_ratio()}"
+
+    script = _load_script(
+        methods={"infotext", "_standalone_infotext_p"},
+        create_infotext=create_infotext, get_i=lambda _p: 0,
+        shared=SimpleNamespace(sd_model=None),
+        opts=SimpleNamespace(
+            token_merging_ratio=base, token_merging_ratio_img2img=img2img
+        ),
+    ).AfterDetailerScript()
+
+    assert script.infotext(_standalone_shell()) == f"ToMe: {expected}"
+
+
+def _load_install(monkeypatch):
+    import importlib.util
+
+    # install.py runs install() at import unless launch says to skip it.
+    launch = ModuleType("launch")
+    launch.args = SimpleNamespace(skip_install=True)
+    monkeypatch.setitem(sys.modules, "launch", launch)
+    path = Path(__file__).resolve().parents[1] / "install.py"
+    spec = importlib.util.spec_from_file_location("_adetailer_install", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_install_keeps_going_when_mediapipe_has_no_wheel(monkeypatch, capsys):
+    # Linux aarch64 on Python 3.13 has no mediapipe 0.10.x: with one pip
+    # command for everything, that failure also left ultralytics uninstalled.
+    import subprocess
+
+    install = _load_install(monkeypatch)
+    calls = []
+
+    def fake_pip(*args):
+        calls.append(args)
+        if any(a.startswith("mediapipe") for a in args):
+            raise subprocess.CalledProcessError(1, "pip")
+
+    monkeypatch.setattr(install, "run_pip", fake_pip)
+    monkeypatch.setattr(install, "is_installed", lambda *a: False)
+    monkeypatch.setattr(install, "numpy_pin", lambda: [])
+
+    install.install()
+
+    assert calls == [
+        ("ultralytics>=8.3.75", "rich>=13.0.0"),
+        ("mediapipe>=0.10.13,<=0.10.99",),
+    ]
+    err = capsys.readouterr().err
+    assert "could not install mediapipe" in err
+
+
+def test_install_keeps_numpy_1_in_both_pip_commands(monkeypatch):
+    # On AUTOMATIC1111 (NumPy 1) the separate MediaPipe command must keep
+    # NumPy 1 too, or it drags NumPy 2 in and breaks the WebUI.
+    install = _load_install(monkeypatch)
+    calls = []
+    monkeypatch.setattr(install, "run_pip", lambda *args: calls.append(args))
+    monkeypatch.setattr(install, "is_installed", lambda *a: False)
+    monkeypatch.setattr(install, "numpy_pin", lambda: ["numpy<2"])
+
+    install.install()
+
+    assert calls == [
+        ("ultralytics>=8.3.75", "rich>=13.0.0", "numpy<2"),
+        ("mediapipe>=0.10.13,<=0.10.99", "numpy<2"),
+    ]
+
+
+def test_install_still_fails_loudly_when_ultralytics_cannot_install(monkeypatch):
+    import subprocess
+
+    install = _load_install(monkeypatch)
+
+    def fake_pip(*args):
+        raise subprocess.CalledProcessError(1, "pip")
+
+    monkeypatch.setattr(install, "run_pip", fake_pip)
+    monkeypatch.setattr(install, "is_installed", lambda *a: False)
+    monkeypatch.setattr(install, "numpy_pin", lambda: [])
+
+    with pytest.raises(subprocess.CalledProcessError):
+        install.install()
+
+
+def _color_runtime(monkeypatch, **host):
+    calls = []
+
+    def setup(image):
+        calls.append(("setup", image.size, image.getpixel((0, 0))))
+        return "target"
+
+    def apply(target, image):
+        calls.append(("apply", target, image.size))
+        return Image.new("RGB", image.size, (0, 0, 255))
+
+    funcs = {"setup_color_correction": setup, "apply_color_correction": apply, **host}
+    monkeypatch.setitem(sys.modules, "modules.processing", SimpleNamespace(**funcs))
+    return _load_script(functions={"_match_region_colors"}), calls
+
+
+def _region_mask(size, box):
+    mask = Image.new("L", size, 0)
+    mask.paste(255, box)
+    return mask
+
+
+def test_match_region_colors_corrects_only_the_region(monkeypatch):
+    # A face inpainted paler or with another tint: its box, with the padding
+    # around it, is matched to the same box before the pass, as the host's
+    # own color correction does, and only the masked pixels change.
+    runtime, calls = _color_runtime(monkeypatch)
+    before = Image.new("RGB", (40, 40), (100, 100, 100))
+    after = Image.new("RGB", (40, 40), (255, 0, 0))
+    after.info["parameters"] = "face"
+    mask = _region_mask((40, 40), (10, 10, 20, 20))
+
+    out = runtime._match_region_colors(before, after, mask, 4, 0)
+
+    assert calls == [("setup", (18, 18), (100, 100, 100)), ("apply", "target", (18, 18))]
+    assert out.getpixel((15, 15)) == (0, 0, 255)
+    assert out.getpixel((8, 8)) == (255, 0, 0)  # in the box, outside the mask
+    assert out.getpixel((30, 30)) == (255, 0, 0)
+    assert out.info["parameters"] == "face"
+    assert after.getpixel((15, 15)) == (255, 0, 0)  # the input is not changed
+
+
+def test_match_region_colors_blurs_the_edge_and_stops_at_the_border(monkeypatch):
+    runtime, calls = _color_runtime(monkeypatch)
+    before = Image.new("RGB", (40, 40), (100, 100, 100))
+    after = Image.new("RGB", (40, 40), (255, 0, 0))
+
+    mask = _region_mask((40, 40), (0, 0, 10, 10))
+    out = runtime._match_region_colors(before, after, mask, 10, 3)
+
+    # Around the blurred mask, as the host crops; the padding stops at the
+    # image border.
+    right, bottom = mask.filter(ImageFilter.GaussianBlur(3)).getbbox()[2:]
+    assert calls[0][1] == (min(right + 10, 40), min(bottom + 10, 40))
+    edge = out.getpixel((10, 5))  # first pixel outside the mask
+    assert edge not in ((255, 0, 0), (0, 0, 255))
+    assert out.getpixel((4, 4)) != (255, 0, 0)
+
+
+def test_match_region_colors_has_no_straight_edge_without_padding(monkeypatch):
+    # With the box taken around the sharp mask, a padding of 0 cut the
+    # blurred edge at the box: the correction jumped from about half to
+    # nothing along a straight line, the very box the option should hide.
+    runtime, _calls = _color_runtime(monkeypatch)
+    before = Image.new("RGB", (60, 60), (100, 100, 100))
+    after = Image.new("RGB", (60, 60), (255, 0, 0))
+
+    out = runtime._match_region_colors(before, after, _region_mask((60, 60), (20, 20, 40, 40)), 0, 4)
+
+    row = [out.getpixel((x, 30))[2] for x in range(60)]
+    assert row[30] > 200  # the middle of the region is corrected
+    assert row[0] == 0 and row[59] == 0
+    assert max(abs(a - b) for a, b in zip(row, row[1:])) < 40
+
+
+def test_match_region_colors_is_an_option_off_by_default():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    option = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_match_region_colors"
+    )
+    info = option.args[1]
+    kwargs = {k.arg: k.value for k in info.func.value.keywords}
+    assert ast.literal_eval(kwargs["default"]) is False
+    assert ast.unparse(kwargs["section"]) == "section"
+    label = ast.literal_eval(kwargs["label"])
+    assert label == "Match the colors of each inpainted region to the picture"
+    # One plain block each, for the WebUI's localizer and Language Diffusion.
+    for text in (label, ast.literal_eval(info.args[0])):
+        assert not re.search(r"\*|`|\[[^\]]*\]\(|\n", text)
+
+
+def test_match_region_colors_keeps_the_result_when_it_cannot_run(monkeypatch):
+    runtime, calls = _color_runtime(monkeypatch)
+    before = Image.new("RGB", (40, 40), (100, 100, 100))
+    after = Image.new("RGB", (40, 40), (255, 0, 0))
+    assert runtime._match_region_colors(before, after, None, 32, 4) is after
+    empty = Image.new("L", (40, 40), 0)
+    assert runtime._match_region_colors(before, after, empty, 32, 4) is after
+    assert calls == []
+
+    # Whole-picture inpaint can come back on a canvas rounded to 8 pixels.
+    small = Image.new("RGB", (36, 36), (100, 100, 100))
+    out = runtime._match_region_colors(small, after, _region_mask((36, 36), (8, 8, 16, 16)), 0, 0)
+    assert out.size == (40, 40)
+    assert out.getpixel((10, 10)) == (0, 0, 255)
+
+    def broken(*_args):
+        msg = "bad shape"
+        raise ValueError(msg)
+
+    runtime, _calls = _color_runtime(monkeypatch, apply_color_correction=broken)
+    mask = _region_mask((40, 40), (10, 10, 20, 20))
+    assert runtime._match_region_colors(before, after, mask, 4, 0) is after
+    monkeypatch.setitem(sys.modules, "modules.processing", SimpleNamespace())
+    assert runtime._match_region_colors(before, after, mask, 4, 0) is after
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "matched"),
+    [
+        ({"ad_match_region_colors": True}, True),
+        ({}, False),
+        # The host's own color correction already matched the region.
+        ({"ad_match_region_colors": True, "img2img_color_correction": True}, False),
+    ],
+    ids=["on", "off-by-default", "host-correction-on"],
+)
+def test_match_region_colors_runs_after_each_region(opts_data, matched):
+    seen = []
+    inputs = []
+
+    def match(before, after, mask, padding, blur):
+        seen.append((before, mask, padding, blur))
+        return Image.new("RGB", after.size, "blue")
+
+    def process_images(p2):
+        inputs.append(p2.init_images[0])
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")])
+
+    masks = _region_masks(2)
+    run, pp, before = _detailer(
+        _mask_state(), process_images, n_masks=2, Image=Image,
+        opts=SimpleNamespace(data=opts_data), _match_region_colors=match,
+    )
+    script = _script_of(run)
+    script.pred_preprocessing = lambda *_args: list(masks)
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4,
+    )
+
+    p = SimpleNamespace(extra_generation_params={})
+    assert script._postprocess_image_inner(p, pp, args) is True
+
+    if matched:
+        assert [(m, pad, blur) for _b, m, pad, blur in seen] == [
+            (masks[0], 32, 4), (masks[1], 32, 4),
+        ]
+        assert seen[0][0] is before  # the picture before the 1st region
+        # The 2nd region starts from the 1st region's matched result.
+        assert inputs[1].getpixel((0, 0)) == (0, 0, 255)
+        assert pp.image.getpixel((0, 0)) == (0, 0, 255)
+    else:
+        assert seen == []
+        assert pp.image.getpixel((0, 0)) == (255, 0, 0)
+
+
+# A region that fails with an error leaves the others running.
+
+
+def _failing_regions(outcomes, capsys=None, process_error=None):
+    """Run one tab whose regions succeed ("ok") or raise ("error") in
+    order. Returns the result, the final image, the p2 values each call saw
+    and the images the successful regions returned."""
+    state = _mask_state()
+    seen = []
+    results = []
+
+    def process_images(p2):
+        seen.append((p2.denoising_strength, p2.width, p2.color_corrections))
+        outcome = outcomes[len(seen) - 1]
+        # As the host and fix_p2 would: values derived for this region.
+        p2.denoising_strength, p2.width = 0.9, 768
+        p2.color_corrections = ["this region"]
+        if outcome == "error":
+            if process_error is not None:
+                process_error()
+            raise RuntimeError(f"broken region {len(seen)}")
+        image = Image.new("RGB", (8, 8), (len(seen) * 40, 0, 0))
+        results.append(image)
+        return SimpleNamespace(images=[image])
+
+    run, pp, before = _detailer(state, process_images, n_masks=len(outcomes))
+    script = _script_of(run)
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[pp.image], prompt="face", close=lambda: None,
+        denoising_strength=0.4, width=512, height=512, color_corrections=None,
+    )
+    return run(), pp.image, before, seen, results
+
+
+@pytest.mark.parametrize(
+    "outcomes",
+    [
+        ["error", "ok"], ["ok", "error"], ["ok", "error", "ok"],
+        ["error", "ok", "error"],
+    ],
+)
+def test_a_region_that_fails_leaves_the_other_regions_detailed(outcomes):
+    processed, image, _before, seen, results = _failing_regions(outcomes)
+
+    # Every region was tried, each from the tab's own values.
+    assert seen == [(0.4, 512, None)] * len(outcomes)
+    # The last region that succeeded is the result, even when a later
+    # one failed.
+    assert processed is True
+    assert image is results[-1]
+
+
+def test_a_pass_whose_regions_all_fail_keeps_the_image():
+    processed, image, before, seen, _results = _failing_regions(["error", "error"])
+
+    assert len(seen) == 2
+    assert processed is False
+    assert image is before
+
+
+def test_a_failed_region_prints_the_traceback_once_then_one_line(capsys):
+    _failing_regions(["error", "ok", "error"])
+
+    err = capsys.readouterr().err
+    assert err.count("Traceback") == 1
+    assert "region 1 of tab 1 failed (RuntimeError: broken region 1)" in err
+    assert "region 3 of tab 1 failed (RuntimeError: broken region 3)" in err
+
+
+def test_a_failed_region_is_reported_on_one_line(capsys, monkeypatch):
+    # torch and CUDA errors often have a text on several lines: the line per
+    # region must stay one line.
+    def broken(*_args):
+        msg = "CUDA out of memory.\nTried to allocate 2.00 GiB"
+        raise RuntimeError(msg)
+
+    _failing_regions(["error", "error"], process_error=broken)
+
+    lines = [x for x in capsys.readouterr().err.splitlines() if "failed (" in x]
+    assert lines
+    for line in lines:
+        assert "(RuntimeError: CUDA out of memory.); left unchanged" in line
+
+
+def test_standalone_run_reports_regions_that_failed_with_an_error(tmp_path):
+    run, image = _nan_standalone(tmp_path)
+
+    result, status = run(["error", "error"])
+    assert result is None
+    # The reason of the first failure, as before plus.9: a folder run shows it.
+    assert status == (
+        "⚠️ ADetailer run failed: error while inpainting "
+        "(RuntimeError: CUDA out of memory.)."
+    )
+
+    result, status = run(["error", "ok"])
+    assert result is not None
+    assert status == (
+        "✅ ADetailer pass complete. 1 region(s) failed with an error and "
+        "were left unchanged (see console)."
+    )
+    # Nothing carried over from the runs above.
+    assert run(["ok"])[1] == "✅ ADetailer pass complete."
+    assert run(None) == (image, "ℹ️ Nothing detected — image unchanged.")
+
+
+# Settings -> ADetailer -> "Detailed region opacity".
+
+
+def _blend_runtime():
+    return _load_script(functions={"_blend_region"}, Image=Image)
+
+
+def test_blend_region_mixes_the_result_with_the_picture_before():
+    blend = _blend_runtime()._blend_region
+    before = Image.new("RGB", (8, 8), (0, 0, 0))
+    after = Image.new("RGB", (8, 8), (200, 100, 50))
+    after.info["parameters"] = "face"
+
+    half = blend(before, after, 50)
+    assert half.getpixel((3, 3)) == (100, 50, 25)
+    assert half.info["parameters"] == "face"
+    assert blend(before, after, 0).tobytes() == before.tobytes()
+
+    # A canvas rounded to 8 pixels and another mode are matched first.
+    out = blend(Image.new("RGBA", (6, 6), (0, 0, 0, 255)), after, 50)
+    assert out.size == (8, 8)
+    assert out.getpixel((0, 0)) == (100, 50, 25)
+    # Anything that cannot be blended keeps the result.
+    assert blend(None, after, 50) is after
+
+
+def _opacity_run(opts_data, outcomes=None, skip=(), **host_globals):
+    """One tab with len(outcomes) regions; each returns its own colour.
+    Returns the blend calls, the final image, the start image and the
+    region results."""
+    outcomes = outcomes or ["ok", "ok"]
+    calls = []
+    results = []
+
+    def blend(before, after, opacity):
+        calls.append((before, after, opacity))
+        return Image.new("RGB", after.size, (0, 255, 0))
+
+    state = _mask_state()
+    done = []
+
+    def process_images(p2):
+        done.append(p2.init_images[0])
+        if outcomes[len(done) - 1] == "error":
+            raise RuntimeError("broken region")
+        image = Image.new("RGB", (8, 8), (len(done) * 40, 0, 0))
+        results.append(image)
+        return SimpleNamespace(images=[image])
+
+    run, pp, before = _detailer(
+        state, process_images, n_masks=len(outcomes) + len(skip), Image=Image,
+        opts=SimpleNamespace(data=opts_data), _blend_region=blend, **host_globals,
+    )
+    script = _script_of(run)
+    script.i2i_prompts_replace = lambda p2, _pos, _neg, j: setattr(
+        p2, "prompt", "[SKIP]" if j in skip else "face"
+    )
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4,
+    )
+    p = SimpleNamespace(extra_generation_params={})
+    assert script._postprocess_image_inner(p, pp, args) is True
+    return calls, pp.image, before, results, done
+
+
+@pytest.mark.parametrize("opts_data", [{}, {"ad_region_opacity": 100}, {"ad_region_opacity": 100.0}])
+def test_full_region_opacity_leaves_the_result_untouched(opts_data):
+    calls, image, _before, results, _done = _opacity_run(opts_data)
+
+    assert calls == []
+    assert image is results[-1]
+
+
+def test_region_opacity_blends_each_region_with_the_picture_before_it():
+    calls, image, before, results, done = _opacity_run({"ad_region_opacity": 50.0})
+
+    assert [(b, a, o) for b, a, o in calls] == [
+        (before, results[0], 50), (done[1], results[1], 50),
+    ]
+    # The 2nd region starts from the 1st region's blended result.
+    assert done[1].getpixel((0, 0)) == (0, 255, 0)
+    assert image.getpixel((0, 0)) == (0, 255, 0)
+
+
+def test_region_opacity_blends_after_the_color_match():
+    order = []
+
+    def match(_before, after, *_args):
+        order.append("match")
+        return Image.new("RGB", after.size, (0, 0, 255))
+
+    calls, _image, _before, _results, _done = _opacity_run(
+        {"ad_region_opacity": 30, "ad_match_region_colors": True},
+        outcomes=["ok"], _match_region_colors=match,
+    )
+
+    order += ["blend"] * len(calls)
+    assert order == ["match", "blend"]
+    # The blend gets the color-matched result.
+    assert calls[0][1].getpixel((0, 0)) == (0, 0, 255)
+
+
+def test_region_opacity_skips_regions_that_were_not_inpainted():
+    # A [SKIP] region and a region that failed are left as they were: there
+    # is nothing to blend.
+    calls, _image, before, results, done = _opacity_run(
+        {"ad_region_opacity": 50}, outcomes=["error", "ok"], skip=(0,),
+    )
+
+    assert len(done) == 2  # the [SKIP] region never reached the host
+    assert [(b, a) for b, a, _o in calls] == [(before, results[0])]
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "written"),
+    [({}, None), ({"ad_region_opacity": 100}, None), ({"ad_region_opacity": 40.0}, 40)],
+)
+def test_region_opacity_is_written_to_the_parameters_only_below_100(opts_data, written):
+    runtime = _load_script(
+        methods={"extra_params"},
+        opts=SimpleNamespace(data=opts_data),
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    params = runtime.AfterDetailerScript().extra_params([])
+    assert params.get("ADetailer region opacity") == written
+
+
+def test_region_opacity_is_a_settings_slider_at_100_by_default():
+    script_text = _SCRIPT_PATH.read_text(encoding="utf-8")
+    option = script_text[script_text.index('        "ad_region_opacity",'):]
+    option = option[: option.index("shared.opts.add_option")]
+    assert "default=100," in option
+    assert '"minimum": 0, "maximum": 100, "step": 1' in option
+    assert "component=gr.Slider" in option
+
+
+_API_DEFAULT_TABS = {
+    # "Remember last-used settings" on: ui.py gives the API a fresh setup.
+    "remembered": (
+        {"ad_model": "face_yolov8n.pt", "ad_tab_enable": True},
+        {"ad_model": "None", "ad_tab_enable": False},
+    ),
+    # Off: the built widgets' own values, a fresh setup too.
+    "fresh": (
+        {"ad_model": "face_yolov8n.pt", "ad_tab_enable": True, "ad_prompt": ""},
+        {"ad_model": "None", "ad_tab_enable": False, "ad_prompt": ""},
+    ),
+}
+
+
+@pytest.mark.parametrize("build", sorted(_API_DEFAULT_TABS))
+@pytest.mark.parametrize(
+    ("request_args", "passes"),
+    [
+        # The short form of the upstream wiki: one pass per tab sent (#485).
+        ([{"ad_model": "hand_yolov8n.pt"}], ["hand_yolov8n.pt"]),
+        (
+            [{"ad_model": "hand_yolov8n.pt"}, {"ad_model": "eyes.pt"}],
+            ["hand_yolov8n.pt", "eyes.pt"],
+        ),
+        # The short form sending exactly the default tab: still one pass.
+        ([{"ad_model": "face_yolov8n.pt", "ad_tab_enable": True}], ["face_yolov8n.pt"]),
+        # The documented form, unchanged.
+        ([True, False, {"ad_model": "hand_yolov8n.pt"}], ["hand_yolov8n.pt"]),
+        # No tab sent: a fresh setup's 1st tab, unchanged.
+        ([True], ["face_yolov8n.pt"]),
+        # The panel's own default is off: nothing runs, unchanged.
+        ([], []),
+        ([False], []),
+    ],
+)
+def test_an_api_request_runs_one_pass_per_tab_it_sends(build, request_args, passes):
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods={"is_ad_enabled", "get_args"}, ADetailerArgs=ADetailerArgs,
+        ordinal=lambda n: str(n),
+    )
+    script = runtime.AfterDetailerScript()
+    first, second = _API_DEFAULT_TABS[build]
+    script._ad_api_default_tab = first
+    # modules/api/api.py init_script_args: every input the request leaves out
+    # keeps its default (the panel off, Skip img2img off, then each tab).
+    defaults = [False, False, first, second]
+    args = [*request_args, *defaults[len(request_args):]]
+
+    ran = []
+    if script.is_ad_enabled(*args):
+        ran = [a.ad_model for a in script.get_args(SimpleNamespace(), *args) if not a.need_skip()]
+    assert ran == passes
+
+
+def test_adui_records_the_api_default_of_the_first_tab():
+    # get_args compares with what the host's API reads: the 1st tab's .value.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    adui = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "adui"
+    )
+    assigns = [
+        ast.unparse(node) for node in ast.walk(adui) if isinstance(node, ast.Assign)
+    ]
+    assert "script._ad_api_default_tab = states[0].value" in assigns
+
+
+def _crop_upscaler_runtime(data, *, labels=None, upscalers=("None", "Lanczos", "R-ESRGAN 4x+"), flags=None):
+    shared = SimpleNamespace(cmd_opts=flags or SimpleNamespace())
+    if upscalers is not None:
+        shared.sd_upscalers = [SimpleNamespace(name=n) for n in upscalers]
+    if labels is None:
+        labels = {"upscaler_for_img2img": SimpleNamespace(section=("upscaling", "Upscaling"))}
+    return _load_script(
+        methods={"get_override_settings"},
+        functions={"_crop_upscaler_usable", "_crop_upscaler_choices", "_is_forge_modules"},
+        assigns={"AD_CROP_UPSCALER_WEBUI"},
+        shared=shared,
+        opts=SimpleNamespace(data=data, data_labels=labels),
+        _forge_wanted_modules=lambda _args: None,
+    )
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        SimpleNamespace(freeze_settings=True),
+        SimpleNamespace(freeze_specific_settings="CLIP_stop_at_last_layers, sd_vae"),
+        SimpleNamespace(freeze_settings_in_sections="sd"),
+    ],
+    ids=["all", "specific", "section"],
+)
+def test_frozen_settings_leave_the_tabs_own_clip_skip_out(flags, capsys):
+    # With --freeze-settings the host refuses to set an option for the pass
+    # and raises: every region of a tab with "Use separate CLIP skip" failed.
+    from adetailer.args import ADetailerArgs
+
+    labels = {
+        "upscaler_for_img2img": SimpleNamespace(section=("upscaling", "Upscaling")),
+        "CLIP_stop_at_last_layers": SimpleNamespace(section=("sd", "Stable Diffusion")),
+    }
+    runtime = _crop_upscaler_runtime({}, labels=labels, flags=flags)
+    runtime._FROZEN_REPORTED.clear()
+    script = runtime.AfterDetailerScript()
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_use_clip_skip=True, ad_clip_skip=2)
+
+    assert script.get_override_settings(None, args) == {}
+    assert script.get_override_settings(None, args) == {}
+    err = capsys.readouterr().err
+    assert err.count("settings are frozen") == 1  # once a session
+    assert "'CLIP_stop_at_last_layers'" in err
+
+
+def test_unfrozen_settings_keep_the_tabs_own_clip_skip():
+    from adetailer.args import ADetailerArgs
+
+    runtime = _crop_upscaler_runtime({}, flags=SimpleNamespace(freeze_settings=False))
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_use_clip_skip=True, ad_clip_skip=2)
+    assert runtime.AfterDetailerScript().get_override_settings(None, args) == {
+        "CLIP_stop_at_last_layers": 2
+    }
+
+
+@pytest.mark.parametrize("only_masked", [True, False])
+def test_crop_upscaler_setting_gives_the_pass_its_upscaler(only_masked):
+    # The host enlarges the area a pass inpaints with "Upscaler for img2img".
+    from adetailer.args import ADetailerArgs
+
+    runtime = _crop_upscaler_runtime({"ad_crop_upscaler": "R-ESRGAN 4x+"})
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_only_masked=only_masked)
+    override = runtime.AfterDetailerScript().get_override_settings(None, args)
+    assert override["upscaler_for_img2img"] == "R-ESRGAN 4x+"
+
+
+@pytest.mark.parametrize(
+    ("data", "kwargs"),
+    [
+        ({}, {}),  # never saved: the first choice
+        ({"ad_crop_upscaler": "Use the WebUI's img2img upscaler"}, {}),
+        # An upscaler that is no longer installed.
+        ({"ad_crop_upscaler": "4x-Removed"}, {}),
+        # A host without the option, or without the list of upscalers.
+        ({"ad_crop_upscaler": "R-ESRGAN 4x+"}, {"labels": {}}),
+        ({"ad_crop_upscaler": "R-ESRGAN 4x+"}, {"upscalers": None}),
+        # Frozen settings: the host's opts.set would stop the pass.
+        ({"ad_crop_upscaler": "R-ESRGAN 4x+"}, {"flags": SimpleNamespace(freeze_settings=True)}),
+        (
+            {"ad_crop_upscaler": "R-ESRGAN 4x+"},
+            {"flags": SimpleNamespace(freeze_specific_settings="sd_vae, upscaler_for_img2img")},
+        ),
+        (
+            {"ad_crop_upscaler": "R-ESRGAN 4x+"},
+            {"flags": SimpleNamespace(freeze_settings_in_sections="upscaling")},
+        ),
+    ],
+)
+def test_crop_upscaler_setting_keeps_the_webui_upscaler_otherwise(data, kwargs):
+    from adetailer.args import ADetailerArgs
+
+    runtime = _crop_upscaler_runtime(data, **kwargs)
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_only_masked=True)
+    override = runtime.AfterDetailerScript().get_override_settings(None, args)
+    assert "upscaler_for_img2img" not in override
+
+
+@pytest.mark.parametrize(
+    ("upscalers", "expected"),
+    [
+        (("None", "Lanczos", "R-ESRGAN 4x+"), ["None", "Lanczos", "R-ESRGAN 4x+"]),
+        ((), []),
+        (None, []),
+    ],
+)
+def test_crop_upscaler_menu_lists_the_webui_upscalers(upscalers, expected):
+    runtime = _crop_upscaler_runtime({}, upscalers=upscalers)
+    choices = runtime._crop_upscaler_choices()["choices"]
+    assert choices == ["Use the WebUI's img2img upscaler", *expected]
+
+
+def test_crop_upscaler_option_is_registered_with_the_first_choice():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    settings = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "on_ui_settings"
+    )
+    call = next(
+        node for node in ast.walk(settings)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_crop_upscaler"
+    )
+    info = ast.unparse(call.args[1])
+    assert "default=AD_CROP_UPSCALER_WEBUI" in info
+    assert "component_args=_crop_upscaler_choices" in info

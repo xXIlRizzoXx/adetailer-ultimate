@@ -157,6 +157,43 @@ div.block.ad-preview-status {
     color: #fbbf24 !important;
 }
 
+/* The boxes of a single-tab Detection preview, as JSON for picker.js: a field
+ * nobody types in. Hidden here rather than with visible=False, which Gradio 4
+ * does not render at all. */
+.ad-preview-boxes {
+    display: none !important;
+}
+/* Gradio 3 and 4 wrap a Textbox in a "form" container that still takes half
+ * the row of the preview button: hide it too, when it holds only this field. */
+div.form:has(> .ad-preview-boxes):not(:has(> :not(.ad-preview-boxes))) {
+    display: none !important;
+}
+
+/* picker.js: the clickable boxes laid over the Detection preview. The layer
+ * itself lets clicks through; only the boxes take them. */
+.ad-pick-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 2;
+}
+.ad-pick-box {
+    position: absolute;
+    box-sizing: border-box;
+    pointer-events: auto;
+    cursor: pointer;
+    border: 2px solid transparent;
+    border-radius: 3px;
+}
+.ad-pick-box:hover {
+    border-color: rgba(255, 255, 255, 0.9);
+    background: rgba(255, 255, 255, 0.12);
+}
+.ad-pick-box.ad-picked {
+    border: 3px solid #22c55e;
+    background: rgba(34, 197, 94, 0.22);
+}
+
 /* "Combine all tabs" checkbox sits on the same row as the Run button;
  * detach it a bit so the two aren't glued together (user-requested
  * 2026-06-04 "detach it a little from the button"). */

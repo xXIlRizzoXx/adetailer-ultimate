@@ -28,6 +28,7 @@ from adetailer.presets import (
     take_recovery_note,
 )
 from controlnet_ext import controlnet_exists, controlnet_type, get_cn_models
+from controlnet_ext.common import default_cn_module
 
 if controlnet_type == "forge":
     from lib_controlnet import global_state
@@ -105,6 +106,9 @@ class WebuiInfo:
     # the dropdown just offers the pass-through / "None" choices — index-safe.
     text_encoders_list: list[str] = field(default_factory=list)
     model_mapping: dict[str, str] = field(default_factory=dict)
+    # The endings the WebUI takes off a sampler name, per scheduler (label,
+    # name, aliases), for a restart's split_sampler_name. Empty: labels only.
+    scheduler_endings: list[list[str | None]] = field(default_factory=list)
 
 
 def gr_interactive(value: bool = True):
@@ -208,6 +212,7 @@ _GUIDE_SECTIONS: list[tuple[str, str]] = [
 - **MediaPipe face features (new)** — `mediapipe_face_features` treats the face as classes **eyes, mouth, nose, eyebrows, face**; pick all, some, or just one in the CLASSES dropdown.
 - **YOLO-World (`…-world`)** — open vocabulary: type comma-separated words in the classes field to detect almost anything you can name.
 - **Custom models** — drop a `.pt` into your ADetailer models folder. If its classes don't appear, add a sidecar file `<model>.names.json` shaped like `{"names": {"0": "face", "1": "hand"}}`.
+- **More detectors** — larger face and hand models, `person_yolov8m-seg` and a clothing model (`deepfashion2_yolov8s-seg`, 13 clothing classes) are on the Bingsu/adetailer page on Hugging Face; community detectors for eyes, hair, feet and more are on Civitai and Hugging Face (search for "ADetailer"). A `.pt` can contain code: use only files from sources you trust.
 """,
     ),
     (
@@ -274,9 +279,10 @@ Two sibling tools sit right after each tab's **Detection** section (roughly the 
     (
         "💾 Presets, copy/paste & saving",
         """
-- **Preset library** — save / load / rename / delete a whole tab's settings by name; **export / import** the library as a file to move it between machines (on WebUIs that ship Gradio 3, such as AUTOMATIC1111 and reForge's main branch, Export cannot download a file: back up `user_presets.json` from the extension folder instead; Import works everywhere).
+- **Preset library** — save / load / rename / delete a whole tab's settings by name; **export / import** the library as a file to move it between machines.
 - **Copy settings / Paste settings** — clone one tab's settings into another.
 - **Remember last-used settings between restarts** (`Settings → ADetailer`) — restore your last setup after a restart.
+- **Enable ADetailer at startup** (`Settings → ADetailer`) — start with ADetailer already switched on in txt2img, img2img or both (Off by default). Any choice but Off wins over the WebUI's Settings → Defaults for that on/off state; API requests are not affected.
 - **Reset ADetailer settings** (`Settings → ADetailer`) — restore factory defaults.
 - **Where files go** — intermediate step/preview files land in an `adetailer-steps/` sub-folder; the standalone *Run/Batch* results go in a top-level `ADetailer-Inpaint/` folder next to your normal outputs, unless a folder batch uses *Save results in the source folder instead*, which writes beside each source image.
 """,
@@ -289,6 +295,8 @@ Two sibling tools sit right after each tab's **Detection** section (roughly the 
 - **The face no longer looks like the character** — lower **Inpaint denoising strength**.
 - **A style LoRA bleeds onto the detailed region** — turn on **Strip LoRAs from the detailer prompt**.
 - **The mask is too tight / edges show** — use **bbox as mask** or **dilation**, and increase **mask blur**.
+- **The same face is detailed twice** (two boxes on one face) — set **Drop overlapping detections** (`Settings → ADetailer`) to about 0.6.
+- **A face comes out with another tint, or its box shows** — turn on **Match the colors of each inpainted region to the picture** (`Settings → ADetailer`) and increase **mask blur**.
 - **CUDA out of memory** — lower the inpaint resolution; for many images use **batch count**, not batch size; drop the `--cuda-malloc` / `--cuda-stream` / `--pin-shared-memory` launch flags; and turn off on-the-fly LoRA patching if your UI has it.
 """,
     ),
@@ -299,6 +307,7 @@ These go inside the tab's **Prompt** field:
 - **`[SEP]`** — split the prompt so each detected region (1st, 2nd, …) gets its own part.
 - **`[SKIP]`** — skip a region entirely. On its own it skips all; inside a class block (`[CLASS=hand] [SKIP] [/CLASS]`) it skips only that class.
 - **`[PROMPT]`** — insert the main generation prompt at that spot.
+- **A different prompt or LoRA for each face** — set `Settings → ADetailer → Sort bounding boxes by` to *Position (left to right)*, then write one part per face, e.g. `smiling woman <lora:style_a:0.8> [SEP] old man, grey beard [SEP] [SKIP]`. Each face is a pass of its own, so a LoRA in one part is used only for that face; faces beyond the last part get the last part (`[SKIP]` here leaves them as they are).
 """,
     ),
     (
@@ -467,6 +476,27 @@ def on_generate_click(
             f"detector={state.get('ad_model')!a}, classes[{_mode_word}]={_cls!a}"
         )
     return state
+
+
+def split_sampler_name(
+    name: str, scheduler_endings: list[list[str | None]]
+) -> tuple[str, str | None]:
+    """Split a sampler name as the WebUI does at Generate.
+
+    The name loses each scheduler it ends with (label, name or alias, in the
+    WebUI's order); the last one lost is the scheduler, returned by its label
+    (None when the name ends with none). The rest is the sampler, which must
+    still be the exact name of one of the WebUI's samplers. Load does the
+    same in _wire_presets; a restart and pasted parameters use this.
+    """
+    sampler, scheduler = name, None
+    for endings in scheduler_endings:
+        for ending in endings:
+            if ending and sampler.endswith(" " + ending):
+                sampler = sampler[: -len(ending) - 1]
+                scheduler = endings[0]
+                break
+    return sampler, scheduler
 
 
 def _sv(saved: dict[str, Any], attr: str, default):
@@ -768,7 +798,9 @@ def _sync_class_dropdown(selected: list[str] | None, exclude: bool, model: str):
     return ("" if exclude else csv), (csv if exclude else "")
 
 
-def on_cn_model_update(cn_model_name: str, current_module: str | None = None):
+def on_cn_model_update(
+    cn_model_name: str, current_module: str | None = None, keep_none: bool = False
+):
     # The model list matches its type in any case (OpenPoseXL2): so does this.
     cn_model_name = cn_model_name.lower().replace("inpaint_depth", "depth")
     for t in cn_module_choices:
@@ -776,8 +808,13 @@ def on_cn_model_update(cn_model_name: str, current_module: str | None = None):
             choices = cn_module_choices[t]
             # Keep a module that fits the model: Load, Paste and infotext
             # paste set the model and its module together, and this handler
-            # runs after them.
-            value = current_module if current_module in choices else choices[0]
+            # runs after them. Forge lists "None" (no preprocessor) first: a
+            # new model gets its default instead, as on AUTOMATIC1111, and
+            # "None" picked afterwards stays (only a restart keeps it here).
+            fits = current_module in choices and (
+                keep_none or current_module != "None"
+            )
+            value = current_module if fits else default_cn_module(t, choices)
             return gr.update(visible=True, choices=choices, value=value)
     return gr.update(visible=False, choices=["None"], value="None")
 
@@ -846,6 +883,7 @@ def adui(
         all_widgets: list[Widgets] = []
         all_copy_btns: list[gr.Button] = []
         all_paste_btns: list[gr.Button] = []
+        all_paste_options: list[tuple] = []
         all_presets: list[tuple] = []
 
         with gr.Group(), gr.Tabs():
@@ -858,6 +896,7 @@ def adui(
                         preset_widgets,
                         state,
                         infofields,
+                        paste_options,
                     ) = one_ui_group(
                         n=n,
                         is_img2img=is_img2img,
@@ -868,6 +907,7 @@ def adui(
                 all_widgets.append(w)
                 all_copy_btns.append(copy_btn)
                 all_paste_btns.append(paste_btn)
+                all_paste_options.append(paste_options)
                 all_presets.append(preset_widgets)
                 states.append(state)
                 infotext_fields.extend(infofields)
@@ -879,6 +919,8 @@ def adui(
         _wire_copy_paste(
             all_widgets, all_copy_btns, all_paste_btns, clipboard_state, num_models,
             model_mapping=webui_info.model_mapping,
+            all_paste_options=all_paste_options,
+            all_status_mds=[p[7] for p in all_presets],
         )
         try:
             _cn_models = get_cn_models()
@@ -925,9 +967,82 @@ def adui(
             elem_classes=["ad-guide-pointer"],
         )
 
+    # Kept for "Enable ADetailer at startup" (apply_enable_at_startup). The
+    # accordion is built switched off on purpose: see that function.
+    _MAIN_ACCORDIONS["img2img" if is_img2img else "txt2img"] = ad_enable
+
+    # What the host's API gives the 1st tab when a request leaves it out. A
+    # request in the short form [{...}] (no enable / skip values) moves it to
+    # the 3rd place, where is_ad_enabled / get_args find and drop it.
+    if script is not None and states:
+        try:
+            script._ad_api_default_tab = states[0].value
+        except Exception:  # noqa: BLE001 -- never break the UI build
+            pass
+
     # components: [bool, bool, dict, dict, ...]
     components = [ad_enable, ad_skip_img2img, *states]
     return components, infotext_fields
+
+
+# "Enable ADetailer at startup" (Settings -> ADetailer): which modes start with
+# the main ADetailer panel switched on.
+ENABLE_AT_STARTUP_CHOICES = ("Off", "txt2img", "img2img", "Both")
+_ENABLE_AT_STARTUP_MODES = {
+    "txt2img": ("txt2img",),
+    "img2img": ("img2img",),
+    "Both": ("txt2img", "img2img"),
+}
+# The main accordion adui() built last for each mode ("txt2img" / "img2img").
+_MAIN_ACCORDIONS: dict[str, Any] = {}
+
+
+def apply_enable_at_startup(choice: Any) -> list[str]:
+    """Switch the main ADetailer panel on in the modes `choice` names, and
+    return those modes.
+
+    Called from the on_ui_tabs callback, which every supported WebUI runs
+    AFTER building the txt2img and img2img script UIs and BEFORE it applies
+    Settings > Defaults (ui-config.json). So:
+    - the API keeps its default "off": it takes the script defaults from the
+      UI as built (Forge Neo records them right after ui(); A1111 calls ui()
+      again), never from this later change, so a request that does not ask
+      for ADetailer does not run it;
+    - a switched-on panel opts out of ui-config.json, the same flag the
+      per-tab settings use, so the "off" that ui-config.json already holds
+      for every user cannot switch it back off. With "Off" (the default)
+      nothing changes and Settings > Defaults works as before.
+    An unknown value counts as "Off", with one console line. Plain attribute
+    changes, no Gradio listener. Never raises.
+    """
+    accordions = dict(_MAIN_ACCORDIONS)
+    _MAIN_ACCORDIONS.clear()
+    if not isinstance(choice, str) or choice not in ENABLE_AT_STARTUP_CHOICES:
+        print(
+            f"[-] ADetailer: unknown 'Enable ADetailer at startup' value {choice!a},"
+            " using Off."
+        )
+        return []
+    done = []
+    for mode in _ENABLE_AT_STARTUP_MODES.get(choice, ()):
+        acc = accordions.get(mode)
+        if acc is None:
+            continue
+        try:
+            acc.value = True
+            inner = getattr(acc, "accordion", None)
+            if inner is not None:
+                inner.open = True
+                # Forge Neo's own Defaults add this class to an open panel.
+                classes = getattr(inner, "elem_classes", None)
+                if isinstance(classes, list) and "input-accordion-open" not in classes:
+                    classes.append("input-accordion-open")
+                inner.do_not_save_to_config = True
+            acc.do_not_save_to_config = True
+            done.append(mode)
+        except Exception:  # noqa: BLE001 - never break the UI build
+            continue
+    return done
 
 
 def _chip_spot(first, box, size, image_size, taken):
@@ -1080,6 +1195,20 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         (0, 210, 210),
     ]
 
+    def _preview_boxes_json(img, bboxes):
+        """The boxes of a single-tab Detection preview, for javascript/picker.js:
+        the picture's size and each box as [x1, y1, x2, y2] in its pixels, in
+        the order of the numbers drawn on it (box k is detection number k + 1).
+        An empty string when they cannot be read: the preview then works as
+        before, with the numbers typed by hand."""
+        try:
+            import json
+
+            boxes = [[round(float(v), 1) for v in box[:4]] for box in bboxes]
+            return json.dumps({"w": int(img.width), "h": int(img.height), "boxes": boxes})
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _predict(
         image, model_name, classes_csv, exclude_csv, exclude_mode, confidence, imgsz=0
     ):
@@ -1199,6 +1328,13 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     # inpaint via the "Inpaint only these detections" field.
                     _preview = _draw_detection_numbers(
                         _preview, pred.bboxes, getattr(pred, "class_names", None)
+                    )
+                    # The boxes, for javascript/picker.js: clicking one on the
+                    # preview writes its number into that field.
+                    return (
+                        _preview,
+                        f"✅ {n} detection(s). Click the boxes to choose which to inpaint.",
+                        _preview_boxes_json(_preview, pred.bboxes),
                     )
                 return _preview, f"✅ {n} detection(s)."
 
@@ -1333,7 +1469,10 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         # They bake the branch constants so _run's *flat layout is untouched:
         # _detect -> detection only, _apply -> full detect+inpaint.
         def _detect(image, combine, *flat):
-            return _run(image, combine, False, False, *flat)
+            # A third value, the clickable boxes, comes only from a single-tab
+            # preview with detections; every other answer clears them.
+            image, status, *boxes = _run(image, combine, False, False, *flat)
+            return image, status, (boxes[0] if boxes else "")
 
         # Cap how many result thumbnails we hand back to the gallery: a huge
         # folder would otherwise base64 hundreds of full-res images into the
@@ -1718,7 +1857,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         w.ad_preview_btn.click(
             fn=wrap_adetailer_detection(detect_fn),
             inputs=[w.ad_preview_input, w.ad_preview_all_tabs, *tail],
-            outputs=[w.ad_preview_output, w.ad_preview_status],
+            outputs=[w.ad_preview_output, w.ad_preview_status, w.ad_preview_boxes],
         )
         w.ad_apply_btn.click(
             fn=wrap_adetailer_job(apply_fn),
@@ -1781,6 +1920,8 @@ def _wire_copy_paste(
     clipboard_state: gr.State,
     num_models: int,
     model_mapping: dict[str, str] | None = None,
+    all_paste_options: list[tuple] | None = None,
+    all_status_mds: list | None = None,
 ) -> None:
     attrs = _copyable_attrs()
 
@@ -1826,28 +1967,114 @@ def _wire_copy_paste(
     # The UI-only ad_model_classes_dropdown isn't part of ALL_ARGS, so we
     # restore its detector-specific choices and include/exclude selection
     # explicitly and append it to the outputs.
+    #
+    # The tab's "Swap with the copied tab" and "Paste into every tab"
+    # checkboxes widen the scope, like "Reset every tab" does for Reset:
+    # still ONE .click per tab (index-safe). Gradio output lists are static,
+    # so the outputs always span every tab, and a tab the paste does not
+    # reach gets gr.update() no-ops. Swap also reads this tab's current
+    # values, which go to the copied tab, and then empties the clipboard: the
+    # copy no longer matches either tab.
+    options = all_paste_options or [(None, None)] * num_models
+    status_mds = list(all_status_mds or [])
+    all_widget_refs = [
+        getattr(all_widgets[i], a) for i in range(num_models) for a in attrs
+    ]
+    all_dropdowns = [_w.ad_model_classes_dropdown for _w in all_widgets]
 
     for dst_idx in range(num_models):
         dst_widget_refs = [getattr(all_widgets[dst_idx], a) for a in attrs]
-        dst_dropdown = all_widgets[dst_idx].ad_model_classes_dropdown
+        swap_cb, all_cb = options[dst_idx]
 
         def _make_paste_fn(idx: int, n_attrs: int):
-            def _paste_fn(clipboard):
+            def _paste_fn(clipboard, swap=False, to_all=False, *current):
                 source_idx, values = clipboard
+                clip_update = gr.update()
+                paste_updates = [gr.update() for _ in range(num_models)]
+                status_updates = [gr.update() for _ in status_mds]
+                targets: dict[int, dict[str, Any]] = {}
                 if (
-                    source_idx < 0
-                    or source_idx == idx
-                    or len(values) != n_attrs
+                    0 <= source_idx < num_models
+                    and source_idx != idx
+                    and len(values) == n_attrs
                 ):
-                    return [gr.update() for _ in range(n_attrs)] + [gr.update()]
-                return _restored_tab_updates(dict(zip(attrs, values)), attrs, model_mapping)
+                    copied = dict(zip(attrs, values))
+                    if swap and to_all:
+                        if status_updates:
+                            status_updates[idx] = (
+                                "Tick only one: Swap with the copied tab "
+                                "or Paste into every tab."
+                            )
+                    elif to_all:
+                        targets = {
+                            i: copied for i in range(num_models) if i != source_idx
+                        }
+                        if status_updates:
+                            status_updates[idx] = (
+                                "\U0001F4E5 Pasted into every tab."
+                            )
+                    elif swap:
+                        if len(current) == n_attrs:
+                            targets = {
+                                idx: copied,
+                                source_idx: dict(zip(attrs, current)),
+                            }
+                            clip_update = (-1, [])
+                            paste_updates = [
+                                gr.update(
+                                    value="\U0001F4E5 Paste settings",
+                                    interactive=False,
+                                )
+                                for _ in range(num_models)
+                            ]
+                            if status_updates:
+                                for a, b in ((idx, source_idx), (source_idx, idx)):
+                                    status_updates[a] = (
+                                        f"\U0001F501 Swapped with the "
+                                        f"{ordinal(b + 1)} tab."
+                                    )
+                    else:
+                        targets = {idx: copied}
+                # Flattened tab-major to match all_widget_refs. Built
+                # separately for each tab: Gradio 4 pops "value" out of an
+                # update dict in place, so shared dicts would reach only the
+                # first tab.
+                widget_updates = []
+                dropdown_updates = []
+                for i in range(num_models):
+                    if i in targets:
+                        restored = _restored_tab_updates(
+                            targets[i], attrs, model_mapping
+                        )
+                        widget_updates.extend(restored[:-1])
+                        dropdown_updates.append(restored[-1])
+                    else:
+                        widget_updates.extend(gr.update() for _ in attrs)
+                        dropdown_updates.append(gr.update())
+                return [
+                    clip_update,
+                    *paste_updates,
+                    *status_updates,
+                    *widget_updates,
+                    *dropdown_updates,
+                ]
 
             return _paste_fn
 
         all_paste_btns[dst_idx].click(
             fn=_make_paste_fn(dst_idx, len(attrs)),
-            inputs=clipboard_state,
-            outputs=[*dst_widget_refs, dst_dropdown],
+            inputs=(
+                [clipboard_state, swap_cb, all_cb, *dst_widget_refs]
+                if swap_cb is not None and all_cb is not None
+                else [clipboard_state]
+            ),
+            outputs=[
+                clipboard_state,
+                *all_paste_btns,
+                *status_mds,
+                *all_widget_refs,
+                *all_dropdowns,
+            ],
             queue=False,
         )
 
@@ -2364,6 +2591,39 @@ _EXPORT_JS = (
     "document.body.appendChild(a); a['click'](); a.remove(); } return null; }"
 )
 
+# Gradio 3 has no DownloadButton. There the click puts the library into the
+# status, base64 in an HTML comment the page does not show, and this
+# front-end step saves it as a file and takes it out of the status again, so
+# the file never goes back to the server. Same file name as on Gradio 4.
+_EXPORT_MARK = "adetailer-export:"
+_EXPORT_BLOB_JS = (
+    "(s) => { const m = typeof s === 'string' && "
+    "s.match(/\\n*<!-- adetailer-export:([A-Za-z0-9+\\/=]*) -->/); "
+    "if (!m) return s; "
+    "try { const bin = atob(m[1]); const bytes = new Uint8Array(bin.length); "
+    "for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i); "
+    "const url = URL.createObjectURL(new Blob([bytes], { type: 'application/json' })); "
+    "const a = document.createElement('a'); a.href = url; "
+    "a.download = 'adetailer-ultimate-presets.json'; "
+    "document.body.appendChild(a); a['click'](); a.remove(); "
+    "setTimeout(() => URL.revokeObjectURL(url), 60000); "
+    "return s.replace(m[0], ''); } catch (e) { "
+    "return '\u26a0\ufe0f Export could not save the file in this browser. "
+    "Back up user_presets.json from the extension folder instead.'; } }"
+)
+
+
+def _front_end_js_key(button: Any) -> "str | None":
+    """Name of the parameter that gives an event a front-end step: `_js` on
+    Gradio 3, `js` on Gradio 4. None when the button has no such event."""
+    import inspect
+
+    try:
+        params = inspect.signature(getattr(button, "click")).parameters
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return next((k for k in ("_js", "js") if k in params), None)
+
 
 def one_ui_group(
     n: int,
@@ -2419,10 +2679,9 @@ def one_ui_group(
             # gr.DownloadButton needs Gradio 4 (Forge / Forge Neo). AUTOMATIC1111
             # ships Gradio 3, which lacks it — a hard reference crashed the whole
             # ADetailer tab at build there (#2). Fall back to a plain Button so the
-            # tab still loads; preset export just isn't one-click-downloadable on
-            # Gradio 3 (everything else, incl. Import, works). A Button would
-            # show a returned path as its label, so the export handlers below
-            # only explain the limit there.
+            # tab still loads. A Button would show a returned path as its label,
+            # so on Gradio 3 the export handlers below send the library in the
+            # status and a front-end step saves it (_EXPORT_BLOB_JS).
             _DownloadButton = getattr(gr, "DownloadButton", None)
             if _DownloadButton is not None:
                 preset_export_btn = _DownloadButton(
@@ -2431,21 +2690,26 @@ def one_ui_group(
                     # nowrap rule was extended; the user then asked for a
                     # tighter label outright. Emoji kept to mirror the
                     # Import button's 📥 marker visually.
-                    label="\U0001F4E4 Esport",
+                    label="\U0001F4E4 Export",
                     elem_id=eid("ad_preset_export_btn"),
                     scale=0,
                     min_width=160,
                 )
             else:
                 preset_export_btn = gr.Button(
-                    value="\U0001F4E4 Esport",
+                    value="\U0001F4E4 Export",
                     elem_id=eid("ad_preset_export_btn"),
-                    # Marks the fallback for its tooltip
-                    # (javascript/button-tooltips.js).
-                    elem_classes=["ad-export-unavailable"],
                     scale=0,
                     min_width=160,
                 )
+            # Gradio 3: a front-end step saves the file (_EXPORT_BLOB_JS).
+            _export_js_key = (
+                _front_end_js_key(preset_export_btn) if _DownloadButton is None else None
+            )
+            if _DownloadButton is None and _export_js_key is None:
+                # No way to save a file: marks the fallback for its tooltip
+                # (javascript/button-tooltips.js). Plain attribute set.
+                preset_export_btn.elem_classes = ["ad-export-unavailable"]
             preset_import_btn = gr.UploadButton(
                 label="\U0001F4E5 Import",
                 file_types=[".json"],
@@ -2562,6 +2826,29 @@ def one_ui_group(
             scale=0,
             min_width=160,
         )
+        # Scope switches for the Paste button next to them, like "Reset every
+        # tab": no listener of their own, the existing Paste .click reads them
+        # (_wire_copy_paste). Index-safe. Transient, not settings: kept out of
+        # ui-config.json, ALL_ARGS, presets and infotext.
+        paste_swap = gr.Checkbox(
+            label="Swap with the copied tab",
+            value=False,
+            scale=0,
+            min_width=190,
+            elem_id=eid("ad_paste_swap"),
+        )
+        paste_all = gr.Checkbox(
+            label="Paste into every tab",
+            value=False,
+            scale=0,
+            min_width=170,
+            elem_id=eid("ad_paste_all"),
+        )
+        for _transient in (paste_swap, paste_all):
+            try:
+                _transient.do_not_save_to_config = True
+            except Exception:  # noqa: BLE001 — never break UI build over a flag
+                pass
 
     preset_status = gr.Markdown(
         value="",
@@ -2603,9 +2890,17 @@ def one_ui_group(
         from pathlib import Path
 
         if _DownloadButton is None:
-            # Gradio 3 fallback Button: a path would become its label and
-            # nothing would download. Leave the button as it is.
-            return gr.update(), _do_export_status()
+            # Gradio 3 fallback Button: a path would become its label. Leave
+            # the button as it is; the library goes in the status for
+            # _EXPORT_BLOB_JS, when that step can run.
+            if _export_js_key is None:
+                return gr.update(), _do_export_status()
+            import base64
+
+            token = base64.b64encode(export_presets_json().encode("utf-8")).decode(
+                "ascii"
+            )
+            return gr.update(), f"{_do_export_status()}\n\n<!-- {_EXPORT_MARK}{token} -->"
         payload = export_presets_json()
         tmp_dir = Path(tempfile.gettempdir())
         out = tmp_dir / "adetailer-ultimate-presets.json"
@@ -2613,7 +2908,7 @@ def one_ui_group(
         return str(out), _do_export_status()
 
     def _do_export_status() -> str:
-        if _DownloadButton is None:
+        if _DownloadButton is None and _export_js_key is None:
             return (
                 "⚠️ Export as a download needs Gradio 4 (Forge / Forge Neo). "
                 "On this WebUI, back up user_presets.json from the extension "
@@ -2671,8 +2966,9 @@ def one_ui_group(
 
     # DownloadButton wiring: the click refreshes the button's `value` AND the
     # status line; the front-end-only step then downloads that value. Gradio 3
-    # names the parameter `_js` and has no file to download: a no-op step
-    # there keeps the same two registrations (index-safe).
+    # names the parameter `_js`; its step saves the file sent in the status.
+    # Without a front-end step, a no-op step keeps the same two registrations
+    # (index-safe).
     _export_then = (
         {
             "fn": None,
@@ -2681,6 +2977,13 @@ def one_ui_group(
             "js": _EXPORT_JS,
         }
         if _DownloadButton is not None
+        else {
+            "fn": None,
+            "inputs": preset_io_status,
+            "outputs": preset_io_status,
+            _export_js_key: _EXPORT_BLOB_JS,
+        }
+        if _export_js_key is not None
         else {"fn": None}
     )
     preset_export_btn.click(
@@ -3141,6 +3444,18 @@ def one_ui_group(
                         elem_id=eid("ad_preview_status"),
                         elem_classes=["ad-preview-status"],
                     )
+                    # Component only — NO listener of its own: the preview
+                    # button's .click writes a single-tab preview's boxes here
+                    # (JSON), and javascript/picker.js reads them to make the
+                    # boxes clickable. Hidden by CSS, so it still renders on
+                    # Gradio 4; no label, so the WebUI keeps nothing of it in
+                    # ui-config.json.
+                    w.ad_preview_boxes = gr.Textbox(
+                        value="",
+                        show_label=False,
+                        elem_id=eid("ad_preview_boxes"),
+                        elem_classes=["ad-preview-boxes"],
+                    )
 
             with gr.Accordion(
                 "Run ADetailer on an image",
@@ -3333,7 +3648,10 @@ def one_ui_group(
         preset_reset_all,
         preset_preview,
     )
-    return w, copy_btn, paste_btn, preset_widgets, state, infotext_fields
+    return (
+        w, copy_btn, paste_btn, preset_widgets, state, infotext_fields,
+        (paste_swap, paste_all),
+    )
 
 
 def detection(
@@ -3428,8 +3746,8 @@ def mask_preprocessing(
             with gr.Column(variant="compact"):
                 w.ad_x_offset = gr.Slider(
                     label="Mask x(→) offset" + suffix(n),
-                    minimum=-200,
-                    maximum=200,
+                    minimum=-512,
+                    maximum=512,
                     step=1,
                     value=sv("ad_x_offset", 0),
                     visible=True,
@@ -3437,8 +3755,8 @@ def mask_preprocessing(
                 )
                 w.ad_y_offset = gr.Slider(
                     label="Mask y(↑) offset" + suffix(n),
-                    minimum=-200,
-                    maximum=200,
+                    minimum=-512,
+                    maximum=512,
                     step=1,
                     value=sv("ad_y_offset", 0),
                     visible=True,
@@ -3448,8 +3766,8 @@ def mask_preprocessing(
             with gr.Column(variant="compact"):
                 w.ad_dilate_erode = gr.Slider(
                     label="Mask erosion (-) / dilation (+)" + suffix(n),
-                    minimum=-128,
-                    maximum=128,
+                    minimum=-256,
+                    maximum=256,
                     step=4,
                     value=sv("ad_dilate_erode", 4),
                     visible=True,
@@ -3494,7 +3812,7 @@ def inpainting(  # noqa: PLR0915
             w.ad_mask_blur = gr.Slider(
                 label="Inpaint mask blur" + suffix(n),
                 minimum=0,
-                maximum=64,
+                maximum=256,
                 step=1,
                 value=sv("ad_mask_blur", 4),
                 visible=True,
@@ -3538,7 +3856,7 @@ def inpainting(  # noqa: PLR0915
                 w.ad_inpaint_only_masked_padding = gr.Slider(
                     label="Inpaint only masked padding, pixels" + suffix(n),
                     minimum=0,
-                    maximum=256,
+                    maximum=512,
                     step=4,
                     value=sv("ad_inpaint_only_masked_padding", 32),
                     visible=True,
@@ -3755,26 +4073,35 @@ def inpainting(  # noqa: PLR0915
                 *webui_info.sampler_names,
             ]
             _saved_sampler = sv("ad_sampler", sampler_names[1])
-            # A ticked old name such as "DPM++ 2M Karras" is split by the
-            # scheduler's label, into the sampler plus the scheduler the WebUI
-            # ran it with; the fallback below would silently drop the
-            # scheduler. Unlike Load, a scheduler's other names ("karras") are
-            # not split here, and a name whose sampler is missing ("Foo
-            # Karras") falls back without its scheduler.
+            # A ticked old name such as "DPM++ 2M Karras" is split as Load
+            # splits it, as the WebUI does at Generate, into the sampler plus
+            # the scheduler the WebUI ran it with; the fallback below would
+            # silently drop the scheduler.
             _split_scheduler = None
+            _ticked_name = None
             if (
                 sv("ad_use_sampler", False)
                 and isinstance(_saved_sampler, str)
                 and _saved_sampler not in sampler_names
             ):
-                for label in webui_info.scheduler_names or ():
-                    if label and _saved_sampler.endswith(" " + label):
-                        if _saved_sampler[: -len(label) - 1] in webui_info.sampler_names:
-                            _split_scheduler = label
-                            _saved_sampler = _saved_sampler[: -len(label) - 1]
-                        break
+                _ticked_name = _saved_sampler
+                _saved_sampler, _split_scheduler = split_sampler_name(
+                    _saved_sampler,
+                    getattr(webui_info, "scheduler_endings", None)
+                    or [[x] for x in webui_info.scheduler_names or ()],
+                )
             if _saved_sampler not in sampler_names:
                 _saved_sampler = sampler_names[1]
+                # A ticked sampler this WebUI does not have (another WebUI's
+                # sampler, an alias) ran as the first sampler at Generate: as
+                # Load, the tab shows the first sampler and says so. Plain
+                # print, ASCII only (!a), as the saved-detector line below.
+                if _ticked_name is not None:
+                    print(
+                        f"[-] ADetailer: tab {n + 1} - saved sampler "
+                        f"{_ticked_name!a} is NOT in this WebUI's samplers; "
+                        f"uses {_saved_sampler!a} instead."
+                    )
 
             with gr.Row(elem_classes=["ad-2up-row"]):
                 w.ad_sampler = gr.Dropdown(
@@ -3881,7 +4208,7 @@ def controlnet(
     _saved_module = sv("ad_controlnet_module", "None")
     _module_init = {"visible": False, "choices": ["None"], "value": _saved_module}
     try:
-        _upd = on_cn_model_update(_saved_cn, _saved_module)
+        _upd = on_cn_model_update(_saved_cn, _saved_module, keep_none=True)
         if _upd.get("visible"):
             _module_init = {k: _upd[k] for k in ("visible", "choices", "value")}
     except Exception:  # noqa: BLE001 — never break the UI build

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,6 +23,87 @@ if TYPE_CHECKING:
     from ultralytics import YOLO, YOLOWorld
 
 
+class UltralyticsTooOldError(AttributeError):
+    """A detector made with a newer Ultralytics than the installed one.
+
+    Still an AttributeError, the error the load raised before, so any code that
+    catches that keeps working; only the message is clearer."""
+
+
+def _too_old_ultralytics_message(model_path: str | Path, exc: BaseException) -> str | None:
+    """A clear message when loading ``model_path`` failed because the model was
+    saved with a newer Ultralytics (YOLO11, YOLO12, YOLO26...): unpickling it
+    needs a layer class this Ultralytics does not have, e.g.
+    "Can't get attribute 'C3k2' on <module 'ultralytics.nn.modules.block'>".
+    None for any other error, which is then raised unchanged."""
+    seen: set[int] = set()
+    err: BaseException | None = exc
+    while err is not None and id(err) not in seen:
+        seen.add(id(err))
+        text = str(err)
+        if (
+            isinstance(err, AttributeError)
+            and "Can't get attribute" in text
+            and "ultralytics" in text
+        ):
+            break
+        err = err.__cause__ or err.__context__
+    else:
+        return None
+    # The module's file path adds nothing here and makes the line very long.
+    text = re.sub(r" from '[^']*'>", ">", text)
+    try:
+        from importlib.metadata import version
+
+        installed = f"Ultralytics {version('ultralytics')}"
+    except Exception:  # noqa: BLE001
+        installed = "the installed Ultralytics"
+    return (
+        f"[-] ADetailer: the detector {Path(str(model_path)).name!r} was made with"
+        f" a newer Ultralytics than {installed}, so it cannot be loaded"
+        f" ({text}). Update Ultralytics in the WebUI's environment, or choose"
+        " another detector."
+    )
+
+
+def _print_ascii(msg: str) -> None:
+    # ASCII only, so a console in a legacy code page can print it.
+    try:
+        print(msg.encode("ascii", "backslashreplace").decode("ascii"), file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# Where Ultralytics keeps its anonymous usage-analytics object (`events`),
+# newest layout first: ultralytics.utils.events (recent releases such as 8.4) and
+# ultralytics.hub.utils (older 8.x).
+_EVENTS_MODULES = ("ultralytics.utils.events", "ultralytics.hub.utils")
+
+
+def _disable_ultralytics_events() -> None:
+    """Stop Ultralytics from sending anonymous usage analytics, from ADetailer's
+    first detection on. The object is shared by the whole WebUI process, so it
+    stays off for other extensions that use Ultralytics too.
+
+    Ultralytics queues an analytics event on every predict (its on_predict_start
+    callback) and posts it to google-analytics when its `sync` setting is on,
+    which is the default. Only the in-memory `events` object is switched off:
+    the shared settings file of Ultralytics (also used by other programs) is
+    never written. Idempotent and best-effort: a missing module or attribute
+    in another Ultralytics version changes nothing and never stops a detection.
+    """
+    import importlib
+
+    for name in _EVENTS_MODULES:
+        try:
+            events = getattr(importlib.import_module(name), "events", None)
+            if events is not None and hasattr(events, "enabled"):
+                events.enabled = False
+                return
+        except Exception:  # noqa: BLE001
+            continue
+
+
 def ultralytics_predict(
     model_path: str | Path,
     image: Image.Image,
@@ -33,7 +116,15 @@ def ultralytics_predict(
 ) -> PredictOutput[float]:
     from ultralytics import YOLO
 
-    model = YOLO(model_path)
+    _disable_ultralytics_events()
+    try:
+        model = YOLO(model_path)
+    except Exception as e:
+        msg = _too_old_ultralytics_message(model_path, e)
+        if msg is None:
+            raise
+        _print_ascii(msg)
+        raise UltralyticsTooOldError(msg) from e
 
     requested = parse_csv(classes)
     excluded = parse_csv(exclude_classes)

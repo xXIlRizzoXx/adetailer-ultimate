@@ -161,6 +161,7 @@ class El {
         (kids || []).forEach((k) => this.append(typeof k === "string" ? new Text(k) : k));
     }
     append(k) { k.parentElement = this; this.children.push(k); return k; }
+    appendChild(k) { return this.append(k); }
     get textContent() { return this.children.map((c) => c.textContent).join(""); }
     set innerHTML(v) { this.children = []; if (v) this.append(new Text(v)); }
     cloneNode() {
@@ -201,6 +202,8 @@ class El {
         return null;
     }
     dispatchEvent(e) { this.events.push(e.type); }
+    addEventListener(t, f) { (this.handlers = this.handlers || {})[t] = (this.handlers[t] || []).concat([f]); }
+    getBoundingClientRect() { return this.rect || { left: 0, top: 0, width: 0, height: 0 }; }
     // A real click: document capture listeners first, then Gradio toggles
     // the section whose header was clicked.
     click() {
@@ -215,6 +218,7 @@ class El {
 }
 const observers = [];
 const timers = [];
+const intervals = [];
 const listeners = {};
 function run(file, body, extraWindow) {
     const all = (sel) => body.querySelectorAll(sel);
@@ -223,6 +227,7 @@ function run(file, body, extraWindow) {
         getElementById: (id) => body.querySelectorAll("div").concat(all("button"))
             .find((e) => e.id === id) || null,
         querySelectorAll: all,
+        createElement: (tag) => new El(tag),
         addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); },
         createTreeWalker: (root) => {
             const texts = [];
@@ -249,6 +254,7 @@ function run(file, body, extraWindow) {
         Event: class { constructor(t) { this.type = t; } },
         setTimeout: (f) => { timers.push(f); return timers.length; },
         clearTimeout: (id) => { timers[id - 1] = null; },
+        setInterval: (f) => { intervals.push(f); return intervals.length; },
     };
     vm.createContext(ctx);
     vm.runInContext(fs.readFileSync(file, "utf8"), ctx);
@@ -462,6 +468,127 @@ def test_identical_status_answered_within_one_frame_is_shown_again(tmp_path):
     assert out["answered"] == {**everything, "status": False}
     assert out["afterExport"] == {**everything, "io": False}
     assert out["afterResetAll"] == everything
+
+
+STATUS_FADE_PASTE = r"""
+const P = "script_txt2img_adetailer_";
+function statusBlock(id) {
+    const md = new El("span", { class: "md" }, [new El("p", {}, ["Pasted into every tab."])]);
+    const wrapper = new El("div", { class: "svelte-1" }, [
+        new El("div", { class: "prose ad-preset-status" }, [md])]);
+    return new El("div", { id: P + id, class: "block ad-preset-status" }, [wrapper]);
+}
+const paste = new El("span", {}, ["Paste"]);
+const paste2 = new El("span", {}, ["Paste"]);
+const swap = new El("input", { type: "checkbox" });
+const every2 = new El("input", { type: "checkbox" });
+const els = {
+    status: statusBlock("ad_preset_status"),
+    status2: statusBlock("ad_preset_status_2nd"),
+};
+run(SCRIPT, new El("body", {}, [
+    ...Object.values(els),
+    new El("button", { id: P + "ad_paste_settings" }, [paste]),
+    new El("div", { id: P + "ad_paste_swap" }, [new El("label", {}, [swap])]),
+    new El("div", { id: P + "ad_paste_all" }, [new El("label", {}, [new El("input", { type: "checkbox" })])]),
+    new El("button", { id: P + "ad_paste_settings_2nd" }, [paste2]),
+    new El("div", { id: P + "ad_paste_swap_2nd" }, [new El("label", {}, [new El("input", { type: "checkbox" })])]),
+    new El("div", { id: P + "ad_paste_all_2nd" }, [new El("label", {}, [every2])]),
+]));
+const faded = () => Object.fromEntries(
+    Object.entries(els).map(([k, e]) => [k, e.classList.contains("ad-status-faded")]));
+const out = {};
+fireTimers();
+out.start = faded();
+// A plain Paste writes no status: an old message must stay hidden.
+paste.click();
+fireTimers();
+out.plain = faded();
+// With a scope box ticked the same message comes back within one frame.
+swap.checked = true;
+paste.click();
+fireTimers();
+out.swap = faded();
+fireTimers();
+every2.checked = true;
+paste2.click();
+fireTimers();
+out.every2 = faded();
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_paste_with_a_scope_box_shows_its_identical_status_again(tmp_path):
+    # Swap and "Paste into every tab" write the tab's status; on Gradio 4 the
+    # same message answered within one frame changes nothing in the DOM.
+    out = run_js(tmp_path, "preset-status-fade.js", STATUS_FADE_PASTE)
+    everything = {"status": True, "status2": True}
+    assert out["start"] == everything
+    assert out["plain"] == everything
+    assert out["swap"] == {**everything, "status": False}
+    assert out["every2"] == {**everything, "status2": False}
+
+
+STATUS_FADE_PLAIN_PASTE = r"""
+const P = "script_txt2img_adetailer_";
+function statusBlock(id) {
+    const md = new El("span", { class: "md" }, [new El("p", {}, ["Loaded 'faces'."])]);
+    const wrapper = new El("div", { class: "svelte-1" }, [
+        new El("div", { class: "prose ad-preset-status" }, [md])]);
+    return new El("div", { id: P + id, class: "block ad-preset-status" }, [wrapper]);
+}
+const paste = new El("span", {}, ["Paste"]);
+const els = { status: statusBlock("ad_preset_status"), status2: statusBlock("ad_preset_status_2nd") };
+run(SCRIPT, new El("body", {}, [
+    ...Object.values(els),
+    new El("button", { id: P + "ad_paste_settings" }, [paste]),
+    new El("div", { id: P + "ad_paste_swap" }, [new El("label", {}, [new El("input", { type: "checkbox" })])]),
+    new El("div", { id: P + "ad_paste_all" }, [new El("label", {}, [new El("input", { type: "checkbox" })])]),
+]));
+// Gradio 3: the request's `pending` class comes and goes on every output.
+function requestEnds() {
+    for (const block of Object.values(els)) {
+        const wrapper = block.children[0];
+        const obs = observers.find((o) => o.target === block);
+        wrapper.className = "svelte-1 pending";
+        obs.cb([{ type: "attributes", target: wrapper, oldValue: "svelte-1" }]);
+        wrapper.className = "svelte-1";
+        obs.cb([{ type: "attributes", target: wrapper, oldValue: "svelte-1 pending" }]);
+    }
+}
+const faded = () => Object.fromEntries(
+    Object.entries(els).map(([k, e]) => [k, e.classList.contains("ad-status-faded")]));
+fireTimers();
+const out = { start: faded() };
+paste.click();
+requestEnds();
+out.afterPaste = faded();
+// Another request writing the same message (a retried Load) still shows it.
+requestEnds();
+out.afterLoad = faded();
+// Gradio 4: a fast Paste answer shows no end of its request at all. The
+// block must not stay on: a later request with the same message shows it.
+fireTimers();
+paste.click();
+fireTimers();  // the Paste block runs out
+requestEnds();
+out.afterQuietPaste = faded();
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+def test_a_plain_paste_does_not_bring_old_status_messages_back(tmp_path):
+    # Paste lists every tab's status among its outputs: on Gradio 3 the end
+    # of its request was read as an answer and the faded "Loaded 'faces'."
+    # came back for 4 seconds in every tab.
+    out = run_js(tmp_path, "preset-status-fade.js", STATUS_FADE_PLAIN_PASTE)
+    everything = {"status": True, "status2": True}
+    assert out["start"] == everything
+    assert out["afterPaste"] == everything
+    assert out["afterLoad"] == {"status": False, "status2": False}
+    assert out["afterQuietPaste"] == {"status": False, "status2": False}
 
 
 STATUS_FADE_IMPORT = r"""
@@ -857,6 +984,85 @@ def test_export_step_downloads_the_new_file_once_and_clears_it(tmp_path):
     assert out["cleared"] == [None]
 
 
+def _export_blob_js() -> str:
+    tree = ast.parse((ROOT / "aaaaaa" / "ui.py").read_text(encoding="utf-8"))
+    return next(
+        ast.literal_eval(node.value) for node in tree.body
+        if isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "id", "") == "_EXPORT_BLOB_JS"
+    )
+
+
+EXPORT_BLOB_STEP = r"""
+const clicked = [];
+const blobs = {};
+const revoked = [];
+globalThis.document = {
+    createElement: () => ({ click() { clicked.push([this.href, this.download]); },
+                            remove() {} }),
+    body: { appendChild() {} },
+};
+URL.createObjectURL = (blob) => { const u = "blob:" + Object.keys(blobs).length;
+                                  blobs[u] = blob; return u; };
+URL.revokeObjectURL = (u) => revoked.push(u);
+globalThis.setTimeout = (f) => f();
+// Gradio 3.41's wrapper for a front-end-only step with one output: it gets
+// the input's value, then the output's.
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const step = new AsyncFunction("__fn_args", `let result = await (${EXPORT_JS})(...__fn_args);
+                    return (true && !Array.isArray(result)) ? [result] : result;`);
+(async () => {
+    const out = {};
+    out.saved = await step([STATUS, STATUS]);
+    out.plain = await step(["Done.", "Done."]);
+    out.broken = await step(["Done.\n\n<!-- adetailer-export:A -->", ""]);
+    out.clicked = clicked;
+    out.revoked = revoked;
+    out.files = {};
+    for (const [u, b] of Object.entries(blobs)) {
+        out.files[u] = [b.type, Buffer.from(await b.arrayBuffer()).toString("utf8")];
+    }
+    console.log(JSON.stringify(out));
+})();
+"""
+
+
+@needs_node
+def test_gradio_3_export_step_saves_the_library_and_clears_the_status(tmp_path):
+    # On AUTOMATIC1111 (Gradio 3) Export downloaded nothing. The click sends
+    # the library base64 in a hidden comment of its status; the front-end step
+    # saves it as a file in the browser and leaves only the message.
+    import base64
+
+    payload = '{"saved": {"prompt": "caf\u00e9 \u2014 face -->"}}'
+    status = (
+        "\u2705 Exported **1** preset(s).\n\n<!-- adetailer-export:"
+        + base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        + " -->"
+    )
+    driver = tmp_path / "export-blob.js"
+    driver.write_text(
+        f"const EXPORT_JS = {json.dumps(_export_blob_js())};\n"
+        f"const STATUS = {json.dumps(status)};\n" + EXPORT_BLOB_STEP,
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [NODE, str(driver)], capture_output=True, encoding="utf-8", timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert out["clicked"] == [["blob:0", "adetailer-ultimate-presets.json"]]
+    assert out["files"] == {"blob:0": ["application/json", payload]}
+    assert out["revoked"] == ["blob:0"]
+    assert out["saved"] == ["\u2705 Exported **1** preset(s)."]
+    # A status without the comment is left as it is.
+    assert out["plain"] == ["Done."]
+    # A payload that cannot be decoded says so instead of claiming success.
+    assert "user_presets.json" in out["broken"][0]
+    assert "Exported" not in out["broken"][0]
+
+
 MEMORY_KEY = "adetailer-ultimate:open-sections:v1"
 
 
@@ -1123,3 +1329,288 @@ def test_ci_runs_on_pushes_to_the_beta_branch():
     block = re.search(r"^  push:\n(.*?)(?=^  \S)", text, re.M | re.S).group(1)
     branches = re.search(r"^\s+branches:\s*\[([^\]]*)\]", block, re.M).group(1)
     assert {"main", "beta"} <= {b.strip().strip("\"'") for b in branches.split(",")}
+
+
+PICKER = r"""
+const P = "script_img2img_adetailer_";
+const img = new El("img", {});
+img.naturalWidth = CASE.natural[0];
+img.naturalHeight = CASE.natural[1];
+img.objectFit = "contain";
+img.rect = { left: 10, top: 20, width: 400, height: 400 };
+const output = new El("div", { id: P + "ad_preview_output" + CASE.sfx }, [img]);
+output.rect = { left: 10, top: 20, width: 400, height: 400 };
+const boxes = new El("textarea", { value: CASE.boxes });
+const field = new El("textarea", { value: CASE.field });
+const body = new El("body", {}, [
+    output,
+    new El("div", { id: P + "ad_preview_boxes" + CASE.sfx }, [boxes]),
+    new El("div", { id: P + "ad_inpaint_indices" + CASE.sfx }, [field]),
+]);
+run(SCRIPT, body, (w) => {
+    w.getComputedStyle = (e) => ({
+        display: e.style.display,
+        objectFit: e.objectFit || "fill",
+        position: e.style.position || "static",
+    });
+});
+const tick = () => intervals.forEach((f) => f());
+const state = () => {
+    const layer = output.querySelector(".ad-pick-layer");
+    return layer ? layer.children.map((b) => [
+        b.title, b.classList.contains("ad-picked"),
+        b.style.left, b.style.top, b.style.width, b.style.height,
+    ]) : null;
+};
+tick();
+const out = { first: state(), writes: [] };
+for (const k of CASE.clicks) {
+    const box = output.querySelector(".ad-pick-layer").children[k - 1];
+    box.handlers.click.forEach((f) => f({ preventDefault() {}, stopPropagation() {} }));
+    out.writes.push([field.value, field.events.length]);
+}
+tick();
+out.after = state();
+console.log(JSON.stringify(out));
+"""
+
+_TWO_BOXES = json.dumps({"w": 200, "h": 100, "boxes": [[0, 0, 100, 50], [100, 50, 200, 100]]})
+# A 200x100 picture drawn in a 400x400 <img> with object-fit: contain is
+# 400x200, 100 px down: the boxes are scaled by 2 and moved down by 100.
+_BOX_1 = ["#1", "0px", "100px", "200px", "100px"]
+_BOX_2 = ["#2", "200px", "200px", "200px", "100px"]
+
+
+def _picker(tmp_path, *, natural=(200, 100), boxes=_TWO_BOXES, field="", clicks=(), sfx=""):
+    case = json.dumps({
+        "natural": list(natural), "boxes": boxes, "field": field,
+        "clicks": list(clicks), "sfx": sfx,
+    })
+    return run_js(tmp_path, "picker.js", f"const CASE = {case};\n" + PICKER)
+
+
+def _boxes(state, picked):
+    return [[b[0], b[0] in picked, *b[1:]] for b in (_BOX_1, _BOX_2)] == state
+
+
+@needs_node
+@pytest.mark.parametrize("sfx", ["", "_2nd"])
+def test_picker_lays_a_box_over_each_detection(tmp_path, sfx):
+    out = _picker(tmp_path, sfx=sfx)
+    assert _boxes(out["first"], set())
+
+
+@needs_node
+def test_picker_click_adds_and_removes_a_number(tmp_path):
+    out = _picker(tmp_path, clicks=[2, 2, 1])
+    # Each write is announced to Gradio with an input event.
+    assert out["writes"] == [["2", 1], ["", 2], ["1", 3]]
+    assert _boxes(out["after"], {"#1"})
+
+
+@needs_node
+@pytest.mark.parametrize(
+    ("field", "first", "click", "written"),
+    [
+        # The field is read as the detailer pass reads it.
+        ("1-2", {"#1", "#2"}, 1, "2"),
+        ("#2", {"#2"}, 1, "1,2"),
+        ("2 1", {"#1", "#2"}, 2, "1"),
+        ("\uff11\u3001\uff12", {"#1", "#2"}, 2, "1"),
+        ("1 - 2", {"#1", "#2"}, 2, "1"),
+        # A number with no box on this preview is kept; text that is not a
+        # number is skipped, as the detailer pass skips it.
+        ("9, face", set(), 1, "1,9"),
+    ],
+)
+def test_picker_follows_the_numbers_in_the_field(tmp_path, field, first, click, written):
+    out = _picker(tmp_path, field=field, clicks=[click])
+    assert _boxes(out["first"], first)
+    assert out["writes"][0][0] == written
+
+
+@needs_node
+def test_picker_draws_a_box_inside_another_on_top(tmp_path):
+    # The face box came after the eyes, mouth and nose boxes it contains and
+    # was drawn over them, so every click on those went to the face.
+    boxes = json.dumps({"w": 200, "h": 100, "boxes": [[50, 25, 100, 50], [0, 0, 200, 100]]})
+    out = _picker(tmp_path, boxes=boxes)
+    assert [b[0] for b in out["first"]] == ["#2", "#1"]
+    # The click handler of each box still toggles its own number.
+    out = _picker(tmp_path, boxes=boxes, clicks=[2])
+    assert out["writes"] == [["1", 1]]
+
+
+@needs_node
+@pytest.mark.parametrize(
+    ("natural", "boxes"),
+    [
+        ((200, 200), _TWO_BOXES),  # the picture shown is not the one boxed
+        ((200, 100), ""),  # Combine all tabs, no detections or a failure
+        ((200, 100), "not json"),
+    ],
+)
+def test_picker_shows_nothing_when_unsure(tmp_path, natural, boxes):
+    assert _picker(tmp_path, natural=natural, boxes=boxes)["first"] is None
+
+
+def test_the_preview_boxes_field_takes_no_room():
+    # The hidden field of picker.js sits in the row of the preview button. The
+    # "form" container Gradio wraps it in took half that row, squeezing the
+    # status line: it is hidden too, but only when it holds nothing else.
+    rules = {s: body for selectors, body in css_rules() for s in selectors}
+    for selector in (
+        ".ad-preview-boxes",
+        "div.form:has(> .ad-preview-boxes):not(:has(> :not(.ad-preview-boxes)))",
+    ):
+        assert re.search(r"display:\s*none\s*!important", rules[selector]), selector
+
+
+def _option_tooltips() -> dict[str, str]:
+    source = (ROOT / "javascript" / "option-tooltips.js").read_text(encoding="utf-8")
+    block = source.split("const TOOLTIPS = {", 1)[1].split("\n    };", 1)[0]
+    return dict(re.findall(r'(\w+):\s*"([^"]*)"', block))
+
+
+OPTION_TOOLTIPS = r"""
+const P = "script_txt2img_adetailer_";
+const els = {
+    width: new El("div", { id: P + "ad_inpaint_width" }),
+    width2: new El("div", { id: P + "ad_inpaint_width_2nd" }),
+    useWh: new El("div", { id: P + "ad_use_inpaint_width_height" }),
+    img2img11: new El("div", { id: "script_img2img_adetailer_ad_confidence_11th" }),
+    classes: new El("div", { id: P + "ad_model_classes" }),
+    dropdown: new El("div", { id: P + "ad_model_classes_dropdown" }),
+    exclude: new El("div", { id: P + "ad_model_classes_exclude" }),
+    resetAll: new El("div", { id: P + "ad_preset_reset_all_3rd" }),
+    resetBtn: new El("button", { id: P + "ad_preset_reset" }),
+    other: new El("div", { id: "txt2img_denoising_strength" }),
+    own: new El("div", { id: P + "ad_mask_blur" }),
+};
+els.own.title = "kept";
+const body = new El("body", {}, Object.values(els));
+run(SCRIPT, body, { localization: CASE });
+// Gradio re-renders a block: the new node has no title until the observer runs.
+const late = body.append(new El("div", { id: P + "ad_mask_k_2nd" }));
+const before = late.title;
+observers[observers.length - 1].cb();
+const out = { before, late: late.title };
+for (const k in els) out[k] = els[k].title;
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+@pytest.mark.parametrize("translated", [True, False])
+def test_each_option_gets_its_own_tooltip_in_every_tab(tmp_path, translated):
+    # Most options of a tab had only a label: their meaning was in the README.
+    tips = _option_tooltips()
+    localization = {tips["ad_confidence"]: "CONFIDENCE (translated)"} if translated else {}
+    scenario = f"const CASE = {json.dumps(localization)};\n" + OPTION_TOOLTIPS
+    titles = run_js(tmp_path, "option-tooltips.js", scenario)
+    assert titles["width"] == tips["ad_inpaint_width"]
+    assert titles["width2"] == titles["width"]
+    assert titles["useWh"] == tips["ad_use_inpaint_width_height"]
+    assert titles["img2img11"] == (
+        "CONFIDENCE (translated)" if translated else tips["ad_confidence"]
+    )
+    assert titles["classes"] == tips["ad_model_classes"]
+    assert titles["dropdown"] == ""  # it has an info line of its own
+    assert titles["exclude"] == tips["ad_model_classes_exclude"]
+    assert titles["resetAll"] == tips["ad_preset_reset_all"]
+    assert titles["resetBtn"] == ""  # a button: button-tooltips.js names it
+    assert titles["other"] == ""
+    assert titles["own"] == "kept"
+    assert titles["before"] == ""
+    assert titles["late"] == tips["ad_mask_k"]
+
+
+DROPDOWN_TOOLTIPS = r"""
+const P = "script_txt2img_adetailer_";
+const input = new El("input", { value: "DPM++ 2M" });
+const euler = new El("input", { value: "Euler a" });
+const hinted = new El("input", {});
+hinted.title = "Do not do anything special";
+const sampler = new El("div", { id: P + "ad_sampler_2nd" }, [
+    new El("div", { class: "wrap" }, [input, new El("ul", { class: "options" })])]);
+const sampler3 = new El("div", { id: P + "ad_sampler_3rd" }, [euler]);
+const preprocessor = new El("div", { id: P + "ad_controlnet_module" }, [hinted]);
+const other = new El("input", {});
+const body = new El("body", {}, [
+    sampler, sampler3, preprocessor, new El("div", { id: "txt2img_sampling" }, [other])]);
+// AUTOMATIC1111's hints.js keeps its own texts in the global `titles`.
+run(SCRIPT, body, { localization: CASE, titles: { "Euler a": "Euler Ancestral (hint)" } });
+const first = input.title;
+// AUTOMATIC1111's hints.js: the dropdown's list changed, so it empties the
+// input's title and fills it only for a few values it knows.
+input.title = "";
+observers[observers.length - 1].cb();
+console.log(JSON.stringify({
+    first, again: input.title, block: sampler.title, hinted: hinted.title, other: other.title,
+    euler: euler.title,
+}));
+"""
+
+
+@needs_node
+def test_a_dropdown_input_keeps_the_tooltip_when_automatic1111_empties_it(tmp_path):
+    # AUTOMATIC1111's hints.js sets title="" on a dropdown's input each time
+    # its list opens, and an empty title hides the block's: on the dropdown
+    # field the tooltip was gone.
+    tips = _option_tooltips()
+    scenario = "const CASE = {};\n" + DROPDOWN_TOOLTIPS
+    titles = run_js(tmp_path, "option-tooltips.js", scenario)
+    assert titles["block"] == tips["ad_sampler"]
+    assert titles["first"] == tips["ad_sampler"]
+    assert titles["again"] == tips["ad_sampler"]
+    assert titles["hinted"] == "Do not do anything special"  # a title it set stays
+    # A value hints.js explains is left for it to fill a second later.
+    assert titles["euler"] == ""
+    assert titles["other"] == ""
+
+
+def _panel_widgets() -> list[tuple[str, str, bool]]:
+    """(elem_id key, component, has info=) for every widget of the panel."""
+    tree = ast.parse((ROOT / "aaaaaa" / "ui.py").read_text(encoding="utf-8"))
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not ast.unparse(node.func).startswith("gr."):
+            continue
+        kw = {k.arg: k.value for k in node.keywords}
+        eid = kw.get("elem_id")
+        if not (isinstance(eid, ast.Call) and ast.unparse(eid.func) == "eid"):
+            continue
+        key = eid.args[0].value
+        hidden = isinstance(kw.get("visible"), ast.Constant) and kw["visible"].value is False
+        if not hidden:
+            out.append((key, ast.unparse(node.func).split(".")[-1], "info" in kw))
+    return out
+
+
+def test_every_panel_option_without_an_info_line_has_a_tooltip():
+    tips = _option_tooltips()
+    options = ("Checkbox", "Slider", "Dropdown", "Textbox", "Radio", "Number")
+    # The hidden field picker.js fills from the preview is not an option.
+    no_tooltip = {"ad_preview_boxes"}
+    widgets = _panel_widgets()
+    keys = {key for key, _, _ in widgets}
+    checked = [key for key, kind, _ in widgets if kind in options]
+    assert len(checked) > 60
+    missing = [
+        key
+        for key, kind, has_info in widgets
+        if kind in options and not has_info and key not in no_tooltip and key not in tips
+    ]
+    assert missing == []
+    # Every tooltip names a real option, which shows no info line of its own.
+    assert set(tips) <= keys
+    assert [k for k, _, has_info in widgets if has_info and k in tips] == []
+
+
+def test_option_tooltips_are_one_plain_text_block():
+    # The WebUI's localizer and Language Diffusion translate a whole string:
+    # markdown, line breaks or quotes inside it would show as they are.
+    for key, text in _option_tooltips().items():
+        assert text and text == text.strip(), key
+        assert not re.search(r"\*|`|\[[^\]]*\]\(|\n|<", text), key
+        assert text.isascii(), key
