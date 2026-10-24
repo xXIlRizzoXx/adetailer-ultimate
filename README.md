@@ -2113,7 +2113,7 @@ This fork is not affiliated with or endorsed by Bing-su. It builds on the work o
 - 🟡 The plus.9 beta takes up ideas of other forks and requests: [diffus-me/adetailer](https://github.com/diffus-me/adetailer) (LoRA and embedding hashes of the ADetailer prompts), [Anzhc/aadetailer-reforge](https://github.com/Anzhc/aadetailer-reforge) and upstream pull request [#818](https://github.com/Bing-su/adetailer/pull/818) (reForge's Advanced Model Sampling), and upstream requests [#111](https://github.com/Bing-su/adetailer/issues/111), [#251](https://github.com/Bing-su/adetailer/issues/251), [#406](https://github.com/Bing-su/adetailer/issues/406), [#508](https://github.com/Bing-su/adetailer/issues/508) and [#635](https://github.com/Bing-su/adetailer/issues/635).
 - Thanks to everyone who reported problems and tested new features in the Issues, and to the users named in [Requested by users](#-requested-by-users).
 
-The fork is directed by its owner, xXIlRizzoXx, who does not write Python. Its code was written by **[Claude](https://www.anthropic.com/claude)**, Anthropic's coding assistant. The plus.8 reliability update was started with **OpenAI Codex** and reviewed and completed with Claude.
+The fork is directed by its owner, xXIlRizzoXx, who does not write Python. Its code was written by **[Claude](https://www.anthropic.com/claude)**, Anthropic's coding assistant. The plus.8 reliability update was started with **OpenAI Codex** and reviewed and completed with Claude. 🇮🇹
 
 ## See also
 
