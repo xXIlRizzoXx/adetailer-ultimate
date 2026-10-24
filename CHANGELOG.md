@@ -38,6 +38,7 @@ The Guide tab answers five frequent questions with options that already exist; t
 
 **Documented**
 
+- The README shows five new pictures for beta 2, after those of beta 1: the `[PROMPT=words]` token, the `iris` class, "Show labels", the detection previews in the results gallery and the four new settings. Screenshots taken on AUTOMATIC1111 1.10.
 - The notice at the top of the README lists the main changes of beta 2 and those of beta 1. After the beta 1 release, that notice was extended to name every change of beta 1, where before it named only some of them.
 - The README explains "More sort orders" next to "Sort bounding boxes by", also in "A different prompt or LoRA for each face" (so does that line of the Guide tab: leave "More sort orders" on Off for left to right), and "Max inpaint size" in "Scale inpaint to bbox" and "CUDA out of memory" (the Guide tab's "CUDA out of memory" line names it too).
 - The Guide tab explains `[PROMPT=words]` among the special tokens, lists `iris` among the classes of `mediapipe_face_features`, and names "Show labels" next to the Detection preview and "Show detection previews in the results gallery" next to the other saving options.

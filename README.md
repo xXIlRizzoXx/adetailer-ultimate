@@ -47,6 +47,16 @@
 
 <img src="docs/img/11-xyz.jpg" alt="Plus.9 beta, X/Y/Z plot: every tab gets its own axes, and an Enable axis compares pictures with and without ADetailer" width="100%" />
 
+<img src="docs/img/12-prompt-token.jpg" alt="Plus.9 beta 2, prompts: [PROMPT=eyes] brings only the parts of the main prompt that name eyes into the detailer prompt" width="100%" />
+
+<img src="docs/img/13-iris.jpg" alt="Plus.9 beta 2, face parts detector: an iris class with one mask per eye, cut to the eye opening" width="100%" />
+
+<img src="docs/img/14-show-labels.jpg" alt="Plus.9 beta 2, Detection preview: untick Show labels to see only the boxes and masks, without names and scores" width="100%" />
+
+<img src="docs/img/15-gallery-previews.jpg" alt="Plus.9 beta 2, results gallery: the picture with the detection boxes of every pass after your results, not saved to disk" width="100%" />
+
+<img src="docs/img/16-settings-beta2.jpg" alt="Plus.9 beta 2, Settings: four new options, all off by default: gallery previews, hiding the boxes from the live preview, more sort orders and a max inpaint size" width="100%" />
+
 <sub>Screenshots taken on AUTOMATIC1111 1.10. "Exclusive" marks what neither the original ADetailer nor any other fork we know of offers.</sub>
 
 ## Contents
