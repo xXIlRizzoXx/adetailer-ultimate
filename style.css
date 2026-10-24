@@ -193,6 +193,41 @@ div.form:has(> .ad-preview-boxes):not(:has(> :not(.ad-preview-boxes))) {
     border: 3px solid #22c55e;
     background: rgba(34, 197, 94, 0.22);
 }
+/* picker.js "Show labels" off: the preview without labels, laid exactly over
+ * the picture (picker.js sets its place and size), below the clickable boxes. */
+img.ad-plain-picture {
+    position: absolute !important;
+    pointer-events: none;
+    z-index: 1;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    max-width: none !important;
+    max-height: none !important;
+    object-fit: fill !important;
+}
+/* picker.js: the "Show labels" checkbox right after the preview button. */
+label.ad-show-labels {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+    margin-left: 16px;
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+}
+/* The host theme sets appearance: none on every checkbox and draws the tick
+ * only on Gradio's own: keep the browser's checkbox here. */
+label.ad-show-labels > input[type="checkbox"] {
+    -webkit-appearance: checkbox !important;
+    appearance: auto !important;
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    background: none !important;
+    cursor: pointer;
+}
 
 /* "Combine all tabs" checkbox sits on the same row as the Run button;
  * detach it a bit so the two aren't glued together (user-requested

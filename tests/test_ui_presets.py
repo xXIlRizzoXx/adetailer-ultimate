@@ -2372,6 +2372,73 @@ def test_detection_resolution_help_names_the_detectors_own_size():
         assert old not in readme
 
 
+def test_guide_says_combine_all_tabs_detects_at_each_detectors_own_size():
+    # The combined preview passes no detection resolution, so every detector
+    # runs at the size stored in its own file, not at a fixed default.
+    _tree, sections = _guide_sections()
+    lines = [
+        line for body in sections.values() for line in body.splitlines()
+        if line.startswith("- **Detection preview**") and "Combine all tabs" in line
+    ]
+    assert len(lines) == 1
+    assert "default resolution" not in lines[0]
+    assert "each detector's own size" in lines[0]
+
+
+def test_guide_out_of_memory_line_names_max_inpaint_size():
+    # The README's "CUDA out of memory" answer names "Max inpaint size": the
+    # Guide tab's line must say the same.
+    _tree, sections = _guide_sections()
+    lines = [
+        line for body in sections.values() for line in body.splitlines()
+        if line.startswith("- **CUDA out of memory**")
+    ]
+    assert len(lines) == 1
+    assert "**Max inpaint size**" in lines[0]
+
+
+def test_guide_names_show_labels_and_the_gallery_previews():
+    # The Guide tab names the "Show labels" switch next to the Detection
+    # preview and the "Show detection previews in the results gallery"
+    # setting next to the other saving options, in plain text, with the
+    # same cap on the previews as the script.
+    import re
+
+    _tree, sections = _guide_sections()
+    tools = next(body for title, body in sections.items() if "run-on-image" in title)
+    presets = next(body for title, body in sections.items() if "Presets" in title)
+    labels = [line for line in tools.splitlines() if line.startswith("- Show labels")]
+    assert len(labels) == 1
+    assert "Run detection preview" in labels[0]
+    assert "with the labels" in labels[0]
+    gallery = [
+        line for line in presets.splitlines()
+        if line.startswith("- Show detection previews in the results gallery")
+    ]
+    assert len(gallery) == 1
+    for line in labels + gallery:
+        assert "**" not in line and "`" not in line
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "!adetailer.py"
+    ).read_text(encoding="utf-8")
+    cap = re.search(r"^_GALLERY_PREVIEWS_MAX = (\d+)$", script, re.M)
+    assert cap
+    assert f"up to {cap.group(1)} per generation" in gallery[0]
+
+
+def test_guide_per_face_prompts_mention_more_sort_orders():
+    # "More sort orders" overrides "Sort bounding boxes by" when it is not
+    # Off, so the per-face [SEP] guide has to say to leave it on Off (or to
+    # pick the order there).
+    _tree, sections = _guide_sections()
+    lines = [
+        line for body in sections.values() for line in body.splitlines()
+        if line.startswith("- **A different prompt or LoRA for each face**")
+    ]
+    assert len(lines) == 1
+    assert "Position (left to right)" in lines[0]
+    assert "More sort orders* on Off" in lines[0]
+
 def test_guide_says_the_mediapipe_detectors_download_their_model_files():
     # The Guide said they work "without a model file": since plus.7 they need
     # MediaPipe's own files, downloaded on first use, so an offline machine
@@ -2423,6 +2490,58 @@ def test_guide_places_the_detection_tools_after_the_detection_section():
     assert order[:3] == [
         "Detection", ["Detection preview", "Run ADetailer on an image"], "Mask Preprocessing"
     ]
+
+
+def test_guide_answers_the_beta2_questions_with_existing_options():
+    # Five frequent questions are answered with what already exists: the
+    # WebUI's callback order and img2img step option, model file safety, the
+    # Quicksettings list and the area-ratio filters.
+    tree, sections = _guide_sections()
+    lines = [line for body in sections.values() for line in body.splitlines()]
+
+    def line(start):
+        found = [x for x in lines if x.startswith(start)]
+        assert len(found) == 1, start
+        return found[0]
+
+    order = line("- **ADetailer and a face-swap extension")
+    assert "Settings → Callbacks" in order
+    assert "script_postprocess_image callback priority" in order
+    assert "!adetailer.py/script_postprocess_image/AfterDetailerScript" in order
+    assert "restart" in order
+    steps = line("- **Why the detail pass runs fewer steps**")
+    assert "steps × denoising strength" in steps
+    assert "With img2img, do exactly the amount of steps the slider specifies" in steps
+    assert "During img2img, do exactly the number of Steps the slider specifies" in steps
+    safety = line("- **Model file safety**")
+    assert "safe-unpickle" in safety and ".names.json" in safety
+    assert "Bingsu/adetailer" in safety
+    quick = line("- **Save images before ADetailer**")
+    assert "Quicksettings list" in quick and "`ad_save_images_before`" in quick
+    assert "`-ad-before`" in quick
+    small = line("- **Small, distant or background faces")
+    assert "Mask min area ratio" in small and "0.05 = 5%" in small
+    assert "0.25, not 0.5" in small
+    assert "Mask only the top k" in small and "Inpaint only these detections" in small
+
+    # The names quoted from this extension match its code.
+    script = (Path(__file__).resolve().parents[1] / "scripts" / "!adetailer.py").read_text(
+        encoding="utf-8"
+    )
+    assert "class AfterDetailerScript(" in script
+    assert 'suffix="-ad-before"' in script
+    assert '"ad_save_images_before"' in script
+    assert 'label="Save images before ADetailer"' in script
+    ui = (Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py").read_text(
+        encoding="utf-8"
+    )
+    for label in ("Mask min area ratio", "Mask only the top k", "Inpaint only these detections"):
+        assert f'label="{label}' in ui
+    # The ratio is the box area over the whole image area.
+    from adetailer.mask import is_in_ratio
+
+    assert is_in_ratio([0, 0, 50, 50], 0.25, 0.25, 100 * 100)
+    assert not is_in_ratio([0, 0, 50, 50], 0.5, 1.0, 100 * 100)
 
 
 def test_guide_getting_started_places_the_detector_and_names_enable_this_tab():
@@ -2693,3 +2812,56 @@ def test_the_export_button_is_spelled_export():
         if kw.arg in {"label", "value"} and isinstance(kw.value, ast.Constant)
     ]
     assert labels == ["\U0001F4E4 Export", "\U0001F4E4 Export"]
+
+
+def test_guide_explains_the_prompt_token_with_words():
+    _tree, sections = _guide_sections()
+    tokens = next(body for title, body in sections.items() if "Special tokens" in title)
+    line = next(line for line in tokens.splitlines() if line.startswith("- [PROMPT=eyes,hair]"))
+    for words in ("[PROMPT=-dress]", "underscore", "LoRAs", "no part matches"):
+        assert words in line
+    # Plain text: no new inline markdown and no tag the renderer would eat.
+    assert not any(mark in line for mark in ("**", "`", "<", "_"))
+
+
+def test_guide_says_the_script_menu_hides_the_gallery_previews():
+    _tree, sections = _guide_sections()
+    line = next(
+        line
+        for body in sections.values()
+        for line in body.splitlines()
+        if line.startswith("- Show detection previews in the results gallery")
+    )
+    assert "not shown while a script of the Script menu" in line
+    assert not any(mark in line for mark in ("**", "`"))
+
+
+def test_preset_preview_flags_the_prompt_token_with_words(callbacks, monkeypatch):
+    disk = {"eyes": {"ad_prompt": "close-up, [PROMPT=eyes,-dress]", "ad_negative_prompt": ""}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    value = callbacks["_format_preset_preview"]("eyes")["value"]
+    assert "close-up, `[PROMPT=eyes,-dress]`" in value
+    assert "tokens will be expanded" in value
+
+
+def test_preset_preview_says_nothing_of_an_unclosed_prompt_token(callbacks, monkeypatch):
+    # "[PROMPT=eyes" with no "]" is plain text at generation time.
+    disk = {"eyes": {"ad_prompt": "close-up, [PROMPT=eyes", "ad_negative_prompt": ""}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    value = callbacks["_format_preset_preview"]("eyes")["value"]
+    assert "close-up, [PROMPT=eyes" in value
+    assert "will be expanded" not in value
+
+
+def test_guide_says_which_loras_the_prompt_token_brings():
+    _tree, sections = _guide_sections()
+    tokens = next(body for title, body in sections.items() if "Special tokens" in title)
+    line = next(line for line in tokens.splitlines() if line.startswith("- [PROMPT=eyes,hair]"))
+    for words in (
+        "new lines, BREAK and AND",
+        "the numbers of the weights are not searched",
+        "With plain words it never brings the main prompt's LoRAs (Use LoRAs from main prompt adds them)",
+        "with only minus words it keeps them (Strip LoRAs from the detailer prompt removes them)",
+        "[PROMPT=] brings the whole main prompt, like [PROMPT].",
+    ):
+        assert words in line

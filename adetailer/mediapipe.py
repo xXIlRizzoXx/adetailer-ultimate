@@ -46,6 +46,17 @@ _FEATURE_TASK_GROUPS: dict[str, list[tuple[str, ...]]] = {
     "eyebrows": [("FACE_LANDMARKS_LEFT_EYEBROW",), ("FACE_LANDMARKS_RIGHT_EYEBROW",)],
     "face": [("FACE_LANDMARKS_FACE_OVAL",)],
 }
+# Classes detected only when picked by name, never with an empty selection:
+# the iris lies inside "eyes", so "all" would inpaint the eye area twice.
+_OPT_IN_FEATURES = frozenset({"iris"})
+# "iris", per eye: (iris ring connections, iris centre landmark, eye contour
+# connections). The iris points (468-477) exist only in the 478-point tasks
+# FaceLandmarker output. The legacy solutions FaceMesh gives 468 points, so
+# there, or when the ring constants are missing, the iris is simply not found.
+_IRIS_EYES = (
+    ("FACE_LANDMARKS_LEFT_IRIS", 473, "FACE_LANDMARKS_LEFT_EYE"),
+    ("FACE_LANDMARKS_RIGHT_IRIS", 468, "FACE_LANDMARKS_RIGHT_EYE"),
+)
 # Old `solutions` FACEMESH_* constant names, for the fallback path.
 _FEATURE_SOLUTION_GROUPS: dict[str, list[tuple[str, ...]]] = {
     "eyes": [("FACEMESH_LEFT_EYE",), ("FACEMESH_RIGHT_EYE",)],
@@ -442,6 +453,120 @@ def _feature_indices(feature: str) -> tuple[tuple[int, ...], ...]:
     return ()
 
 
+@lru_cache(maxsize=1)
+def _iris_parts() -> tuple[tuple[tuple[int, ...], int, tuple[int, ...]], ...]:
+    """Per eye with an iris ring: (ring indices, centre index, eye contour
+    indices, () when the contour constant is missing). Empty when the tasks
+    FaceLandmarksConnections or its iris constants are not available."""
+    try:
+        from mediapipe.tasks.python import vision
+
+        conns = vision.FaceLandmarksConnections
+    except Exception:  # noqa: BLE001
+        return ()
+
+    def verts(name: str) -> tuple[int, ...]:
+        found: set[int] = set()
+        for c in getattr(conns, name, None) or []:
+            found.add(int(c.start))
+            found.add(int(c.end))
+        return tuple(sorted(found))
+
+    parts = []
+    for ring_name, centre, eye_name in _IRIS_EYES:
+        ring = verts(ring_name)
+        if ring:
+            parts.append((ring, centre, verts(eye_name)))
+    return tuple(parts)
+
+
+def _iris_masks(points: np.ndarray, size: tuple[int, int]) -> list[Image.Image]:
+    """One mask per eye: a circle over the whole iris (centre = the iris centre
+    landmark, else the mean of the ring; radius = mean distance to the ring),
+    cut to the eye contour so a half-closed eyelid is left alone; none for a
+    closed or almost closed eye. The whole circle when the contour constant
+    is missing. Landmarks past the count (468-point
+    solutions output) are skipped, so the iris is then simply not found."""
+    n_pts = points.shape[0]
+    out: list[Image.Image] = []
+    for ring_idx, centre_idx, eye_idx in _iris_parts():
+        ring = points[[i for i in ring_idx if i < n_pts]].astype(float)
+        if not len(ring):
+            continue
+        centre = (
+            points[centre_idx].astype(float) if centre_idx < n_pts else ring.mean(0)
+        )
+        radius = float(np.linalg.norm(ring - centre, axis=1).mean())
+        cx, cy = centre
+        mask = Image.new("L", size, "black")
+        ImageDraw.Draw(mask).ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius), fill="white"
+        )
+        if eye_idx:
+            eye = [i for i in eye_idx if i < n_pts]
+            hull = (
+                cv2.convexHull(points[eye]).reshape(-1).tolist()
+                if len(eye) >= 3
+                else []
+            )
+            # A closed eye (its contour a line, < 3 hull points) has no iris
+            # to show, and an almost closed one too: no mask, rather than the
+            # circle on the eyelid.
+            if len(hull) < 6:
+                continue
+            # Almost closed: the opening above the iris centre is under 20%
+            # of the iris, or under 15% of the circle is left. That share is
+            # drawn 4x larger, around the circle only, so the edge rows PIL
+            # fills whole do not count as an open eye.
+            xy = np.array(hull, dtype=float).reshape(-1, 2)
+            # The opening is measured across the eye, not down the image
+            # column: the contour is turned around the iris centre so the
+            # line through its two farthest points (the eye corners) lies flat.
+            far = np.linalg.norm(xy[:, None] - xy[None], axis=2)
+            a, b = np.unravel_index(int(far.argmax()), far.shape)
+            dx, dy = xy[b] - xy[a]
+            if dx < 0 or (dx == 0 and dy < 0):
+                dx, dy = -dx, -dy
+            ang = np.arctan2(dy, dx)
+            rot = np.array([[np.cos(ang), np.sin(ang)], [-np.sin(ang), np.cos(ang)]])
+            flat = (xy - centre) @ rot.T + centre
+            ys = []
+            for (x0, y0), (x1, y1) in zip(flat, np.roll(flat, -1, axis=0)):
+                if min(x0, x1) <= cx <= max(x0, x1):
+                    if x0 == x1:
+                        ys += [y0, y1]
+                    else:
+                        ys.append(y0 + (cx - x0) * (y1 - y0) / (x1 - x0))
+            if not ys or max(ys) - min(ys) < 0.2 * 2 * radius:
+                continue
+            k = 4
+            ox, oy = cx - radius - 1, cy - radius - 1
+            side = int(np.ceil((2 * radius + 2) * k)) + 1
+
+            def big_xy(x: float, y: float, ox=ox, oy=oy, k=k) -> tuple[float, float]:
+                # A pixel's centre, 4x larger, in the box around the circle.
+                return ((x - ox) * k + k / 2, (y - oy) * k + k / 2)
+
+            big_circle = Image.new("L", (side, side), "black")
+            ImageDraw.Draw(big_circle).ellipse(
+                (*big_xy(cx - radius, cy - radius), *big_xy(cx + radius, cy + radius)),
+                fill="white",
+            )
+            big_eye = Image.new("L", (side, side), "black")
+            ImageDraw.Draw(big_eye).polygon(
+                [big_xy(x, y) for x, y in xy], fill="white"
+            )
+            big = np.array(big_circle) > 0
+            if np.count_nonzero(big & (np.array(big_eye) > 0)) < 0.15 * np.count_nonzero(big):
+                continue
+            eye_mask = Image.new("L", size, "black")
+            ImageDraw.Draw(eye_mask).polygon(hull, fill="white")
+            cut = np.minimum(np.array(mask), np.array(eye_mask))
+            mask = Image.fromarray(cut)
+        out.append(mask)
+    return out
+
+
 def _hull_polys(points: np.ndarray, feature: str) -> list[list[int]]:
     """Convex-hull outlines (flat [x0,y0,x1,y1,...]) for ``feature`` on one face's
     landmark ``points``. Skips indices past the landmark count (468-vs-478 drift)
@@ -726,15 +851,17 @@ def mediapipe_face_features(
 ) -> PredictOutput[int]:
     """Multi-class facial-feature detector: one precise landmark-group mask per
     detected face per REQUESTED feature class (eyes, mouth, nose, eyebrows,
-    face). ``class_names`` is parallel to bboxes/masks, so the CLASSES filter,
-    Auto class-guard, sequential passes and the combined Detection-Preview labels
-    all light up. Empty include selection means ALL features."""
+    face, iris). ``class_names`` is parallel to bboxes/masks, so the CLASSES
+    filter, Auto class-guard, sequential passes and the combined
+    Detection-Preview labels all light up. Empty include selection means ALL
+    features except the opt-in "iris", which gives one mask per eye."""
     requested = {c.casefold() for c in parse_csv(classes)}
     excluded = {c.casefold() for c in parse_csv(exclude_classes)}
     wanted = [
         f
         for f in FACE_FEATURE_CLASSES
-        if (not requested or f in requested) and f not in excluded
+        if (f in requested if requested else f not in _OPT_IN_FEATURES)
+        and f not in excluded
     ]
     if not wanted:
         return PredictOutput()
@@ -750,20 +877,27 @@ def mediapipe_face_features(
 
     for points in faces:
         for feature in wanted:
-            mask = Image.new("L", image.size, "black")
-            draw = ImageDraw.Draw(mask)
-            for hull in _hull_polys(points, feature):
-                draw.polygon(hull, fill="white")
-            # Per-mask bbox keeps all four lists strictly parallel: a feature
-            # that produced no polygon yields an all-black mask -> getbbox()
-            # None -> dropped together with its conf/class, never desyncing.
-            bbox = mask.getbbox()
-            if bbox is None:
-                continue
-            bboxes.append(list(bbox))
-            masks.append(mask)
-            confidences.append(1.0)  # FaceMesh gives no per-part score
-            class_names.append(feature)
+            if feature == "iris":
+                # One mask per eye, so "Position (left to right)" with [SEP]
+                # can prompt each eye on its own; Merge joins them again.
+                feature_masks = _iris_masks(points, image.size)
+            else:
+                mask = Image.new("L", image.size, "black")
+                draw = ImageDraw.Draw(mask)
+                for hull in _hull_polys(points, feature):
+                    draw.polygon(hull, fill="white")
+                feature_masks = [mask]
+            for mask in feature_masks:
+                # Per-mask bbox keeps all four lists strictly parallel: a feature
+                # that produced no polygon yields an all-black mask -> getbbox()
+                # None -> dropped together with its conf/class, never desyncing.
+                bbox = mask.getbbox()
+                if bbox is None:
+                    continue
+                bboxes.append(list(bbox))
+                masks.append(mask)
+                confidences.append(1.0)  # FaceMesh gives no per-part score
+                class_names.append(feature)
 
     if not masks:
         return PredictOutput()

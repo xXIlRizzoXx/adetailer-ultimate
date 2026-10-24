@@ -16,6 +16,13 @@
  * (object-fit letterbox), and writes the numbers into `<tab>_ad_inpaint_indices`
  * with an `input` event, as class-sync.js writes its fields.
  *
+ * "Show labels": a checkbox this script adds right after each preview button
+ * (on by default, one setting for every tab, kept in localStorage). Off, it
+ * lays the copy of the preview without names, scores and numbers (the
+ * "plain" picture of the same hidden field, single-tab and Combine all tabs)
+ * over the preview, below the clickable boxes. Gradio's own picture is never
+ * changed; without that copy the switch does nothing.
+ *
  * SAFETY
  * ------
  * Pure client-side DOM: no Gradio component of its own and no Python-side
@@ -31,6 +38,11 @@
 
     const OUT_KEY = "_ad_preview_output";
     const LAYER_CLASS = "ad-pick-layer";
+    // "Show labels": the switch beside each preview button, and the picture
+    // without labels laid over the preview while it is off.
+    const PLAIN_CLASS = "ad-plain-picture";
+    const SWITCH_CLASS = "ad-show-labels";
+    const SHOW_KEY = "adetailer-show-labels";
 
     function fieldOf(wrapperId) {
         const box = document.getElementById(wrapperId);
@@ -97,12 +109,14 @@
         }
     }
 
-    // The biggest loaded picture inside the preview output.
+    // The biggest loaded picture inside the preview output (never the picture
+    // without labels this script lays over it).
     function pictureOf(output) {
         const imgs = output.querySelectorAll("img");
         let best = null;
         for (let i = 0; i < imgs.length; i += 1) {
             const im = imgs[i];
+            if (im.classList && im.classList.contains(PLAIN_CLASS)) continue;
             if (!im.naturalWidth || !im.naturalHeight) continue;
             if (!best || im.naturalWidth * im.naturalHeight > best.naturalWidth * best.naturalHeight) {
                 best = im;
@@ -231,14 +245,162 @@
         output.appendChild(layer);
     }
 
+    // ---- "Show labels" -------------------------------------------------
+    // The preview button's .click also writes, in the same hidden field, the
+    // preview picture without labels ("plain": a JPEG data URL, only the boxes
+    // and masks). While the switch is off it is laid over the preview, below
+    // the clickable boxes; the labelled picture Gradio shows is never touched.
+    // One setting for every tab, kept in localStorage when the browser allows.
+
+    // The localStorage getter itself can throw (blocked site data).
+    function storage() {
+        try {
+            return window.localStorage || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function readShow() {
+        try {
+            const ls = storage();
+            return !(ls && ls.getItem(SHOW_KEY) === "0");
+        } catch (e) {
+            return true;
+        }
+    }
+
+    let showLabels = readShow();
+
+    function saveShow() {
+        try {
+            const ls = storage();
+            if (ls) ls.setItem(SHOW_KEY, showLabels ? "1" : "0");
+        } catch (e) {
+            /* kept for this page only */
+        }
+    }
+
+    function readPlain(outputId) {
+        const field = fieldOf(outputId.replace(OUT_KEY, "_ad_preview_boxes"));
+        if (!field || !field.value) return null;
+        try {
+            const data = JSON.parse(field.value);
+            if (
+                !data ||
+                !(data.w > 0) ||
+                !(data.h > 0) ||
+                typeof data.plain !== "string" ||
+                data.plain.indexOf("data:image/") !== 0
+            ) {
+                return null;
+            }
+            return data;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function removePlain(output) {
+        const old = output.querySelector("img." + PLAIN_CLASS);
+        if (old) old.remove();
+    }
+
+    function updatePlain(output) {
+        if (!output || !output.id) return;
+        const data = showLabels ? null : readPlain(output.id);
+        const img = data ? pictureOf(output) : null;
+        // Only over the picture it was made for: the shapes must agree.
+        if (
+            !data ||
+            !img ||
+            Math.abs(img.naturalWidth / img.naturalHeight - data.w / data.h) > 0.02
+        ) {
+            removePlain(output);
+            return;
+        }
+        const rect = drawnRect(img, output);
+        if (!rect) {
+            removePlain(output);
+            return;
+        }
+        let plain = output.querySelector("img." + PLAIN_CLASS);
+        if (!plain) {
+            if (window.getComputedStyle(output).position === "static") {
+                output.style.position = "relative";
+            }
+            plain = document.createElement("img");
+            plain.className = PLAIN_CLASS;
+            plain.alt = "";
+            output.appendChild(plain);
+        }
+        if (plain.src !== data.plain) plain.src = data.plain;
+        plain.style.left = rect.left + "px";
+        plain.style.top = rect.top + "px";
+        plain.style.width = rect.width + "px";
+        plain.style.height = rect.height + "px";
+    }
+
+    function syncSwitches() {
+        const labels = document.querySelectorAll("label." + SWITCH_CLASS);
+        for (let i = 0; i < labels.length; i += 1) {
+            const box = labels[i].querySelector("input");
+            if (box) box.checked = showLabels;
+        }
+    }
+
+    // A tab's preview button: "<mode>_ad_preview_btn" plus, from the 2nd tab
+    // on, a "_2nd"-like ending. The switch goes right after it.
+    const BTN_ID = /_ad_preview_btn(_\w+)?$/;
+
+    function addSwitches() {
+        const buttons = document.querySelectorAll('button[id*="_ad_preview_btn"]');
+        for (let i = 0; i < buttons.length; i += 1) {
+            const btn = buttons[i];
+            const row = btn.parentElement;
+            if (!BTN_ID.test(btn.id) || !row || row.querySelector("label." + SWITCH_CLASS)) {
+                continue;
+            }
+            const label = document.createElement("label");
+            label.className = SWITCH_CLASS;
+            label.title = "Untick to see only the boxes, without names, scores and numbers.";
+            const box = document.createElement("input");
+            box.type = "checkbox";
+            box.checked = showLabels;
+            box.addEventListener("change", function () {
+                showLabels = !!box.checked;
+                saveShow();
+                syncSwitches();
+                updateAll();
+            });
+            const text = document.createElement("span");
+            text.textContent = "Show labels";
+            label.appendChild(box);
+            label.appendChild(text);
+            const next = btn.nextElementSibling;
+            if (next) row.insertBefore(label, next);
+            else row.appendChild(label);
+        }
+    }
+
     // A tab's preview output: "<mode>_ad_preview_output" plus, from the 2nd
     // tab on, a "_2nd"-like ending.
     const OUT_ID = /_ad_preview_output(_\w+)?$/;
 
     function updateAll() {
+        try {
+            addSwitches();
+        } catch (e) {
+            /* the preview works as before, without the switch */
+        }
         const outputs = document.querySelectorAll('div[id*="' + OUT_KEY + '"]');
         for (let i = 0; i < outputs.length; i += 1) {
             if (!OUT_ID.test(outputs[i].id)) continue;
+            try {
+                updatePlain(outputs[i]);
+            } catch (e) {
+                removePlain(outputs[i]);
+            }
             try {
                 update(outputs[i]);
             } catch (e) {

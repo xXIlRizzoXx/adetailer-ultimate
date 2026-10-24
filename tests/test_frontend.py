@@ -162,7 +162,18 @@ class El {
     }
     append(k) { k.parentElement = this; this.children.push(k); return k; }
     appendChild(k) { return this.append(k); }
+    insertBefore(k, ref) {
+        const at = this.children.indexOf(ref);
+        if (at < 0) return this.append(k);
+        k.parentElement = this; this.children.splice(at, 0, k); return k;
+    }
+    get nextElementSibling() {
+        const p = this.parentElement;
+        if (!p) return null;
+        return p.children.slice(p.children.indexOf(this) + 1).find((k) => k.nodeType === 1) || null;
+    }
     get textContent() { return this.children.map((c) => c.textContent).join(""); }
+    set textContent(v) { this.children = []; this.append(new Text(String(v))); }
     set innerHTML(v) { this.children = []; if (v) this.append(new Text(v)); }
     cloneNode() {
         const c = new El(this.tagName, { id: this.id, class: this.className });
@@ -1464,6 +1475,169 @@ def test_the_preview_boxes_field_takes_no_room():
         "div.form:has(> .ad-preview-boxes):not(:has(> :not(.ad-preview-boxes)))",
     ):
         assert re.search(r"display:\s*none\s*!important", rules[selector]), selector
+
+
+SHOW_LABELS = r"""
+const P = "script_txt2img_adetailer_";
+const img = new El("img", {});
+img.naturalWidth = CASE.natural[0];
+img.naturalHeight = CASE.natural[1];
+img.objectFit = "contain";
+img.rect = { left: 10, top: 20, width: 400, height: 400 };
+const output = new El("div", { id: P + "ad_preview_output" + CASE.sfx }, [img]);
+output.rect = { left: 10, top: 20, width: 400, height: 400 };
+const btn = new El("button", { id: P + "ad_preview_btn" + CASE.sfx });
+const row = new El("div", { class: "row" }, [
+    btn, new El("div", { id: P + "ad_preview_all_tabs" + CASE.sfx })]);
+const body = new El("body", {}, [
+    output, row,
+    new El("div", { id: P + "ad_preview_boxes" + CASE.sfx }, [
+        new El("textarea", { value: CASE.boxes })]),
+    new El("div", { id: P + "ad_inpaint_indices" + CASE.sfx }, [new El("textarea", {})]),
+]);
+const store = CASE.stored === null ? {} : { "adetailer-show-labels": CASE.stored };
+run(SCRIPT, body, (w) => {
+    w.getComputedStyle = (e) => ({
+        display: e.style.display,
+        objectFit: e.objectFit || "fill",
+        position: e.style.position || "static",
+    });
+    if (CASE.blocked) {
+        Object.defineProperty(w, "localStorage", { get() { throw new Error("blocked"); } });
+    } else {
+        w.localStorage = {
+            getItem: (k) => (k in store ? store[k] : null),
+            setItem: (k, v) => { store[k] = String(v); },
+        };
+    }
+});
+const tick = () => intervals.forEach((f) => f());
+const view = () => {
+    const sw = row.querySelectorAll("label.ad-show-labels");
+    const plain = output.querySelectorAll("img.ad-plain-picture");
+    const layer = output.querySelector(".ad-pick-layer");
+    return {
+        row: row.children.map((c) => c.tagName),
+        switches: sw.length,
+        checked: sw.length ? sw[0].querySelector("input").checked : null,
+        text: sw.length ? sw[0].textContent : null,
+        plain: plain.length ? [plain.length, plain[0].src, plain[0].style.left,
+            plain[0].style.top, plain[0].style.width, plain[0].style.height] : null,
+        boxes: layer ? layer.children.map((b) => [b.style.left, b.style.top]) : null,
+        stored: store["adetailer-show-labels"] === undefined ? null : store["adetailer-show-labels"],
+    };
+};
+tick();
+tick();
+const out = { first: view(), steps: [] };
+for (let i = 0; i < CASE.toggles; i += 1) {
+    const box = row.querySelector("label.ad-show-labels").querySelector("input");
+    box.checked = !box.checked;
+    box.handlers.change.forEach((f) => f({ target: box }));
+    tick();
+    out.steps.push(view());
+}
+console.log(JSON.stringify(out));
+"""
+
+_PLAIN = "data:image/jpeg;base64,AAAA"
+_WITH_PLAIN = json.dumps({
+    "w": 200, "h": 100, "boxes": [[0, 0, 100, 50], [100, 50, 200, 100]], "plain": _PLAIN,
+})
+# Over the picture, drawn 400x200 and 100 px down in its 400x400 <img>.
+_PLAIN_AT = [1, _PLAIN, "0px", "100px", "400px", "200px"]
+
+
+def _show_labels(tmp_path, *, boxes=_WITH_PLAIN, stored=None, toggles=0,
+                 natural=(200, 100), blocked=False, sfx=""):
+    case = json.dumps({
+        "natural": list(natural), "boxes": boxes, "stored": stored,
+        "toggles": toggles, "blocked": blocked, "sfx": sfx,
+    })
+    return run_js(tmp_path, "picker.js", f"const CASE = {case};\n" + SHOW_LABELS)
+
+
+@needs_node
+@pytest.mark.parametrize("sfx", ["", "_2nd"])
+def test_show_labels_switch_sits_after_the_preview_button(tmp_path, sfx):
+    out = _show_labels(tmp_path, sfx=sfx)["first"]
+    # One switch per button, right after it, ticked by default: the preview
+    # looks as before.
+    assert out["row"] == ["BUTTON", "LABEL", "DIV"]
+    assert out["switches"] == 1
+    assert out["checked"] is True
+    assert out["text"] == "Show labels"
+    assert out["plain"] is None
+
+
+@needs_node
+def test_show_labels_off_lays_the_plain_picture_under_the_boxes(tmp_path):
+    out = _show_labels(tmp_path, toggles=2)
+    off, on = out["steps"]
+    assert off["checked"] is False and off["stored"] == "0"
+    assert off["plain"] == _PLAIN_AT
+    # The boxes stay clickable, in the same places.
+    assert off["boxes"] == out["first"]["boxes"] == [["0px", "100px"], ["200px", "200px"]]
+    assert on["checked"] is True and on["stored"] == "1"
+    assert on["plain"] is None
+
+
+@needs_node
+def test_show_labels_off_is_remembered(tmp_path):
+    out = _show_labels(tmp_path, stored="0")["first"]
+    assert out["checked"] is False
+    assert out["plain"] == _PLAIN_AT
+
+
+@needs_node
+def test_show_labels_works_on_combined_previews(tmp_path):
+    # Combine all tabs sends the plain picture but no boxes.
+    boxes = json.dumps({"w": 200, "h": 100, "plain": _PLAIN})
+    out = _show_labels(tmp_path, boxes=boxes, stored="0")["first"]
+    assert out["plain"] == _PLAIN_AT
+    assert out["boxes"] is None
+
+
+@needs_node
+@pytest.mark.parametrize(
+    ("natural", "boxes"),
+    [
+        ((200, 200), _WITH_PLAIN),  # the picture shown is not the one copied
+        ((200, 100), _TWO_BOXES),  # no plain picture: the switch does nothing
+        ((200, 100), ""),
+        ((200, 100), json.dumps({"w": 200, "h": 100, "plain": "javascript:x"})),
+    ],
+)
+def test_show_labels_off_does_nothing_when_unsure(tmp_path, natural, boxes):
+    out = _show_labels(tmp_path, natural=natural, boxes=boxes, stored="0")["first"]
+    assert out["plain"] is None
+
+
+@needs_node
+def test_show_labels_works_without_storage(tmp_path):
+    out = _show_labels(tmp_path, blocked=True, toggles=1)
+    assert out["first"]["checked"] is True
+    assert out["steps"][0]["plain"] == _PLAIN_AT
+
+
+def test_show_labels_styles_exist():
+    rules = {s: body for selectors, body in css_rules() for s in selectors}
+    plain = rules["img.ad-plain-picture"]
+    assert re.search(r"pointer-events:\s*none", plain)
+    # Below the clickable boxes of picker.js.
+    z = int(re.search(r"z-index:\s*(\d+)", plain).group(1))
+    assert z < int(re.search(r"z-index:\s*(\d+)", rules[".ad-pick-layer"]).group(1))
+    assert "label.ad-show-labels" in rules
+
+
+def test_show_labels_checkbox_shows_its_tick():
+    # AUTOMATIC1111's theme sets appearance: none on every checkbox and draws
+    # the tick only on Gradio's own: the plain checkbox picker.js adds looked
+    # the same ticked and unticked.
+    rules = {s: body for selectors, body in css_rules() for s in selectors}
+    box = rules['label.ad-show-labels > input[type="checkbox"]']
+    assert re.search(r"(?<!-)appearance:\s*auto\s*!important", box)
+    assert re.search(r"-webkit-appearance:\s*checkbox\s*!important", box)
 
 
 def _option_tooltips() -> dict[str, str]:

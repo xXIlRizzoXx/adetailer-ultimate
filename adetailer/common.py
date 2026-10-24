@@ -36,6 +36,10 @@ class PredictOutput(Generic[T]):
     # to label each box like the single-tab plot. Empty for MediaPipe / when
     # unavailable. Added at the END so any positional construction is safe.
     class_names: list[str] = field(default_factory=list)
+    # The same picture as `preview` with its boxes and masks but no class
+    # names and scores, for the "Show labels" switch of the Detection preview.
+    # Only the preview asks for it; None otherwise or when it can't be drawn.
+    preview_plain: Optional[Image.Image] = None
 
 
 def _short_reason(error: BaseException | None) -> str:
@@ -55,10 +59,16 @@ def _short_reason(error: BaseException | None) -> str:
 
 
 def hf_download(file: str, repo_id: str = REPO_ID, check_remote: bool = True) -> str:
-    # Same three tries as before (Hugging Face, its mirror, the local cache),
-    # but the first remote error is kept, so the console can say WHY the
-    # model could not be loaded (no connection, proxy, SSL, ...).
+    # The local Hugging Face cache first: a model downloaded once loads
+    # without contacting the network. Then Hugging Face and its mirror. The
+    # first remote error is kept, so the console can say WHY the model could
+    # not be loaded (no connection, proxy, SSL, ...).
     error: BaseException | None = None
+    try:
+        return hf_hub_download(repo_id, file, local_files_only=True)
+    except Exception as e:  # noqa: BLE001
+        cache_error = e
+
     if check_remote:
         try:
             return hf_hub_download(repo_id, file, etag_timeout=1)
@@ -72,11 +82,7 @@ def hf_download(file: str, repo_id: str = REPO_ID, check_remote: bool = True) ->
         except Exception as e:  # noqa: BLE001
             error = error or e
 
-    try:
-        return hf_hub_download(repo_id, file, local_files_only=True)
-    except Exception as e:  # noqa: BLE001
-        error = error or e
-
+    error = error or cache_error
     if check_remote:
         msg = f"[-] ADetailer: Failed to load model {file!r} from huggingface"
         reason = _short_reason(error)
@@ -180,7 +186,16 @@ def get_models(
         "person_yolov8s-seg.pt",
         "yolov8x-worldv2.pt",
     ]
-    models.update(download_models(*to_download, check_remote=huggingface))
+    # A built-in model already in the model folders (models/adetailer or an
+    # extra folder) is used from there, without contacting Hugging Face. The
+    # first one found wins, as for the other models; the menu order stays.
+    local = {}
+    for path in model_paths:
+        local.setdefault(path.name, str(path))
+    missing = [name for name in to_download if name not in local]
+    downloaded = download_models(*missing, check_remote=huggingface) if missing else {}
+    for name in to_download:
+        models[name] = local[name] if name in local else downloaded.get(name, "INVALID")
 
     models.update(
         {

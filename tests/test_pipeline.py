@@ -38,8 +38,13 @@ def _load_runtime(**host_globals):
     selected = ast.parse("from __future__ import annotations").body
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in {
-            "_forge_wanted_modules", "_parse_class_prompts", "_class_prompt_for"
+            "_forge_wanted_modules", "_parse_class_prompts", "_class_prompt_for",
+            "_empty_prompt_note",
         }:
+            selected.append(node)
+        elif isinstance(node, ast.Assign) and any(
+            getattr(target, "id", "") == "_PROMPT_TOKEN_RE" for target in node.targets
+        ):
             selected.append(node)
         elif isinstance(node, ast.ClassDef) and node.name == "AfterDetailerScript":
             node.bases = []
@@ -55,7 +60,7 @@ def _load_runtime(**host_globals):
             for method in node.body:
                 method.decorator_list = []
             selected.append(node)
-    namespace = {"Path": Path, "sys": sys, **_NETWORK_HASHES, **host_globals}
+    namespace = {"Path": Path, "sys": sys, "re": re, **_NETWORK_HASHES, **host_globals}
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_SCRIPT_PATH), "exec"), namespace)
     return SimpleNamespace(**namespace)
@@ -544,6 +549,13 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
     if "get_override_settings" in methods or "_crop_upscaler_usable" in functions:
         functions = {*functions, "_setting_frozen"}
         assigns = {*assigns, "_FROZEN_REPORTED"}
+    # And those that read Settings > ADetailer "Max inpaint size".
+    if {"fix_p2", "extra_params"} & set(methods):
+        functions = {*functions, "_max_inpaint_side", "_cap_inpaint_size"}
+    # And the pass, which says when [PROMPT=words] left a prompt empty.
+    if "_postprocess_image_inner" in methods:
+        functions = {*functions, "_empty_prompt_note"}
+        assigns = {*assigns, "_PROMPT_TOKEN_RE"}
     tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
     selected = ast.parse("from __future__ import annotations").body
     for node in tree.body:
@@ -933,7 +945,7 @@ _CLASS_PROMPT = "detailed, [CLASS=face]smile[/CLASS], [CLASS=hand]five fingers[/
 
 
 def _class_prompt_script(opts_data=None):
-    from adetailer.args import BBOX_SORTBY
+    from adetailer.args import BBOX_SORTBY, BBOX_SORTBY_MORE
     from adetailer.classes import _has_token, build_class_guard
     from adetailer.mask import (
         filter_by_indices,
@@ -956,6 +968,7 @@ def _class_prompt_script(opts_data=None):
         assigns={"_INLINE_CLASS_RE"},
         opts=SimpleNamespace(data=dict(opts_data or {})),
         BBOX_SORTBY=BBOX_SORTBY,
+        BBOX_SORTBY_MORE=BBOX_SORTBY_MORE,
         filter_by_indices=filter_by_indices,
         filter_by_ratio=filter_by_ratio,
         filter_overlapping=filter_overlapping,
@@ -2348,8 +2361,12 @@ _INLINE_PROMPT_FUNCTIONS = {
     "_resolve_inline_class_prompt", "_extract_lora_tags", "_extract_lora_triggers",
     "_merge_lora_tags", "_append_lora_triggers", "_strip_lora_tags",
     "_without_style_loras", "_strip_host_comments",
+    "_filter_main_prompt", "_split_prompt_pieces", "_ad_verbose", "_vprint",
+    "_drop_empty_tokens",
 }
-_INLINE_PROMPT_ASSIGNS = {"_INLINE_CLASS_RE", "_LORA_TAG_RE", "_LORA_TRIGGER_RE"}
+_INLINE_PROMPT_ASSIGNS = {
+    "_INLINE_CLASS_RE", "_LORA_TAG_RE", "_LORA_TRIGGER_RE", "_PROMPT_TOKEN_RE",
+}
 
 
 @pytest.mark.parametrize(
@@ -2609,6 +2626,9 @@ def test_readme_says_how_scale_inpaint_to_bbox_rounds_its_sizes():
         # A part never gets "face", which surrounds it, in its negative.
         ("eyes", ("eyes, detailed", "blurry, mouth, nose, eyebrows")),
         ("mouth", ("mouth, detailed", "blurry, eyes, nose, eyebrows")),
+        # The iris lies inside the eyes: neither is the other's negative, and
+        # the opt-in iris is no other part's negative.
+        ("iris", ("iris, detailed", "blurry, mouth, nose, eyebrows")),
     ],
 )
 def test_class_guard_of_face_features_never_negates_the_face_or_its_parts(
@@ -2639,7 +2659,7 @@ def test_class_guard_of_face_features_never_negates_the_face_or_its_parts(
     )
 
     assert (p2.prompt, p2.negative_prompt) == expected
-    assert len(get_model_class_names(MEDIAPIPE_FACE_FEATURES_MODEL)) == 5
+    assert len(get_model_class_names(MEDIAPIPE_FACE_FEATURES_MODEL)) == 6
 
 
 def test_xyz_prompt_search_replace_writes_the_parameters_before_the_batch_starts():
@@ -8984,3 +9004,1228 @@ def test_crop_upscaler_option_is_registered_with_the_first_choice():
     info = ast.unparse(call.args[1])
     assert "default=AD_CROP_UPSCALER_WEBUI" in info
     assert "component_args=_crop_upscaler_choices" in info
+
+
+def test_gallery_previews_option_says_the_script_menu_hides_them():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    settings = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "on_ui_settings"
+    )
+    call = next(
+        node for node in ast.walk(settings)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_gallery_previews"
+    )
+    info = next(
+        node.args[0].value for node in ast.walk(call.args[1])
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "info"
+    )
+    assert "not shown while a script of the Script menu is selected" in info
+    # One plain text block.
+    assert not any(mark in info for mark in ("**", "`", "[", "\n"))
+
+
+def test_api_tab_with_an_empty_model_is_off_like_none():
+    # An API request may send "ad_model": "" for a tab it does not use. That
+    # tab is off, like "None": alone it leaves ADetailer off, and next to a
+    # real tab it does not count (it used to fail with "Model '' not found"
+    # and stop the tabs after it).
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(methods={"is_ad_enabled"}, ADetailerArgs=ADetailerArgs)
+    script = runtime.AfterDetailerScript()
+
+    assert script.is_ad_enabled(True, False, {"ad_model": ""}) is False
+    assert script.is_ad_enabled({"ad_model": "  "}) is False
+    assert script.is_ad_enabled(
+        True, False, {"ad_model": ""}, {"ad_model": "face_yolov8n.pt"}
+    ) is True
+
+
+@pytest.mark.parametrize(
+    ("flags", "system", "expect"),
+    [
+        # AUTOMATIC1111 / Forge: --use-cpu all (or adetailer) runs it on CPU.
+        ({"use_cpu": ["all"]}, "Windows", "cpu"),
+        ({"use_cpu": ["adetailer"]}, "Windows", "cpu"),
+        ({"use_cpu": "all"}, "Windows", "cpu"),
+        ({"use_cpu": ["all"]}, "Darwin", "cpu"),
+        ({"use_cpu": ["sd", "interrogate"]}, "Windows", ""),
+        # Forge Neo has no use_cpu; --cpu runs everything on CPU there.
+        ({"cpu": True}, "Windows", "cpu"),
+        ({"cpu": True}, "Darwin", "cpu"),
+        # Forge: --always-cpu.
+        ({"always_cpu": True}, "Windows", "cpu"),
+        # Unchanged: the low-VRAM flags, macOS, and a GPU WebUI.
+        ({"lowvram": True}, "Windows", "cpu"),
+        # Forge Neo: --novram, like lowvram (macOS keeps its default).
+        ({"novram": True}, "Windows", "cpu"),
+        ({"novram": True}, "Darwin", ""),
+        ({"medvram": True}, "Darwin", ""),
+        ({"cpu": False, "use_cpu": None}, "Windows", ""),
+        ({}, "Windows", ""),
+    ],
+)
+def test_detector_runs_on_cpu_when_the_whole_webui_does(flags, system, expect):
+    cmd_opts = SimpleNamespace(**flags)
+    runtime = _load_script(
+        methods={"get_ultralytics_device"},
+        shared=SimpleNamespace(cmd_opts=cmd_opts),
+        cmd_opts=cmd_opts,
+        platform=SimpleNamespace(system=lambda: system),
+    )
+
+    assert runtime.AfterDetailerScript.get_ultralytics_device() == expect
+
+
+# Settings -> ADetailer -> "Max inpaint size, pixels per side (0 = no limit)".
+
+
+def _cap_runtime():
+    return _load_script(functions={"_cap_inpaint_size"})._cap_inpaint_size
+
+
+@pytest.mark.parametrize(
+    ("size", "max_side", "capped"),
+    [
+        ((4800, 3200), 0, (4800, 3200)),  # 0 = no limit
+        ((1024, 768), 1024, (1024, 768)),  # already fits
+        ((4800, 3200), 2048, (2048, 1360)),  # landscape
+        ((3200, 4800), 2048, (1360, 2048)),  # portrait
+        ((4096, 128), 1024, (1024, 64)),  # never below 64
+    ],
+)
+def test_cap_inpaint_size_keeps_the_shape_and_multiples_of_8(size, max_side, capped, capsys):
+    assert _cap_runtime()(*size, max_side) == capped
+    out = capsys.readouterr().out
+    if capped == size:
+        assert out == ""
+    else:
+        line = f"[-] ADetailer: inpaint size {size[0]}x{size[1]} -> {capped[0]}x{capped[1]}"
+        assert line in out
+        assert out.isascii()
+
+
+def test_cap_inpaint_size_longer_side_is_exactly_the_limit():
+    from fractions import Fraction
+
+    cap = _cap_runtime()
+    for longest in range(1032, 6000, 8):
+        for other in (64, 520, 1000, longest):
+            w, h = cap(longest, other, 1024)
+            assert w == 1024
+            assert h == max(64, int(Fraction(other * 1024, longest)) // 8 * 8)
+            assert h % 8 == 0
+
+
+def _max_side_fix_p2(opts_data, **arg_values):
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    runtime = _load_script(
+        methods={
+            "fix_p2", "get_dynamic_denoise_strength", "get_optimal_crop_image_size",
+            "get_seed", "get_each_tab_seed",
+        },
+        opts=SimpleNamespace(data=opts_data),
+        shared=SimpleNamespace(opts=SimpleNamespace(data={}), sd_model=None),
+        get_i=lambda _p: 0,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    p2 = SimpleNamespace(width=1024, height=1024, denoising_strength=0.4)
+    args = ADetailerArgs(ad_model="person_yolov8n-seg.pt", **arg_values)
+    outer = SimpleNamespace(seed=1, subseed=1, all_seeds=[1], all_subseeds=[1])
+    # A 600 x 400 detection on a 1536 x 1536 picture.
+    pred = SimpleNamespace(bboxes=[[100, 100, 700, 500]])
+    runtime.AfterDetailerScript().fix_p2(
+        outer, p2, SimpleNamespace(image=Image.new("RGB", (1536, 1536))), args, pred, 0
+    )
+    return p2.width, p2.height
+
+
+_SCALE_8 = {"ad_use_resolution_scale": True, "ad_resolution_scale": 8.0}
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "arg_values", "size"),
+    [
+        # Off by default: Scale inpaint to bbox 8x asks for 4800 x 3200.
+        ({}, _SCALE_8, (4800, 3200)),
+        ({"ad_max_inpaint_side": 0}, _SCALE_8, (4800, 3200)),
+        ({"ad_max_inpaint_side": "x"}, _SCALE_8, (4800, 3200)),
+        # Capped, with the same shape.
+        ({"ad_max_inpaint_side": 2048}, _SCALE_8, (2048, 1360)),
+        ({"ad_max_inpaint_side": 2048.0}, _SCALE_8, (2048, 1360)),
+        # The size from the inpaint size (and bbox matching) is capped too.
+        ({"ad_max_inpaint_side": 768}, {}, (768, 768)),
+        (
+            {"ad_max_inpaint_side": 512, "ad_match_inpaint_bbox_size": "Free"},
+            {},
+            (512, 344),
+        ),
+        # A size the user set, or whole-picture inpaint, is left alone.
+        (
+            {"ad_max_inpaint_side": 512},
+            {"ad_use_inpaint_width_height": True, **_SCALE_8},
+            (1024, 1024),
+        ),
+        (
+            {"ad_max_inpaint_side": 512},
+            {"ad_inpaint_only_masked": False, **_SCALE_8},
+            (1024, 1024),
+        ),
+    ],
+)
+def test_max_inpaint_size_caps_the_region_canvas(opts_data, arg_values, size):
+    assert _max_side_fix_p2(opts_data, **arg_values) == size
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "written"),
+    [({}, None), ({"ad_max_inpaint_side": 0}, None), ({"ad_max_inpaint_side": 2048.0}, 2048)],
+)
+def test_max_inpaint_size_is_written_to_the_parameters_only_when_set(opts_data, written):
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods={"extra_params"},
+        opts=SimpleNamespace(data=opts_data),
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    tab = ADetailerArgs(ad_model="face_yolov8n.pt")
+    params = runtime.AfterDetailerScript().extra_params([tab])
+    assert params.get("ADetailer max inpaint size") == written
+
+
+@pytest.mark.parametrize(
+    ("tabs", "written"),
+    [
+        # No tab the limit applies to: not written.
+        ([], None),
+        ([{"ad_model": "face_yolov8n.pt", "ad_use_inpaint_width_height": True}], None),
+        ([{"ad_model": "face_yolov8n.pt", "ad_inpaint_only_masked": False}], None),
+        ([{"ad_model": "None"}], None),
+        ([{"ad_model": "face_yolov8n.pt", "ad_tab_enable": False}], None),
+        # One running tab it applies to is enough.
+        (
+            [
+                {"ad_model": "face_yolov8n.pt", "ad_use_inpaint_width_height": True},
+                {"ad_model": "hand_yolov8n.pt"},
+            ],
+            1024,
+        ),
+    ],
+)
+def test_max_inpaint_size_is_written_only_when_a_running_tab_uses_it(tabs, written):
+    # The limit applies only with "Inpaint only masked" and without "Use
+    # separate width/height": the parameters must not claim it otherwise.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods={"extra_params"},
+        opts=SimpleNamespace(data={"ad_max_inpaint_side": 1024}),
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    arg_list = [ADetailerArgs(**values) for values in tabs]
+    params = runtime.AfterDetailerScript().extra_params(arg_list)
+    assert params.get("ADetailer max inpaint size") == written
+
+
+def test_max_inpaint_size_is_a_settings_slider_off_by_default():
+    script_text = _SCRIPT_PATH.read_text(encoding="utf-8")
+    option = script_text[script_text.index('        "ad_max_inpaint_side",'):]
+    option = option[: option.index("shared.opts.add_option")]
+    assert "default=0," in option
+    assert '"minimum": 0, "maximum": 4096, "step": 64' in option
+    assert "component=gr.Slider" in option
+
+
+# Settings -> ADetailer -> "Hide detection boxes from the live preview".
+
+
+def _live_preview_run(opts_data):
+    shown = []
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=shown.append,
+    )
+    saved = []
+
+    def process_images(p2):
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")])
+
+    run, pp, before = _detailer(
+        state, process_images, n_masks=1, Image=Image,
+        opts=SimpleNamespace(data=opts_data),
+    )
+    script = _script_of(run)
+    script.save_image = lambda _p, image, **kwargs: saved.append(
+        (image, kwargs.get("condition"))
+    )
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4,
+    )
+    p = SimpleNamespace(extra_generation_params={})
+    assert script._postprocess_image_inner(p, pp, args) is True
+    # The preview with the boxes is the detector's preview image.
+    return shown, saved, before
+
+
+@pytest.mark.parametrize(
+    "opts_data", [{}, {"ad_hide_live_preview_boxes": False}]
+)
+def test_live_preview_shows_the_detection_boxes_by_default(opts_data):
+    shown, saved, boxes = _live_preview_run(opts_data)
+    assert shown == [boxes]
+    assert (boxes, "ad_save_previews") in saved
+
+
+def test_hide_detection_boxes_keeps_them_out_of_the_live_preview():
+    shown, saved, boxes = _live_preview_run({"ad_hide_live_preview_boxes": True})
+    assert shown == []
+    # "Save mask previews" still gets the preview with the boxes.
+    assert (boxes, "ad_save_previews") in saved
+
+
+def test_hide_detection_boxes_is_a_settings_checkbox_off_by_default():
+    script_text = _SCRIPT_PATH.read_text(encoding="utf-8")
+    option = script_text[script_text.index('        "ad_hide_live_preview_boxes",'):]
+    option = option[: option.index("shared.opts.add_option")]
+    assert "default=False," in option
+    assert "component=" not in option
+
+
+# Settings -> ADetailer -> "Show detection previews in the results gallery".
+
+
+def _gallery_preview_run(opts_data, p):
+    # One detailer pass on a fake detector: returns the detector's preview.
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+
+    def process_images(p2):
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")])
+
+    run, pp, before = _detailer(
+        state, process_images, n_masks=1, Image=Image,
+        opts=SimpleNamespace(data=opts_data),
+        _GALLERY_PREVIEWS_MAX=_gallery_previews_max(),
+    )
+    script = _script_of(run)
+    script.infotext = lambda _p: "face, Steps: 20, Seed: 7"
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4,
+    )
+    assert script._postprocess_image_inner(p, pp, args) is True
+    return before
+
+
+@pytest.mark.parametrize("opts_data", [{}, {"ad_gallery_previews": False}])
+def test_gallery_previews_are_not_kept_when_the_option_is_off(opts_data):
+    p = SimpleNamespace(extra_generation_params={})
+    _gallery_preview_run(opts_data, p)
+    assert not hasattr(p, "_ad_gallery_previews")
+
+
+@pytest.mark.parametrize("hide_boxes", [False, True])
+def test_gallery_previews_keep_each_preview_with_its_parameters(hide_boxes):
+    # "Hide detection boxes from the live preview" does not change them.
+    p = SimpleNamespace(extra_generation_params={})
+    opts_data = {"ad_gallery_previews": True, "ad_hide_live_preview_boxes": hide_boxes}
+    boxes = _gallery_preview_run(opts_data, p)
+    assert p._ad_gallery_previews == [(boxes, "face, Steps: 20, Seed: 7")]
+    # A second pass (the next tab or the next image) is added after it.
+    _gallery_preview_run(opts_data, p)
+    assert len(p._ad_gallery_previews) == 2
+
+
+@pytest.mark.parametrize("flag", ["is_api", "_ad_standalone"])
+def test_gallery_previews_are_not_kept_for_api_or_standalone_runs(flag):
+    p = SimpleNamespace(extra_generation_params={}, **{flag: True})
+    _gallery_preview_run({"ad_gallery_previews": True}, p)
+    assert not hasattr(p, "_ad_gallery_previews")
+
+
+@pytest.mark.parametrize(
+    ("script_args", "kept"),
+    [
+        # The Script menu on None (0, or None as the host reads it too):
+        # kept as before.
+        ((0, 512, True), 1),
+        ([], 1),
+        ((None, 512), 1),
+        # A script picked there (SD upscale, Prompt matrix...) reads the
+        # result by position: nothing kept, also when the value is unclear.
+        ((3, 512, True), 0),
+        (("x", 512), 0),
+    ],
+)
+def test_gallery_previews_are_not_kept_with_a_script_of_the_script_menu(
+    script_args, kept
+):
+    p = SimpleNamespace(extra_generation_params={}, script_args=script_args)
+    _gallery_preview_run({"ad_gallery_previews": True}, p)
+    assert len(getattr(p, "_ad_gallery_previews", [])) == kept
+
+
+@pytest.mark.parametrize(
+    ("script_args", "added"), [((0, 1), 1), ((None, 1), 1), ((3, 1), 0), (("x", 1), 0)]
+)
+def test_gallery_postprocess_adds_nothing_with_a_script_of_the_script_menu(
+    script_args, added
+):
+    p = SimpleNamespace(
+        script_args=script_args,
+        _ad_gallery_previews=[(Image.new("RGB", (8, 8)), "params")],
+    )
+    processed = _processed()
+    _gallery_postprocess().postprocess(p, processed)
+    assert len(processed.images) == len(processed.infotexts) == 2 + added
+    assert p._ad_gallery_previews == []
+
+
+def _gallery_previews_max():
+    # The module-level limit, read from the script (the tests load only some
+    # of its names).
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            getattr(target, "id", "") == "_GALLERY_PREVIEWS_MAX"
+            for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    return 32
+
+
+def test_gallery_previews_stop_at_the_limit_and_say_so_once(capsys):
+    assert _gallery_previews_max() == 32
+    p = SimpleNamespace(extra_generation_params={})
+    for _ in range(34):
+        _gallery_preview_run({"ad_gallery_previews": True}, p)
+    # The others are not kept in memory.
+    assert len(p._ad_gallery_previews) == 32
+    lines = [
+        line for line in capsys.readouterr().out.splitlines()
+        if "results gallery" in line
+    ]
+    assert len(lines) == 1
+    assert "first 32 detection previews" in lines[0]
+    assert "'Save mask previews'" in lines[0]
+    assert lines[0].isascii()
+    # The next generation starts again from zero and may say it again.
+    processed = _processed()
+    _gallery_postprocess().postprocess(p, processed)
+    assert len(processed.images) == 2 + 32
+    assert p._ad_gallery_previews == []
+    assert not p._ad_gallery_previews_full
+
+
+def _gallery_postprocess():
+    runtime = _load_script(
+        methods={"postprocess"},
+        opts=SimpleNamespace(data={}, enable_pnginfo=True),
+    )
+    return runtime.AfterDetailerScript()
+
+
+def _processed(n_images=2, grid=False, infotexts=None):
+    images = [Image.new("RGB", (8, 8), "blue") for _ in range(n_images)]
+    texts = [f"image {i}" for i in range(n_images)]
+    if grid:
+        images.insert(0, Image.new("RGB", (16, 8), "green"))
+        texts.insert(0, "grid")
+    return SimpleNamespace(
+        images=images,
+        infotexts=texts if infotexts is None else infotexts,
+        info=texts[0],
+        index_of_first_image=1 if grid else 0,
+    )
+
+
+def test_gallery_postprocess_leaves_the_result_alone_without_previews():
+    processed = _processed(grid=True)
+    images, texts = list(processed.images), list(processed.infotexts)
+    _gallery_postprocess().postprocess(SimpleNamespace(), processed)
+    assert processed.images == images
+    assert processed.infotexts == texts
+    assert processed.index_of_first_image == 1
+
+
+def test_gallery_postprocess_adds_the_previews_after_the_images():
+    first = Image.new("RGB", (8, 8), "white")
+    second = Image.new("RGB", (8, 8), "black")
+    p = SimpleNamespace(
+        _ad_gallery_previews=[(first, "image 0 params"), (second, "")]
+    )
+    processed = _processed(grid=True)
+    generated = list(processed.images)
+    _gallery_postprocess().postprocess(p, processed)
+    # The grid and the generated images keep their places.
+    assert processed.images == [*generated, first, second]
+    assert processed.index_of_first_image == 1
+    # Each preview has its parameters at the same index; one without its own
+    # takes the job's, so Save and Send to can still read a seed.
+    assert processed.infotexts == [
+        "grid", "image 0", "image 1", "image 0 params", "grid"
+    ]
+    assert first.info["parameters"] == "image 0 params"
+    # Shown once: the next job starts empty.
+    assert p._ad_gallery_previews == []
+
+
+def test_gallery_postprocess_fills_the_parameters_of_returned_masks():
+    # AUTOMATIC1111 returns an inpainting mask with no parameters of its own.
+    preview = Image.new("RGB", (8, 8), "white")
+    p = SimpleNamespace(_ad_gallery_previews=[(preview, "preview params")])
+    processed = _processed(n_images=2, infotexts=["image 0"])
+    _gallery_postprocess().postprocess(p, processed)
+    assert len(processed.infotexts) == len(processed.images) == 3
+    assert processed.infotexts[-1] == "preview params"
+
+
+def test_gallery_postprocess_adds_nothing_to_an_api_response():
+    p = SimpleNamespace(
+        is_api=True,
+        _ad_gallery_previews=[(Image.new("RGB", (8, 8)), "params")],
+    )
+    processed = _processed()
+    images, texts = list(processed.images), list(processed.infotexts)
+    _gallery_postprocess().postprocess(p, processed)
+    assert processed.images == images
+    assert processed.infotexts == texts
+    assert p._ad_gallery_previews == []
+
+
+def test_gallery_postprocess_keeps_the_previews_for_the_stand_in_result():
+    # postprocess_image() restarts the other scripts with an empty stand-in
+    # result on a copy of p, which shares the list: the real result needs it.
+    kept = [(Image.new("RGB", (8, 8)), "params")]
+    real_p = SimpleNamespace(_ad_gallery_previews=kept)
+    dummy = SimpleNamespace(images=[], infotexts=[], info="")
+    _gallery_postprocess().postprocess(copy(real_p), dummy)
+    assert dummy.images == []
+    assert real_p._ad_gallery_previews is kept
+    assert len(kept) == 1
+
+
+def test_gallery_previews_is_a_settings_checkbox_off_by_default():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    settings = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "on_ui_settings"
+    )
+    calls = [
+        node for node in ast.walk(settings)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+    ]
+    calls.sort(key=lambda node: node.lineno)
+    keys = [node.args[0].value for node in calls]
+    # Next to "Save mask previews".
+    assert keys[keys.index("ad_save_previews") + 1] == "ad_gallery_previews"
+    option = calls[keys.index("ad_gallery_previews")]
+    info_call = option.args[1]
+    kwargs = {kw.arg: kw.value for kw in info_call.func.value.keywords}
+    assert ast.literal_eval(kwargs["default"]) is False
+    assert ast.unparse(kwargs["section"]) == "section"
+    label = ast.literal_eval(kwargs["label"])
+    info = ast.literal_eval(info_call.args[0])
+    assert label == "Show detection previews in the results gallery"
+    for text in (label, info):
+        assert not any(mark in text for mark in ("**", "`", "["))
+
+
+# Settings -> ADetailer -> "More sort orders (overrides Sort bounding boxes by)".
+
+
+def _sorted_by_settings(opts_data):
+    from adetailer.args import BBOX_SORTBY, BBOX_SORTBY_MORE
+    from adetailer.common import PredictOutput
+    from adetailer.mask import sort_bboxes
+
+    runtime = _load_script(
+        methods={"sort_bboxes"},
+        opts=SimpleNamespace(data=opts_data),
+        BBOX_SORTBY=BBOX_SORTBY,
+        BBOX_SORTBY_MORE=BBOX_SORTBY_MORE,
+        sort_bboxes=sort_bboxes,
+    )
+    # Left, middle and right boxes; the middle one is the most confident.
+    bboxes = [[10, 50, 60, 100], [100, 10, 150, 60], [200, 30, 250, 80]]
+    pred = PredictOutput(
+        bboxes=[list(b) for b in bboxes],
+        masks=[Image.new("L", (300, 300), n) for n in (1, 2, 3)],
+        confidences=[0.5, 0.9, 0.7],
+        preview=Image.new("RGB", (300, 300)),
+    )
+    pred = runtime.AfterDetailerScript().sort_bboxes(pred)
+    return [bboxes.index(b) for b in pred.bboxes]
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "order"),
+    [
+        # Off (also missing, unknown or unreadable): Sort bounding boxes by.
+        ({}, [0, 1, 2]),
+        ({"ad_bbox_sortby_more": "Off"}, [0, 1, 2]),
+        ({"ad_bbox_sortby": "Position (center to edge)"}, [1, 2, 0]),
+        (
+            {"ad_bbox_sortby": "Position (center to edge)", "ad_bbox_sortby_more": "Off"},
+            [1, 2, 0],
+        ),
+        (
+            {"ad_bbox_sortby": "Position (center to edge)", "ad_bbox_sortby_more": "Sideways"},
+            [1, 2, 0],
+        ),
+        (
+            {"ad_bbox_sortby": "Position (center to edge)", "ad_bbox_sortby_more": ["x"]},
+            [1, 2, 0],
+        ),
+        ({"ad_bbox_sortby_more": None}, [0, 1, 2]),
+        # Any other choice is used instead of Sort bounding boxes by.
+        (
+            {"ad_bbox_sortby": "Position (left to right)",
+             "ad_bbox_sortby_more": "Position (right to left)"},
+            [2, 1, 0],
+        ),
+        ({"ad_bbox_sortby_more": "Position (top to bottom)"}, [1, 2, 0]),
+        ({"ad_bbox_sortby_more": "Area (small to large)"}, [0, 1, 2]),
+        ({"ad_bbox_sortby_more": "Confidence (high to low)"}, [1, 2, 0]),
+    ],
+)
+def test_more_sort_orders_override_sort_bounding_boxes_by(opts_data, order):
+    assert _sorted_by_settings(opts_data) == order
+
+
+def test_more_sort_orders_is_a_settings_radio_off_by_default():
+    script_text = _SCRIPT_PATH.read_text(encoding="utf-8")
+    start = script_text.index('        "ad_bbox_sortby",')
+    sortby = script_text[start:]
+    sortby = sortby[: sortby.index("shared.opts.add_option")]
+    # The original setting is unchanged, and the new one comes right after.
+    assert "component_args={\"choices\": BBOX_SORTBY}," in sortby
+    rest = script_text[start + len(sortby):]
+    option = rest[rest.index("(") + 1:]
+    option = option[: option.index("shared.opts.add_option")]
+    assert option.lstrip().startswith('"ad_bbox_sortby_more",')
+    assert 'default="Off",' in option
+    assert "component=gr.Radio" in option
+    assert "BBOX_SORTBY_MORE" in option
+
+
+def _bind_nans_exception(devices):
+    # Run the script's top-level statement that binds NansException against
+    # a stand-in for modules.devices.
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    stmt = next(
+        node
+        for node in tree.body
+        if "NansException" in ast.unparse(node)
+        and isinstance(node, (ast.ImportFrom, ast.Try))
+    )
+    modules = ModuleType("modules")
+    modules.devices = devices
+    saved = {name: sys.modules.get(name) for name in ("modules", "modules.devices")}
+    sys.modules.update({"modules": modules, "modules.devices": devices})
+    try:
+        namespace = {}
+        exec(compile(ast.Module(body=[stmt], type_ignores=[]), str(_SCRIPT_PATH), "exec"), namespace)
+    finally:
+        for name, old in saved.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+    return namespace["NansException"]
+
+
+def test_the_script_loads_on_a_webui_without_nans_exception():
+    # Forge Neo or another host could drop modules.devices.NansException: a
+    # plain import stopped the whole extension from loading there.
+    nans = _bind_nans_exception(ModuleType("modules.devices"))
+    # A class of its own, which nothing raises: it never catches a real error.
+    assert issubclass(nans, Exception)
+    assert nans is not Exception
+
+
+def test_the_script_keeps_the_hosts_nans_exception():
+    devices = ModuleType("modules.devices")
+
+    class NansException(Exception):  # noqa: N818
+        pass
+
+    devices.NansException = NansException
+    assert _bind_nans_exception(devices) is NansException
+
+
+# [PROMPT=words]: only some parts of the main prompt in the tab's prompt.
+
+
+def _prompt_filter_script(verbose_lines=None, **host_globals):
+    """The prompt methods with the [PROMPT=...] helpers; `verbose_lines`,
+    when given, turns the verbose log on and collects its lines."""
+    functions = set(_INLINE_PROMPT_FUNCTIONS)
+    if verbose_lines is not None:
+        functions -= {"_ad_verbose", "_vprint"}
+        host_globals.update(_ad_verbose=lambda: True, _vprint=verbose_lines.append)
+    return _load_script(
+        methods=_INLINE_PROMPT_METHODS,
+        functions=functions,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        get_i=lambda p: getattr(p, "_i", 0),
+        **host_globals,
+    )
+
+
+def _filter_prompt(ad_prompt, main, *, negative="", ad_negative="", i=0,
+                   all_prompts=None, **args):
+    from adetailer.args import ADetailerArgs
+
+    script = _prompt_filter_script().AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt=main, all_prompts=all_prompts or [main],
+        negative_prompt=negative, all_negative_prompts=[negative],
+        styles=[], _i=i,
+    )
+    return script.get_prompt(
+        p, ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt=ad_prompt,
+                         ad_negative_prompt=ad_negative, **args)
+    )
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "main", "expected"),
+    [
+        # The two examples of the request: keep only, and drop.
+        (
+            "close-up, detailed iris, [PROMPT=eyes]",
+            "1girl, green eyes, red dress, <lora:body:0.8>",
+            "close-up, detailed iris, green eyes",
+        ),
+        (
+            "[PROMPT=-beach,-heels]",
+            "masterpiece, black hair, (freckles:1.2), beach, high heels",
+            "masterpiece, black hair, (freckles:1.2)",
+        ),
+        # Several words, weights kept, a comma inside brackets does not split.
+        (
+            "[PROMPT=eyes,hair], sharp",
+            "1girl, (green eyes:1.2), [long|short] hair, (red dress, lace:1.1)",
+            "(green eyes:1.2), [long|short] hair, sharp",
+        ),
+        (
+            "[PROMPT=dress]",
+            "1girl, (red dress, lace:1.1), green eyes",
+            "(red dress, lace:1.1)",
+        ),
+        # Whole word, any case, "_" counts as a space (in both).
+        ("[PROMPT=EYES]", "blue_eyes, eyeshadow, Green Eyes", "blue_eyes, Green Eyes"),
+        ("[PROMPT=eye], face", "blue eyes, eyeshadow", "face"),
+        ("[PROMPT=green_eyes]", "green  eyes, green dress", "green  eyes"),
+        # A weight around the token is kept (the WebUI multiplies them).
+        ("([PROMPT=eyes]:1.2), face", "1girl, green eyes", "(green eyes:1.2), face"),
+        # Mixed: a part must name a plain word and no "-" one.
+        (
+            "[PROMPT=eyes,-dress]",
+            "green eyes, eyes like a red dress, red dress",
+            "green eyes",
+        ),
+        # No word at all is the plain [PROMPT].
+        ("[PROMPT=], face", "1girl, <lora:a:1>", "1girl, <lora:a:1>, face"),
+        ("[PROMPT= - ], face", "1girl", "1girl, face"),
+        # Next to the plain token.
+        ("[PROMPT=eyes] / [PROMPT]", "1girl, green eyes", "green eyes / 1girl, green eyes"),
+    ],
+)
+def test_prompt_token_with_words_brings_only_those_parts(ad_prompt, main, expected):
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+def test_prompt_token_gives_each_sep_part_its_own_words():
+    main = "1girl, green eyes, black hair, red dress"
+    prompts, _ = _filter_prompt(
+        "[PROMPT=eyes] [SEP] [PROMPT=hair], braids [SEP] [SKIP]", main
+    )
+    assert prompts == ["green eyes", "black hair, braids", "[SKIP]"]
+
+
+def test_prompt_token_follows_each_image_of_a_batch():
+    # A wildcard picked another value for each image: all_prompts[i].
+    batch = [
+        "1girl, green eyes, red dress",
+        "1girl, blue eyes, red dress",
+        "1girl, (brown eyes:1.1), red dress",
+    ]
+    got = [
+        _filter_prompt("close-up, [PROMPT=eyes]", "1girl, __eyes__ eyes",
+                       i=i, all_prompts=batch)[0][0]
+        for i in range(4)
+    ]
+    assert got == [
+        "close-up, green eyes", "close-up, blue eyes",
+        "close-up, (brown eyes:1.1)", "close-up, green eyes",
+    ]
+
+
+def test_prompt_token_works_in_the_negative_prompt():
+    _, negative = _filter_prompt(
+        "face", "1girl", negative="blurry, bad hands, lowres",
+        ad_negative="[PROMPT=-hands]",
+    )
+    assert negative == ["blurry, lowres"]
+
+
+def test_prompt_token_inside_a_class_block():
+    from adetailer.args import ADetailerArgs
+
+    script = _prompt_filter_script().AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="1girl, green eyes, red dress",
+        all_prompts=["1girl, green eyes, red dress"],
+        negative_prompt="", all_negative_prompts=[""], styles=[],
+    )
+    args = ADetailerArgs(
+        ad_model="faces.pt",
+        ad_prompt="detailed, [CLASS=face] [PROMPT=eyes] [/CLASS]"
+        "[CLASS=hand] five fingers [/CLASS]",
+    )
+    prompts, negatives = script.get_prompt(p, args)
+    pred = SimpleNamespace(class_names=["face", "hand"])
+    regions = []
+    for j in range(2):
+        p2 = SimpleNamespace()
+        script.i2i_prompts_replace(p2, prompts, negatives, j)
+        script._apply_inline_class_prompts(p2, pred, j, 2, False, p, args)
+        regions.append(p2.prompt)
+    assert regions == ["detailed, green eyes", "detailed, five fingers"]
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "expected"),
+    [
+        # Keep only: LoRAs never come along, also inside a kept part.
+        ("[PROMPT=eyes]", "green eyes"),
+        ("face, [PROMPT=body]", "face"),
+        ("[PROMPT=eyes,-dress]", "green eyes"),
+        # Drop: they all stay, also those of a dropped part.
+        ("[PROMPT=-eyes]", "1girl, <lora:body:0.8>, <lyco:eyes:1>, red dress"),
+        ("[PROMPT=-dress]", "1girl, <lora:body:0.8>, green eyes <lyco:eyes:1>"),
+    ],
+)
+def test_prompt_token_loras(ad_prompt, expected):
+    main = "1girl, <lora:body:0.8>, green eyes <lyco:eyes:1>, red dress"
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+def test_prompt_token_with_loras_from_main_prompt_still_adds_them():
+    main = "1girl, <lora:body:0.8>, green eyes"
+    got = _filter_prompt("[PROMPT=eyes]", main, ad_use_main_loras=True)[0][0]
+    assert got == "green eyes <lora:body:0.8>"
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "expected"),
+    [
+        ("close-up, [PROMPT=hat], detailed", "close-up, detailed"),
+        ("[PROMPT=hat], close-up", "close-up"),
+        ("close-up, [PROMPT=hat]", "close-up"),
+        ("[PROMPT=hat]", ""),
+        # An emptied weight or group goes too, not only its comma.
+        ("close-up, ([PROMPT=hat]:1.2), detailed", "close-up, detailed"),
+        ("close-up, [[PROMPT=hat]]", "close-up"),
+    ],
+)
+def test_prompt_token_matching_nothing_is_empty(ad_prompt, expected):
+    assert _filter_prompt(ad_prompt, "1girl, green eyes")[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "main", "expected"),
+    [
+        # Nested weights around an empty token go too.
+        ("close-up, (([PROMPT=hat]:1.2):1.1), detailed", "1girl", "close-up, detailed"),
+        ("close-up, [([PROMPT=hat]:1.2)]", "1girl", "close-up"),
+        # Only where the token was: the rest of the tab's text stays as typed,
+        # and so does the text a plain [PROMPT] brings.
+        ("[PROMPT=hat], a,, b", "1girl", "a,, b"),
+        ("close-up, () [PROMPT=hat], b", "1girl", "close-up, (), b"),
+        ("[PROMPT=hat], [PROMPT]", "1girl,, green eyes", "1girl,, green eyes"),
+        ("([PROMPT=hat], shiny:1.2), b", "1girl", "(shiny:1.2), b"),
+        # A BREAK or AND it leaves at the start or the end goes with it.
+        ("[PROMPT=hat] BREAK close-up", "1girl", "close-up"),
+        ("close-up AND [PROMPT=hat]", "1girl", "close-up"),
+        ("a BREAK [PROMPT=hat] BREAK b", "1girl", "a BREAK b"),
+        ("close-up\n[PROMPT=hat]", "1girl", "close-up"),
+        # Text after it in the same part keeps the separator before it.
+        ("close-up, [PROMPT=hat] detailed eyes", "1girl", "close-up, detailed eyes"),
+        ("x BREAK [PROMPT=hat] y", "1girl", "x BREAK y"),
+        ("a cat AND [PROMPT=hat] dog", "1girl", "a cat AND dog"),
+        # Negative or several weights and braces go too; prompt editing stays.
+        ("close-up, ([PROMPT=hat]:-1), b", "1girl", "close-up, b"),
+        ("close-up, ([PROMPT=hat]:1.2:1), b", "1girl", "close-up, b"),
+        ("close-up, {[PROMPT=hat]}, b", "1girl", "close-up, b"),
+        ("close-up, [[PROMPT=hat]:x:5], b", "1girl", "close-up, [:x:5], b"),
+        ("close-up, <[PROMPT=hat]>, b", "1girl", "close-up, <>, b"),
+        # Between two separators, AND stays before BREAK, as between parts.
+        ("a AND [PROMPT=hat] BREAK b", "1girl", "a AND b"),
+        ("a BREAK [PROMPT=hat] AND b", "1girl", "a AND b"),
+        ("a, [PROMPT=hat] BREAK b", "1girl", "a BREAK b"),
+        # Last in a group or weight: the comma before it goes too.
+        ("close-up, (detailed eyes, [PROMPT=hat]:1.2), b", "1girl", "close-up, (detailed eyes:1.2), b"),
+        ("a, (b, [PROMPT=hat])", "1girl", "a, (b)"),
+        ("a, [detailed eyes, [PROMPT=hat]:x:5]", "1girl", "a, [detailed eyes:x:5]"),
+    ],
+)
+def test_an_empty_prompt_token_is_tidied_only_where_it_was(ad_prompt, main, expected):
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "main", "expected"),
+    [
+        # Brackets that never close: every comma splits.
+        ("[PROMPT=eyes]", "i <3 cats, green eyes, red dress", "green eyes"),
+        ("[PROMPT=-dress]", "i <3 cats, green eyes, red dress", "i <3 cats, green eyes"),
+        # A new line, BREAK and AND separate parts, and are never a part.
+        ("[PROMPT=eyes]", "1girl\ngreen eyes BREAK red dress AND sky", "green eyes"),
+        (
+            "[PROMPT=-dress]",
+            "1girl\ngreen eyes BREAK red dress AND sky",
+            "1girl, green eyes AND sky",
+        ),
+        ("[PROMPT=BREAK]", "1girl BREAK green eyes", ""),
+        # Only the whole uppercase words, outside brackets.
+        ("[PROMPT=eyes]", "BREAKFAST, cats and green eyes", "cats and green eyes"),
+        ("[PROMPT=eyes]", "(cats AND green eyes:1.1), hat", "(cats AND green eyes:1.1)"),
+        # The numbers of the weights are not searched; the part keeps its weight.
+        ("[PROMPT=1]", "(green eyes:1.2), [hat:1], <lora:a:1>", ""),
+        ("[PROMPT=eyes]", "(green eyes:1.2), red dress", "(green eyes:1.2)"),
+        ("[PROMPT=2b]", "2b, red dress", "2b"),
+    ],
+)
+def test_prompt_token_parts(ad_prompt, main, expected):
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "main", "expected"),
+    [
+        # Two kept parts are joined by the separator that was between them.
+        ("[PROMPT=-beach]", "a cat AND a dog, beach", "a cat AND a dog"),
+        ("[PROMPT=-beach]", "a cat BREAK a dog, beach", "a cat BREAK a dog"),
+        ("[PROMPT=-beach]", "a cat, beach BREAK a dog", "a cat BREAK a dog"),
+        ("[PROMPT=-beach]", "a cat, beach, sky", "a cat, sky"),
+        ("[PROMPT=-beach]", "a cat\nbeach\nsky", "a cat, sky"),
+        # AND wins over BREAK (the host splits at AND first).
+        ("[PROMPT=-beach]", "a cat BREAK beach AND sky", "a cat AND sky"),
+        ("[PROMPT=-beach]", "a cat AND beach BREAK sky", "a cat AND sky"),
+        # The same for plain words.
+        ("[PROMPT=cat,dog]", "a cat AND a dog, beach", "a cat AND a dog"),
+        ("[PROMPT=cat,dog]", "a cat, beach BREAK a dog", "a cat BREAK a dog"),
+    ],
+)
+def test_prompt_token_keeps_and_and_break_between_parts(ad_prompt, main, expected):
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "expected"),
+    [
+        # Like the LoRAs: never brought by plain words, not searched by name,
+        # kept by the minus form.
+        ("[PROMPT=eyes]", "green eyes"),
+        ("face, [PROMPT=skin]", "face"),
+        ("face, [PROMPT=hypernet]", "face"),
+        ("[PROMPT=-eyes]", "1girl, <hypernet:skin:1>, <hypernet:soft:0.5>"),
+    ],
+)
+def test_prompt_token_hypernetworks(ad_prompt, expected):
+    main = "1girl, <hypernet:skin:1>, green eyes <hypernet:soft:0.5>"
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+def _empty_prompt_pass(p, ad_prompt, prompts, n=0):
+    # One detailer pass whose tab prompt came out as `prompts`.
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+
+    def process_images(p2):
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")])
+
+    run, pp, _before = _detailer(
+        state, process_images, n_masks=1, Image=Image,
+        opts=SimpleNamespace(data={}),
+    )
+    script = _script_of(run)
+    script.get_prompt = lambda *_args: (prompts, [""])
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4, ad_prompt=ad_prompt,
+    )
+    script._postprocess_image_inner(p, pp, args, n=n)
+
+
+def test_a_prompt_left_empty_by_the_token_is_said_once_per_tab(capsys):
+    p = SimpleNamespace(extra_generation_params={})
+    for _ in range(3):  # three images of the batch
+        _empty_prompt_pass(p, "[PROMPT=hat]", [""])
+    _empty_prompt_pass(p, "close-up [SEP] [PROMPT=cap, -x]", ["close-up", ""], n=1)
+    lines = [
+        line for line in capsys.readouterr().out.splitlines() if "is empty" in line
+    ]
+    assert lines == [
+        "[-] ADetailer: tab 1 prompt is empty: [PROMPT=hat] matched no part "
+        "of the main prompt.",
+        "[-] ADetailer: tab 2 prompt is empty: [PROMPT=cap, -x] matched no part "
+        "of the main prompt.",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "prompts"),
+    [
+        ("face, [PROMPT=hat]", ["face"]),  # not empty
+        ("", [""]),  # no token
+        ("[PROMPT]", [""]),  # an empty main prompt
+        ("[PROMPT=]", [""]),
+    ],
+)
+def test_a_prompt_not_emptied_by_the_token_says_nothing(capsys, ad_prompt, prompts):
+    _empty_prompt_pass(SimpleNamespace(extra_generation_params={}), ad_prompt, prompts)
+    assert "is empty" not in capsys.readouterr().out
+
+
+def test_prompt_token_matching_nothing_logs_only_with_verbose(capsys):
+    from adetailer.args import ADetailerArgs
+
+    p = SimpleNamespace(
+        prompt="1girl", all_prompts=["1girl"], negative_prompt="",
+        all_negative_prompts=[""], styles=[],
+    )
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="face, [PROMPT=hat]")
+    lines = []
+    script = _prompt_filter_script(verbose_lines=lines).AfterDetailerScript()
+    assert script.get_prompt(p, args)[0] == ["face"]
+    assert len(lines) == 1
+    assert "[PROMPT=hat]" in lines[0]
+    assert lines[0].isascii()
+    # Verbose off (the default): nothing printed.
+    script = _prompt_filter_script().AfterDetailerScript()
+    assert script.get_prompt(p, args)[0] == ["face"]
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    "ad_prompt",
+    [
+        "  close-up ,, sharp  [PROMPT] ,  x ",
+        "[PROMPT=eyes",
+        "[prompt=eyes], face",
+        "a [PROMPT ] b",
+    ],
+)
+def test_a_prompt_without_the_token_is_unchanged(ad_prompt):
+    # The old [PROMPT] path, byte for byte.
+    main = "1girl, green eyes"
+    expected = main.join(ad_prompt.split("[PROMPT]"))
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "s", "r", "main", "expected"),
+    [
+        # "(AD 1st)": the token's words are not replaced; the replacement
+        # reaches the text it brings, as with [PROMPT].
+        ("[PROMPT=eyes]", "eyes", "hair", False, "green hair"),
+        # "(AD 1st and main prompt)": the main prompt is already replaced,
+        # the tab's own text once.
+        ("[PROMPT=smile], smile", "smile", "big smile", True, "big smile, big smile"),
+        ("[PROMPT=smile], smile", "smile", "big smile", False, "big smile, big smile"),
+    ],
+)
+def test_prompt_sr_leaves_the_token_alone(ad_prompt, s, r, main, expected):
+    from adetailer.args import ADetailerArgs
+
+    runtime = _prompt_sr_script()
+    script = runtime.AfterDetailerScript()
+    p = SimpleNamespace(prompt="1girl, green eyes, smile", negative_prompt="", styles=[])
+    runtime.search_and_replace_prompt(p, r, [s, r], replace_in_main_prompt=main)
+    p.all_prompts, p.all_negative_prompts = [p.prompt], [p.negative_prompt]
+    positive, _ = script.get_prompt(
+        p, ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt=ad_prompt)
+    )
+    assert positive == [expected]
+
+
+@pytest.mark.parametrize(
+    ("sr", "ad_prompt", "ad_negative", "saved", "saved_negative"),
+    [
+        # A part the token leaves empty is saved as typed, or pasting it
+        # back would read a blank part: the whole main prompt.
+        (
+            ("blue", "red"), "[PROMPT=hat] [SEP] blue eyes", "[PROMPT=hat]",
+            "[PROMPT=hat] [SEP] red eyes", "[PROMPT=hat]",
+        ),
+        # The S/R reaches the text around the token, not its words.
+        (("1.2", "1.5"), "([PROMPT=hat]:1.2)", "", "([PROMPT=hat]:1.5)", "blurry"),
+        (("hat", "cap"), "[PROMPT=hat]", "", "[PROMPT=hat]", "blurry"),
+        # Not empty: as before.
+        (("blue", "red"), "close-up, [PROMPT=hat]", "", "close-up", "blurry"),
+    ],
+)
+def test_xyz_prompt_sr_saves_a_part_the_token_left_empty_as_typed(
+    sr, ad_prompt, ad_negative, saved, saved_negative
+):
+    from aaaaaa.p_method import get_i
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS | {"process", "extra_params", "_record_xyz_prompt_sr"},
+        functions=_INLINE_PROMPT_FUNCTIONS,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        get_i=get_i,
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: True
+    script.set_skip_img2img = lambda *_args: None
+    script.get_args = lambda *_args: [
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=ad_prompt,
+            ad_negative_prompt=ad_negative,
+        )
+    ]
+    p = SimpleNamespace(
+        iteration=0, batch_size=1, prompt="a photo", negative_prompt="blurry",
+        all_prompts=["a photo"], all_negative_prompts=["blurry"],
+        extra_generation_params={},
+        _ad_xyz_prompt_sr=[SimpleNamespace(s=sr[0], r=sr[1])],
+    )
+
+    script.process(p, True, False, {})
+
+    params = p.extra_generation_params
+    assert params["ADetailer prompt"] == saved
+    assert params.get("ADetailer negative prompt", "") == saved_negative
+
+
+def _xyz_record_runtime(strip=None):
+    from aaaaaa.p_method import get_i
+
+    comments = SimpleNamespace(
+        script_class=type("ScriptStripComments", (), {"__module__": "comments.py"}),
+        module=SimpleNamespace(strip_comments=strip),
+    )
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS | {"process", "extra_params", "_record_xyz_prompt_sr"},
+        functions=_INLINE_PROMPT_FUNCTIONS,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        opts=SimpleNamespace(data={}),
+        scripts=SimpleNamespace(scripts_data=[comments] if strip else []),
+        is_img2img_inpaint=lambda _p: False,
+        get_i=get_i,
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: True
+    script.set_skip_img2img = lambda *_args: None
+    return script
+
+
+def _xyz_record_photo(sr):
+    return SimpleNamespace(
+        iteration=0, batch_size=1, prompt="a photo", negative_prompt="blurry",
+        all_prompts=["a photo"], all_negative_prompts=["blurry"],
+        extra_generation_params={},
+        _ad_xyz_prompt_sr=[SimpleNamespace(s=sr[0], r=sr[1])],
+    )
+
+
+def test_xyz_prompt_sr_saves_as_typed_a_part_left_with_only_a_comment():
+    # The pass removes the comment, so the part is empty there: saved as
+    # typed, not as the comment alone (pasted back, a blank part).
+    from adetailer.args import ADetailerArgs
+
+    script = _xyz_record_runtime(_a1111_strip_comments)
+    script.get_args = lambda *_args: [
+        ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="[PROMPT=hat]\n# note")
+    ]
+    p = _xyz_record_photo(("blue", "red"))
+
+    script.process(p, True, False, {})
+
+    assert p.extra_generation_params["ADetailer prompt"] == "[PROMPT=hat]\n# note"
+
+
+def test_xyz_prompt_sr_leaves_the_tokens_of_the_class_prompts_alone():
+    from adetailer.args import ADetailerArgs
+
+    script = _xyz_record_runtime()
+    script.get_args = lambda *_args: [
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt="detailed",
+            ad_class_prompts="face: hat, [PROMPT=hat] hat",
+        )
+    ]
+    p = _xyz_record_photo(("hat", "cap"))
+
+    script.process(p, True, False, {})
+
+    assert p.extra_generation_params["ADetailer class prompts"] == (
+        "face: cap, [PROMPT=hat] cap"
+    )
+
+
+@pytest.mark.parametrize(
+    ("orig", "expected"),
+    [
+        # Skip img2img runs the host pass at 128x128 and keeps the picture's
+        # own size in p._ad_orig: the header showed 128x128.
+        (SimpleNamespace(width=1216, height=832), "size=1216x832"),
+        (None, "size=128x128"),
+    ],
+)
+def test_verbose_header_shows_the_picture_size_with_skip_img2img(orig, expected):
+    printed = []
+    runtime = _load_script(
+        functions={"_verbose_gen_header", "_vfmt", "_vwrap"},
+        assigns={"_V_LINE"},
+        _ad_verbose=lambda: True,
+        _vprint=printed.append,
+        shared=SimpleNamespace(sd_model=None, opts=SimpleNamespace(data_labels={}, data={})),
+    )
+    p = SimpleNamespace(width=128, height=128, seed=777)
+    if orig is not None:
+        p._ad_orig = orig
+    runtime._verbose_gen_header(p, [])
+    assert expected in printed[0]

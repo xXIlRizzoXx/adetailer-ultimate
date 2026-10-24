@@ -3,8 +3,9 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from adetailer import mediapipe as detector
 from adetailer.mediapipe import mediapipe_predict
@@ -650,3 +651,353 @@ def test_mediapipe_that_fails_to_import_does_not_leave_sounddevice_blocked(
     result = mediapipe_predict("mediapipe_face_short", Image.new("RGB", (8, 8)))
     assert result.bboxes == []
     assert "broken mediapipe" in capsys.readouterr().err
+
+
+def test_face_features_iris_is_the_last_class():
+    # Appended at the end: the order of the five older classes (dropdown,
+    # sequential passes, saved presets) stays as it was.
+    from adetailer.classes import (
+        FACE_FEATURE_CLASSES,
+        MEDIAPIPE_FACE_FEATURES_MODEL,
+        get_model_class_names,
+    )
+
+    expected = ["eyes", "mouth", "nose", "eyebrows", "face", "iris"]
+    assert expected == FACE_FEATURE_CLASSES
+    assert get_model_class_names(MEDIAPIPE_FACE_FEATURES_MODEL) == expected
+
+
+def _square(box):
+    mask = Image.new("L", (32, 24), "black")
+    mask.paste(255, box)
+    return mask
+
+
+@pytest.mark.parametrize(
+    ("include", "exclude", "expected"),
+    [
+        # No class picked: the five classes of before, never the iris, so the
+        # eye area is not inpainted twice.
+        ("", "", ["eyes", "mouth", "nose", "eyebrows", "face"]),
+        ("", "face", ["eyes", "mouth", "nose", "eyebrows"]),
+        # Picked by name: one iris mask per eye; the eyes stay one mask.
+        ("iris", "", ["iris", "iris"]),
+        ("eyes,iris", "", ["eyes", "iris", "iris"]),
+        ("IRIS", "iris", []),
+    ],
+)
+def test_face_features_iris_is_opt_in_with_one_mask_per_eye(
+    monkeypatch, include, exclude, expected
+):
+    monkeypatch.setattr(detector, "_run_face_mesh", lambda *_: [object()])
+    monkeypatch.setattr(
+        detector,
+        "_hull_polys",
+        lambda *_: [[2, 2, 8, 2, 8, 8, 2, 8], [20, 2, 26, 2, 26, 8, 20, 8]],
+    )
+    monkeypatch.setattr(
+        detector,
+        "_iris_masks",
+        lambda *_: [_square((3, 3, 7, 7)), _square((21, 3, 25, 7))],
+    )
+    result = detector.mediapipe_face_features(
+        Image.new("RGB", (32, 24)), classes=include, exclude_classes=exclude
+    )
+    assert result.class_names == expected
+    assert len(result.bboxes) == len(result.masks) == len(result.confidences) == len(expected)
+    assert all(mask.getbbox() == tuple(box) for mask, box in zip(result.masks, result.bboxes))
+    iris = [box for box, name in zip(result.bboxes, result.class_names) if name == "iris"]
+    if iris:
+        assert iris == [[3, 3, 7, 7], [21, 3, 25, 7]]
+
+
+def _fake_connections(monkeypatch, **groups):
+    """A fake `mediapipe` whose tasks FaceLandmarksConnections has only the
+    given groups (name -> list of (start, end)) and no legacy solutions."""
+    conns = SimpleNamespace(
+        **{
+            name: [SimpleNamespace(start=a, end=b) for a, b in pairs]
+            for name, pairs in groups.items()
+        }
+    )
+    vision = ModuleType("mediapipe.tasks.python.vision")
+    vision.FaceLandmarksConnections = conns
+    python = ModuleType("mediapipe.tasks.python")
+    python.vision = vision
+    tasks = ModuleType("mediapipe.tasks")
+    tasks.python = python
+    mp = ModuleType("mediapipe")
+    mp.tasks = tasks
+    for name, module in {
+        "mediapipe": mp,
+        "mediapipe.tasks": tasks,
+        "mediapipe.tasks.python": python,
+        "mediapipe.tasks.python.vision": vision,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    detector._feature_indices.cache_clear()
+    cache = getattr(detector, "_iris_parts", None)
+    if cache is not None:
+        cache.cache_clear()
+
+
+_LEFT_EYE = [(263, 249), (249, 390), (390, 373), (373, 263)]
+_RIGHT_EYE = [(33, 7), (7, 163), (163, 144), (144, 33)]
+_LEFT_IRIS = [(474, 475), (475, 476), (476, 477), (477, 474)]
+_RIGHT_IRIS = [(469, 470), (470, 471), (471, 472), (472, 469)]
+_ALL_GROUPS = {
+    "FACE_LANDMARKS_LEFT_EYE": _LEFT_EYE,
+    "FACE_LANDMARKS_RIGHT_EYE": _RIGHT_EYE,
+    "FACE_LANDMARKS_LEFT_IRIS": _LEFT_IRIS,
+    "FACE_LANDMARKS_RIGHT_IRIS": _RIGHT_IRIS,
+}
+
+
+@pytest.fixture
+def _clean_feature_cache():
+    def clear():
+        detector._feature_indices.cache_clear()
+        cache = getattr(detector, "_iris_parts", None)
+        if cache is not None:
+            cache.cache_clear()
+
+    clear()
+    yield
+    clear()
+
+
+def _half_closed_eyes(count=478):
+    """A fake face: two flat eye openings (12 px high) over irises of radius
+    10, as in a half-closed eye. Image left: the face's right eye."""
+    points = np.zeros((count, 2), dtype=int)
+    for dx, eye, ring, centre in (
+        (0, (33, 7, 163, 144), (469, 470, 471, 472), 468),
+        (60, (263, 249, 390, 373), (474, 475, 476, 477), 473),
+    ):
+        cx, cy = 30 + dx, 50
+        eye_xy = ((cx - 20, cy), (cx, cy - 6), (cx + 20, cy), (cx, cy + 6))
+        ring_xy = ((cx + 10, cy), (cx, cy - 10), (cx - 10, cy), (cx, cy + 10))
+        for i, xy in (*zip(eye, eye_xy), *zip(ring, ring_xy), (centre, (cx, cy))):
+            if i < count:
+                points[i] = xy
+    return points
+
+
+def _iris_result(monkeypatch, groups, points):
+    _fake_connections(monkeypatch, **groups)
+    monkeypatch.setattr(detector, "_run_face_mesh", lambda *_: [points])
+    return detector.mediapipe_face_features(Image.new("RGB", (128, 100)), classes="iris")
+
+
+def _eye_area(cx):
+    area = Image.new("L", (128, 100), "black")
+    ImageDraw.Draw(area).polygon(
+        [(cx - 20, 50), (cx, 44), (cx + 20, 50), (cx, 56)], fill="white"
+    )
+    return np.array(area) > 0
+
+
+@pytest.mark.usefixtures("_clean_feature_cache")
+def test_iris_parts_pair_each_ring_with_its_centre_and_eye(monkeypatch):
+    _fake_connections(monkeypatch, **_ALL_GROUPS)
+    assert detector._iris_parts() == (
+        ((474, 475, 476, 477), 473, (249, 263, 373, 390)),
+        ((469, 470, 471, 472), 468, (7, 33, 144, 163)),
+    )
+
+
+@pytest.mark.usefixtures("_clean_feature_cache")
+def test_iris_mask_covers_the_iris_but_never_leaves_the_eye(monkeypatch):
+    result = _iris_result(monkeypatch, _ALL_GROUPS, _half_closed_eyes())
+    assert result.class_names == ["iris", "iris"]
+    assert len(result.masks) == len(result.bboxes) == 2
+    for mask, box in zip(result.masks, result.bboxes):
+        cx = 90 if box[0] > 64 else 30
+        arr = np.array(mask) > 0
+        assert arr[50, cx]  # the iris centre
+        assert arr[50, cx - 9]
+        assert arr[50, cx + 9]  # the iris edge, left and right
+        # A circle, not the diamond through the 4 ring points: the area
+        # between two ring points is covered too.
+        assert arr[47, cx + 8]
+        # Cut to the eye opening: nothing on the eyelids.
+        assert not (arr & ~_eye_area(cx)).any()
+        assert list(mask.getbbox()) == box
+
+
+@pytest.mark.usefixtures("_clean_feature_cache")
+def test_iris_mask_is_the_whole_circle_without_the_eye_contour(monkeypatch):
+    groups = {k: v for k, v in _ALL_GROUPS.items() if "IRIS" in k}
+    result = _iris_result(monkeypatch, groups, _half_closed_eyes())
+    assert result.class_names == ["iris", "iris"]
+    for mask, box in zip(result.masks, result.bboxes):
+        cx = 90 if box[0] > 64 else 30
+        arr = np.array(mask) > 0
+        assert arr[50, cx]
+        assert arr[42, cx]
+        assert arr[58, cx]  # above and below the lids
+        assert arr[45, cx + 6]  # inside the circle, outside the diamond
+        assert mask.getbbox() == (cx - 10, 40, cx + 11, 61)
+
+
+def _eyes_open(points, half_height):
+    # The eye openings of _half_closed_eyes, `half_height` px above and below
+    # the centre line (0 = a closed eye, its contour on one row).
+    out = points.copy()
+    for eye in ((33, 7, 163, 144), (263, 249, 390, 373)):
+        out[eye[1], 1] = 50 - half_height
+        out[eye[3], 1] = 50 + half_height
+    return out
+
+
+@pytest.mark.usefixtures("_clean_feature_cache")
+@pytest.mark.parametrize(
+    ("half_height", "found"),
+    [
+        (0, 0),  # closed: no circle on the eyelid
+        (1, 0),  # almost closed: under 15% of the circle left
+        (3, 2),  # open enough: one iris per eye
+        (6, 2),
+    ],
+)
+def test_iris_mask_of_a_closed_or_almost_closed_eye(monkeypatch, half_height, found):
+    points = _eyes_open(_half_closed_eyes(), half_height)
+    result = _iris_result(monkeypatch, _ALL_GROUPS, points)
+    assert result.class_names == ["iris"] * found
+    assert len(result.masks) == len(result.bboxes) == found
+
+
+def _flat_lid_eyes(radius, top, bottom):
+    # Whole-pixel landmarks: two eye openings with flat lids on rows `top`
+    # and `bottom`, over irises of `radius` centred on row 50.
+    points = np.zeros((478, 2), dtype=int)
+    for dx, eye, ring, centre in (
+        (0, (33, 7, 163, 144), (469, 470, 471, 472), 468),
+        (60, (263, 249, 390, 373), (474, 475, 476, 477), 473),
+    ):
+        cx, cy = 30 + dx, 50
+        eye_xy = ((cx - 20, top), (cx + 20, top), (cx + 20, bottom), (cx - 20, bottom))
+        ring_xy = (
+            (cx + radius, cy), (cx, cy - radius), (cx - radius, cy), (cx, cy + radius)
+        )
+        for i, xy in (*zip(eye, eye_xy), *zip(ring, ring_xy), (centre, (cx, cy))):
+            points[i] = xy
+    return points
+
+
+@pytest.mark.usefixtures("_clean_feature_cache")
+@pytest.mark.parametrize(
+    ("radius", "top", "bottom", "found"),
+    [
+        # Lids 1 px apart (radius 8) or 2 px apart (radius 10): the rows PIL
+        # fills whole on the lids are no open eye, so no mask.
+        (8, 50, 51, 0),
+        (8, 49, 51, 0),
+        (10, 49, 51, 0),
+        # Half open and open: one iris per eye.
+        (8, 46, 54, 2),
+        (8, 40, 60, 2),
+    ],
+)
+def test_iris_mask_of_an_eye_with_flat_lids(monkeypatch, radius, top, bottom, found):
+    result = _iris_result(monkeypatch, _ALL_GROUPS, _flat_lid_eyes(radius, top, bottom))
+    assert result.class_names == ["iris"] * found
+    assert len(result.masks) == len(result.bboxes) == found
+
+
+def _tilted(points, degrees):
+    # The eyes of _flat_lid_eyes turned around their iris centres, as with a
+    # tilted head; whole-pixel landmarks like the real ones.
+    out = points.astype(float)
+    t = np.radians(degrees)
+    rot = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+    for idx, centre in (
+        ((33, 7, 163, 144, 469, 470, 471, 472), 468),
+        ((263, 249, 390, 373, 474, 475, 476, 477), 473),
+    ):
+        c = out[centre].copy()
+        out[list(idx)] = (out[list(idx)] - c) @ rot.T + c
+    return np.rint(out).astype(int)
+
+
+@pytest.mark.usefixtures("_clean_feature_cache")
+@pytest.mark.parametrize("degrees", [45, 60, 90])
+def test_iris_mask_of_a_closed_eye_on_a_tilted_head(monkeypatch, degrees):
+    # Lids 2 px apart: still no mask when the head is tilted, although the
+    # image column through the iris centre crosses the eye far longer.
+    points = _tilted(_flat_lid_eyes(8, 49, 51), degrees)
+    result = _iris_result(monkeypatch, _ALL_GROUPS, points)
+    assert result.class_names == []
+
+
+@pytest.mark.usefixtures("_clean_feature_cache")
+@pytest.mark.parametrize("degrees", [0, 30, 45, 60, 90])
+@pytest.mark.parametrize("radius", [2, 8])
+def test_iris_mask_of_a_half_closed_eye_on_a_tilted_head(monkeypatch, degrees, radius):
+    # Lids half the iris radius above and below its centre: one iris per eye
+    # at any tilt.
+    half = max(1, radius // 2)
+    points = _tilted(_flat_lid_eyes(radius, 50 - half, 50 + half), degrees)
+    result = _iris_result(monkeypatch, _ALL_GROUPS, points)
+    assert result.class_names == ["iris", "iris"]
+
+
+@pytest.mark.usefixtures("_clean_feature_cache")
+@pytest.mark.parametrize(
+    ("half_width", "half_height", "found"),
+    [
+        # Tall enough over the centre, but the opening covers under 15% of
+        # the circle (radius 6): counted whole, its edge pixels made it more.
+        (2, 4, 0),
+        (4, 2, 0),
+        (6, 4, 1),
+    ],
+)
+def test_iris_share_left_is_not_inflated_by_edge_pixels(
+    monkeypatch, half_width, half_height, found
+):
+    monkeypatch.setattr(
+        detector, "_iris_parts", lambda: (((469, 470, 471, 472), 468, (7, 33, 144, 163)),)
+    )
+    points = np.zeros((478, 2), dtype=int)
+    cx, cy, r = 30, 50, 6
+    eye_xy = (
+        (cx - half_width, cy), (cx, cy - half_height),
+        (cx + half_width, cy), (cx, cy + half_height),
+    )
+    ring_xy = ((cx + r, cy), (cx, cy - r), (cx - r, cy), (cx, cy + r))
+    for i, xy in (*zip((33, 7, 163, 144), eye_xy), *zip((469, 470, 471, 472), ring_xy)):
+        points[i] = xy
+    points[468] = (cx, cy)
+    assert len(detector._iris_masks(points, (64, 100))) == found
+
+
+@pytest.mark.usefixtures("_clean_feature_cache")
+def test_iris_centre_falls_back_to_the_ring_mean(monkeypatch):
+    monkeypatch.setattr(
+        detector, "_iris_parts", lambda: (((469, 470, 471, 472), 999, ()),)
+    )
+    (mask,) = detector._iris_masks(_half_closed_eyes(), (128, 100))
+    assert mask.getbbox() == (20, 40, 41, 61)
+
+
+@pytest.mark.usefixtures("_clean_feature_cache")
+@pytest.mark.parametrize(
+    ("groups", "count"),
+    [
+        # mediapipe without the iris constants: no error, no iris.
+        ({k: v for k, v in _ALL_GROUPS.items() if "IRIS" not in k}, 478),
+        # Constants present but only 468 landmarks (the legacy solutions
+        # FaceMesh has no iris points): no error, no iris.
+        (_ALL_GROUPS, 468),
+    ],
+)
+def test_iris_is_simply_not_found_without_iris_landmarks(monkeypatch, groups, count):
+    _fake_connections(monkeypatch, **groups)
+    monkeypatch.setattr(
+        detector, "_run_face_mesh", lambda *_: [_half_closed_eyes(count)]
+    )
+    image = Image.new("RGB", (128, 100))
+    assert detector.mediapipe_face_features(image, classes="iris").class_names == []
+    result = detector.mediapipe_face_features(image, classes="eyes,iris")
+    assert result.class_names == ["eyes"]

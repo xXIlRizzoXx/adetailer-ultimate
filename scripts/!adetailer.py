@@ -55,6 +55,7 @@ from adetailer import (
 from adetailer.args import (
     ALL_ARGS,
     BBOX_SORTBY,
+    BBOX_SORTBY_MORE,
     BUILTIN_SCRIPT,
     INPAINT_BBOX_MATCH_MODES,
     SCRIPT_DEFAULT,
@@ -100,7 +101,13 @@ except ImportError:
     # on A1111. Degrade gracefully: the only thing we lose there is the
     # cosmetic reset-settings divider, which is guarded on use below.
     OptionDiv = None
-from modules.devices import NansException
+try:
+    from modules.devices import NansException
+except ImportError:
+    # A WebUI without it would not load the extension at all: a class that
+    # nothing raises, so a failing pass is handled like any other error.
+    class NansException(Exception):  # noqa: N818
+        pass
 from modules.processing import (
     Processed,
     StableDiffusionProcessingImg2Img,
@@ -138,6 +145,9 @@ PARAMS_TXT = "params.txt"
 # results. The final image itself is saved by the WebUI's own pipeline, never
 # through Script.save_image, so routing the whole method here doesn't touch it.
 AD_EXTRA_SUBDIR = "adetailer-steps"
+# Settings > ADetailer "Show detection previews in the results gallery": at
+# most this many previews per generation are kept in memory and shown.
+_GALLERY_PREVIEWS_MAX = 32
 # Dedicated top-level folder for "Run ADetailer on an image" results (issue #4),
 # created as a SIBLING of the txt2img / img2img output folders — see
 # run_detailer_on_image. Keeps these standalone results out of the normal
@@ -456,6 +466,175 @@ def _strip_lora_tags(prompt: str) -> str:
     return ", ".join(seg for seg in parts if seg)
 
 
+# [PROMPT] and [PROMPT=words] in a tab's prompt (the plain token has no group).
+_PROMPT_TOKEN_RE = re.compile(r"\[PROMPT(?:=([^\]]*))?\]")
+
+
+def _split_prompt_pieces(prompt: str, with_seps: bool = False) -> list:
+    """The parts of `prompt` between its commas, stripped, empty ones dropped.
+    A new line and the words BREAK and AND separate parts too (they are
+    never a part). A separator inside ( ) [ ] < > { } does not split (a
+    backslash escapes the next character), so `(red dress, lace:1.2)` stays
+    one part; when those brackets are not balanced at the end (`i <3 cats`),
+    every separator splits. With `with_seps`, each part comes as (part,
+    the separators since the part before it)."""
+
+    def split(nested: bool) -> tuple[list[str], list[str], int]:
+        pieces, seps, start, depth, escaped, k = [], [], 0, 0, False, 0
+        while k < len(prompt):
+            ch = prompt[k]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif nested and ch in "([<{":
+                depth += 1
+            elif nested and ch in ")]>}":
+                depth = max(0, depth - 1)
+            elif depth == 0:
+                word = None
+                if ch in "BA" and (k == 0 or not re.match(r"\w", prompt[k - 1])):
+                    word = re.compile(r"(?:BREAK|AND)\b").match(prompt, k)
+                if ch in ",\n" or word:
+                    size = 1 if word is None else word.end() - k
+                    pieces.append(prompt[start:k])
+                    seps.append(prompt[k : k + size])
+                    start = k + size
+                    k += size
+                    continue
+            k += 1
+        pieces.append(prompt[start:])
+        seps.append("")
+        return pieces, seps, depth
+
+    pieces, seps, depth = split(nested=True)
+    if depth != 0:
+        pieces, seps, _depth = split(nested=False)
+    out, gap = [], []
+    for piece, sep in zip(pieces, seps):
+        if piece.strip():
+            out.append((piece.strip(), gap) if with_seps else piece.strip())
+            gap = []
+        gap.append(sep)
+    return out
+
+
+def _filter_main_prompt(prompt: str, spec: str) -> str:
+    """The parts of the main `prompt` that `[PROMPT=spec]` brings.
+
+    `spec` lists words split by commas: a plain word keeps only the parts
+    that name it, a word with "-" in front drops the parts that name it.
+    With both, a part must name a plain word and none of the "-" ones. A
+    word matches whole, ignoring case, with "_" read as a space; the LoRA
+    tags (and hypernetwork tags) of a part and the numbers of its weights
+    (":1.2") are not searched. When there is a plain word the main
+    prompt's LoRA tags never come along; with only "-" words they all
+    stay. No word at all brings the whole prompt, like [PROMPT]. The parts
+    come as they were, weights included, joined by the AND or BREAK that
+    was between them, else by ", " (a new line too); "" when no part
+    matches.
+    """
+    # The LoRA tags of _LORA_TAG_RE and the hypernetwork ones.
+    tags = re.compile(r"<(?:lora|lyco|hypernet):[^>]+>", re.IGNORECASE)
+
+    def norm(text: str) -> str:
+        text = re.sub(r":\s*[-+]?(?:\d+\.?\d*|\.\d+)", " ", text)
+        return re.sub(r"\s+", " ", text.replace("_", " ")).strip().casefold()
+
+    keep, drop = [], []
+    for word in spec.split(","):
+        word = word.strip()
+        minus = word.startswith("-")
+        word = norm(word.lstrip("-"))
+        if word:
+            (drop if minus else keep).append(
+                re.compile(r"(?<!\w)" + re.escape(word) + r"(?!\w)")
+            )
+    if not keep and not drop:
+        return prompt
+    out, gap = [], []
+    for piece, seps in _split_prompt_pieces(prompt, with_seps=True):
+        gap += seps
+        text = norm(tags.sub(" ", piece))
+        named = any(w.search(text) for w in drop)
+        if keep:
+            if named or not any(w.search(text) for w in keep):
+                continue
+            if tags.search(piece):
+                piece = re.sub(r"\s{2,}", " ", tags.sub("", piece)).strip()
+        elif named:
+            # The LoRA tags of a dropped part stay.
+            piece = " ".join(tags.findall(piece))
+        if piece:
+            if out:
+                # The separator that was between them, also across dropped
+                # parts: AND before BREAK (the host splits the prompt at AND
+                # first, BREAK only inside one of its parts), else a comma.
+                out.append(
+                    " AND " if "AND" in gap else " BREAK " if "BREAK" in gap else ", "
+                )
+            out.append(piece)
+            gap = []
+    return "".join(out)
+
+
+def _drop_empty_tokens(text: str) -> str:
+    """Remove each "\\x00" (where a [PROMPT=words] token matched nothing)
+    with what only it filled: the weights or groups around it, "(:1.2)",
+    "(:-1)", "(:1.2:1)", "[]" or "{}", nested ones too, and one comma, new
+    line, BREAK or AND next to it (the one before it only when another one,
+    the end, or the end of a group or weight comes after it; between two,
+    an AND stays before a BREAK). The rest of the text stays as it is."""
+    sep = r"(?:\s*(?:,|\n|\bBREAK\b|\bAND\b)\s*)"
+    before = None
+    while before != text:
+        before = text
+        # Two next to each other are one.
+        text = re.sub(r"\x00(?:(?:\s|,|\bBREAK\b|\bAND\b)*\x00)+", "\x00", text)
+        text = re.sub(r"[(\[]\s*\x00\s*(?::\s*[\d.]*)?\s*[)\]]", "\x00", text)
+        # Negative or several weights, and braces ("[:x:5]" is left alone).
+        text = re.sub(r"\(\s*\x00\s*(?::\s*[-+]?[\d.]*\s*)+\)", "\x00", text)
+        text = re.sub(r"\{\s*\x00\s*\}", "\x00", text)
+
+    def one_sep(m: re.Match) -> str:
+        # Between two separators: AND before BREAK, as in _filter_main_prompt,
+        # else the one after it.
+        for word in ("AND", "BREAK"):
+            for side in m.groups():
+                if re.search(rf"\b{word}\b", side):
+                    return side
+        return m.group(2)
+
+    text = re.sub(rf"({sep})\x00({sep})", one_sep, text)
+    # The separator before it goes also at the end of a group or weight.
+    return re.sub(
+        rf"^\s*\x00(?:{sep}|\s*)|{sep}\x00(?=\s*(?:$|[)\]}}:|])|{sep})|\x00{sep}|\s*\x00",
+        "",
+        text,
+    )
+
+
+def _empty_prompt_note(ad_prompt: str, prompts: list[str], n: int) -> str:
+    """The console line for tab `n` when a part of its prompt came out empty
+    because its [PROMPT=words] tokens matched nothing; "" otherwise."""
+    raw = re.split(r"\s*\[SEP\]\s*", ad_prompt or "")
+    for k, out in enumerate(prompts):
+        if k >= len(raw) or (out or "").strip():
+            continue
+        tokens = [
+            m.group(0)
+            for m in _PROMPT_TOKEN_RE.finditer(raw[k])
+            if re.sub(r"[\s,-]", "", m.group(1) or "")
+        ]
+        if tokens:
+            names = " ".join(tokens).encode("ascii", "backslashreplace").decode()
+            return (
+                f"[-] ADetailer: tab {n + 1} prompt is empty: {names} "
+                "matched no part of the main prompt."
+            )
+    return ""
+
+
 # First choice of Settings > ADetailer "Upscaler for ADetailer's inpaint area": the
 # pass keeps the WebUI's own "Upscaler for img2img".
 AD_CROP_UPSCALER_WEBUI = "Use the WebUI's img2img upscaler"
@@ -606,6 +785,32 @@ def _match_region_colors(before, after, mask, padding: int, blur: int):
     return matched
 
 
+def _max_inpaint_side() -> int:
+    """Settings > ADetailer "Max inpaint size": 0 (also when unreadable) = no limit."""
+    try:
+        return max(int(float(opts.data.get("ad_max_inpaint_side", 0) or 0)), 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _cap_inpaint_size(width: int, height: int, max_side: int) -> tuple[int, int]:
+    """Shrink width x height, keeping the shape, so the longer side is at most
+    max_side; multiples of 8, at least 64. Unchanged when max_side is 0 or the
+    size already fits."""
+    longest = max(width, height)
+    if max_side <= 0 or longest <= max_side:
+        return width, height
+    # Integer arithmetic: the longer side becomes exactly max_side (rounded
+    # down to a multiple of 8), never 8 less through a float like 1023.99.
+    new_w = max(64, width * max_side // longest // 8 * 8)
+    new_h = max(64, height * max_side // longest // 8 * 8)
+    print(
+        f"[-] ADetailer: inpaint size {width}x{height} -> {new_w}x{new_h} "
+        f"(max inpaint size {max_side})."
+    )
+    return new_w, new_h
+
+
 def _blend_region(before, after, opacity: int):
     """Mix a region's result with the picture before that region, `opacity`
     percent of the result. Outside the mask the two pictures are already
@@ -738,11 +943,14 @@ def _verbose_gen_header(p, arg_list) -> None:
             ckpt = shared.sd_model.sd_checkpoint_info.model_name
         except Exception:  # noqa: BLE001
             ckpt = "?"
+        # With Skip img2img the host pass runs at a tiny size: show the width
+        # and height set in img2img, which that mode keeps in p._ad_orig.
+        size = getattr(p, "_ad_orig", p)
         lines = [
             "",
             f"[-] ADetailer verbose ═{_V_LINE}",
-            f"      checkpoint={ckpt} | size={getattr(p, 'width', '?')}x"
-            f"{getattr(p, 'height', '?')} | seed={getattr(p, 'seed', '?')} | "
+            f"      checkpoint={ckpt} | size={getattr(size, 'width', '?')}x"
+            f"{getattr(size, 'height', '?')} | seed={getattr(p, 'seed', '?')} | "
             f"active tabs={active}",
         ]
         # Skip our own toggle and the three Settings-page UI elements (a divider,
@@ -1103,6 +1311,16 @@ class AfterDetailerScript(scripts.Script):
         opacity = min(max(opacity, 0), 100)
         if opacity != 100:
             params["ADetailer region opacity"] = opacity
+        # "Max inpaint size", written only when a limit is set and a tab it
+        # applies to runs ("Inpaint only masked" without its own width/height).
+        max_side = _max_inpaint_side()
+        if max_side and any(
+            not args.need_skip()
+            and args.ad_inpaint_only_masked
+            and not args.ad_use_inpaint_width_height
+            for args in arg_list
+        ):
+            params["ADetailer max inpaint size"] = max_side
         return params
 
     @staticmethod
@@ -1111,13 +1329,22 @@ class AfterDetailerScript(scripts.Script):
         # doesn't expose `use_cpu`: fall back to an empty list when the
         # attribute is missing (or None) so the check just no-ops.
         use_cpu = getattr(shared.cmd_opts, "use_cpu", None) or []
-        if "adetailer" in use_cpu:
+        if isinstance(use_cpu, str):
+            use_cpu = [use_cpu]
+        if "adetailer" in use_cpu or "all" in use_cpu:
+            return "cpu"
+        # The whole WebUI on CPU: --cpu (Forge Neo), --always-cpu (Forge, reForge).
+        if any(
+            getattr(shared.cmd_opts, flag, False) is True
+            for flag in ("cpu", "always_cpu")
+        ):
             return "cpu"
 
         if platform.system() == "Darwin":
             return ""
 
-        vram_args = ["lowvram", "medvram", "medvram_sdxl"]
+        # novram: Forge Neo only (--novram); getattr keeps it off elsewhere.
+        vram_args = ["lowvram", "medvram", "medvram_sdxl", "novram"]
         if any(getattr(cmd_opts, vram, False) for vram in vram_args):
             return "cpu"
 
@@ -1170,6 +1397,37 @@ class AfterDetailerScript(scripts.Script):
             # A box that looks empty (a stray space or newline) is blank too.
             if not prompts[n].strip():
                 prompts[n] = blank_replacement
+            elif "[PROMPT=" in prompts[n]:
+                # [PROMPT=words] brings only some parts of the main prompt
+                # (see _filter_main_prompt), [PROMPT] all of it; the S/R
+                # leaves both tokens alone, as below.
+                pieces = _PROMPT_TOKEN_RE.split(prompts[n])
+                texts, specs = pieces[0::2], pieces[1::2]
+                for pair in replacements:
+                    if getattr(pair, "main", False):
+                        texts = [text.replace(pair.s, pair.r) for text in texts]
+                emptied = False
+                out = texts[0]
+                for spec, text in zip(specs, texts[1:]):
+                    if spec is None:
+                        out += blank_replacement + text
+                        continue
+                    found = _filter_main_prompt(blank_replacement, spec)
+                    if not found:
+                        emptied = True
+                        if _ad_verbose():
+                            _vprint(
+                                f"[-] ADetailer: [PROMPT={spec}] matched no part "
+                                "of the main prompt, left empty"
+                            )
+                        # Marks the spot for _drop_empty_tokens.
+                        found = "\x00"
+                    out += found + text
+                if emptied:
+                    # Only there: the weight or group, "(:1.2)" or "[]", and
+                    # the comma an empty token leaves behind.
+                    out = _drop_empty_tokens(out)
+                prompts[n] = out
             else:
                 # An X/Y/Z S/R that also changed the main prompt has already
                 # reached the text [PROMPT] stands for: it replaces only the
@@ -1827,6 +2085,12 @@ class AfterDetailerScript(scripts.Script):
         return model_mapping[name]
 
     def sort_bboxes(self, pred: PredictOutput) -> PredictOutput:
+        # Settings > ADetailer "More sort orders" wins when it is not "Off";
+        # "Off" or a value it does not know keeps "Sort bounding boxes by".
+        more = opts.data.get("ad_bbox_sortby_more", BBOX_SORTBY_MORE[0])
+        if isinstance(more, str) and more in BBOX_SORTBY_MORE[1:]:
+            more_idx = len(BBOX_SORTBY) - 1 + BBOX_SORTBY_MORE.index(more)
+            return sort_bboxes(pred, more_idx)
         sortby = opts.data.get("ad_bbox_sortby", BBOX_SORTBY[0])
         sortby_idx = BBOX_SORTBY.index(sortby)
         return sort_bboxes(pred, sortby_idx)
@@ -2510,7 +2774,8 @@ class AfterDetailerScript(scripts.Script):
         for that class). Skipped for a
         Merge and Invert mask, which is the background. For
         mediapipe_face_features, whose "face" holds the other parts, the face
-        region gets no negatives and "face" is never a part's negative. The
+        region gets no negatives and "face" is never a part's negative ("iris"
+        and "eyes" never negate each other, and "iris" no other part). The
         whole thing degrades to a silent no-op — never a crash — for the
         class-less MediaPipe models and other class-less models, any per-mask
         misalignment, or on any WebUI where the class-name lookup fails
@@ -2540,9 +2805,16 @@ class AfterDetailerScript(scripts.Script):
             if args.is_mediapipe_features():
                 # "face" is the whole face, which holds the other parts: never
                 # negate a part in the face region, nor "face" in a part's.
+                # The iris lies inside "eyes": neither negates the other, and
+                # the opt-in "iris" is never another part's negative.
                 names_full = [
                     c for c in names_full
-                    if c == detected or (detected != "face" and c != "face")
+                    if c == detected
+                    or (
+                        detected != "face"
+                        and c not in ("face", "iris")
+                        and not (detected == "iris" and c == "eyes")
+                    )
                 ]
 
             pos, neg = build_class_guard(
@@ -2611,6 +2883,13 @@ class AfterDetailerScript(scripts.Script):
         else:
             p2.width, p2.height = self.get_optimal_crop_image_size(
                 p2.width, p2.height, size_bbox
+            )
+        # Settings > ADetailer "Max inpaint size": the sizes worked out above
+        # (2 and 3) are capped, so a large detection scaled up does not run
+        # out of video memory. 0 (the default) = no limit.
+        if args.ad_inpaint_only_masked and not args.ad_use_inpaint_width_height:
+            p2.width, p2.height = _cap_inpaint_size(
+                p2.width, p2.height, _max_inpaint_side()
             )
 
     @rich_traceback
@@ -2729,6 +3008,23 @@ class AfterDetailerScript(scripts.Script):
 
     def _record_xyz_prompt_sr(self, p, arg_list: list[ADetailerArgs]) -> None:
         """Put in `arg_list` the prompts an X/Y/Z Prompt S/R cell saves."""
+        # A part a [PROMPT=words] token left empty would paste back as a
+        # blank part (the whole main prompt): save it as typed, the S/R
+        # applied around its tokens.
+        def as_typed(typed: str, parts: list[str]) -> list[str]:
+            raw = re.split(r"\s*\[SEP\]\s*", typed or "")
+            parts = list(parts)
+            for k, part in enumerate(parts):
+                # Empty also when only a prompt comment is left: the pass
+                # removes it.
+                empty = not _strip_host_comments(part).strip()
+                if k < len(raw) and empty and "[PROMPT=" in raw[k]:
+                    bits = re.split(r"(\[PROMPT(?:=[^\]]*)?\])", raw[k])
+                    for pair in p._ad_xyz_prompt_sr:
+                        bits[0::2] = [b.replace(pair.s, pair.r) for b in bits[0::2]]
+                    parts[k] = "".join(bits)
+            return parts
+
         # Record every [SEP] segment, without the append text and the
         # LoRA options the parameters save on their own: pasted back,
         # they would be applied a second time. Every tab: the S/R
@@ -2745,6 +3041,10 @@ class AfterDetailerScript(scripts.Script):
             replaced_positive_prompt, replaced_negative_prompt = self.get_prompt(
                 p, bare, keep_comments=True
             )
+            replaced_positive_prompt = as_typed(bare.ad_prompt, replaced_positive_prompt)
+            replaced_negative_prompt = as_typed(
+                bare.ad_negative_prompt, replaced_negative_prompt
+            )
             tab.ad_prompt = " [SEP] ".join(replaced_positive_prompt)
             tab.ad_negative_prompt = " [SEP] ".join(replaced_negative_prompt)
             # The sequential passes replace it in the per-class lines too,
@@ -2754,8 +3054,11 @@ class AfterDetailerScript(scripts.Script):
                 for line in tab.ad_class_prompts.splitlines():
                     name, colon, rest = line.partition(":")
                     if colon:
+                        # Around its [PROMPT=words] tokens, as above.
+                        bits = re.split(r"(\[PROMPT(?:=[^\]]*)?\])", rest)
                         for pair in p._ad_xyz_prompt_sr:
-                            rest = rest.replace(pair.s, pair.r)
+                            bits[0::2] = [b.replace(pair.s, pair.r) for b in bits[0::2]]
+                        rest = "".join(bits)
                     lines.append(name + colon + rest)
                 tab.ad_class_prompts = "\n".join(lines)
 
@@ -2968,6 +3271,17 @@ class AfterDetailerScript(scripts.Script):
 
         i2i = self.get_i2i_p(p, args, pp.image)
         ad_prompts, ad_negatives = self.get_prompt(p, args)
+        # A [PROMPT=words] token that left the whole prompt empty: said
+        # once per tab and generation, also without the verbose log.
+        note = _empty_prompt_note(getattr(args, "ad_prompt", ""), ad_prompts, n)
+        if note:
+            noted = getattr(p, "_ad_empty_prompt_noted", None)
+            if not isinstance(noted, set):
+                noted = set()
+                p._ad_empty_prompt_noted = noted
+            if n not in noted:
+                noted.add(n)
+                print(note)
 
         is_mediapipe = args.is_mediapipe()
 
@@ -3019,7 +3333,16 @@ class AfterDetailerScript(scripts.Script):
         self._ad_detected = True
         masks = self.pred_preprocessing(p, pred, args)
         _verbose_detection(pred, masks, _det_ms)
-        shared.state.assign_current_image(pred.preview)
+        # The picture with the detection boxes goes to the WebUI's live
+        # preview (and the progress API), unless Settings > ADetailer "Hide
+        # detection boxes from the live preview" is on: then the preview keeps
+        # its last picture until the inpainting steps replace it.
+        try:
+            hide_boxes = bool(opts.data.get("ad_hide_live_preview_boxes", False))
+        except Exception:  # noqa: BLE001
+            hide_boxes = False
+        if not hide_boxes:
+            shared.state.assign_current_image(pred.preview)
 
         # Save the mask preview. In a sequential-class run each pass saves
         # its OWN preview (labelled by class via `_seq_label`) so the user
@@ -3040,6 +3363,39 @@ class AfterDetailerScript(scripts.Script):
             condition="ad_save_previews",
             suffix=preview_suffix,
         )
+        # Settings > ADetailer "Show detection previews in the results
+        # gallery": keep this preview, with the parameters of its image, for
+        # postprocess(), which adds it after the generated images. Not for an
+        # API request (no extra images in the response) or a standalone run
+        # (Detection preview, Run ADetailer on an image: their own output),
+        # nor with a script of the Script menu (SD upscale, Prompt matrix...):
+        # it reads processed.images by position. The host's ScriptRunner.run
+        # takes script_args[0] as the chosen script, 0 or None = None.
+        try:
+            chosen = (getattr(p, "script_args", None) or [0])[0]
+            to_gallery = (
+                bool(opts.data.get("ad_gallery_previews", False))
+                and not getattr(p, "is_api", False)
+                and not getattr(p, "_ad_standalone", False)
+                and int(0 if chosen is None else chosen) == 0
+            )
+        except Exception:  # noqa: BLE001
+            to_gallery = False
+        if to_gallery:
+            gallery_previews = getattr(p, "_ad_gallery_previews", None)
+            if not isinstance(gallery_previews, list):
+                gallery_previews = []
+                p._ad_gallery_previews = gallery_previews
+            if len(gallery_previews) < _GALLERY_PREVIEWS_MAX:
+                gallery_previews.append((pred.preview, self.infotext(p)))
+            elif not getattr(p, "_ad_gallery_previews_full", False):
+                # Once per generation; the others are not kept in memory.
+                p._ad_gallery_previews_full = True
+                print(
+                    f"[-] ADetailer: the results gallery shows the first "
+                    f"{_GALLERY_PREVIEWS_MAX} detection previews of this "
+                    f"generation; turn on 'Save mask previews' to save them all."
+                )
 
         steps = len(masks)
         processed = None
@@ -3428,6 +3784,49 @@ class AfterDetailerScript(scripts.Script):
 
             self.write_params_txt(params_txt_content)
 
+    def postprocess(self, p, processed, *args_):  # noqa: ARG002
+        # Settings > ADetailer "Show detection previews in the results
+        # gallery": add the previews kept during the job after the generated
+        # images (and the grid), each with its own parameters at the same
+        # index, so the gallery, Send to and Save read the right ones. They
+        # are not saved to disk.
+        previews = getattr(p, "_ad_gallery_previews", None)
+        if not previews:
+            return
+        images_list = getattr(processed, "images", None)
+        infotexts = getattr(processed, "infotexts", None)
+        # postprocess_image() calls the scripts' postprocess with an empty
+        # stand-in result on a copy of p: leave the list for the real one.
+        if not isinstance(images_list, list) or not images_list:
+            return
+        p._ad_gallery_previews = []
+        p._ad_gallery_previews_full = False
+        if getattr(p, "is_api", False) or not isinstance(infotexts, list):
+            return
+        # A script of the Script menu reads processed.images by position
+        # (SD upscale joins its tiles in order): add nothing, also in doubt.
+        # 0 or None = None, as in the host's ScriptRunner.run.
+        try:
+            chosen = (getattr(p, "script_args", None) or [0])[0]
+            if int(0 if chosen is None else chosen) != 0:
+                return
+        except Exception:  # noqa: BLE001
+            return
+        info = getattr(processed, "info", "") or ""
+        # AUTOMATIC1111 returns inpainting masks with no parameters of their
+        # own: fill those places, or the previews would read the wrong ones.
+        if len(infotexts) < len(images_list):
+            infotexts.extend([info] * (len(images_list) - len(infotexts)))
+        for image, text in previews:
+            text = text or info
+            try:
+                if text and getattr(opts, "enable_pnginfo", True):
+                    image.info["parameters"] = text
+            except Exception:  # noqa: BLE001
+                pass
+            images_list.append(image)
+            infotexts.append(text)
+
 
 def _is_forge_modules() -> bool:
     """True on Forge / Forge Neo, where VAE + text encoders are unified into the
@@ -3710,6 +4109,28 @@ def on_ui_settings():
     )
 
     shared.opts.add_option(
+        "ad_gallery_previews",
+        shared.OptionInfo(
+            default=False,
+            label="Show detection previews in the results gallery",
+            section=section,
+        ).info(
+            "Adds the picture with the detection boxes of every ADetailer pass after the generated images, with the parameters of its image, up to 32 per generation. They are not saved to disk and API responses do not include them. They are not shown while a script of the Script menu is selected"
+        ),
+    )
+
+    shared.opts.add_option(
+        "ad_hide_live_preview_boxes",
+        shared.OptionInfo(
+            default=False,
+            label="Hide detection boxes from the live preview",
+            section=section,
+        ).info(
+            "While ADetailer works, the live preview no longer shows the picture with the boxes it detected; it keeps its last picture until the inpainting steps replace it. The Detection preview button and 'Save mask previews' are not affected"
+        ),
+    )
+
+    shared.opts.add_option(
         "ad_save_inpaint_masks",
         shared.OptionInfo(
             default=False, label="Save inpaint masks", section=section
@@ -3808,6 +4229,19 @@ def on_ui_settings():
     )
 
     shared.opts.add_option(
+        "ad_bbox_sortby_more",
+        shared.OptionInfo(
+            default="Off",
+            label="More sort orders (overrides Sort bounding boxes by)",
+            component=gr.Radio,
+            component_args={"choices": BBOX_SORTBY_MORE},
+            section=section,
+        ).info(
+            "Any choice other than Off is used instead of 'Sort bounding boxes by', for example to give the first part of a [SEP] prompt to the face on the right. Off keeps 'Sort bounding boxes by'"
+        ),
+    )
+
+    shared.opts.add_option(
         "ad_drop_overlapping_detections",
         shared.OptionInfo(
             default=0.0,
@@ -3852,6 +4286,19 @@ def on_ui_settings():
             section=section,
         ).info(
             "Strict is for SDXL only, and matches exactly to trained SDXL resolutions. Free works with any model, but will use potentially unsupported dimensions."
+        ),
+    )
+
+    shared.opts.add_option(
+        "ad_max_inpaint_side",
+        shared.OptionInfo(
+            default=0,
+            label="Max inpaint size, pixels per side (0 = no limit)",
+            component=gr.Slider,
+            component_args={"minimum": 0, "maximum": 4096, "step": 64},
+            section=section,
+        ).info(
+            "With 'Inpaint only masked' and without 'Use separate width/height', a region whose inpaint size would have a side longer than this is inpainted smaller, with the same shape, so 'Scale inpaint to bbox' on a large detection does not run out of video memory. 0 = no limit"
         ),
     )
 

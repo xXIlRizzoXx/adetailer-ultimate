@@ -101,7 +101,16 @@ def test_is_mediapipe(ad_model: str, expect: bool) -> None:
 
 @pytest.mark.parametrize(
     ("ad_model", "expect"),
-    [("mediapipe_face_full", False), ("face_yolov8n.pt", False), ("None", True)],
+    [
+        ("mediapipe_face_full", False),
+        ("face_yolov8n.pt", False),
+        ("None", True),
+        # An API request with an empty model: the tab is off, like "None",
+        # instead of failing with "Model '' not found" and stopping the tabs
+        # after it.
+        ("", True),
+        ("   ", True),
+    ],
 )
 def test_need_skip(ad_model: str, expect: bool) -> None:
     args = ADetailerArgs(ad_model=ad_model)

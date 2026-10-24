@@ -113,6 +113,7 @@ def ultralytics_predict(
     exclude_classes: str = "",
     use_bbox_mask: bool = False,
     imgsz: int = 0,
+    plain_preview: bool = False,
 ) -> PredictOutput[float]:
     from ultralytics import YOLO
 
@@ -240,12 +241,25 @@ def ultralytics_predict(
     preview = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
     preview = Image.fromarray(preview)
 
+    # The Detection preview also asks for the same picture with the boxes and
+    # masks but no class names and scores (its "Show labels" switch). Best
+    # effort: an Ultralytics whose plot() lacks these options gives none.
+    preview_plain = None
+    if plain_preview:
+        try:
+            preview_plain = Image.fromarray(
+                cv2.cvtColor(pred[0].plot(labels=False, conf=False), cv2.COLOR_BGR2RGB)
+            )
+        except Exception:  # noqa: BLE001
+            preview_plain = None
+
     return PredictOutput(
         bboxes=bboxes,
         masks=masks,
         confidences=confidences,
         class_names=class_names,
         preview=preview,
+        preview_plain=preview_plain,
     )
 
 

@@ -623,8 +623,151 @@ def test_only_a_single_tab_preview_with_detections_gives_clickable_boxes(
         "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
     )
 
-    assert boxes == ""
+    if combine:
+        # Only the picture without labels, for "Show labels": no boxes.
+        assert "boxes" not in json.loads(boxes)
+    else:
+        assert boxes == ""
     assert "Click the boxes" not in status
+
+
+def _plain_of(boxes_json):
+    import base64
+
+    url = json.loads(boxes_json)["plain"]
+    head, data = url.split(",", 1)
+    assert head == "data:image/jpeg;base64"
+    return Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB")
+
+
+@pytest.mark.parametrize("has_plain", [True, False])
+def test_single_tab_preview_sends_the_picture_without_labels(
+    host, monkeypatch, has_plain
+):
+    # "Show labels" off shows the detector's picture drawn without names and
+    # scores; it travels in the hidden boxes field, so no output is added.
+    asked = []
+    plain = Image.new("RGB", (64, 32), (0, 0, 255))
+
+    def predict(_path, **kwargs):
+        asked.append(kwargs.get("plain_preview"))
+        return SimpleNamespace(
+            bboxes=[[1, 2, 30, 20]], confidences=[0.9], masks=[],
+            preview=Image.new("RGB", (64, 32), (255, 0, 0)), class_names=["face"],
+            **({"preview_plain": plain} if has_plain else {}),
+        )
+
+    callback = _wired_preview(
+        monkeypatch, predict, _draw_detection_numbers=lambda img, *_a: img
+    )
+    image, _status, boxes = callback(
+        Image.new("RGB", (64, 32), "white"), False,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert asked == [True]
+    data = json.loads(boxes)
+    assert data["boxes"] == [[1, 2, 30, 20]]
+    if not has_plain:
+        assert "plain" not in data
+        return
+    got = _plain_of(boxes)
+    assert got.size == image.size
+    r, g, b = got.getpixel((10, 10))
+    assert b > 200 and r < 50  # the plain picture, not the labelled one
+
+
+def test_single_tab_plain_picture_of_another_size_is_left_out(host, monkeypatch):
+    def predict(_path, **_kwargs):
+        return SimpleNamespace(
+            bboxes=[[1, 2, 30, 20]], confidences=[0.9], masks=[],
+            preview=Image.new("RGB", (64, 32)), class_names=["face"],
+            preview_plain=Image.new("RGB", (32, 32)),
+        )
+
+    callback = _wired_preview(
+        monkeypatch, predict, _draw_detection_numbers=lambda img, *_a: img
+    )
+    _image, _status, boxes = callback(
+        Image.new("RGB", (64, 32), "white"), False,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+    assert "plain" not in json.loads(boxes)
+
+
+def test_mediapipe_plain_picture_is_drawn_without_class_names(host, monkeypatch):
+    # mediapipe_face_features writes each part's name on its preview; the
+    # picture without labels is drawn again with the same boxes and masks only.
+    pred = SimpleNamespace(
+        bboxes=[[0, 0, 10, 10]], confidences=[1.0], masks=["mask"],
+        preview=Image.new("RGB", (16, 16)), class_names=["eyes"],
+    )
+    drawn = []
+
+    def draw_preview(img, bboxes, masks, class_names=None):
+        drawn.append((img.size, bboxes, masks, class_names))
+        return Image.new("RGB", img.size, (0, 255, 0))
+
+    mediapipe = ModuleType("adetailer.mediapipe")
+    mediapipe.mediapipe_predict = lambda *_args, **_kwargs: pred
+    mediapipe.draw_preview = draw_preview
+    monkeypatch.setitem(sys.modules, "adetailer.mediapipe", mediapipe)
+    callback = _wired_preview(
+        monkeypatch, lambda *_a, **_k: None, _draw_detection_numbers=lambda img, *_a: img
+    )
+    _image, _status, boxes = callback(
+        Image.new("RGB", (16, 16), "white"), False,
+        "mediapipe_face_features", "", "", False, 0.3, "hand.pt", "", "", False, 0.3,
+        "mediapipe_face_features",
+    )
+
+    assert drawn == [((16, 16), [[0, 0, 10, 10]], ["mask"], None)]
+    r, g, b = _plain_of(boxes).getpixel((8, 8))
+    assert g > 200 and r < 50 and b < 50
+
+
+def test_combined_preview_sends_its_picture_without_labels(host, monkeypatch):
+    # Combine all tabs: the copy has the tints and outlines but none of the
+    # label chips; it differs from the labelled preview only where they are.
+    from PIL import ImageChops, ImageDraw
+
+    chips = []
+    rectangle = ImageDraw.ImageDraw.rectangle
+
+    def record(self, xy, *args, **kwargs):
+        if kwargs.get("fill") is not None:
+            chips.append(list(xy))
+        return rectangle(self, xy, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "rectangle", record)
+
+    def predict(path, **_kwargs):
+        found = [[40, 90, 160, 200]] if "face" in path else [[180, 30, 240, 80]]
+        return SimpleNamespace(
+            bboxes=found, confidences=[0.9], masks=[], preview=None,
+            class_names=["face" if "face" in path else "hand"],
+        )
+
+    callback = _wired_preview(monkeypatch, predict)
+    image, _status, boxes = callback(
+        Image.new("RGB", (256, 256), "white"), True,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert "boxes" not in json.loads(boxes)
+    plain = _plain_of(boxes)
+    assert plain.size == image.size
+    diff = ImageChops.difference(image, plain).convert("L").point(lambda v: 255 * (v > 80))
+    changed = [
+        (x, y) for y in range(256) for x in range(256) if diff.getpixel((x, y))
+    ]
+    assert len(chips) == 2 and changed
+    # Every changed pixel lies on a label chip; the outlines are the same.
+    assert all(
+        any(c[0] <= x <= c[2] and c[1] <= y <= c[3] for c in chips) for x, y in changed
+    )
+    assert plain.getpixel((40, 150))[0] > 180  # the face tab's red outline
+    assert plain.getpixel((40, 150))[1] < 120
 
 
 def test_the_preview_boxes_field_has_no_label_and_no_listener():

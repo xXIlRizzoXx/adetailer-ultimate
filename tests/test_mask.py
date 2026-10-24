@@ -15,6 +15,8 @@ from adetailer.mask import (
     mask_preprocess,
     offset,
     parse_indices,
+    SortBy,
+    sort_bboxes,
 )
 
 
@@ -494,3 +496,89 @@ def test_filter_overlapping_threshold_is_strict():
     b = [5, 0, 15, 10]
     assert len(filter_overlapping(_overlap_pred([a, b], [0.9, 0.8]), 0.4).bboxes) == 2
     assert len(filter_overlapping(_overlap_pred([a, b], [0.9, 0.8]), 0.3).bboxes) == 1
+
+
+# Settings -> ADetailer -> "Sort bounding boxes by".
+
+
+def _sort_pred(confidences=(0.5, 0.9, 0.7)):
+    from adetailer.common import PredictOutput
+
+    # Three boxes: a small one on the right, a large one at the bottom left
+    # and a middle one at the top.
+    bboxes = [[300, 100, 360, 160], [10, 200, 210, 400], [120, 20, 220, 120]]
+    masks = [Image.new("L", (400, 400), n) for n in (1, 2, 3)]
+    return PredictOutput(
+        bboxes=[list(b) for b in bboxes],
+        masks=masks,
+        confidences=list(confidences),
+        preview=Image.new("RGB", (400, 400)),
+        class_names=["face", "hand", "eyes"][: len(bboxes)],
+    )
+
+
+def test_sort_choices_are_exactly_the_original_four():
+    from adetailer.args import BBOX_SORTBY
+
+    # An older version reads ad_bbox_sortby with BBOX_SORTBY.index() and fails
+    # every generation on a choice it does not know: new orders go in the
+    # separate "More sort orders" setting (BBOX_SORTBY_MORE), never here.
+    assert BBOX_SORTBY == [
+        "None",
+        "Position (left to right)",
+        "Position (center to edge)",
+        "Area (large to small)",
+    ]
+
+
+def test_more_sort_orders_map_to_the_sort_values_after_the_original_ones():
+    from adetailer.args import BBOX_SORTBY, BBOX_SORTBY_MORE
+
+    assert BBOX_SORTBY_MORE == [
+        "Off",
+        "Position (right to left)",
+        "Position (top to bottom)",
+        "Area (small to large)",
+        "Confidence (high to low)",
+    ]
+    assert len(BBOX_SORTBY) + len(BBOX_SORTBY_MORE) - 1 == len(SortBy)
+    assert [SortBy(len(BBOX_SORTBY) - 1 + i) for i in range(1, 5)] == [
+        SortBy.RIGHT_TO_LEFT,
+        SortBy.TOP_TO_BOTTOM,
+        SortBy.AREA_SMALL_TO_LARGE,
+        SortBy.CONFIDENCE,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("order_by", "order"),
+    [
+        (SortBy.LEFT_TO_RIGHT, [1, 2, 0]),
+        (SortBy.AREA, [1, 2, 0]),
+        (SortBy.RIGHT_TO_LEFT, [0, 2, 1]),
+        (SortBy.TOP_TO_BOTTOM, [2, 0, 1]),
+        (SortBy.AREA_SMALL_TO_LARGE, [0, 2, 1]),
+        (SortBy.CONFIDENCE, [1, 2, 0]),
+    ],
+)
+def test_sort_bboxes_keeps_masks_scores_and_classes_with_their_box(order_by, order):
+    original = _sort_pred()
+    pred = sort_bboxes(_sort_pred(), order_by)
+
+    assert pred.bboxes == [original.bboxes[i] for i in order]
+    assert [m.getpixel((0, 0)) for m in pred.masks] == [i + 1 for i in order]
+    assert pred.confidences == [original.confidences[i] for i in order]
+    assert pred.class_names == [original.class_names[i] for i in order]
+
+
+@pytest.mark.parametrize("confidences", [(), (0.9, 0.8)])
+def test_sort_by_confidence_without_one_score_per_box_keeps_the_order(confidences):
+    original = _sort_pred()
+    pred = sort_bboxes(_sort_pred(confidences), SortBy.CONFIDENCE)
+    assert pred.bboxes == original.bboxes
+
+
+def test_sort_by_confidence_keeps_the_detector_order_on_equal_scores():
+    original = _sort_pred((0.8, 0.8, 0.9))
+    pred = sort_bboxes(_sort_pred((0.8, 0.8, 0.9)), SortBy.CONFIDENCE)
+    assert pred.bboxes == [original.bboxes[i] for i in (2, 0, 1)]

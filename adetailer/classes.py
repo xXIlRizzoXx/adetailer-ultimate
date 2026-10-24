@@ -20,8 +20,9 @@ def parse_csv(csv: str) -> list[str]:
 # (adetailer/mediapipe.py imports these). Lives here in the stdlib-only leaf
 # module so mediapipe.py / args.py / ui.py can import it without a cycle.
 # Order = dropdown order = sequential-pass order; keep STABLE (preset/PNG-info).
+# "iris" is opt-in: detected only when picked by name (see mediapipe.py).
 MEDIAPIPE_FACE_FEATURES_MODEL = "mediapipe_face_features"
-FACE_FEATURE_CLASSES = ["eyes", "mouth", "nose", "eyebrows", "face"]
+FACE_FEATURE_CLASSES = ["eyes", "mouth", "nose", "eyebrows", "face", "iris"]
 
 
 def _names_from_json(data: Any) -> list[str]:

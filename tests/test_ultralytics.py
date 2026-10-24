@@ -527,3 +527,59 @@ def test_detection_works_when_ultralytics_analytics_cannot_be_found(
     result = ultralytics_predict(str(tmp_path / "face.pt"), Image.new("RGB", (4, 4)))
 
     assert len(result.bboxes) == 1
+
+
+class _PlotResult(_FakeResult):
+    """A result whose plot() takes Ultralytics' labels/conf options."""
+
+    def __init__(self, names, cls, calls):
+        super().__init__(names, cls)
+        self.calls = calls
+
+    def plot(self, **kwargs):
+        self.calls.append(kwargs)
+        img = np.zeros((4, 4, 3), np.uint8)
+        if kwargs.get("labels", True):
+            img[0, 0] = 255  # stands for the text of a label
+        return img
+
+
+@pytest.mark.parametrize("plain", [True, False])
+def test_plain_preview_is_plotted_without_labels(tmp_path, monkeypatch, plain):
+    # The Detection preview's "Show labels" switch needs the same picture
+    # without class names and scores; only the preview asks for it.
+    calls = []
+    module = ModuleType("ultralytics")
+
+    class YOLO:
+        def __init__(self, path):
+            self.names = {0: "face"}
+
+        def __call__(self, image, **kwargs):
+            return [_PlotResult(self.names, [0.0], calls)]
+
+    module.YOLO = YOLO
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+    kwargs = {"plain_preview": True} if plain else {}
+
+    result = ultralytics_predict(str(tmp_path / "face.pt"), Image.new("RGB", (4, 4)), **kwargs)
+
+    assert result.preview.getpixel((0, 0)) == (255, 255, 255)
+    if plain:
+        assert calls == [{}, {"labels": False, "conf": False}]
+        assert result.preview_plain.getpixel((0, 0)) == (0, 0, 0)
+        assert result.preview_plain.size == result.preview.size
+    else:
+        assert calls == [{}]
+        assert result.preview_plain is None
+
+
+def test_plain_preview_is_skipped_by_an_old_plot(tmp_path, monkeypatch):
+    # An Ultralytics whose plot() has no labels/conf options: no plain
+    # picture, and the detection still works.
+    _fake_yolo(monkeypatch, [0.0], {0: "face"})
+    result = ultralytics_predict(
+        str(tmp_path / "face.pt"), Image.new("RGB", (4, 4)), plain_preview=True
+    )
+    assert result.bboxes and result.preview is not None
+    assert result.preview_plain is None

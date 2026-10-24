@@ -20,6 +20,10 @@ class SortBy(IntEnum):
     LEFT_TO_RIGHT = 1
     CENTER_TO_EDGE = 2
     AREA = 3
+    RIGHT_TO_LEFT = 4
+    TOP_TO_BOTTOM = 5
+    AREA_SMALL_TO_LARGE = 6
+    CONFIDENCE = 7
 
 
 class MergeInvert(IntEnum):
@@ -212,6 +216,16 @@ def _key_area(bbox: list[T]) -> T:
     return -bbox_area(bbox)
 
 
+def _key_right_to_left(bbox: list[T]) -> T:
+    """Right to left, by the right edge of [x1, y1, x2, y2]."""
+    return -bbox[2]
+
+
+def _key_top_to_bottom(bbox: list[T]) -> T:
+    """Top to bottom, by the top edge of [x1, y1, x2, y2]."""
+    return bbox[1]
+
+
 def sort_bboxes(
     pred: PredictOutput[T], order: int | SortBy = SortBy.NONE
 ) -> PredictOutput[T]:
@@ -226,11 +240,28 @@ def sort_bboxes(
         key = partial(_key_center_to_edge, center=center)
     elif order == SortBy.AREA:
         key = _key_area
+    elif order == SortBy.RIGHT_TO_LEFT:
+        # The mirror of left to right: by the right edge.
+        key = _key_right_to_left
+    elif order == SortBy.TOP_TO_BOTTOM:
+        key = _key_top_to_bottom
+    elif order == SortBy.AREA_SMALL_TO_LARGE:
+        key = bbox_area
+    elif order == SortBy.CONFIDENCE:
+        # Without one score per box (e.g. a detector that gives none) the
+        # order is kept as it is.
+        if not pred.confidences or len(pred.confidences) != len(pred.bboxes):
+            return pred
+        key = None
     else:
         raise RuntimeError
 
     items = len(pred.bboxes)
-    idx = sorted(range(items), key=lambda i: key(pred.bboxes[i]))
+    if key is None:
+        # Most confident first; equal scores keep the detector's order.
+        idx = sorted(range(items), key=lambda i: -pred.confidences[i])
+    else:
+        idx = sorted(range(items), key=lambda i: key(pred.bboxes[i]))
     pred.bboxes = [pred.bboxes[i] for i in idx]
     pred.masks = [pred.masks[i] for i in idx]
     if pred.confidences:

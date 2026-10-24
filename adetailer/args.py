@@ -261,7 +261,12 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
         return self.ad_model == MEDIAPIPE_FACE_FEATURES_MODEL
 
     def need_skip(self) -> bool:
-        return self.ad_model == "None" or self.ad_tab_enable is False
+        # An empty model (an API request) is off too, like "None".
+        return (
+            not self.ad_model.strip()
+            or self.ad_model == "None"
+            or self.ad_tab_enable is False
+        )
 
 
 _all_args = [
@@ -337,6 +342,18 @@ BBOX_SORTBY = [
     "Position (left to right)",
     "Position (center to edge)",
     "Area (large to small)",
+]
+
+# Settings > ADetailer "More sort orders", a separate setting: an older
+# version reading a new choice in ad_bbox_sortby would fail every
+# generation, while it ignores this key. "Off" keeps ad_bbox_sortby; the
+# other choices are SortBy 4, 5, ... in adetailer/mask.py, in this order.
+BBOX_SORTBY_MORE = [
+    "Off",
+    "Position (right to left)",
+    "Position (top to bottom)",
+    "Area (small to large)",
+    "Confidence (high to low)",
 ]
 
 MASK_MERGE_INVERT = ["None", "Merge", "Merge and Invert"]

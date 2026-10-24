@@ -209,10 +209,11 @@ _GUIDE_SECTIONS: list[tuple[str, str]] = [
 - **Segmentation vs box** — segmentation models give a precise mask shape; box-only models give a rectangle. You can force the rectangle with *Use bbox as mask* (see Mask preprocessing).
 - **Multi-class models** — a model that knows several classes (e.g. a person/face/hand model, or a custom one) shows the **CLASSES** dropdown so you can pick which parts to detail.
 - **MediaPipe** — `mediapipe_face_mesh` and `..._eyes_only` detect faces/eyes by landmarks. They need no `.pt` model, but MediaPipe's own small model files (`face_landmarker.task` for these two) are downloaded into `adetailer/_mediapipe_models/` on first use; on an offline machine, place them there by hand (the console names each missing file and its URL).
-- **MediaPipe face features (new)** — `mediapipe_face_features` treats the face as classes **eyes, mouth, nose, eyebrows, face**; pick all, some, or just one in the CLASSES dropdown.
+- **MediaPipe face features (new)** — `mediapipe_face_features` treats the face as classes **eyes, mouth, nose, eyebrows, face, iris**; pick all, some, or just one in the CLASSES dropdown. The iris gives one mask per eye and is found only when you pick it, never with no class picked.
 - **YOLO-World (`…-world`)** — open vocabulary: type comma-separated words in the classes field to detect almost anything you can name.
 - **Custom models** — drop a `.pt` into your ADetailer models folder. If its classes don't appear, add a sidecar file `<model>.names.json` shaped like `{"names": {"0": "face", "1": "hand"}}`.
 - **More detectors** — larger face and hand models, `person_yolov8m-seg` and a clothing model (`deepfashion2_yolov8s-seg`, 13 clothing classes) are on the Bingsu/adetailer page on Hugging Face; community detectors for eyes, hair, feet and more are on Civitai and Hugging Face (search for "ADetailer"). A `.pt` can contain code: use only files from sources you trust.
+- **Model file safety** — a `.pt` detector is a pickle file, and loading one can run code stored in it. ADetailer reads only `.pt` detectors (no `.safetensors`) and, like the original ADetailer, loads them with AUTOMATIC1111's safe-unpickle check switched off, because that check does not accept the Python classes a YOLO model contains (Forge Neo has no such check). So a scanner or site warning about a YOLO `.pt` is common and proves neither that the file is harmful nor that it is safe: download detectors only from sources you trust (the bundled ones come from the Bingsu/adetailer page on Hugging Face). On AUTOMATIC1111 with the check on, a `<model>.names.json` beside a custom model lets the panel list its classes without opening the file.
 """,
     ),
     (
@@ -264,6 +265,7 @@ Use different settings **only** for the detail pass; each is off (inherits the m
 - **Detailer checkpoint / VAE** — run the detail pass with a different model / VAE.
 - **Separate text encoder** — Forge / Forge Neo only; use a different text encoder for the detail pass (e.g. an SDXL detailer under a different base).
 - **Sampler / scheduler / steps / CFG scale / CLIP skip** — per-pass sampling settings.
+- **Why the detail pass runs fewer steps** — it is an img2img pass, and img2img runs only about steps × denoising strength (30 steps at 0.4 denoise ≈ 12), also with *Use separate steps*. To run the full number, turn on the WebUI option `Settings → img2img → With img2img, do exactly the amount of steps the slider specifies` (Forge Neo: *During img2img, do exactly the number of Steps the slider specifies*). It applies to every img2img generation, not only to ADetailer.
 - **Apply only on hires. fix** — run this tab only when hires.fix is on.
 """,
     ),
@@ -271,7 +273,8 @@ Use different settings **only** for the detail pass; each is off (inherits the m
         "🧰 Preview & run-on-image tools",
         """
 Two sibling tools sit right after each tab's **Detection** section (roughly the middle of the tab, above Mask preprocessing and Inpainting):
-- **Detection preview** — drop an image to see what the detector would find (boxes), without generating. The single-tab preview honours this tab's **Detection resolution**. **Combine all tabs** overlays every tab's detector at once (that combined view stays at the default resolution).
+- **Detection preview** — drop an image to see what the detector would find (boxes), without generating. The single-tab preview honours this tab's **Detection resolution**. **Combine all tabs** overlays every tab's detector at once (that combined view uses each detector's own size).
+- Show labels — the checkbox next to 🔍 Run detection preview. Untick it to see only the boxes and masks, without the class names, scores and numbers; the boxes can still be clicked. It is on by default and the browser remembers it. The download button of the preview always saves the picture with the labels.
 - **Run ADetailer on an image** — drop a finished image and run the full detect + inpaint pass on it, without regenerating. Optional **Save result to outputs** writes to a dedicated `ADetailer-Inpaint` folder; click the result to enlarge it.
 - **Batch a whole folder (new)** — paste a **folder path** in that same tool to detail every image inside it in one go; each result is always saved: to the `ADetailer-Inpaint` folder or, with **📁 Save results in the source folder instead** ticked, beside each source image as `name-ad` (a new file — originals are never overwritten; `name-ad-1`, `name-ad-2`… if the name is taken). A folder path takes priority over a single dropped image.
 """,
@@ -283,6 +286,8 @@ Two sibling tools sit right after each tab's **Detection** section (roughly the 
 - **Copy settings / Paste settings** — clone one tab's settings into another.
 - **Remember last-used settings between restarts** (`Settings → ADetailer`) — restore your last setup after a restart.
 - **Enable ADetailer at startup** (`Settings → ADetailer`) — start with ADetailer already switched on in txt2img, img2img or both (Off by default). Any choice but Off wins over the WebUI's Settings → Defaults for that on/off state; API requests are not affected.
+- **Save images before ADetailer** (`Settings → ADetailer`) — also saves each image as it was before ADetailer changed it (file name ending in `-ad-before`), to compare checkpoints or LoRAs. To switch it from the top of the page, add `ad_save_images_before` to `Settings → User interface → Quicksettings list` (on Forge Neo, `User Interface → Quicksettings List`), then apply and reload the UI.
+- Show detection previews in the results gallery (Settings → ADetailer, off by default) — adds the picture with the detection boxes of every ADetailer pass after the generated images, with the parameters of its image, up to 32 per generation. It does not save them to disk (Save mask previews does) and API responses do not include them. They are not shown while a script of the Script menu (X/Y/Z plot, SD upscale...) is selected.
 - **Reset ADetailer settings** (`Settings → ADetailer`) — restore factory defaults.
 - **Where files go** — intermediate step/preview files land in an `adetailer-steps/` sub-folder; the standalone *Run/Batch* results go in a top-level `ADetailer-Inpaint/` folder next to your normal outputs, unless a folder batch uses *Save results in the source folder instead*, which writes beside each source image.
 """,
@@ -296,8 +301,10 @@ Two sibling tools sit right after each tab's **Detection** section (roughly the 
 - **A style LoRA bleeds onto the detailed region** — turn on **Strip LoRAs from the detailer prompt**.
 - **The mask is too tight / edges show** — use **bbox as mask** or **dilation**, and increase **mask blur**.
 - **The same face is detailed twice** (two boxes on one face) — set **Drop overlapping detections** (`Settings → ADetailer`) to about 0.6.
+- **Small, distant or background faces get detailed too** — raise **Mask min area ratio**. It is the detection box's share of the whole image: 0.01 = 1%, 0.05 = 5%, and a box half as wide and half as tall as the image is 0.25, not 0.5. **Mask only the top k** with the method set to area keeps only the k biggest (1 = the main subject), and **Inpaint only these detections** keeps just the numbered boxes you pick in the Detection preview.
+- **ADetailer and a face-swap extension (ReActor, roop…) run in the wrong order** — in `Settings → Callbacks`, set **script_postprocess_image callback priority**: entries listed there run first, in that order. Put the face-swap entry before ADetailer's (the one ending in `!adetailer.py/script_postprocess_image/AfterDetailerScript`) to detail the swapped face, or ADetailer's first for the opposite; apply and restart the WebUI. This only works when the other extension changes the image in that same step: one that works in the later postprocess step always runs after ADetailer.
 - **A face comes out with another tint, or its box shows** — turn on **Match the colors of each inpainted region to the picture** (`Settings → ADetailer`) and increase **mask blur**.
-- **CUDA out of memory** — lower the inpaint resolution; for many images use **batch count**, not batch size; drop the `--cuda-malloc` / `--cuda-stream` / `--pin-shared-memory` launch flags; and turn off on-the-fly LoRA patching if your UI has it.
+- **CUDA out of memory** — lower the inpaint resolution; for many images use **batch count**, not batch size; drop the `--cuda-malloc` / `--cuda-stream` / `--pin-shared-memory` launch flags; turn off on-the-fly LoRA patching if your UI has it; or set **Max inpaint size** (`Settings → ADetailer`), e.g. to 1024, so a scaled-up region is inpainted smaller.
 """,
     ),
     (
@@ -307,7 +314,8 @@ These go inside the tab's **Prompt** field:
 - **`[SEP]`** — split the prompt so each detected region (1st, 2nd, …) gets its own part.
 - **`[SKIP]`** — skip a region entirely. On its own it skips all; inside a class block (`[CLASS=hand] [SKIP] [/CLASS]`) it skips only that class.
 - **`[PROMPT]`** — insert the main generation prompt at that spot.
-- **A different prompt or LoRA for each face** — set `Settings → ADetailer → Sort bounding boxes by` to *Position (left to right)*, then write one part per face, e.g. `smiling woman <lora:style_a:0.8> [SEP] old man, grey beard [SEP] [SKIP]`. Each face is a pass of its own, so a LoRA in one part is used only for that face; faces beyond the last part get the last part (`[SKIP]` here leaves them as they are).
+- [PROMPT=eyes,hair] — insert only the parts of the main prompt (the parts between its commas, new lines, BREAK and AND) that name one of these words, with their weights, e.g. close-up, [PROMPT=eyes] brings green eyes when a wildcard picked them for this image. A minus sign drops parts instead: [PROMPT=-dress] brings all the rest. Words match whole, in any case, and an underscore counts as a space; the numbers of the weights are not searched. With plain words it never brings the main prompt's LoRAs (Use LoRAs from main prompt adds them); with only minus words it keeps them (Strip LoRAs from the detailer prompt removes them). When no part matches, it adds nothing. [PROMPT=] brings the whole main prompt, like [PROMPT].
+- **A different prompt or LoRA for each face** — set `Settings → ADetailer → Sort bounding boxes by` to *Position (left to right)* and leave *More sort orders* on Off (or pick another order there, such as right to left), then write one part per face, e.g. `smiling woman <lora:style_a:0.8> [SEP] old man, grey beard [SEP] [SKIP]`. Each face is a pass of its own, so a LoRA in one part is used only for that face; faces beyond the last part get the last part (`[SKIP]` here leaves them as they are).
 """,
     ),
     (
@@ -317,7 +325,7 @@ Highlights added on top of upstream ADetailer:
 - **Class filtering** (pick which parts), **Exclude (NOT)** mode, **sequential** per-class passes, and **per-class prompts**.
 - **Auto class-guard**, **inline `[CLASS=]`** prompts, **Strip LoRAs**, **LoRAs + triggers from the main prompt**.
 - **HD Detection resolution**, **Dynamic denoise by area**, **per-pass text encoder** (Forge/Neo).
-- **MediaPipe face-features** detector (eyes/mouth/nose/eyebrows/face).
+- **MediaPipe face-features** detector (eyes/mouth/nose/eyebrows/face/iris).
 - **Run ADetailer on an image** and **batch a whole folder** without regenerating.
 - **Preset library** with export/import, **copy/paste between tabs**, **remembered settings**, and this guide.
 - Built to work across **A1111, Forge, Forge Neo and reForge**.
@@ -381,12 +389,16 @@ def _format_preset_preview(name: str | None):
         return s if len(s) <= n else s[: n - 1].rstrip() + "…"
 
     def _flag_tokens(s: str) -> str:
-        # Wrap [SEP]/[PROMPT] in backticks so they're visually distinct
-        # — note to the user that these are placeholders, not literals.
-        return (
+        # Wrap [SEP]/[PROMPT]/[PROMPT=words] in backticks so they're visually
+        # distinct — note to the user that these are placeholders, not literals.
+        import re
+
+        return re.sub(
+            r"\[PROMPT=[^\]`]*\]",
+            lambda m: f"`{m.group(0)}`",
             (s or "")
             .replace("[SEP]", "`[SEP]`")
-            .replace("[PROMPT]", "`[PROMPT]`")
+            .replace("[PROMPT]", "`[PROMPT]`"),
         )
 
     pos = _flag_tokens(_trunc(data.get("ad_prompt", "")))
@@ -420,8 +432,15 @@ def _format_preset_preview(name: str | None):
             "- **Class-specific prompts:** "
             + (", ".join(first_classes) if first_classes else "_(set)_")
         )
-    if "[SEP]" in (data.get("ad_prompt", "") + data.get("ad_negative_prompt", "")) or "[PROMPT]" in (
-        data.get("ad_prompt", "") + data.get("ad_negative_prompt", "")
+    import re
+
+    if "[SEP]" in (data.get("ad_prompt", "") + data.get("ad_negative_prompt", "")) or any(
+        token in data.get("ad_prompt", "") + data.get("ad_negative_prompt", "")
+        for token in ("[PROMPT]",)
+    ) or re.search(
+        # Only a closed [PROMPT=words] is a token.
+        r"\[PROMPT=[^\]]*\]",
+        data.get("ad_prompt", "") + data.get("ad_negative_prompt", ""),
     ):
         lines.append(
             "- _`[SEP]` / `[PROMPT]` tokens will be expanded against the main prompt at generation time._"
@@ -1195,26 +1214,72 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         (0, 210, 210),
     ]
 
-    def _preview_boxes_json(img, bboxes):
+    def _preview_boxes_json(img, bboxes, plain=""):
         """The boxes of a single-tab Detection preview, for javascript/picker.js:
         the picture's size and each box as [x1, y1, x2, y2] in its pixels, in
         the order of the numbers drawn on it (box k is detection number k + 1).
+        ``bboxes`` None (Combine all tabs) leaves the boxes out: nothing to
+        click. ``plain`` (see _plain_picture), when given, is the same picture
+        without labels, shown by picker.js while "Show labels" is off.
         An empty string when they cannot be read: the preview then works as
         before, with the numbers typed by hand."""
         try:
             import json
 
-            boxes = [[round(float(v), 1) for v in box[:4]] for box in bboxes]
-            return json.dumps({"w": int(img.width), "h": int(img.height), "boxes": boxes})
+            data = {"w": int(img.width), "h": int(img.height)}
+            if bboxes is not None:
+                data["boxes"] = [[round(float(v), 1) for v in box[:4]] for box in bboxes]
+            if plain:
+                data["plain"] = plain
+            return json.dumps(data)
         except Exception:  # noqa: BLE001
             return ""
 
+    def _plain_picture(plain, size):
+        """The preview picture without labels (only its boxes and masks), as a
+        JPEG data URL for the "Show labels" switch of javascript/picker.js. At
+        most 2048 px a side, to keep the page light: it is only shown at the
+        preview's size. An empty string when there is none, it does not have
+        the ``size`` of the labelled picture, or it cannot be encoded: the
+        switch then does nothing."""
+        try:
+            if plain is None or tuple(plain.size) != tuple(size):
+                return ""
+            import base64
+            import io
+
+            pic = plain.convert("RGB")
+            if max(pic.size) > 2048:
+                pic = pic.copy()
+                pic.thumbnail((2048, 2048))
+            buf = io.BytesIO()
+            pic.save(buf, format="JPEG", quality=90)
+            return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(
+                "ascii"
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _mediapipe_plain(image, pred):
+        """A MediaPipe preview without labels: only mediapipe_face_features
+        writes its class names on the picture; redraw it without them."""
+        if not getattr(pred, "class_names", None):
+            return pred.preview
+        try:
+            from adetailer.mediapipe import draw_preview
+
+            return draw_preview(image.convert("RGB").copy(), pred.bboxes, pred.masks)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _predict(
-        image, model_name, classes_csv, exclude_csv, exclude_mode, confidence, imgsz=0
+        image, model_name, classes_csv, exclude_csv, exclude_mode, confidence, imgsz=0,
+        plain=False,
     ):
         """Run one detector. Returns (PredictOutput | None, error_str | None).
         `imgsz` (0 = the detector's own size) is the optional HD detection resolution; it
-        only affects ultralytics models — mediapipe ignores it."""
+        only affects ultralytics models — mediapipe ignores it. `plain` also asks
+        an ultralytics model for its picture without labels (preview_plain)."""
         if not model_name or model_name == "None":
             return None, "no model"
         try:
@@ -1255,6 +1320,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     classes=classes_csv or "",
                     exclude_classes=(exclude_csv if exclude_mode and exclude_csv else ""),
                     imgsz=int(imgsz or 0),
+                    **({"plain_preview": True} if plain else {}),
                 )
             return pred, None
         except Exception as e:  # noqa: BLE001 — surface to the UI
@@ -1315,7 +1381,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     imgsz = 0
                 pred, err = _predict(
                     image, model_name, classes_csv, exclude_csv, exclude_mode,
-                    confidence, imgsz,
+                    confidence, imgsz, plain=True,
                 )
                 if err:
                     return None, f"⚠️ Preview failed: {err}"
@@ -1324,6 +1390,11 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     return None, "ℹ️ No detections."
                 _preview = pred.preview
                 if _preview is not None and pred and pred.bboxes:
+                    # The same picture without labels, for "Show labels".
+                    _plain = getattr(pred, "preview_plain", None)
+                    if _plain is None and model_name.lower().startswith("mediapipe"):
+                        _plain = _mediapipe_plain(image, pred)
+                    _plain = _plain_picture(_plain, _preview.size)
                     # Number each box (#1, #2, …) so the user can pick which to
                     # inpaint via the "Inpaint only these detections" field.
                     _preview = _draw_detection_numbers(
@@ -1334,7 +1405,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     return (
                         _preview,
                         f"✅ {n} detection(s). Click the boxes to choose which to inpaint.",
-                        _preview_boxes_json(_preview, pred.bboxes),
+                        _preview_boxes_json(_preview, pred.bboxes, _plain),
                     )
                 return _preview, f"✅ {n} detection(s)."
 
@@ -1428,6 +1499,9 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 for box in bboxes:
                     x1, y1, x2, y2 = [int(v) for v in box[:4]]
                     draw.rectangle([x1, y1, x2, y2], outline=color, width=line_w)
+            # The picture so far, with tints and outlines but no labels: shown
+            # by picker.js while "Show labels" is off.
+            plain = _plain_picture(canvas, canvas.size)
             taken = []  # the labels drawn so far, kept clear of each other
             for i, color, bboxes, confs, names, _masks in results:
                 for j, box in enumerate(bboxes):
@@ -1463,6 +1537,8 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 canvas,
                 f"✅ {total} detection(s) across {len(targets)} tab(s) — "
                 + " | ".join(summary),
+                # No boxes: each number belongs to its own tab, nothing to pick.
+                _preview_boxes_json(canvas, None, plain) if plain else "",
             )
 
         # Two thin wrappers over the one _run body, one per dedicated button.
@@ -1470,7 +1546,8 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         # _detect -> detection only, _apply -> full detect+inpaint.
         def _detect(image, combine, *flat):
             # A third value, the clickable boxes, comes only from a single-tab
-            # preview with detections; every other answer clears them.
+            # preview with detections (Combine all tabs gives only its picture
+            # without labels); every other answer clears them.
             image, status, *boxes = _run(image, combine, False, False, *flat)
             return image, status, (boxes[0] if boxes else "")
 

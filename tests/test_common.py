@@ -164,18 +164,19 @@ def test_hf_download_says_why_the_model_failed(monkeypatch):
 
     calls, printed = _fake_hub(
         monkeypatch,
+        FileNotFoundError("not in the cache"),
         OSError("[Errno 11001] getaddrinfo failed\nmore details"),
         ConnectionError("mirror unreachable"),
-        FileNotFoundError("not in the cache"),
     )
 
     assert common.hf_download("face_yolov8n.pt") == "INVALID"
 
-    # Same tries, same order as before.
+    # The local cache first, then Hugging Face and its mirror; the reason is
+    # the first remote error, not the cache miss.
     assert calls == [
+        {"local_files_only": True},
         {"etag_timeout": 1},
         {"etag_timeout": 1, "endpoint": "https://hf-mirror.com"},
-        {"local_files_only": True},
     ]
     assert printed == [
         "[-] ADetailer: Failed to load model 'face_yolov8n.pt' from huggingface"
@@ -232,3 +233,75 @@ def test_hf_download_success_prints_nothing(monkeypatch):
     assert common.hf_download("face_yolov8n.pt") == "cached/face_yolov8n.pt"
     assert len(calls) == 2
     assert printed == []
+
+
+def test_hf_download_uses_the_cached_model_without_the_network(monkeypatch):
+    # A model already in the Hugging Face cache loads with no request to
+    # Hugging Face or its mirror (offline start, no traffic at each start).
+    from adetailer import common
+
+    calls, printed = _fake_hub(monkeypatch, None, result="cache/face_yolov8n.pt")
+
+    assert common.hf_download("face_yolov8n.pt") == "cache/face_yolov8n.pt"
+    assert calls == [{"local_files_only": True}]
+    assert printed == []
+
+
+def test_builtin_model_in_the_model_folder_is_used_without_hugging_face(
+    tmp_path, monkeypatch
+):
+    # face_yolov8n.pt already in models/adetailer (or an extra folder): that
+    # file is used and only the missing built-in models are looked up.
+    import adetailer.common as common
+
+    main = tmp_path / "adetailer"
+    extra = tmp_path / "extra"
+    main.mkdir()
+    extra.mkdir()
+    (main / "face_yolov8n.pt").write_bytes(b"x")
+    (extra / "hand_yolov8n.pt").write_bytes(b"x")
+    (main / "my_eyes.pt").write_bytes(b"x")
+    asked = []
+
+    def fake_download(*names, check_remote=True):
+        asked.extend(names)
+        return {name: f"cache/{name}" for name in names}
+
+    monkeypatch.setattr(common, "download_models", fake_download)
+    models = common.get_models(main, extra)
+
+    assert "face_yolov8n.pt" not in asked
+    assert "hand_yolov8n.pt" not in asked
+    assert "face_yolov8s.pt" in asked
+    assert models["face_yolov8n.pt"] == str(main / "face_yolov8n.pt")
+    assert models["hand_yolov8n.pt"] == str(extra / "hand_yolov8n.pt")
+    assert models["face_yolov8s.pt"] == "cache/face_yolov8s.pt"
+    # Menu order unchanged: the built-in models first, in their usual order.
+    assert list(models)[:6] == [
+        "face_yolov8n.pt",
+        "face_yolov8s.pt",
+        "hand_yolov8n.pt",
+        "person_yolov8n-seg.pt",
+        "person_yolov8s-seg.pt",
+        "yolov8x-worldv2.pt",
+    ]
+    assert list(models)[-1] == "my_eyes.pt"
+
+
+def test_every_builtin_model_on_disk_means_no_lookup_at_all(tmp_path, monkeypatch):
+    import adetailer.common as common
+
+    for name in (
+        "face_yolov8n.pt", "face_yolov8s.pt", "hand_yolov8n.pt",
+        "person_yolov8n-seg.pt", "person_yolov8s-seg.pt", "yolov8x-worldv2.pt",
+    ):
+        (tmp_path / name).write_bytes(b"x")
+
+    def no_download(*names, **_kwargs):
+        assert not names, "no lookup expected"
+        return {}
+
+    monkeypatch.setattr(common, "download_models", no_download)
+    models = common.get_models(tmp_path)
+
+    assert models["yolov8x-worldv2.pt"] == str(tmp_path / "yolov8x-worldv2.pt")

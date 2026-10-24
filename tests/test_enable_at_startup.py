@@ -234,6 +234,7 @@ def _registered_options(ui):
         OptionDiv=None,
         SCRIPT_DEFAULT="",
         BBOX_SORTBY=["None"],
+        BBOX_SORTBY_MORE=["Off"],
         INPAINT_BBOX_MATCH_MODES=["Off"],
         InpaintBBoxMatchMode=SimpleNamespace(OFF=SimpleNamespace(value="Off")),
         _make_reset_settings_button=object(),
