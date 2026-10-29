@@ -106,6 +106,9 @@ class WebuiInfo:
     # the dropdown just offers the pass-through / "None" choices — index-safe.
     text_encoders_list: list[str] = field(default_factory=list)
     model_mapping: dict[str, str] = field(default_factory=dict)
+    # Reads the detector folders again and returns the detector names (the
+    # 🔄 button next to the detector menu). None: the names in model_mapping.
+    refresh_models: Any = None
     # The endings the WebUI takes off a sampler name, per scheduler (label,
     # name, aliases), for a restart's split_sampler_name. Empty: labels only.
     scheduler_endings: list[list[str | None]] = field(default_factory=list)
@@ -972,6 +975,7 @@ def adui(
         # Cross-tab Detection-preview wiring (also a post-loop "second pass"):
         # lets each tab's "Combine all tabs" checkbox run every tab's detector.
         _wire_detection_previews(all_widgets, webui_info, num_models, script)
+        _wire_model_refresh(all_widgets, webui_info, num_models)
 
         # The full user guide lives in its own top-level "ADetailer Guide" tab
         # (opt-in, off by default — see the on_ui_tabs gate + the
@@ -1984,6 +1988,65 @@ def _sync_preset_choices(names: list[str]) -> None:
                 )
         except Exception:  # noqa: BLE001 — never cost the action its result
             pass
+
+
+# Every detector dropdown built in this process, as weak references (see
+# _PRESET_DROPDOWNS), so the 🔄 button can update the page config too.
+_MODEL_DROPDOWNS: list = []
+
+
+def _model_choices(names: list[str], n: int) -> list[str]:
+    # As one_ui_group builds them: "None" last on the 1st tab, first after.
+    return [*names, "None"] if n == 0 else ["None", *names]
+
+
+def _sync_model_choices(dropdowns: list, names: list[str]) -> None:
+    # A browser reload is served the page config built at startup: update each
+    # detector dropdown's own choices list in place, as _sync_preset_choices
+    # does, so a reload lists the refreshed detectors. Best effort.
+    for dd in dropdowns:
+        try:
+            cur = dd.choices
+            if not isinstance(cur, list) or not cur:
+                continue
+            first = "None" in (cur[0] if isinstance(cur[0], (tuple, list)) else [cur[0]])
+            new = ["None", *names] if first else [*names, "None"]
+            cur[:] = [(x, x) for x in new] if isinstance(cur[0], (tuple, list)) else new
+        except Exception:  # noqa: BLE001 — never cost the action its result
+            pass
+
+
+def _wire_model_refresh(all_widgets, webui_info, num_models):
+    """The 🔄 button next to each tab's detector menu: read the detector
+    folders again and update the menu of every tab.
+
+    One .click per tab, wired after every tab exists so it can update them all
+    (like _wire_detection_previews). A tab keeps its detector while it is
+    still installed; otherwise it takes the tab's first choice, as at startup.
+    """
+    dropdowns = [w.ad_model for w in all_widgets[:num_models]]
+
+    def refresh(*current):
+        try:
+            if callable(webui_info.refresh_models):
+                names = list(webui_info.refresh_models())
+            else:
+                names = list(webui_info.model_mapping)
+        except Exception:  # noqa: BLE001 — keep the menus as they are
+            return [gr.update() for _ in current]
+        live = [ref() for ref in list(_MODEL_DROPDOWNS)]
+        _sync_model_choices([dd for dd in live if dd is not None], names)
+        updates = []
+        for n, value in enumerate(current):
+            choices = _model_choices(names, n)
+            keep = value if value in choices else choices[0]
+            updates.append(gr.update(choices=choices, value=keep))
+        return updates
+
+    for w in all_widgets[:num_models]:
+        w.ad_model_refresh.click(
+            fn=refresh, inputs=dropdowns, outputs=dropdowns, queue=False
+        )
 
 
 def _copyable_attrs() -> list[str]:
@@ -3095,6 +3158,15 @@ def one_ui_group(
                 elem_id=eid("ad_model"),
                 info="Select a model to use for detection.",
             )
+            # Wired in _wire_model_refresh, after every tab exists.
+            w.ad_model_refresh = gr.Button(
+                value="\U0001F504",
+                elem_id=eid("ad_model_refresh"),
+                elem_classes=["tool", "ad-model-refresh"],
+                scale=0,
+                min_width=40,
+            )
+        _MODEL_DROPDOWNS.append(weakref.ref(w.ad_model))
 
         # For a RESTORED YOLO-World detector, on_ad_model_update has NOT run yet
         # (it fires on ad_model.change, not at initial render), so its world

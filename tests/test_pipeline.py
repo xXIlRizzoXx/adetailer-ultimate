@@ -14,6 +14,7 @@ import random
 import re
 import sys
 import time
+from collections import OrderedDict
 from contextlib import nullcontext
 from copy import copy
 from pathlib import Path
@@ -556,6 +557,15 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
     if "_postprocess_image_inner" in methods:
         functions = {*functions, "_empty_prompt_note"}
         assigns = {*assigns, "_PROMPT_TOKEN_RE"}
+    # And the "applied ad_prompt" line, which ignores the removed comments.
+    if "compare_prompt" in methods:
+        functions = {*functions, "_strip_host_comments"}
+    # And what looks a detector up, which reads the detector folders again.
+    if "get_ad_model" in methods or "_clear_missing_class_prompts" in functions:
+        functions = {*functions, "_known_model", "refresh_model_mapping"}
+        assigns = {*assigns, "_XYZ_MODEL_LIST"}
+    if "make_axis_on_xyz_grid" in functions:
+        assigns = {*assigns, "_XYZ_MODEL_LIST"}
     tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
     selected = ast.parse("from __future__ import annotations").body
     for node in tree.body:
@@ -564,6 +574,8 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
         elif isinstance(node, ast.Assign) and any(
             getattr(target, "id", "") in assigns for target in node.targets
         ):
+            selected.append(node)
+        elif isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") in assigns:
             selected.append(node)
         elif (
             isinstance(node, ast.ClassDef)
@@ -1620,8 +1632,10 @@ def _ui_split_sampler_name():
 def _paste_callback(
     skipped=(), schedulers=("Automatic", "Uniform", "Karras", "Exponential"),
     model_mapping=None, samplers=("DPM++ 2M", "DPM++ 2M SDE", "Euler", "Euler a"),
+    **host,
 ):
     return _load_script(
+        **host,
         functions={"_clear_missing_class_prompts", "_scheduler_endings"},
         assigns={
             "_INFOTEXT_MODEL_KEY",
@@ -1631,7 +1645,7 @@ def _paste_callback(
         # Empty: no installed-detector check, as for a WebUI without models.
         model_mapping=model_mapping or {},
         shared=SimpleNamespace(
-            opts=SimpleNamespace(infotext_skip_pasting=list(skipped))
+            opts=SimpleNamespace(infotext_skip_pasting=list(skipped), data={})
         ),
         all_samplers=[SimpleNamespace(name=n) for n in samplers],
         # A label, or a scheduler with its name and aliases too.
@@ -7219,6 +7233,28 @@ def test_adetailer_prompt_comments_follow_the_webui_option():
     assert missing.AfterDetailerScript().get_prompt(p, args)[0] == ["detailed face # note"]
 
 
+@pytest.mark.parametrize("strip", [_a1111_strip_comments, _neo_strip_comments])
+def test_a_lora_commented_out_in_an_adetailer_prompt_is_not_applied(strip):
+    # Issue #7: LoRAs toggled off with `#` lines in a tab's prompt were still
+    # loaded, because the comment reached the model with the LoRA tag in it.
+    from adetailer.args import ADetailerArgs
+
+    script = _comments_runtime(None, strip).AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="a woman", negative_prompt="", styles=[],
+        all_prompts=["a woman"], all_negative_prompts=[""],
+    )
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt",
+        ad_prompt="detailed face\n<lora:kept:1>\n# <lora:off:1>\n#<lora:off2:0.8>",
+    )
+
+    prompt = script.get_prompt(p, args)[0][0]
+
+    assert "<lora:kept:1>" in prompt
+    assert "lora:off" not in prompt
+
+
 @pytest.mark.parametrize(
     ("tab", "expected"),
     [
@@ -7302,6 +7338,252 @@ def test_pasting_a_detector_that_is_not_installed_leaves_its_tab_and_adetailer_o
     out = capsys.readouterr().out
     assert out.isascii()
     assert out.count("is not installed") == len(dropped)
+
+
+def _detector_folders(fresh):
+    # get_models as the folders are now; records whether it went online,
+    # and in get_models.dirs the folders it was asked to read.
+    calls = []
+
+    def get_models(*dirs, huggingface=True):
+        calls.append(huggingface)
+        get_models.dirs.append(dirs)
+        if isinstance(fresh, BaseException):
+            raise fresh
+        return OrderedDict(fresh)
+
+    get_models.dirs = []
+    return get_models, calls
+
+
+def test_a_detector_added_while_the_webui_runs_is_found(tmp_path, capsys):
+    # Issue #8: a detector copied into the folders after the start failed
+    # Generate ("not found") until a restart or Settings > Reload UI.
+    mapping = OrderedDict([("face_yolov8n.pt", "a/face_yolov8n.pt")])
+    get_models, calls = _detector_folders(
+        [("face_yolov8n.pt", "a/face_yolov8n.pt"), ("new.pt", "b/new.pt")]
+    )
+    runtime = _load_script(
+        methods={"get_ad_model"},
+        model_mapping=mapping,
+        get_models=get_models,
+        adetailer_dir=tmp_path,
+        shared=SimpleNamespace(opts=SimpleNamespace(data={"ad_extra_models_dir": "x|y"})),
+    )
+    runtime._XYZ_MODEL_LIST[:] = ["None", "face_yolov8n.pt"]
+
+    assert runtime.AfterDetailerScript().get_ad_model("new.pt") == "b/new.pt"
+    # Read again without the network, into the same dict the UI and the API
+    # hold, and into the X/Y/Z axes' list.
+    assert calls == [False]
+    # The extra folders of the setting are read again too, as at startup.
+    assert get_models.dirs == [(tmp_path, "x", "y")]
+    assert runtime.model_mapping is mapping
+    assert list(mapping) == ["face_yolov8n.pt", "new.pt"]
+    assert runtime._XYZ_MODEL_LIST == ["None", "face_yolov8n.pt", "new.pt"]
+    # A known detector does not read the folders.
+    runtime.AfterDetailerScript().get_ad_model("face_yolov8n.pt")
+    assert calls == [False]
+    with pytest.raises(ValueError, match="not found"):
+        runtime.AfterDetailerScript().get_ad_model("typo.pt")
+
+
+def test_a_detector_removed_while_the_webui_runs_leaves_the_list(tmp_path):
+    # A detector deleted from the folders leaves the menu and the X/Y/Z axes
+    # after the 🔄: kept, Generate would load a file that is gone.
+    mapping = OrderedDict(
+        [("face_yolov8n.pt", "a/face_yolov8n.pt"), ("old.pt", "b/old.pt")]
+    )
+    get_models, _calls = _detector_folders([("face_yolov8n.pt", "a/face_yolov8n.pt")])
+    runtime = _load_script(
+        methods={"get_ad_model"},
+        model_mapping=mapping,
+        get_models=get_models,
+        adetailer_dir=tmp_path,
+        shared=SimpleNamespace(opts=SimpleNamespace(data={})),
+    )
+    runtime._XYZ_MODEL_LIST[:] = ["None", "face_yolov8n.pt", "old.pt"]
+
+    assert runtime.refresh_model_mapping() == ["face_yolov8n.pt"]
+    assert runtime.model_mapping is mapping
+    assert list(mapping) == ["face_yolov8n.pt"]
+    assert runtime._XYZ_MODEL_LIST == ["None", "face_yolov8n.pt"]
+    with pytest.raises(ValueError, match="not found"):
+        runtime.AfterDetailerScript().get_ad_model("old.pt")
+
+
+def test_a_failed_folder_read_keeps_the_detector_list(tmp_path, capsys):
+    mapping = OrderedDict([("face_yolov8n.pt", "a/face_yolov8n.pt")])
+    get_models, _calls = _detector_folders(OSError("disk"))
+    runtime = _load_script(
+        methods={"get_ad_model"},
+        model_mapping=mapping,
+        get_models=get_models,
+        adetailer_dir=tmp_path,
+        shared=SimpleNamespace(opts=SimpleNamespace(data={})),
+    )
+
+    assert runtime.refresh_model_mapping() == ["face_yolov8n.pt"]
+    # No extra folders set: only the detector folder (as at startup).
+    assert get_models.dirs == [(tmp_path, "")]
+    assert list(mapping) == ["face_yolov8n.pt"]
+    assert "couldn't read the detector folders again" in capsys.readouterr().out
+
+
+def test_a_detector_replaced_by_one_of_the_same_name_gets_its_new_classes(tmp_path):
+    # The class names are kept per path for the session: after the 🔄 a
+    # detector replaced by a file of the same name kept the old names, and a
+    # class filter "hand" picked the id of another class of the new model.
+    from adetailer.classes import get_model_class_names, resolve_class_ids
+
+    pt = tmp_path / "parts.pt"
+    pt.write_bytes(b"x")
+    sidecar = tmp_path / "parts.names.json"
+    sidecar.write_text('["face", "hand"]', encoding="utf-8")
+    mapping = OrderedDict([("parts.pt", str(pt))])
+
+    def runtime_with(fresh):
+        get_models, _calls = _detector_folders(fresh)
+        return _load_script(
+            functions={"refresh_model_mapping"},
+            assigns={"_XYZ_MODEL_LIST"},
+            model_mapping=mapping,
+            get_models=get_models,
+            get_model_class_names=get_model_class_names,
+            adetailer_dir=tmp_path,
+            shared=SimpleNamespace(opts=SimpleNamespace(data={})),
+        )
+
+    get_model_class_names.cache_clear()
+    try:
+        assert resolve_class_ids(str(pt), ["hand"]) == [1]
+        sidecar.write_text('["eyes", "mouth", "hand"]', encoding="utf-8")
+        # A failed folder read changes nothing, the names neither.
+        runtime_with(OSError("disk")).refresh_model_mapping()
+        assert get_model_class_names(str(pt)) == ["face", "hand"]
+
+        runtime_with([("parts.pt", str(pt))]).refresh_model_mapping()
+
+        assert get_model_class_names(str(pt)) == ["eyes", "mouth", "hand"]
+        assert resolve_class_ids(str(pt), ["hand"]) == [2]
+    finally:
+        get_model_class_names.cache_clear()
+
+
+def test_the_refresh_button_is_given_the_folder_read():
+    # Without refresh_models the 🔄 only lists the names already in memory,
+    # and a detector copied into the folders stays missing (issue #8).
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    call = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "WebuiInfo"
+    )
+    keywords = {k.arg: ast.unparse(k.value) for k in call.keywords}
+    assert keywords.get("refresh_models") == "refresh_model_mapping"
+    assert keywords.get("model_mapping") == "model_mapping"
+
+
+def test_public_docs_describe_the_refresh_button_and_the_prompt_line_as_they_work():
+    # Beta 3's notes said the 🔄 has no hover text on a translated interface
+    # (its English tooltip is kept), that a Prompt S/R alone prints the
+    # "applied 1st ad_prompt" line (the saved prompt already has it), and the
+    # troubleshooting entry still asked for a restart after adding a detector.
+    docs = _public_docs()
+    readme, changelog = docs["README.md"], docs["CHANGELOG.md"]
+    beta3 = changelog[: changelog.index("## v26.2.0+plus.9.beta.2")]
+    tooltips = (_SCRIPT_PATH.parents[1] / "javascript" / "button-tooltips.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "adetailer_ad_model_refresh" in tooltips
+    for text in (readme, beta3):
+        assert "no hover text on a translated" not in text
+        assert "without a hover text on a translated" not in text
+    assert "hover text stays in English on a translated interface" in beta3
+    assert "hover text stays in English on a translated interface" in readme
+    assert "a Prompt S/R or the text appended" not in beta3
+    assert "such as `[SEP]`, a wildcard or the text appended to it" in beta3
+    folder = next(
+        line for line in readme.splitlines()
+        if line.startswith("- The file must be in `models/adetailer`")
+    )
+    assert "click 🔄" in folder
+    # The class-name file is read again after the 🔄 too, and the beta 3
+    # notes, the users' requests table and the features list name the 🔄.
+    sidecar = next(
+        line for line in readme.splitlines()
+        if line.startswith("- Class names are looked up once per session")
+    )
+    assert "🔄" in sidecar
+    fixed = readme.split("#### Fixed in plus.9 beta 3", 1)[1].split("\n### ", 1)[0]
+    assert ".zip" in fixed
+    assert any(
+        line.startswith("| [#8](https://github.com/xXIlRizzoXx/adetailer-ultimate/issues/8)")
+        for line in readme.splitlines()
+    )
+    assert any(
+        line.startswith("| [#7](https://github.com/xXIlRizzoXx/adetailer-ultimate/issues/7)")
+        and "(#prompts)" in line
+        for line in readme.splitlines()
+    )
+    # The extra model folders are read again by the 🔄 and by an unknown
+    # detector name, not only by Reload UI.
+    reset = next(
+        line for line in readme.splitlines()
+        if line.startswith("| 🔄 Reset ADetailer settings to defaults")
+    )
+    assert "extra model folders change only after" not in reset
+    assert "🔄" in reset.split("Max tabs", 1)[1]
+    features = readme.split("### Detection and classes", 1)[1].split("\n### ", 1)[0]
+    assert "🔄" in features
+
+
+def test_pasting_a_detector_added_while_the_webui_runs_keeps_it(tmp_path, capsys):
+    from adetailer.args import ADetailerArgs
+
+    mapping = OrderedDict(_INSTALLED)
+    get_models, _calls = _detector_folders([*_INSTALLED.items(), ("face_yolov9c.pt", "b")])
+    params = _infotext(ADetailerArgs(ad_model="face_yolov9c.pt", ad_prompt="a face"))
+
+    _paste_callback(
+        model_mapping=mapping, get_models=get_models, adetailer_dir=tmp_path
+    )._clear_missing_class_prompts("", params)
+
+    assert params["ADetailer model"] == "face_yolov9c.pt"
+    assert "is not installed" not in capsys.readouterr().out
+
+
+def test_the_applied_prompt_line_leaves_out_a_prompt_that_only_lost_its_comments(capsys):
+    # With the comments removed from the ADetailer prompts (plus.9 beta 1),
+    # every pass printed "applied 1st ad_prompt: '...\n\n...'" for a prompt
+    # that differed only by the user's own notes (issue #7).
+    comments = SimpleNamespace(
+        script_class=type("ScriptStripComments", (), {"__module__": "comments.py"}),
+        module=SimpleNamespace(strip_comments=_neo_strip_comments),
+    )
+    runtime = _load_script(
+        methods={"compare_prompt"}, ordinal=str, suffix=_ui_suffix(),
+        opts=SimpleNamespace(data={}), scripts=SimpleNamespace(scripts_data=[comments]),
+    )
+    typed = {
+        "ADetailer prompt": "<lora:a:1>\n# <lora:b:1>\ndetailed face",
+        "ADetailer negative prompt": "blurry // old",
+    }
+
+    runtime.AfterDetailerScript.compare_prompt(
+        typed, SimpleNamespace(all_prompts=["<lora:a:1>\n\ndetailed face"],
+                               all_negative_prompts=["blurry"]),
+    )
+    assert capsys.readouterr().out == ""
+
+    # Any other change is still printed.
+    runtime.AfterDetailerScript.compare_prompt(
+        typed, SimpleNamespace(all_prompts=["<lora:a:1>\n\ndetailed face, sharp eyes"],
+                               all_negative_prompts=["blurry"]),
+    )
+    out = capsys.readouterr().out
+    assert "ad_prompt: '<lora:a:1>\\n\\ndetailed face, sharp eyes'" in out
+    assert "ad_negative_prompt" not in out
 
 
 def _readme_section(start, end):
@@ -7972,6 +8254,56 @@ def test_xyz_axes_reach_every_tab_and_keep_the_old_labels(data, tabs):
     for value, expected_value in (("False", False), ("True", True), ("true", True)):
         enable.apply(pc, value, ["False", "True"])
         assert pc._ad_xyz_enable is expected_value
+
+
+def test_xyz_detector_axes_list_the_detectors_found_by_the_refresh(tmp_path):
+    # Issue #8: the X/Y/Z detector axes list the detectors that the 🔄 or a
+    # detector name not in the list found, without a restart.
+    from functools import partial
+
+    class AxisOption:
+        def __init__(self, label, type, apply, choices=None, **_kwargs):  # noqa: A002
+            self.label, self.choices = label, choices
+
+    grid = SimpleNamespace(
+        AxisOption=AxisOption,
+        axis_options=[AxisOption("Nothing", str, lambda *_a: None)],
+    )
+    script_class = type("Script", (), {"__module__": "xyz_grid.py"})
+    get_models, calls = _detector_folders(
+        [("face_yolov8n.pt", "a/face_yolov8n.pt"), ("new.pt", "b/new.pt")]
+    )
+    mapping = OrderedDict([("face_yolov8n.pt", "a/face_yolov8n.pt")])
+    runtime = _load_script(
+        functions={
+            "make_axis_on_xyz_grid", "set_value", "set_enable",
+            "search_and_replace_prompt", "refresh_model_mapping",
+        },
+        scripts=SimpleNamespace(
+            scripts_data=[SimpleNamespace(script_class=script_class, module=grid)]
+        ),
+        partial=partial,
+        model_mapping=mapping,
+        all_samplers=[],
+        schedulers=[],
+        get_cn_models=list,
+        opts=SimpleNamespace(data={"ad_max_models": 2}),
+        ordinal=_ui_ordinal(),
+        get_models=get_models,
+        adetailer_dir=tmp_path,
+        shared=SimpleNamespace(opts=SimpleNamespace(data={})),
+    )
+    runtime.make_axis_on_xyz_grid()
+    axis = {x.label: x for x in grid.axis_options}
+    labels = ["[ADetailer] ADetailer model 1st", "[ADetailer] ADetailer model 2nd"]
+    for label in labels:
+        assert axis[label].choices() == ["None", "face_yolov8n.pt"]
+
+    runtime.refresh_model_mapping()
+
+    assert calls == [False]
+    for label in labels:
+        assert axis[label].choices() == ["None", "face_yolov8n.pt", "new.pt"]
 
 
 def test_xyz_axes_are_skipped_without_the_xyz_script():
@@ -10185,6 +10517,318 @@ def test_xyz_prompt_sr_saves_as_typed_a_part_left_with_only_a_comment():
     script.process(p, True, False, {})
 
     assert p.extra_generation_params["ADetailer prompt"] == "[PROMPT=hat]\n# note"
+
+
+@pytest.mark.parametrize(
+    ("strip", "comment"),
+    [(_a1111_strip_comments, "# note"), (_neo_strip_comments, "// note"), (None, "")],
+)
+def test_xyz_prompt_sr_keeps_the_line_break_that_ends_a_comment_before_sep(strip, comment):
+    # "blue face # note\n[SEP] blue eyes" was saved on one line: pasted
+    # back, the comment ran to the end of the line and took "[SEP] red eyes"
+    # with it, so the second detection got the first one's prompt.
+    from types import SimpleNamespace as NS
+
+    from adetailer.args import ADetailerArgs
+
+    script = _xyz_record_runtime(strip)
+    script.get_args = lambda *_args: [
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt",
+            ad_prompt=f"blue face {comment}\n[SEP] blue eyes",
+            ad_negative_prompt=f"blue hands {comment}\n[SEP] blue ears",
+        )
+    ]
+    p = _xyz_record_photo(("blue", "red"))
+
+    script.process(p, True, False, {})
+
+    params = p.extra_generation_params
+    if not comment:
+        # Without a comment the saved text is as before.
+        assert params["ADetailer prompt"] == "red face [SEP] red eyes"
+        assert params["ADetailer negative prompt"] == "red hands [SEP] red ears"
+        return
+    assert params["ADetailer prompt"] == f"red face {comment}\n[SEP] red eyes"
+    assert params["ADetailer negative prompt"] == f"red hands {comment}\n[SEP] red ears"
+    # Pasted back, the pass gets both segments again.
+    pasted = _comments_runtime(None, strip).AfterDetailerScript()
+    photo = NS(
+        prompt="a", negative_prompt="", styles=[], all_prompts=["a"],
+        all_negative_prompts=[""],
+    )
+    positive, negative = pasted.get_prompt(
+        photo,
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt",
+            ad_prompt=params["ADetailer prompt"],
+            ad_negative_prompt=params["ADetailer negative prompt"],
+        ),
+    )
+    assert [s.strip() for s in positive] == ["red face", "red eyes"]
+    assert [s.strip() for s in negative] == ["red hands", "red ears"]
+
+
+@pytest.mark.parametrize(
+    ("strip", "comment"), [(_a1111_strip_comments, "#"), (_neo_strip_comments, "//")]
+)
+def test_xyz_prompt_sr_leaves_a_sep_commented_out_on_the_same_line_inactive(strip, comment):
+    # In "blue face # [SEP] blue eyes" the comment hides the [SEP] too: the
+    # pass uses one segment. Saved as "red face #\n[SEP] red eyes", it pasted
+    # back as two, so the second detection got a prompt the picture never had.
+    from types import SimpleNamespace as NS
+
+    from adetailer.args import ADetailerArgs
+
+    typed = f"blue face {comment} [SEP] blue eyes"
+    typed_negative = f"blue hands {comment} [SEP] blue ears"
+    photo = NS(
+        prompt="a", negative_prompt="", styles=[], all_prompts=["a"],
+        all_negative_prompts=[""],
+    )
+    run = _comments_runtime(None, strip).AfterDetailerScript()
+    positive, negative = run.get_prompt(
+        photo,
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=typed, ad_negative_prompt=typed_negative
+        ),
+    )
+    assert [s.strip() for s in positive] == ["blue face"]
+    assert [s.strip() for s in negative] == ["blue hands"]
+
+    script = _xyz_record_runtime(strip)
+    script.get_args = lambda *_args: [
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=typed, ad_negative_prompt=typed_negative
+        )
+    ]
+    p = _xyz_record_photo(("blue", "red"))
+
+    script.process(p, True, False, {})
+
+    params = p.extra_generation_params
+    assert params["ADetailer prompt"] == f"red face {comment} [SEP] red eyes"
+    assert params["ADetailer negative prompt"] == f"red hands {comment} [SEP] red ears"
+    # Pasted back, one segment, as in the generation.
+    pasted = _comments_runtime(None, strip).AfterDetailerScript()
+    positive, negative = pasted.get_prompt(
+        photo,
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt",
+            ad_prompt=params["ADetailer prompt"],
+            ad_negative_prompt=params["ADetailer negative prompt"],
+        ),
+    )
+    assert [s.strip() for s in positive] == ["red face"]
+    assert [s.strip() for s in negative] == ["red hands"]
+
+
+_SR_PHOTO = SimpleNamespace(
+    prompt="a photo", negative_prompt="blurry", styles=[],
+    all_prompts=["a photo"], all_negative_prompts=["blurry"],
+)
+
+
+def _sr_pass(strip, prompt, negative, pairs=()):
+    # The segments the detailer pass uses, with the S/R pairs of the cell.
+    from adetailer.args import ADetailerArgs
+
+    photo = copy(_SR_PHOTO)
+    if pairs:
+        photo._ad_xyz_prompt_sr = list(pairs)
+    return _comments_runtime(None, strip).AfterDetailerScript().get_prompt(
+        photo,
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=prompt, ad_negative_prompt=negative
+        ),
+    )
+
+
+def _sr_saved(strip, prompt, negative, pairs):
+    # The ADetailer prompts an X/Y/Z Prompt S/R cell saves.
+    from adetailer.args import ADetailerArgs
+
+    script = _xyz_record_runtime(strip)
+    script.get_args = lambda *_args: [
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=prompt, ad_negative_prompt=negative
+        )
+    ]
+    p = _xyz_record_photo(("", ""))
+    p._ad_xyz_prompt_sr = list(pairs)
+    script.process(p, True, False, {})
+    params = p.extra_generation_params
+    return params.get("ADetailer prompt", ""), params.get("ADetailer negative prompt", "")
+
+
+_SR_BLUE = (SimpleNamespace(s="blue", r="red", main=False),)
+_SR_BLUE_MAIN = (SimpleNamespace(s="blue", r="red", main=True),)
+_SR_A1111 = (_a1111_strip_comments, "#")
+_SR_NEO = (_neo_strip_comments, "//")
+_SR_BOTH_HOSTS = (
+    # A [SEP] a comment hides, with other parts on the next lines.
+    "blue face\n{c} [SEP] blue eyes\n[SEP] blue hands",
+    "blue face {c} note [SEP] blue eyes\n[SEP] blue hands",
+    "blue face {c} note\n[SEP] blue eyes",
+    "blue face {c} [SEP] blue eyes",
+    "blue face\n[SEP] blue eyes {c} n\n[SEP] blue hands",
+    "blue face {c} a [SEP] b [SEP] c\n[SEP] blue eyes {c} d [SEP] e\n[SEP] blue hands",
+    "blue face [SEP]\n{c} [SEP] hidden\nblue eyes",
+    "blue face {c} note\r\n[SEP] blue eyes {c} x [SEP] y\r\n[SEP] blue hands",
+    "{c} [SEP] only comment\nblue face [SEP] blue eyes",
+    "blue face [SEP] blue eyes {c} trailing",
+    "blue face {c} [SEP]",
+    "blue face\n{c} note\n[SEP] blue eyes",
+    "[PROMPT=hat] {c} x [SEP] y\n[SEP] blue eyes",
+    # An empty [PROMPT=...] token takes the line break that ends a comment.
+    "blue face {c} note\n[PROMPT=hat], smile",
+    "blue face {c}old[PROMPT=hat]\nsmile",
+    # [SEP] next to each other, first, last, with [SKIP].
+    "blue face {c} x [SEP][SEP] y\n[SEP] blue eyes",
+    "[SEP] blue face {c} x [SEP] y\n[SEP] blue eyes",
+    "blue face {c} x [SEP] y\n[SEP]",
+    "blue face {c} x [SEP] y\n[SEP] [SKIP]\n[SEP] blue eyes",
+    # A lone carriage return does not end a comment.
+    "blue face {c} x\r[SEP] blue eyes",
+    # Tokens inside a comment.
+    "blue face {c} [PROMPT=a]\n[SEP] blue eyes",
+    "blue face {c} x [SEP] y\n[SEP] [PROMPT], blue eyes",
+)
+
+
+@pytest.mark.parametrize(
+    ("strip", "typed", "pairs"),
+    [
+        *[
+            (strip, typed.format(c=c), pairs)
+            for strip, c in (_SR_A1111, _SR_NEO)
+            for typed in _SR_BOTH_HOSTS
+            for pairs in (_SR_BLUE, _SR_BLUE_MAIN)
+        ],
+        *[
+            (strip, f"blue face {c} a [SEP] b\n[SEP] blue eyes",
+             (SimpleNamespace(s="a [SEP] b", r="q", main=False),))
+            for strip, c in (_SR_A1111, _SR_NEO)
+        ],
+        (_a1111_strip_comments, " eyes # [SEP] [SEP] #[PROMPT=hat]\r\n // face", _SR_BLUE),
+        (_a1111_strip_comments, "blue face #[SEP]# y\n[SEP] blue eyes", _SR_BLUE),
+        (_a1111_strip_comments, "blue face a#b [SEP] c\n[SEP] blue eyes", _SR_BLUE),
+        # '//' is not a comment on AUTOMATIC1111.
+        (_a1111_strip_comments, "blue face // x [SEP] blue eyes", _SR_BLUE),
+        # Forge Neo: block comments, '#' comments, URLs.
+        (_neo_strip_comments, "blue face /* x [SEP] y\n z */ [SEP] blue eyes", _SR_BLUE),
+        (_neo_strip_comments, "blue face /* [SEP] */ blue eyes [SEP] blue hands", _SR_BLUE),
+        (
+            _neo_strip_comments,
+            "blue face /* a */ [SEP] blue eyes // b [SEP] c\n[SEP] blue hands", _SR_BLUE,
+        ),
+        (_neo_strip_comments, "blue face # x [SEP] y\n[SEP] blue eyes", _SR_BLUE),
+        (_neo_strip_comments, "blue face /* open [SEP] blue eyes", _SR_BLUE),
+        (_neo_strip_comments, "blue face\t//\tx\t[SEP]\ty \n \t[SEP]\tblue eyes", _SR_BLUE),
+        (_neo_strip_comments, "blue face /[SEP]/ y [SEP] blue eyes", _SR_BLUE),
+        (_neo_strip_comments, "blue face /[SEP]* y */ [SEP] blue eyes", _SR_BLUE),
+        (
+            _neo_strip_comments,
+            "blue face // x /* y\n[SEP] z */ [SEP] blue eyes\n[SEP] blue hands", _SR_BLUE,
+        ),
+        (
+            _neo_strip_comments,
+            "blue face <lora:x:0.8> http://a.b/c [SEP] d\n[SEP] blue eyes", _SR_BLUE,
+        ),
+        # Without the Comments script (or with its option off).
+        (None, "blue face # x [SEP] blue eyes\n[SEP] blue hands", _SR_BLUE),
+    ],
+)
+def test_xyz_prompt_sr_saved_prompt_pastes_back_as_the_generation_parts(strip, typed, pairs):
+    # The host's own comment rules decide which [SEP] split the pass; the
+    # saved text, pasted back (PNG Info, Send to), gives the same parts.
+    used_positive, used_negative = _sr_pass(strip, typed, typed, pairs)
+    saved_positive, saved_negative = _sr_saved(strip, typed, typed, pairs)
+    pasted_positive, pasted_negative = _sr_pass(strip, saved_positive, saved_negative)
+    assert [s.strip() for s in pasted_positive] == [s.strip() for s in used_positive], (
+        saved_positive
+    )
+    assert [s.strip() for s in pasted_negative] == [s.strip() for s in used_negative], (
+        saved_negative
+    )
+
+
+@pytest.mark.parametrize(
+    ("strip", "typed", "negative", "saved", "saved_negative"),
+    [
+        # As before: no comments, no [SEP], or no Comments script.
+        (_a1111_strip_comments, "blue face [SEP] blue eyes", "", "red face [SEP] red eyes", "blurry"),
+        (
+            _neo_strip_comments, "blue face\n[SEP]  blue eyes [SEP] blue hands", "x",
+            "red face [SEP] red eyes [SEP] red hands", "x",
+        ),
+        (None, "blue face # note\n[SEP] blue eyes", "", "red face # note [SEP] red eyes", "blurry"),
+        (_a1111_strip_comments, "blue face", "", "red face", "blurry"),
+        (_a1111_strip_comments, "blue face # note", "", "red face # note", "blurry"),
+        (
+            _a1111_strip_comments, "blue face # note\n[SEP] blue eyes", "",
+            "red face # note\n[SEP] red eyes", "blurry",
+        ),
+        (
+            _neo_strip_comments, "blue face // note\n[SEP] blue eyes", "",
+            "red face // note\n[SEP] red eyes", "blurry",
+        ),
+        (
+            _a1111_strip_comments, "blue face # [SEP] blue eyes", "",
+            "red face # [SEP] red eyes", "blurry",
+        ),
+        (
+            _neo_strip_comments, "blue face // [SEP] blue eyes", "",
+            "red face // [SEP] red eyes", "blurry",
+        ),
+        (_a1111_strip_comments, "[PROMPT=hat]\n# note", "", "[PROMPT=hat]\n# note", "blurry"),
+        (_a1111_strip_comments, "blue face [SEP] ", "", "red face [SEP] a photo", "blurry"),
+        # A control character already typed stays as it is.
+        (
+            _a1111_strip_comments, "blue face \x04 x [SEP] blue eyes", "",
+            "red face \x04 x [SEP] red eyes", "blurry",
+        ),
+        (
+            _neo_strip_comments, "blue face \x04 x [SEP] blue eyes", "",
+            "red face \x04 x [SEP] red eyes", "blurry",
+        ),
+        # Without its comment this part would not give the pass's text: it
+        # is saved as the pass used it, the other parts keep their comments.
+        (
+            _a1111_strip_comments, "blue face # note\n[PROMPT=hat], smile", "",
+            "red face, smile", "blurry",
+        ),
+        (
+            _neo_strip_comments, "blue face // note\n[PROMPT=hat], smile [SEP] blue eyes # x",
+            "", "red face, smile [SEP] red eyes # x", "blurry",
+        ),
+        # A part left with only a comment is not swapped for the main prompt.
+        (_a1111_strip_comments, "blue face [SEP] # c", "", "red face [SEP] # c", "blurry"),
+        (_neo_strip_comments, "blue face [SEP] // c", "", "red face [SEP] // c", "blurry"),
+    ],
+)
+def test_xyz_prompt_sr_saved_prompt_text(strip, typed, negative, saved, saved_negative):
+    assert _sr_saved(strip, typed, negative, _SR_BLUE) == (saved, saved_negative)
+
+
+@pytest.mark.parametrize("strip", [None, _a1111_strip_comments, _neo_strip_comments])
+@pytest.mark.parametrize(
+    ("sr", "ad_prompt", "ad_negative", "saved", "saved_negative"),
+    [
+        (
+            ("blue", "red"), "[PROMPT=hat] [SEP] blue eyes", "[PROMPT=hat]",
+            "[PROMPT=hat] [SEP] red eyes", "[PROMPT=hat]",
+        ),
+        (("1.2", "1.5"), "([PROMPT=hat]:1.2)", "", "([PROMPT=hat]:1.5)", "blurry"),
+        (("hat", "cap"), "[PROMPT=hat]", "", "[PROMPT=hat]", "blurry"),
+        (("blue", "red"), "close-up, [PROMPT=hat]", "", "close-up", "blurry"),
+    ],
+)
+def test_xyz_prompt_sr_saved_token_parts_on_every_comment_rule(
+    strip, sr, ad_prompt, ad_negative, saved, saved_negative
+):
+    pairs = (SimpleNamespace(s=sr[0], r=sr[1], main=False),)
+    assert _sr_saved(strip, ad_prompt, ad_negative, pairs) == (saved, saved_negative)
 
 
 def test_xyz_prompt_sr_leaves_the_tokens_of_the_class_prompts_alone():

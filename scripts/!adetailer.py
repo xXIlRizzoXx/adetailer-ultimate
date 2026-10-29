@@ -173,6 +173,43 @@ print(
     f"[-] ADetailer initialized. version: {__version__}, num models: {len(model_mapping)}"
 )
 
+# The detector choices of the X/Y/Z plot axes, refreshed with model_mapping.
+_XYZ_MODEL_LIST: list[str] = []
+
+
+def refresh_model_mapping() -> list[str]:
+    """Read the detector folders again, for models added or removed while the
+    WebUI runs; return the detector names.
+
+    model_mapping is updated in place, as the UI, the API and the X/Y/Z axes
+    hold this same dict. Built-in models come from the local Hugging Face
+    cache only: no network. A failed scan keeps the old list.
+    """
+    try:
+        extra = shared.opts.data.get("ad_extra_models_dir", "")
+        fresh = get_models(adetailer_dir, *str(extra or "").split("|"), huggingface=False)
+    except Exception as e:  # noqa: BLE001 - never cost the caller its result
+        print(f"[-] ADetailer: couldn't read the detector folders again ({e}).")
+        return list(model_mapping)
+    model_mapping.clear()
+    model_mapping.update(fresh)
+    if _XYZ_MODEL_LIST:
+        _XYZ_MODEL_LIST[:] = ["None", *model_mapping]
+    # A detector replaced by a file of the same name may have other classes.
+    try:
+        get_model_class_names.cache_clear()
+    except Exception:  # noqa: BLE001
+        pass
+    return list(model_mapping)
+
+
+def _known_model(name: str) -> bool:
+    # A detector added after the start is found by reading the folders again.
+    if name in model_mapping:
+        return True
+    refresh_model_mapping()
+    return name in model_mapping
+
 
 # A1111/Forge LoRA + LyCORIS prompt syntax. Captures the full <lora:...> /
 # <lyco:...> tag including its weights so it can be re-appended verbatim.
@@ -1093,6 +1130,7 @@ class AfterDetailerScript(scripts.Script):
             vae_list=vae_list,
             text_encoders_list=text_encoders_list,
             model_mapping=model_mapping,
+            refresh_models=refresh_model_mapping,
             scheduler_endings=_scheduler_endings(),
         )
 
@@ -2079,7 +2117,7 @@ class AfterDetailerScript(scripts.Script):
             )
 
     def get_ad_model(self, name: str):
-        if name not in model_mapping:
+        if not _known_model(name):
             msg = f"[-] ADetailer: Model {name!r} not found. Available models: {list(model_mapping.keys())}"
             raise ValueError(msg)
         return model_mapping[name]
@@ -2222,14 +2260,25 @@ class AfterDetailerScript(scripts.Script):
         # sys.stdout, not the rich print: a prompt can hold "[..]" that rich
         # would treat as markup. ascii(), so a console pipe in a legacy code
         # page can print any character of it.
+        # A prompt that differs only by the comments the pass took out is not
+        # printed: those comments are the user's own notes.
+        def changed(typed, used):
+            if typed == used:
+                return False
+            if isinstance(typed, str) and isinstance(used, str):
+                return _strip_host_comments(typed).split() != used.split()
+            return True
+
         pt = "ADetailer prompt" + suffix(n)
-        if pt in extra_params and extra_params[pt] != processed.all_prompts[0]:
+        if pt in extra_params and changed(extra_params[pt], processed.all_prompts[0]):
             sys.stdout.write(
                 f"[-] ADetailer: applied {ordinal(n + 1)} ad_prompt: {processed.all_prompts[0]!a}\n"
             )
 
         ng = "ADetailer negative prompt" + suffix(n)
-        if ng in extra_params and extra_params[ng] != processed.all_negative_prompts[0]:
+        if ng in extra_params and changed(
+            extra_params[ng], processed.all_negative_prompts[0]
+        ):
             sys.stdout.write(
                 f"[-] ADetailer: applied {ordinal(n + 1)} ad_negative_prompt: {processed.all_negative_prompts[0]!a}\n"
             )
@@ -3008,6 +3057,38 @@ class AfterDetailerScript(scripts.Script):
 
     def _record_xyz_prompt_sr(self, p, arg_list: list[ADetailerArgs]) -> None:
         """Put in `arg_list` the prompts an X/Y/Z Prompt S/R cell saves."""
+        hidden = "\x04"  # a [SEP] a prompt comment hides: kept out of the split
+
+        # Which [SEP] the pass splits on, asked to the host itself: each one
+        # marked, the comments removed with the WebUI's own rules and option;
+        # a mark the comments took was hidden. Only those are swapped for
+        # `hidden`, so the parts below are the pass's own segments.
+        def protect(typed: str) -> str:
+            pieces = (typed or "").split("[SEP]")
+            if len(pieces) == 1 or hidden in typed:
+                return typed
+            marked = pieces[0] + "".join(
+                f"\x02{j}\x03" + piece for j, piece in enumerate(pieces[1:])
+            )
+            left = _strip_host_comments(marked)
+            out = pieces[0]
+            for j, piece in enumerate(pieces[1:]):
+                out += ("[SEP]" if f"\x02{j}\x03" in left else hidden) + piece
+            return out
+
+        # A part is kept with its comments only when, without them, it gives
+        # the pass's text (or nothing); else (an empty [PROMPT=...] that took
+        # the line break ending a comment) it is saved as the pass used it.
+        def checked(parts: list[str], used: list[str]) -> list[str]:
+            if len(parts) != len(used):
+                return parts
+
+            def same(part: str, segment: str) -> bool:
+                left = _strip_host_comments(part)
+                return not left.strip() or left.split() == segment.split()
+
+            return [a if same(a, b) else b for a, b in zip(parts, used)]
+
         # A part a [PROMPT=words] token left empty would paste back as a
         # blank part (the whole main prompt): save it as typed, the S/R
         # applied around its tokens.
@@ -3025,13 +3106,29 @@ class AfterDetailerScript(scripts.Script):
                     parts[k] = "".join(bits)
             return parts
 
+        # A part that ends inside a comment still open ends its line before
+        # [SEP]: on the same line, pasted back, the comment would hide the
+        # [SEP] and the parts after it. The hidden ones go back as [SEP].
+        def join(parts: list[str], typed: str) -> str:
+            text = ""
+            for k, part in enumerate(parts):
+                if k:
+                    open_end = "\x01" not in _strip_host_comments(parts[k - 1] + "\x01")
+                    text += "\n[SEP] " if open_end else " [SEP] "
+                text += part
+            return text if hidden in (typed or "") else text.replace(hidden, "[SEP]")
+
         # Record every [SEP] segment, without the append text and the
         # LoRA options the parameters save on their own: pasted back,
         # they would be applied a second time. Every tab: the S/R
         # reaches each tab's prompt in the detailer pass.
         for tab in arg_list:
+            positive = protect(tab.ad_prompt)
+            negative = protect(tab.ad_negative_prompt)
             bare = tab.copy(
                 update={
+                    "ad_prompt": positive,
+                    "ad_negative_prompt": negative,
                     "ad_prompt_append": "",
                     "ad_negative_prompt_append": "",
                     "ad_use_main_loras": False,
@@ -3041,12 +3138,17 @@ class AfterDetailerScript(scripts.Script):
             replaced_positive_prompt, replaced_negative_prompt = self.get_prompt(
                 p, bare, keep_comments=True
             )
-            replaced_positive_prompt = as_typed(bare.ad_prompt, replaced_positive_prompt)
-            replaced_negative_prompt = as_typed(
-                bare.ad_negative_prompt, replaced_negative_prompt
+            used_positive_prompt, used_negative_prompt = self.get_prompt(p, bare)
+            replaced_positive_prompt = as_typed(
+                positive, checked(replaced_positive_prompt, used_positive_prompt)
             )
-            tab.ad_prompt = " [SEP] ".join(replaced_positive_prompt)
-            tab.ad_negative_prompt = " [SEP] ".join(replaced_negative_prompt)
+            replaced_negative_prompt = as_typed(
+                negative, checked(replaced_negative_prompt, used_negative_prompt)
+            )
+            tab.ad_prompt = join(replaced_positive_prompt, tab.ad_prompt)
+            tab.ad_negative_prompt = join(
+                replaced_negative_prompt, tab.ad_negative_prompt
+            )
             # The sequential passes replace it in the per-class lines too,
             # after the class name, which stays as typed.
             if tab.ad_class_prompts:
@@ -4451,7 +4553,8 @@ def make_axis_on_xyz_grid():
     if xyz_grid is None:
         return
 
-    model_list = ["None", *model_mapping.keys()]
+    model_list = _XYZ_MODEL_LIST
+    model_list[:] = ["None", *model_mapping.keys()]
     xyz_samplers = [sampler.name for sampler in all_samplers]
     xyz_schedulers = [scheduler.label for scheduler in schedulers]
 
@@ -4727,7 +4830,7 @@ def _clear_missing_class_prompts(_infotext: str, params: dict) -> None:
             # and classes, and this detector does not switch ADetailer on.
             model = str(params[key])
             missing = model != "None" and bool(model_mapping) and (
-                model not in model_mapping
+                not _known_model(model)
             )
             detector = detector or (model != "None" and not missing)
             defaults = dict(_INFOTEXT_PASTE_DEFAULTS)

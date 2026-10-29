@@ -52,6 +52,10 @@
         adetailer_ad_preview_btn:
             "Run the configured detector against the input image WITHOUT inpainting. The result shows bounding boxes / masks so you can tune confidence + class filter before committing to a full generation.",
 
+        // Detector menu
+        adetailer_ad_model_refresh:
+            "Read the detector folders again, so a model added or removed while the WebUI runs shows up in the detector menu of every tab on this side (txt2img or img2img); the other side's menus follow after a page reload or with their own refresh button.",
+
         // Run ADetailer on an existing image (no re-generation)
         adetailer_ad_apply_btn:
             "Run the full ADetailer detect + inpaint pass on the input image, using this tab's detector / detailer checkpoint / prompt / LoRAs — without regenerating the base image. Tick 'Save result to outputs' to also write it to your outputs folder.",

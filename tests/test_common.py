@@ -101,6 +101,8 @@ def test_zip_in_the_detector_folders_is_named_once_and_the_list_is_unchanged(
     assert "eyes [v2].ZIP" in err
     assert "found 2 .zip file(s)" in err
     assert "extract the .pt file" in err
+    # From beta 3 the refresh button next to the detector menu is enough.
+    assert "click the refresh button next to the detector menu" in err
 
 
 def test_no_zip_message_without_zip_files(tmp_path, monkeypatch, capsys):

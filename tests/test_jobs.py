@@ -156,13 +156,16 @@ _EVENTS = {"click", "change", "input", "select", "upload", "submit", "release", 
 
 
 @pytest.mark.parametrize(
-    ("relpath", "expected"), [("aaaaaa/ui.py", 27), ("scripts/!adetailer.py", 1)]
+    ("relpath", "expected"), [("aaaaaa/ui.py", 28), ("scripts/!adetailer.py", 1)]
 )
 def test_no_new_gradio_event_listener(relpath, expected):
     # Forge numbers the event handlers (fn_index) in registration order, so a
-    # new listener shifts the WebUI's own handlers: the project adds none.
+    # new listener shifts the WebUI's own handlers: the project adds none
+    # without a live check of the gallery on AUTOMATIC1111 and Forge Neo
+    # (Send to, Save, a full page reload). The 28th is the detector menu's
+    # 🔄 .click (_wire_model_refresh, plus.9 beta 3, issue #8).
     # This counts the registration calls in the source (the project's grep
-    # also counts a comment in ui.py, hence its 28); a call inside a loop,
+    # also counts a comment in ui.py, hence its 29); a call inside a loop,
     # such as the per-setting .change of ALL_ARGS, counts once here, which is
     # why tests/test_args.py pins ALL_ARGS too.
     tree = ast.parse((_UI_PATH.parents[1] / relpath).read_text(encoding="utf-8"))

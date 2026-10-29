@@ -108,8 +108,8 @@ _ZIP_NAMES_SHOWN = 5
 
 
 def warn_zip_models(*dirs: str | os.PathLike[str]) -> None:
-    """Say once, when the model list is built, that a .zip in the detector
-    folders is not read. Many detectors on Civitai download as a .zip, and the
+    """Say, whenever the model list is built or read again, that a .zip in
+    the detector folders is not read. Many detectors on Civitai download as a .zip, and the
     model then simply never showed up in the list. The list itself is
     unchanged; any error here is ignored."""
     try:
@@ -133,8 +133,8 @@ def warn_zip_models(*dirs: str | os.PathLike[str]) -> None:
         msg = (
             f"[-] ADetailer: found {len(zips)} .zip file(s) in the detector"
             f" model folders ({names}). ADetailer only reads .pt files: extract"
-            " the .pt file from the .zip into the same folder and restart the"
-            " WebUI."
+            " the .pt file from the .zip into the same folder, then click the"
+            " refresh button next to the detector menu or restart the WebUI."
         )
         # Plain print, not rich (a file name with [brackets] is not markup),
         # and ASCII only, so a console in a legacy code page can print it.
