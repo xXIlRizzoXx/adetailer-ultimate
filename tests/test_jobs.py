@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -151,28 +152,124 @@ def test_no_event_forces_the_gradio_queue():
     assert forced == []
 
 
-_EVENTS = {"click", "change", "input", "select", "upload", "submit", "release", "then"}
+# The events of Gradio 3.41 and 4.40, and what chains or joins them.
+_EVENTS = {
+    "blur", "change", "click", "delete", "edit", "focus", "input", "key_up", "like",
+    "load", "on", "pause", "pause_recording", "play", "release", "select",
+    "start_recording", "stop", "stop_recording", "stream", "submit", "success",
+    "then", "tick", "unload", "upload",
+}
+# "clear", "end" and "apply" are Gradio events too, but also methods of dicts,
+# regular expression matches and other objects: such a call counts when it has
+# arguments. dict.clear() and re.Match.end() take none here; the one other call
+# with arguments, the WebUI's FilenameGenerator.apply() (namegen), is left out
+# by name.
+_LISTENER_ARGS = {"fn", "inputs", "outputs"}
+_PLAIN_RECEIVERS = {"namegen"}
+
+
+def _event_name(node):
+    # w.button.click(...) or getattr(w.button, "click")(...)
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr, getattr(node.func.value, "id", "")
+    if (
+        isinstance(node.func, ast.Call)
+        and getattr(node.func.func, "id", "") == "getattr"
+        and len(node.func.args) >= 2
+        and isinstance(node.func.args[1], ast.Constant)
+    ):
+        return node.func.args[1].value, ""
+    return None, ""
+
+
+def _is_listener_call(node):
+    name, receiver = _event_name(node)
+    if name is None:
+        return False
+    if name in _EVENTS or any(k.arg in _LISTENER_ARGS for k in node.keywords):
+        return True
+    if name in ("clear", "end", "apply") and receiver not in _PLAIN_RECEIVERS:
+        return bool(node.args or node.keywords)
+    return False
+
+
+def _listener_calls(source):
+    return [
+        f"{node.lineno}:{_event_name(node)[0]}"
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and _is_listener_call(node)
+    ]
 
 
 @pytest.mark.parametrize(
-    ("relpath", "expected"), [("aaaaaa/ui.py", 27), ("scripts/!adetailer.py", 1)]
+    ("relpath", "expected"), [("aaaaaa/ui.py", 28), ("scripts/!adetailer.py", 1)]
 )
 def test_no_new_gradio_event_listener(relpath, expected):
     # Forge numbers the event handlers (fn_index) in registration order, so a
-    # new listener shifts the WebUI's own handlers: the project adds none.
+    # new listener shifts the WebUI's own handlers: the project adds none
+    # without a live check of the gallery on AUTOMATIC1111 and Forge Neo
+    # (Send to, Save, a full page reload). The 28th is the detector menu's
+    # 🔄 .click (_wire_model_refresh, plus.9 beta 3, issue #8).
     # This counts the registration calls in the source (the project's grep
-    # also counts a comment in ui.py, hence its 28); a call inside a loop,
+    # also counts a comment in ui.py, hence its 29); a call inside a loop,
     # such as the per-setting .change of ALL_ARGS, counts once here, which is
     # why tests/test_args.py pins ALL_ARGS too.
-    tree = ast.parse((_UI_PATH.parents[1] / relpath).read_text(encoding="utf-8"))
-    calls = [
-        f"{node.lineno}:{node.func.attr}"
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _EVENTS
-    ]
+    calls = _listener_calls((_UI_PATH.parents[1] / relpath).read_text(encoding="utf-8"))
     assert len(calls) == expected, calls
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        "blur", "change", "click", "delete", "edit", "focus", "input", "key_up",
+        "like", "load", "on", "pause", "pause_recording", "play", "release", "select",
+        "start_recording", "stop", "stop_recording", "stream", "submit", "success",
+        "then", "tick", "unload", "upload",
+    ],
+)
+def test_the_listener_count_sees_every_gradio_event(event):
+    # A listener of a kind the project does not use yet shifts fn_index all
+    # the same.
+    assert len(_listener_calls(f"w.ad_model.{event}(fn=None)")) == 1
+    assert len(_listener_calls(f"w.ad_model.{event}(print, None, None)")) == 1
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "w.ad_model.clear(fn=None)",
+        "w.ad_model.end(inputs=[])",
+        "w.ad_model.apply(outputs=[])",
+        "gr.on(triggers=[w.ad_model.change], fn=None)",
+        # The same events with the handler given by position or inside **.
+        "w.ad_preview.clear(print, None, None)",
+        "w.ad_preview.clear(queue=False, **wiring)",
+        "w.ad_preview.clear(_js='f')",
+        "w.ad_model.end(print, None, None)",
+        "w.ad_model.apply(print, w.ad_model, None)",
+        "w.ad_preview.end(print)",
+        "w.ad_preview.apply(print)",
+        "w.ad_preview.end(*wiring)",
+        'getattr(w.ad_preview, "click")(print, None, None)',
+    ],
+)
+def test_the_listener_count_sees_a_call_with_the_arguments_of_a_listener(source):
+    assert len(_listener_calls(source)) == 1
+
+
+def test_the_listener_count_sees_each_link_of_a_chain():
+    assert len(_listener_calls("w.button.click(fn=None).then(fn=None).success(fn=None)")) == 3
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "names.clear()", "word.end()", "copy.copy(data)", "namegen.apply(text)",
+        "x.sort(key=len)", 'inspect.signature(getattr(button, "click"))',
+    ],
+)
+def test_the_listener_count_leaves_out_the_plain_methods_of_the_same_name(source):
+    assert _listener_calls(source) == []
 
 
 def _wired_apply(monkeypatch, script):
@@ -489,6 +586,98 @@ def test_wired_same_folder_console_line_prints_on_a_legacy_code_page(
         assert b"\\u9854.png: no free '-ad' file name left." in console
 
 
+_HIDDEN_DIRS = "⚠️ Folder batch is disabled: the WebUI was started with --hide-ui-dir-config."
+
+
+def _hide_dirs(hidden):
+    sys.modules["modules.shared"].cmd_opts = SimpleNamespace(hide_ui_dir_config=hidden)
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_is_refused_with_hide_ui_dir_config(
+    host, monkeypatch, tmp_path, same_folder
+):
+    # The WebUI blocks its own folder batches with this flag, the one a shared
+    # WebUI is started with: a guest must not read or write a server folder here.
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "private.png")
+    _hide_dirs(True)
+    calls = []
+
+    def detail(image, _args, save, tab=0):
+        calls.append(image)
+        return image, "✅ ADetailer pass complete."
+
+    callback = _wired_apply(monkeypatch, SimpleNamespace(run_detailer_on_image=detail))
+    tab = ("face.pt", "", "", False, 0.3, "face.pt")
+
+    assert callback(None, str(tmp_path), same_folder, True, *tab) == (None, _HIDDEN_DIRS)
+    # The folder wins over a dropped image, as it does without the flag.
+    dropped = Image.new("RGB", (8, 8), "white")
+    assert callback(dropped, f'"{tmp_path}"', same_folder, True, *tab) == (None, _HIDDEN_DIRS)
+    assert calls == []
+    assert [f.name for f in tmp_path.iterdir()] == ["private.png"]
+
+
+def test_hide_ui_dir_config_does_not_tell_whether_a_folder_exists(
+    host, monkeypatch, tmp_path
+):
+    _hide_dirs(True)
+    callback = _wired_apply(monkeypatch, SimpleNamespace())
+    tab = ("face.pt", "", "", False, 0.3, "face.pt")
+
+    missing = callback(None, str(tmp_path / "missing"), False, True, *tab)
+    assert missing == callback(None, str(tmp_path), False, True, *tab)
+    assert missing == (None, _HIDDEN_DIRS)
+
+
+def test_hide_ui_dir_config_keeps_the_single_image_run(host, monkeypatch):
+    _hide_dirs(True)
+    calls = []
+
+    def detail(image, _args, save, tab=0):
+        calls.append(save)
+        return image, "✅ ADetailer pass complete."
+
+    callback = _wired_apply(monkeypatch, SimpleNamespace(run_detailer_on_image=detail))
+    image = Image.new("RGB", (8, 8), "white")
+    gallery, status = callback(image, "", False, True, "face.pt", "", "", False, 0.3, "face.pt")
+
+    assert calls == [True]
+    assert gallery is not None
+    assert len(gallery) == 1
+    assert status == "✅ ADetailer pass complete."
+
+
+@pytest.mark.parametrize(
+    "cmd_opts",
+    [SimpleNamespace(hide_ui_dir_config=False), SimpleNamespace(), None, "absent"],
+    ids=["flag off", "host without the flag", "no cmd_opts value", "no cmd_opts"],
+)
+def test_wired_folder_runs_without_hide_ui_dir_config(
+    host, monkeypatch, tmp_path, cmd_opts
+):
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "a.png")
+    if cmd_opts != "absent":
+        sys.modules["modules.shared"].cmd_opts = cmd_opts
+    calls = []
+
+    def detail(image, _args, save, tab=0):
+        calls.append(save)
+        return image, "✅ ADetailer pass complete."
+
+    callback = _wired_apply(monkeypatch, SimpleNamespace(run_detailer_on_image=detail))
+    tab = ("face.pt", "", "", False, 0.3, "face.pt")
+    gallery, status = callback(None, str(tmp_path), False, True, *tab)
+
+    assert calls == [True]
+    assert len(gallery) == 1
+    assert status.startswith("✅ Batch done — 1 image(s): 1 detailed")
+    missing = tmp_path / "missing"
+    assert callback(None, str(missing), False, True, *tab) == (
+        None, f"⚠️ Folder not found: {missing}",
+    )
+
+
 def _wired_preview(monkeypatch, predict, script=None, **extra):
     """The real two-tab Detection preview wiring, with a stub detector."""
     detector = ModuleType("adetailer.ultralytics")
@@ -576,7 +765,7 @@ def test_combined_preview_reports_a_failed_detector(host, monkeypatch, second_ta
         return SimpleNamespace(bboxes=[], confidences=[], masks=[], preview=None)
 
     callback = _wired_preview(monkeypatch, predict)
-    image, status = callback(
+    image, status, _boxes = callback(
         Image.new("RGB", (8, 8), "white"), True,
         "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
     )
@@ -592,6 +781,208 @@ def test_combined_preview_reports_a_failed_detector(host, monkeypatch, second_ta
         assert status.startswith("⚠️ Preview failed")
         assert "Tab2: ERR (simulated detector failure)" in status
         assert "No detections" not in status
+
+
+@pytest.mark.parametrize(
+    ("combine", "found", "fails"),
+    [(True, True, False), (False, False, False), (False, True, True)],
+)
+def test_only_a_single_tab_preview_with_detections_gives_clickable_boxes(
+    host, monkeypatch, combine, found, fails
+):
+    # picker.js makes the boxes clickable from the third output. With "Combine
+    # all tabs" each number belongs to its own tab, so there is nothing to
+    # pick; with no detection or a failed detector there are no boxes. Every
+    # such answer clears the boxes of an earlier preview.
+    def predict(_path, **_kwargs):
+        if fails:
+            msg = "simulated detector failure"
+            raise RuntimeError(msg)
+        boxes = [[1, 2, 5, 6]] if found else []
+        return SimpleNamespace(
+            bboxes=boxes, confidences=[0.9] * len(boxes), masks=[],
+            preview=Image.new("RGB", (8, 8)) if found else None,
+            class_names=["face"] * len(boxes),
+        )
+
+    callback = _wired_preview(monkeypatch, predict)
+    _image, status, boxes = callback(
+        Image.new("RGB", (8, 8), "white"), combine,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    if combine:
+        # Only the picture without labels, for "Show labels": no boxes.
+        assert "boxes" not in json.loads(boxes)
+    else:
+        assert boxes == ""
+    assert "Click the boxes" not in status
+
+
+def _plain_of(boxes_json):
+    import base64
+
+    url = json.loads(boxes_json)["plain"]
+    head, data = url.split(",", 1)
+    assert head == "data:image/jpeg;base64"
+    return Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB")
+
+
+@pytest.mark.parametrize("has_plain", [True, False])
+def test_single_tab_preview_sends_the_picture_without_labels(
+    host, monkeypatch, has_plain
+):
+    # "Show labels" off shows the detector's picture drawn without names and
+    # scores; it travels in the hidden boxes field, so no output is added.
+    asked = []
+    plain = Image.new("RGB", (64, 32), (0, 0, 255))
+
+    def predict(_path, **kwargs):
+        asked.append(kwargs.get("plain_preview"))
+        return SimpleNamespace(
+            bboxes=[[1, 2, 30, 20]], confidences=[0.9], masks=[],
+            preview=Image.new("RGB", (64, 32), (255, 0, 0)), class_names=["face"],
+            **({"preview_plain": plain} if has_plain else {}),
+        )
+
+    callback = _wired_preview(
+        monkeypatch, predict, _draw_detection_numbers=lambda img, *_a: img
+    )
+    image, _status, boxes = callback(
+        Image.new("RGB", (64, 32), "white"), False,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert asked == [True]
+    data = json.loads(boxes)
+    assert (data["w"], data["h"]) == (64, 32)
+    assert data["boxes"] == [[1, 2, 30, 20]]
+    if not has_plain:
+        assert "plain" not in data
+        return
+    got = _plain_of(boxes)
+    assert got.size == image.size
+    r, g, b = got.getpixel((10, 10))
+    assert b > 200 and r < 50  # the plain picture, not the labelled one
+
+
+def test_single_tab_plain_picture_of_another_size_is_left_out(host, monkeypatch):
+    def predict(_path, **_kwargs):
+        return SimpleNamespace(
+            bboxes=[[1, 2, 30, 20]], confidences=[0.9], masks=[],
+            preview=Image.new("RGB", (64, 32)), class_names=["face"],
+            preview_plain=Image.new("RGB", (32, 32)),
+        )
+
+    callback = _wired_preview(
+        monkeypatch, predict, _draw_detection_numbers=lambda img, *_a: img
+    )
+    _image, _status, boxes = callback(
+        Image.new("RGB", (64, 32), "white"), False,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+    assert "plain" not in json.loads(boxes)
+
+
+def test_mediapipe_plain_picture_is_drawn_without_class_names(host, monkeypatch):
+    # mediapipe_face_features writes each part's name on its preview; the
+    # picture without labels is drawn again with the same boxes and masks only.
+    pred = SimpleNamespace(
+        bboxes=[[0, 0, 10, 10]], confidences=[1.0], masks=["mask"],
+        preview=Image.new("RGB", (16, 16)), class_names=["eyes"],
+    )
+    drawn = []
+
+    def draw_preview(img, bboxes, masks, class_names=None):
+        drawn.append((img.size, bboxes, masks, class_names))
+        return Image.new("RGB", img.size, (0, 255, 0))
+
+    mediapipe = ModuleType("adetailer.mediapipe")
+    mediapipe.mediapipe_predict = lambda *_args, **_kwargs: pred
+    mediapipe.draw_preview = draw_preview
+    monkeypatch.setitem(sys.modules, "adetailer.mediapipe", mediapipe)
+    callback = _wired_preview(
+        monkeypatch, lambda *_a, **_k: None, _draw_detection_numbers=lambda img, *_a: img
+    )
+    _image, _status, boxes = callback(
+        Image.new("RGB", (16, 16), "white"), False,
+        "mediapipe_face_features", "", "", False, 0.3, "hand.pt", "", "", False, 0.3,
+        "mediapipe_face_features",
+    )
+
+    assert drawn == [((16, 16), [[0, 0, 10, 10]], ["mask"], None)]
+    r, g, b = _plain_of(boxes).getpixel((8, 8))
+    assert g > 200 and r < 50 and b < 50
+
+
+def test_combined_preview_sends_its_picture_without_labels(host, monkeypatch):
+    # Combine all tabs: the copy has the tints and outlines but none of the
+    # label chips; it differs from the labelled preview only where they are.
+    from PIL import ImageChops, ImageDraw
+
+    chips = []
+    rectangle = ImageDraw.ImageDraw.rectangle
+
+    def record(self, xy, *args, **kwargs):
+        if kwargs.get("fill") is not None:
+            chips.append(list(xy))
+        return rectangle(self, xy, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "rectangle", record)
+
+    def predict(path, **_kwargs):
+        found = [[40, 90, 160, 200]] if "face" in path else [[180, 30, 240, 80]]
+        return SimpleNamespace(
+            bboxes=found, confidences=[0.9], masks=[], preview=None,
+            class_names=["face" if "face" in path else "hand"],
+        )
+
+    callback = _wired_preview(monkeypatch, predict)
+    image, _status, boxes = callback(
+        Image.new("RGB", (256, 256), "white"), True,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert "boxes" not in json.loads(boxes)
+    plain = _plain_of(boxes)
+    assert plain.size == image.size
+    diff = ImageChops.difference(image, plain).convert("L").point(lambda v: 255 * (v > 80))
+    changed = [
+        (x, y) for y in range(256) for x in range(256) if diff.getpixel((x, y))
+    ]
+    assert len(chips) == 2 and changed
+    # Every changed pixel lies on a label chip; the outlines are the same.
+    assert all(
+        any(c[0] <= x <= c[2] and c[1] <= y <= c[3] for c in chips) for x, y in changed
+    )
+    assert plain.getpixel((40, 150))[0] > 180  # the face tab's red outline
+    assert plain.getpixel((40, 150))[1] < 120
+
+
+def test_the_preview_boxes_field_has_no_label_and_no_listener():
+    # The boxes go out as a third output of the preview button's existing
+    # .click, into a field with no listener of its own (fn_index stays put)
+    # and no label, so the WebUI keeps nothing of it in ui-config.json.
+    tree = ast.parse(_UI_PATH.read_text(encoding="utf-8"))
+    made = [
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "attr", None) == "ad_preview_boxes" for t in node.targets)
+    ]
+    assert len(made) == 1
+    assert made[0].func.attr == "Textbox"
+    assert "label" not in {k.arg for k in made[0].keywords}
+    clicks = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "click"
+        and getattr(getattr(node.func, "value", None), "attr", None) == "ad_preview_btn"
+    ]
+    assert len(clicks) == 1
+    outputs = next(k.value for k in clicks[0].keywords if k.arg == "outputs")
+    assert [e.attr for e in outputs.elts] == [
+        "ad_preview_output", "ad_preview_status", "ad_preview_boxes",
+    ]
 
 
 def _load_draw_detection_numbers():
@@ -723,7 +1114,7 @@ def test_combined_preview_keeps_its_labels_with_a_bitmap_font(
         )
 
     callback = _wired_preview(monkeypatch, predict)
-    image, status = callback(
+    image, status, _boxes = callback(
         Image.new("RGB", (128, 128), "white"), True,
         "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
     )
@@ -763,7 +1154,7 @@ def _two_tab_combined_preview(monkeypatch):
     def run(face_boxes, hand_boxes):
         boxes.update({"models/face.pt": face_boxes, "models/hand.pt": hand_boxes})
         chips.clear()
-        image, status = callback(
+        image, status, _boxes = callback(
             Image.new("RGB", (256, 256), "white"), True,
             "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
         )
@@ -830,13 +1221,18 @@ def test_single_tab_preview_chips_get_the_class_names(host, monkeypatch, model):
     callback = _wired_preview(
         monkeypatch, lambda _path, **_kwargs: pred, _draw_detection_numbers=draw
     )
-    _image, status = callback(
+    _image, status, boxes = callback(
         Image.new("RGB", (16, 16), "white"), False,
         model, "", "", False, 0.3, "hand.pt", "", "", False, 0.3, model,
     )
 
-    assert status == "✅ 2 detection(s)."
+    assert status == "✅ 2 detection(s). Click the boxes to choose which to inpaint."
     assert calls == [(pred.bboxes, ["eyes", "nose"])]
+    # The boxes picker.js makes clickable: the picture's size and each box, in
+    # the order of the numbers drawn on it.
+    assert json.loads(boxes) == {
+        "w": 16, "h": 16, "boxes": [[0, 0, 10, 10], [2, 2, 12, 12]],
+    }
 
 
 def test_wired_folder_still_skips_an_unreadable_file(host, monkeypatch, tmp_path):
@@ -1626,7 +2022,7 @@ def test_combined_preview_label_text_sits_inside_its_label(host, monkeypatch, he
         )
 
     callback = _wired_preview(monkeypatch, predict)
-    (image, status), rects, texts = _chips_and_texts(
+    (image, status, _boxes), rects, texts = _chips_and_texts(
         monkeypatch, callback, Image.new("RGB", (640, height), "white"), True,
         "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
     )

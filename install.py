@@ -77,6 +77,7 @@ def install():
     ]
 
     pkgs = []
+    mediapipe_cmd = None
     for pkg, low, high in deps:
         if not is_installed(pkg, low, high):
             if low and high:
@@ -87,10 +88,26 @@ def install():
                 cmd = f"{pkg}<={high}"
             else:
                 cmd = pkg
-            pkgs.append(cmd)
+            if pkg == "mediapipe":
+                mediapipe_cmd = cmd
+            else:
+                pkgs.append(cmd)
 
     if pkgs:
         run_pip(*pkgs, *numpy_pin())
+
+    # Separate command: some platforms have no mediapipe 0.10.x wheel at all
+    # (Linux aarch64 on Python 3.13), and a failure there must not stop
+    # ultralytics from installing. Only the mediapipe_* detectors need it.
+    if mediapipe_cmd:
+        try:
+            run_pip(mediapipe_cmd, *numpy_pin())
+        except subprocess.CalledProcessError:
+            print(
+                f"[-] ADetailer: could not install {mediapipe_cmd}; the"
+                " mediapipe_* detectors will not work, the YOLO ones will.",
+                file=sys.stderr,
+            )
 
 
 try:

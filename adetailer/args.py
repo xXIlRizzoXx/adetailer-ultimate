@@ -261,7 +261,12 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
         return self.ad_model == MEDIAPIPE_FACE_FEATURES_MODEL
 
     def need_skip(self) -> bool:
-        return self.ad_model == "None" or self.ad_tab_enable is False
+        # An empty model (an API request) is off too, like "None".
+        return (
+            not self.ad_model.strip()
+            or self.ad_model == "None"
+            or self.ad_tab_enable is False
+        )
 
 
 _all_args = [
@@ -339,6 +344,18 @@ BBOX_SORTBY = [
     "Area (large to small)",
 ]
 
+# Settings > ADetailer "More sort orders", a separate setting: an older
+# version reading a new choice in ad_bbox_sortby would fail every
+# generation, while it ignores this key. "Off" keeps ad_bbox_sortby; the
+# other choices are SortBy 4, 5, ... in adetailer/mask.py, in this order.
+BBOX_SORTBY_MORE = [
+    "Off",
+    "Position (right to left)",
+    "Position (top to bottom)",
+    "Area (small to large)",
+    "Confidence (high to low)",
+]
+
 MASK_MERGE_INVERT = ["None", "Merge", "Merge and Invert"]
 
 _script_default = (
@@ -351,7 +368,18 @@ _script_default = (
 )
 SCRIPT_DEFAULT = ",".join(sorted(_script_default))
 
-_builtin_script = ("soft_inpainting", "hypertile_script")
+# reForge's "Advanced Model Sampling" scripts set the v-prediction / flow
+# sampling of the model: without them the detailer pass of such a model
+# comes out broken. These names come from Anzhc's aadetailer-reforge fork
+# (commit 2d1a12e). WebUIs without these scripts are not affected. The
+# reForge-RescaleCFG extension names its script file the same way, so it
+# also stays on in the detailer pass, as it does in that fork.
+_builtin_script = (
+    "soft_inpainting",
+    "hypertile_script",
+    "advanced_model_sampling_script",
+    "advanced_model_sampling_script_backported",
+)
 BUILTIN_SCRIPT = ",".join(sorted(_builtin_script))
 
 

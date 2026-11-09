@@ -5,7 +5,9 @@ from PIL import Image, ImageDraw
 
 from adetailer.mask import (
     bbox_area,
+    bbox_iou,
     dilate_erode,
+    filter_overlapping,
     has_intersection,
     is_all_black,
     mask_invert,
@@ -13,6 +15,8 @@ from adetailer.mask import (
     mask_preprocess,
     offset,
     parse_indices,
+    SortBy,
+    sort_bboxes,
 )
 
 
@@ -389,3 +393,223 @@ def test_mask_invert():
     draw.rectangle((3, 3, 5, 5), fill="black")
 
     assert np.array_equal(np.array(inverted[0]), np.array(expect))
+
+
+def _overlap_pred(bboxes, confidences=None, class_names=None):
+    from adetailer.common import PredictOutput
+
+    masks = []
+    for box in bboxes:
+        mask = Image.new("L", (512, 512), 0)
+        mask.paste(255, tuple(int(v) for v in box))
+        masks.append(mask)
+    return PredictOutput(
+        bboxes=[list(b) for b in bboxes],
+        masks=masks,
+        confidences=list(confidences or []),
+        preview=Image.new("RGB", (512, 512)),
+        class_names=list(class_names or []),
+    )
+
+
+def test_bbox_iou():
+    assert bbox_iou([0, 0, 10, 10], [0, 0, 10, 10]) == 1.0
+    assert bbox_iou([0, 0, 10, 10], [20, 20, 30, 30]) == 0.0
+    assert bbox_iou([0, 0, 10, 10], [10, 0, 20, 10]) == 0.0  # touching edges
+    assert bbox_iou([0, 0, 10, 10], [5, 0, 15, 10]) == pytest.approx(50 / 150)
+    assert bbox_iou([0, 0, 0, 0], [0, 0, 0, 0]) == 0.0  # empty boxes
+
+
+def test_filter_overlapping_keeps_the_more_confident_duplicate():
+    # One face found twice (boxes almost the same) plus a second face.
+    face = [100, 100, 200, 200]
+    twin = [104, 102, 204, 202]
+    other = [300, 100, 400, 200]
+    pred = _overlap_pred([face, twin, other], confidences=[0.6, 0.9, 0.8])
+    twin_mask = pred.masks[1]
+
+    out = filter_overlapping(pred, 0.6)
+
+    # Detector order is kept; every parallel list stays aligned.
+    assert out.bboxes == [twin, other]
+    assert out.confidences == [0.9, 0.8]
+    assert out.masks[0] is twin_mask
+    assert len(out.masks) == 2
+
+
+@pytest.mark.parametrize("max_overlap", [0, 0.0, -1])
+def test_filter_overlapping_off_changes_nothing(max_overlap):
+    pred = _overlap_pred([[0, 0, 100, 100], [0, 0, 100, 100]], [0.5, 0.9])
+    before = (list(pred.bboxes), list(pred.masks), list(pred.confidences))
+    out = filter_overlapping(pred, max_overlap)
+    assert (out.bboxes, out.masks, out.confidences) == before
+
+
+def test_filter_overlapping_keeps_small_boxes_inside_a_big_one():
+    # Eyes inside a face cover only a small part of it: the IoU stays low.
+    face = [100, 100, 300, 300]
+    eye_l = [140, 160, 180, 190]
+    eye_r = [220, 160, 260, 190]
+    pred = _overlap_pred([face, eye_l, eye_r], [0.9, 0.8, 0.7])
+    out = filter_overlapping(pred, 0.3)
+    assert out.bboxes == [face, eye_l, eye_r]
+
+
+def test_filter_overlapping_compares_only_the_same_class():
+    box = [100, 100, 200, 200]
+    near = [102, 100, 202, 200]
+    pred = _overlap_pred(
+        [box, near, box], [0.9, 0.95, 0.5], class_names=["face", "hand", "face"]
+    )
+    out = filter_overlapping(pred, 0.5)
+    # The hand stays (another class); the weaker second face goes.
+    assert out.bboxes == [box, near]
+    assert out.class_names == ["face", "hand"]
+    assert out.confidences == [0.9, 0.95]
+
+
+@pytest.mark.parametrize("confidences", [None, [1.0, 1.0, 1.0]])
+def test_filter_overlapping_without_or_with_equal_confidences(confidences):
+    # MediaPipe may report no score (1.0 for all): the earlier box wins.
+    a = [10, 10, 110, 110]
+    b = [12, 10, 112, 110]
+    c = [14, 10, 114, 110]
+    pred = _overlap_pred([a, b, c], confidences)
+    out = filter_overlapping(pred, 0.5)
+    assert out.bboxes == [a]
+    assert out.confidences == ([] if confidences is None else [1.0])
+    assert len(out.masks) == 1
+
+
+def test_filter_overlapping_one_or_no_detection():
+    from adetailer.common import PredictOutput
+
+    empty = PredictOutput()
+    assert filter_overlapping(empty, 0.5) is empty
+    one = _overlap_pred([[0, 0, 10, 10]], [0.9])
+    assert filter_overlapping(one, 0.5).bboxes == [[0, 0, 10, 10]]
+
+
+def test_filter_overlapping_threshold_is_strict():
+    # IoU exactly 1/3: dropped only when it is MORE than the setting.
+    a = [0, 0, 10, 10]
+    b = [5, 0, 15, 10]
+    assert len(filter_overlapping(_overlap_pred([a, b], [0.9, 0.8]), 0.4).bboxes) == 2
+    assert len(filter_overlapping(_overlap_pred([a, b], [0.9, 0.8]), 0.3).bboxes) == 1
+
+
+# Settings -> ADetailer -> "Sort bounding boxes by".
+
+
+def _sort_pred(confidences=(0.5, 0.9, 0.7)):
+    from adetailer.common import PredictOutput
+
+    # Three boxes: a small one on the right, a large one at the bottom left
+    # and a middle one at the top.
+    bboxes = [[300, 100, 360, 160], [10, 200, 210, 400], [120, 20, 220, 120]]
+    masks = [Image.new("L", (400, 400), n) for n in (1, 2, 3)]
+    return PredictOutput(
+        bboxes=[list(b) for b in bboxes],
+        masks=masks,
+        confidences=list(confidences),
+        preview=Image.new("RGB", (400, 400)),
+        class_names=["face", "hand", "eyes"][: len(bboxes)],
+    )
+
+
+def test_sort_choices_are_exactly_the_original_four():
+    from adetailer.args import BBOX_SORTBY
+
+    # An older version reads ad_bbox_sortby with BBOX_SORTBY.index() and fails
+    # every generation on a choice it does not know: new orders go in the
+    # separate "More sort orders" setting (BBOX_SORTBY_MORE), never here.
+    assert BBOX_SORTBY == [
+        "None",
+        "Position (left to right)",
+        "Position (center to edge)",
+        "Area (large to small)",
+    ]
+
+
+def test_more_sort_orders_map_to_the_sort_values_after_the_original_ones():
+    from adetailer.args import BBOX_SORTBY, BBOX_SORTBY_MORE
+
+    assert BBOX_SORTBY_MORE == [
+        "Off",
+        "Position (right to left)",
+        "Position (top to bottom)",
+        "Area (small to large)",
+        "Confidence (high to low)",
+    ]
+    assert len(BBOX_SORTBY) + len(BBOX_SORTBY_MORE) - 1 == len(SortBy)
+    assert [SortBy(len(BBOX_SORTBY) - 1 + i) for i in range(1, 5)] == [
+        SortBy.RIGHT_TO_LEFT,
+        SortBy.TOP_TO_BOTTOM,
+        SortBy.AREA_SMALL_TO_LARGE,
+        SortBy.CONFIDENCE,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("order_by", "order"),
+    [
+        (SortBy.LEFT_TO_RIGHT, [1, 2, 0]),
+        (SortBy.AREA, [1, 2, 0]),
+        (SortBy.RIGHT_TO_LEFT, [0, 2, 1]),
+        (SortBy.TOP_TO_BOTTOM, [2, 0, 1]),
+        (SortBy.AREA_SMALL_TO_LARGE, [0, 2, 1]),
+        (SortBy.CONFIDENCE, [1, 2, 0]),
+    ],
+)
+def test_sort_bboxes_keeps_masks_scores_and_classes_with_their_box(order_by, order):
+    original = _sort_pred()
+    pred = sort_bboxes(_sort_pred(), order_by)
+
+    assert pred.bboxes == [original.bboxes[i] for i in order]
+    assert [m.getpixel((0, 0)) for m in pred.masks] == [i + 1 for i in order]
+    assert pred.confidences == [original.confidences[i] for i in order]
+    assert pred.class_names == [original.class_names[i] for i in order]
+
+
+@pytest.mark.parametrize(
+    ("order_by", "bboxes"),
+    [
+        # The wide box ends further right but starts further left.
+        (SortBy.RIGHT_TO_LEFT, [[100, 0, 150, 50], [0, 0, 200, 100]]),
+        # The tall box starts higher but ends lower.
+        (SortBy.TOP_TO_BOTTOM, [[0, 10, 50, 20], [60, 0, 100, 200]]),
+    ],
+)
+def test_right_to_left_and_top_to_bottom_use_the_right_and_top_edges(order_by, bboxes):
+    from adetailer.common import PredictOutput
+
+    # Right to left goes by the right edge of each box and top to bottom by
+    # its top edge: here the other edge gives the opposite order.
+    pred = sort_bboxes(
+        PredictOutput(
+            bboxes=[list(b) for b in bboxes],
+            masks=[Image.new("L", (200, 200), n) for n in (1, 2)],
+            confidences=[0.9, 0.8],
+            preview=Image.new("RGB", (200, 200)),
+            class_names=["face", "hand"],
+        ),
+        order_by,
+    )
+
+    assert pred.bboxes == [bboxes[1], bboxes[0]]
+    assert [m.getpixel((0, 0)) for m in pred.masks] == [2, 1]
+    assert pred.confidences == [0.8, 0.9]
+    assert pred.class_names == ["hand", "face"]
+
+
+@pytest.mark.parametrize("confidences", [(), (0.9, 0.8)])
+def test_sort_by_confidence_without_one_score_per_box_keeps_the_order(confidences):
+    original = _sort_pred()
+    pred = sort_bboxes(_sort_pred(confidences), SortBy.CONFIDENCE)
+    assert pred.bboxes == original.bboxes
+
+
+def test_sort_by_confidence_keeps_the_detector_order_on_equal_scores():
+    original = _sort_pred((0.8, 0.8, 0.9))
+    pred = sort_bboxes(_sort_pred((0.8, 0.8, 0.9)), SortBy.CONFIDENCE)
+    assert pred.bboxes == [original.bboxes[i] for i in (2, 0, 1)]

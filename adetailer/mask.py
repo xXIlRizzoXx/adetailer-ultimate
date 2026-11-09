@@ -20,6 +20,10 @@ class SortBy(IntEnum):
     LEFT_TO_RIGHT = 1
     CENTER_TO_EDGE = 2
     AREA = 3
+    RIGHT_TO_LEFT = 4
+    TOP_TO_BOTTOM = 5
+    AREA_SMALL_TO_LARGE = 6
+    CONFIDENCE = 7
 
 
 class MergeInvert(IntEnum):
@@ -212,6 +216,16 @@ def _key_area(bbox: list[T]) -> T:
     return -bbox_area(bbox)
 
 
+def _key_right_to_left(bbox: list[T]) -> T:
+    """Right to left, by the right edge of [x1, y1, x2, y2]."""
+    return -bbox[2]
+
+
+def _key_top_to_bottom(bbox: list[T]) -> T:
+    """Top to bottom, by the top edge of [x1, y1, x2, y2]."""
+    return bbox[1]
+
+
 def sort_bboxes(
     pred: PredictOutput[T], order: int | SortBy = SortBy.NONE
 ) -> PredictOutput[T]:
@@ -226,11 +240,28 @@ def sort_bboxes(
         key = partial(_key_center_to_edge, center=center)
     elif order == SortBy.AREA:
         key = _key_area
+    elif order == SortBy.RIGHT_TO_LEFT:
+        # The mirror of left to right: by the right edge.
+        key = _key_right_to_left
+    elif order == SortBy.TOP_TO_BOTTOM:
+        key = _key_top_to_bottom
+    elif order == SortBy.AREA_SMALL_TO_LARGE:
+        key = bbox_area
+    elif order == SortBy.CONFIDENCE:
+        # Without one score per box (e.g. a detector that gives none) the
+        # order is kept as it is.
+        if not pred.confidences or len(pred.confidences) != len(pred.bboxes):
+            return pred
+        key = None
     else:
         raise RuntimeError
 
     items = len(pred.bboxes)
-    idx = sorted(range(items), key=lambda i: key(pred.bboxes[i]))
+    if key is None:
+        # Most confident first; equal scores keep the detector's order.
+        idx = sorted(range(items), key=lambda i: -pred.confidences[i])
+    else:
+        idx = sorted(range(items), key=lambda i: key(pred.bboxes[i]))
     pred.bboxes = [pred.bboxes[i] for i in idx]
     pred.masks = [pred.masks[i] for i in idx]
     if pred.confidences:
@@ -347,6 +378,56 @@ def filter_by_indices(pred: PredictOutput[T], spec: str) -> PredictOutput[T]:
         pred.confidences = [pred.confidences[i] for i in keep]
     if pred.class_names:
         pred.class_names = [pred.class_names[i] for i in keep]
+    return pred
+
+
+def bbox_iou(a: list[T], b: list[T]) -> float:
+    """Intersection over union of two [x1, y1, x2, y2] boxes (0.0 to 1.0)."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    inter = w * h
+    union = bbox_area(a) + bbox_area(b) - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def filter_overlapping(pred: PredictOutput[T], max_overlap: float) -> PredictOutput[T]:
+    """Drop a detection whose box overlaps a more confident one of the same
+    class by MORE than ``max_overlap`` (intersection over union), so the same
+    face found twice is inpainted once. ``0`` (or less) turns it off.
+
+    Intersection over union, not "share of the smaller box": eyes inside a
+    face cover a small part of the face box, so they are kept. Only boxes of
+    the same class are compared, because two classes the user asked for (a
+    face and a hand on it) are different regions with their own prompts; a
+    detector without class names (MediaPipe) counts as one class. Without
+    usable confidences, or on a tie, the earlier detection wins. The kept
+    detections stay in detector order and every parallel list stays aligned.
+    """
+    n = len(pred.bboxes)
+    if max_overlap <= 0 or n <= 1:
+        return pred
+    confs = pred.confidences if len(pred.confidences) == n else None
+    classes = pred.class_names if len(pred.class_names) == n else None
+    order = sorted(range(n), key=lambda i: -confs[i]) if confs else range(n)
+    kept: list[int] = []
+    for i in order:
+        if not any(
+            (classes is None or classes[i] == classes[k])
+            and bbox_iou(pred.bboxes[i], pred.bboxes[k]) > max_overlap
+            for k in kept
+        ):
+            kept.append(i)
+    if len(kept) == n:
+        return pred
+    keep = sorted(kept)
+    pred.bboxes = [pred.bboxes[i] for i in keep]
+    pred.masks = [pred.masks[i] for i in keep]
+    if confs:
+        pred.confidences = [confs[i] for i in keep]
+    if classes:
+        pred.class_names = [classes[i] for i in keep]
     return pred
 
 

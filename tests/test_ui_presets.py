@@ -14,6 +14,14 @@ from adetailer.args import ALL_ARGS
 from adetailer.classes import MEDIAPIPE_FACE_FEATURES_MODEL
 
 
+def _default_cn_module():
+    """controlnet_ext/common.py's default_cn_module (it only imports re)."""
+    path = Path(__file__).resolve().parents[1] / "controlnet_ext" / "common.py"
+    namespace = {}
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)
+    return namespace["default_cn_module"]
+
+
 class Component:
     def click(self, fn, **kwargs):
         self.callback = fn
@@ -32,7 +40,8 @@ def callbacks():
         "_do_import", "suffix", "_class_filter_infotext_fields",
         "_skipped_infotext_keys", "_tab_infotext_fields", "on_cn_model_update",
         "_do_export", "_do_export_status", "_format_preset_preview",
-        "_sync_preset_choices",
+        "_sync_preset_choices", "_model_choices", "_sync_model_choices",
+        "_added_model_update", "_md_safe",
     }
     functions = [
         node for node in ast.walk(source)
@@ -40,7 +49,9 @@ def callbacks():
         or (
             isinstance(node, (ast.Assign, ast.AnnAssign))
             and any(
-                getattr(t, "id", "") in {"_CLASS_FILTER_DEFAULTS", "_PRESET_DROPDOWNS"}
+                getattr(t, "id", "") in {
+                    "_CLASS_FILTER_DEFAULTS", "_PRESET_DROPDOWNS", "_MODEL_DROPDOWNS",
+                }
                 for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
             )
         )
@@ -68,6 +79,7 @@ def callbacks():
             "inpaint": ["inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"],
             "openpose": ["openpose", "openpose_face", "openpose_full"],
         },
+        "default_cn_module": _default_cn_module(),
     }
     exec(compile(module, str(path), "exec"), namespace)
     return namespace
@@ -78,6 +90,185 @@ def widgets():
         **{attr: Component() for attr in ALL_ARGS.attrs},
         ad_model_classes_dropdown=Component(),
     )
+
+
+def _paste_tab(result, tab, tabs, statuses=0):
+    """Tab `tab`'s argument updates plus its classes dropdown update, out of a
+    Paste answer: clipboard, Paste buttons, statuses, then every tab's
+    arguments (tab-major) and every tab's classes dropdown."""
+    count = len(ALL_ARGS.attrs)
+    base = 1 + tabs + statuses
+    return [
+        *result[base + tab * count: base + (tab + 1) * count],
+        result[base + tabs * count + tab],
+    ]
+
+
+def _wired_paste(callbacks, tabs, mapping=None):
+    all_widgets = [widgets() for _ in range(tabs)]
+    paste_buttons = [Component() for _ in range(tabs)]
+    options = [(Component(), Component()) for _ in range(tabs)]
+    statuses = [Component() for _ in range(tabs)]
+    callbacks["_wire_copy_paste"](
+        all_widgets, [Component() for _ in range(tabs)], paste_buttons,
+        Component(), tabs, mapping,
+        all_paste_options=options, all_status_mds=statuses,
+    )
+    return all_widgets, paste_buttons, options, statuses
+
+
+def _snapshot(model, prompt, enable):
+    return {
+        a: {"ad_model": model, "ad_prompt": prompt, "ad_tab_enable": enable}.get(a)
+        for a in ALL_ARGS.attrs
+    }
+
+
+def test_paste_reads_its_scope_checkboxes_and_this_tabs_values(callbacks):
+    tabs = 3
+    all_widgets, paste_buttons, options, statuses = _wired_paste(callbacks, tabs)
+    btn = paste_buttons[1]
+    attrs = list(ALL_ARGS.attrs)
+    assert btn.inputs[1:3] == list(options[1])
+    assert btn.inputs[3:] == [getattr(all_widgets[1], a) for a in attrs]
+    # Outputs span every tab, like "Reset every tab": clipboard, Paste
+    # buttons, statuses, every tab's arguments and classes dropdowns.
+    assert len(btn.outputs) == 1 + 2 * tabs + tabs * len(attrs) + tabs
+    assert btn.outputs[1 + tabs: 1 + 2 * tabs] == statuses
+    assert btn.outputs[-tabs:] == [w.ad_model_classes_dropdown for w in all_widgets]
+
+
+def test_plain_paste_still_changes_only_this_tab(callbacks):
+    tabs = 3
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs)
+    source = _snapshot("faces.pt", "a face", True)
+    current = list(_snapshot("animals.pt", "a dog", False).values())
+    result = paste_buttons[2].callback((0, list(source.values())), False, False, *current)
+    assert result[: 1 + 2 * tabs] == [{}] * (1 + 2 * tabs)  # clipboard, labels, status
+    pasted = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 2, tabs, tabs)))
+    assert pasted["ad_model"]["value"] == "faces.pt"
+    for t in (0, 1):
+        assert all(u == {} for u in _paste_tab(result, t, tabs, tabs))
+
+
+def test_swap_exchanges_the_two_tabs_and_empties_the_clipboard(callbacks):
+    tabs = 3
+    _, paste_buttons, _, _ = _wired_paste(
+        callbacks, tabs, {"faces.pt": "faces.pt", "custom-world.pt": "custom-world.pt"}
+    )
+    copied = _snapshot("faces.pt", "a face", True)
+    copied["ad_model_classes"] = "face"
+    here = _snapshot("custom-world.pt", "a red hat", False)
+    here["ad_model_classes"] = "red hat"
+    result = paste_buttons[2].callback(
+        (0, list(copied.values())), True, False, *here.values()
+    )
+    assert result[0] == (-1, [])  # the copy matches neither tab any more
+    assert result[1: 1 + tabs] == [
+        {"value": "\U0001F4E5 Paste settings", "interactive": False}
+    ] * tabs
+    status = result[1 + tabs: 1 + 2 * tabs]
+    assert status == [
+        "\U0001F501 Swapped with the 3rd tab.", {}, "\U0001F501 Swapped with the 1st tab."
+    ]
+    dst = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 2, tabs, tabs)))
+    src = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 0, tabs, tabs)))
+    assert (dst["ad_model"]["value"], dst["ad_prompt"]["value"]) == ("faces.pt", "a face")
+    assert dst["ad_tab_enable"]["value"] is True
+    assert (src["ad_model"]["value"], src["ad_prompt"]["value"]) == (
+        "custom-world.pt", "a red hat"
+    )
+    assert src["ad_tab_enable"]["value"] is False
+    # Each detector's class UI travels with it: YOLO-World keeps its typed
+    # vocabulary in the free-text field, the fixed-class detector its pick.
+    assert src["ad_model_classes"] == {"value": "red hat", "visible": True}
+    assert _paste_tab(result, 0, tabs, tabs)[-1]["choices"] == []
+    assert dst["ad_model_classes"]["visible"] is False
+    assert _paste_tab(result, 2, tabs, tabs)[-1]["value"] == ["face"]
+    assert all(u == {} for u in _paste_tab(result, 1, tabs, tabs))
+
+
+def test_paste_into_every_tab_gives_each_tab_its_own_updates(callbacks):
+    # As with "Reset every tab": Gradio 4 pops "value" out of each update in
+    # place, so tabs sharing one update object would be left unchanged.
+    tabs = 4
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs)
+    copied = _snapshot("faces.pt", "a face", True)
+    current = list(_snapshot("animals.pt", "a dog", False).values())
+    result = paste_buttons[0].callback((1, list(copied.values())), False, True, *current)
+    assert result[0] == {}  # the copy is still valid: kept
+    assert result[1: 1 + tabs] == [{}] * tabs
+    assert result[1 + tabs] == "\U0001F4E5 Pasted into every tab."
+    per_tab = [_paste_tab(result, t, tabs, tabs) for t in range(tabs)]
+    assert all(u == {} for u in per_tab[1])  # the copied tab is left alone
+    reached = [u for t in (0, 2, 3) for u in per_tab[t]]
+    assert len({id(u) for u in reached}) == len(reached)
+    for t in (0, 2, 3):
+        pasted = dict(zip(ALL_ARGS.attrs, per_tab[t]))
+        assert pasted["ad_model"].pop("value") == "faces.pt"
+        assert pasted["ad_tab_enable"]["value"] is True
+
+
+@pytest.mark.parametrize(
+    ("clipboard", "swap", "to_all"),
+    [
+        ((-1, []), True, False),  # nothing copied yet
+        ((-1, []), False, True),
+        ((1, "same tab"), True, False),  # the copied tab itself
+        ((5, "gone"), True, False),  # a tab that no longer exists
+        ((5, "gone"), False, True),
+        ((0, "copied"), True, True),  # both ticked: ambiguous
+    ],
+)
+def test_paste_that_cannot_apply_changes_no_tab(callbacks, clipboard, swap, to_all):
+    tabs = 3
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs)
+    values = list(_snapshot("faces.pt", "a face", True).values())
+    source = clipboard[0]
+    result = paste_buttons[1].callback(
+        (source, values if source >= 0 else []), swap, to_all, *values
+    )
+    assert result[0] == {}
+    assert result[1: 1 + tabs] == [{}] * tabs
+    assert all(
+        u == {} for t in range(tabs) for u in _paste_tab(result, t, tabs, tabs)
+    )
+    status = result[1 + tabs: 1 + 2 * tabs]
+    if swap and to_all:
+        assert status[1].startswith("Tick only one")
+        assert status[0] == status[2] == {}
+    else:
+        assert status == [{}] * tabs
+
+
+def test_paste_scope_checkboxes_are_transient_interface_only():
+    # Like "Reset every tab": never frozen on by ui-config.json, and not tab
+    # settings (ALL_ARGS, presets, infotext, API, remembered settings).
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    group = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "one_ui_group"
+    )
+    boxes = {
+        ast.unparse(k.value): node
+        for node in ast.walk(group)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "gr.Checkbox"
+        for k in node.keywords
+        if k.arg == "elem_id"
+    }
+    for key, label in (
+        ("ad_paste_swap", "Swap with the copied tab"),
+        ("ad_paste_all", "Paste into every tab"),
+    ):
+        box = boxes[f"eid('{key}')"]
+        kw = {k.arg: ast.unparse(k.value) for k in box.keywords}
+        assert kw["label"] == repr(label)
+        assert kw["value"] == "False"
+        assert key not in ALL_ARGS.attrs
+    source = ast.unparse(group)
+    assert "for _transient in (paste_swap, paste_all):" in source
+    assert "_transient.do_not_save_to_config = True" in source
 
 
 @pytest.mark.parametrize("action", ["load", "paste"])
@@ -111,7 +302,9 @@ def test_restore_changes_detector_and_keeps_class_filter(
         callbacks["_wire_copy_paste"](
             all_widgets, copy_buttons, paste_buttons, Component(), 2, mapping
         )
-        result = paste_buttons[1].callback((0, [state.get(a) for a in attrs]))
+        result = _paste_tab(
+            paste_buttons[1].callback((0, [state.get(a) for a in attrs])), 1, 2
+        )
     else:
         callbacks["get_preset"] = lambda name: state
         preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(2)]
@@ -373,8 +566,10 @@ def test_import_accepts_a_file_with_a_byte_order_mark(callbacks, tmp_path):
 def test_export_on_gradio_3_keeps_the_button_label(callbacks, tmp_path, monkeypatch):
     # Gradio 3 has no DownloadButton: a returned path became the plain
     # Button's label and "Exported" was reported although nothing downloaded.
+    # Without a front-end step to save a file, the status still says so.
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     callbacks["_DownloadButton"] = None
+    callbacks["_export_js_key"] = None
     label, status = callbacks["_do_export"]()
     assert label == {}
     assert list(tmp_path.iterdir()) == []
@@ -382,9 +577,37 @@ def test_export_on_gradio_3_keeps_the_button_label(callbacks, tmp_path, monkeypa
     assert "Gradio 4" in status
 
 
-def test_only_the_gradio_3_export_button_is_marked_for_its_tooltip():
-    # The tooltip promised a JSON download that the Gradio 3 fallback button
-    # cannot give; button-tooltips.js tells it apart by this class.
+def test_export_on_gradio_3_sends_the_library_to_save_in_the_browser(
+    callbacks, tmp_path, monkeypatch
+):
+    # On AUTOMATIC1111 (Gradio 3) Export downloaded nothing. The click now
+    # sends the library in the status, hidden in a comment, for the front-end
+    # step to save; the button keeps its label and no file is written.
+    import base64
+    import re
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    callbacks["_DownloadButton"] = None
+    callbacks["_export_js_key"] = "_js"
+    callbacks["_EXPORT_MARK"] = "adetailer-export:"
+    callbacks["export_presets_json"] = lambda: '{"saved": {"prompt": "caf\\u00e9 -->"}}'
+    label, status = callbacks["_do_export"]()
+    assert label == {}
+    assert list(tmp_path.iterdir()) == []
+    match = re.fullmatch(
+        r"(✅ Exported \*\*1\*\* preset\(s\)\.)\n\n<!-- adetailer-export:([A-Za-z0-9+/=]*) -->",
+        status,
+    )
+    assert match, status
+    assert base64.b64decode(match.group(2)).decode("utf-8") == (
+        '{"saved": {"prompt": "caf\\u00e9 -->"}}'
+    )
+
+
+def test_only_a_gradio_3_export_button_that_cannot_save_is_marked():
+    # The tooltip promised a JSON download that a Gradio 3 fallback button
+    # without a front-end step cannot give; button-tooltips.js tells it apart
+    # by this class. With the step it downloads, and keeps the usual tooltip.
     path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     branch = next(
@@ -392,15 +615,48 @@ def test_only_the_gradio_3_export_button_is_marked_for_its_tooltip():
         if isinstance(node, ast.If) and ast.unparse(node.test) == "_DownloadButton is not None"
         and any("ad_preset_export_btn" in ast.unparse(n) for n in node.body)
     )
+    for nodes in (branch.body, branch.orelse):
+        call = next(
+            n for s in nodes for n in ast.walk(s)
+            if isinstance(n, ast.Call) and "ad_preset_export_btn" in ast.unparse(n)
+        )
+        assert "elem_classes" not in {k.arg for k in call.keywords}
+    marked = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "_DownloadButton is None and _export_js_key is None"
+        and "ad-export-unavailable" in ast.unparse(node)
+    )
+    assert ast.unparse(marked.body[0]) == (
+        "preset_export_btn.elem_classes = ['ad-export-unavailable']"
+    )
 
-    def classes(nodes):
-        calls = [n for s in nodes for n in ast.walk(s) if isinstance(n, ast.Call)]
-        call = next(c for c in calls if "ad_preset_export_btn" in ast.unparse(c))
-        kw = {k.arg: k.value for k in call.keywords}
-        return ast.literal_eval(kw["elem_classes"]) if "elem_classes" in kw else []
 
-    assert "ad-export-unavailable" in classes(branch.orelse)
-    assert "ad-export-unavailable" not in classes(branch.body)
+@pytest.mark.parametrize("gradio", ["3", "4", "none"])
+def test_front_end_step_parameter_follows_the_gradio_version(gradio):
+    # Gradio 3 names an event's front-end step `_js`, Gradio 4 `js`.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    func = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_front_end_js_key"
+    )
+    namespace = {"Any": object}
+    exec(compile(ast.Module(body=[func], type_ignores=[]), str(path), "exec"), namespace)
+
+    class Gradio3Event:  # Gradio 3.41: a callable object
+        def __call__(self, fn, inputs=None, outputs=None, queue=None, _js=None):
+            pass
+
+    def gradio4_click(fn=None, inputs=None, outputs=None, js=None, queue=None):
+        pass
+
+    button = SimpleNamespace(
+        click={"3": Gradio3Event(), "4": gradio4_click, "none": object()}[gradio]
+    )
+    assert namespace["_front_end_js_key"](button) == {
+        "3": "_js", "4": "js", "none": None
+    }[gradio]
 
 
 def test_hires_only_help_says_the_tab_is_skipped_without_hires_fix():
@@ -489,8 +745,11 @@ def test_export_downloads_the_file_its_click_wrote(gradio_4):
     )
     namespace = {
         "preset_export_btn": "button",
+        "preset_io_status": "status",
         "_EXPORT_JS": "js",
+        "_EXPORT_BLOB_JS": "blob-js",
         "_DownloadButton": object if gradio_4 else None,
+        "_export_js_key": None if gradio_4 else "_js",
     }
     kwargs = eval(compile(ast.Expression(assign.value), str(path), "eval"), namespace)
     if gradio_4:
@@ -498,7 +757,14 @@ def test_export_downloads_the_file_its_click_wrote(gradio_4):
             "fn": None, "inputs": "button", "outputs": "button", "js": "js"
         }
     else:
-        # Gradio 3 names it `_js` and rejects `js`; nothing to download there.
+        # Gradio 3 names it `_js` and rejects `js`; the step saves the file
+        # the click sent in the status, and takes it out of the status.
+        assert kwargs == {
+            "fn": None, "inputs": "status", "outputs": "status", "_js": "blob-js"
+        }
+        # Without a front-end step, the same two registrations, doing nothing.
+        namespace["_export_js_key"] = None
+        kwargs = eval(compile(ast.Expression(assign.value), str(path), "eval"), namespace)
         assert kwargs == {"fn": None}
 
 
@@ -522,6 +788,38 @@ def test_controlnet_model_change_keeps_a_fitting_module(
     update = callbacks["on_cn_model_update"](model, module)
     assert update["visible"] is True
     assert update["value"] == expected
+
+
+_FORGE_INPAINT = ["None", "inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"]
+_FORGE_OPENPOSE = ["None", "dw_openpose_full", "openpose", "openpose_full"]
+
+
+@pytest.mark.parametrize(
+    ("model", "module", "expected"),
+    [
+        # A new model on a tab without one: its default, not "None".
+        (CN_INPAINT, "None", "inpaint_global_harmonious"),
+        ("control_v11p_sd15_openpose [cab727d4]", "None", "openpose_full"),
+        # A module that fits is kept; one that does not falls back to the default.
+        (CN_INPAINT, "inpaint_only", "inpaint_only"),
+        ("control_v11p_sd15_openpose [cab727d4]", "inpaint_only", "openpose_full"),
+    ],
+)
+def test_a_forge_controlnet_model_gets_its_default_preprocessor(
+    callbacks, model, module, expected
+):
+    # Forge, Forge Neo and reForge list "None" (the picture as it is) first:
+    # choosing a model set "None", so pose, depth or inpaint models ran
+    # without their preprocessor.
+    choices = callbacks["cn_module_choices"]
+    choices["inpaint"], choices["openpose"] = _FORGE_INPAINT, _FORGE_OPENPOSE
+
+    update = callbacks["on_cn_model_update"](model, module)
+
+    assert (update["visible"], update["value"]) == (True, expected)
+    # "None" picked on purpose and remembered: a restart keeps it.
+    kept = callbacks["on_cn_model_update"](model, "None", keep_none=True)
+    assert kept["value"] == "None"
 
 
 def test_controlnet_model_none_hides_the_module(callbacks):
@@ -633,6 +931,7 @@ def test_restored_controlnet_model_shows_its_module_at_startup(saved, expected):
         "get_cn_models": lambda: [CN_INPAINT],
         "controlnet_exists": True,
         "cn_module_choices": {"inpaint": choices},
+        "default_cn_module": _default_cn_module(),
     }
     module = ast.Module(body=[source.body[0], *nodes], type_ignores=[])
     exec(compile(module, str(path), "exec"), namespace)
@@ -649,28 +948,29 @@ def test_restored_controlnet_model_shows_its_module_at_startup(saved, expected):
 @pytest.mark.parametrize(
     ("saved", "schedulers", "expected"),
     [
-        # A ticked old name is split by the scheduler's label: the WebUI ran it
-        # as the sampler plus that scheduler, and a restart must keep it so.
+        # A ticked old name is split as Load splits it: the WebUI ran it as
+        # the sampler plus that scheduler, and a restart must keep it so.
         ((True, "DPM++ 2M Karras", "Use same scheduler"), None, ("DPM++ 2M", "Karras")),
         ((True, "DPM++ 2M SDE Exponential", "Uniform"), None,
          ("DPM++ 2M SDE", "Exponential")),
         # Everything else is restored as before.
         ((False, "DPM++ 2M Karras", "Use same scheduler"), None,
          ("DPM++ 2M", "Use same scheduler")),
-        ((True, "Foo Karras", "Use same scheduler"), None,
-         ("DPM++ 2M", "Use same scheduler")),
         ((True, "Euler a", "Karras"), None, ("Euler a", "Karras")),
         ((True, "Use same sampler", "Karras"), None, ("Use same sampler", "Karras")),
-        # Another WebUI's sampler: the first sampler, as Load shows it.
+        # Another WebUI's sampler: the first sampler, as Load shows it, with
+        # the scheduler the name ended with.
         ((True, "Res Multistep", "Karras"), None, ("DPM++ 2M", "Karras")),
-        # Only Load also splits a scheduler's other names (a known issue).
-        ((True, "DPM++ 2M karras", "Uniform"), None, ("DPM++ 2M", "Uniform")),
+        ((True, "Foo Karras", "Use same scheduler"), None, ("DPM++ 2M", "Karras")),
+        # As Load, a scheduler's other names are split too.
+        ((True, "DPM++ 2M karras", "Uniform"), None, ("DPM++ 2M", "Karras")),
+        ((True, "Euler a SGMUniform", "Uniform"), None, ("Euler a", "SGM Uniform")),
         # WebUI < 1.9 has no schedulers: nothing to split.
         ((True, "DPM++ 2M Karras", "Use same scheduler"), [],
          ("DPM++ 2M", "Use same scheduler")),
     ],
 )
-def test_restart_splits_a_ticked_old_sampler_name(saved, schedulers, expected):
+def test_restart_splits_a_ticked_old_sampler_name(saved, schedulers, expected, capsys):
     # Remembered settings could hold a ticked "DPM++ 2M Karras" (an older
     # preset or Reset, a pasted image). At the next start the name is not a
     # choice and fell back to the first sampler with the saved scheduler:
@@ -679,7 +979,10 @@ def test_restart_splits_a_ticked_old_sampler_name(saved, schedulers, expected):
 
     path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
     source = ast.parse(path.read_text(encoding="utf-8"))
-    names = {"inpainting", "elem_id", "_sv", "suffix", "ordinal", "gr_interactive"}
+    names = {
+        "inpainting", "elem_id", "_sv", "suffix", "ordinal", "gr_interactive",
+        "split_sampler_name",
+    }
     nodes = [
         node for node in source.body
         if isinstance(node, ast.FunctionDef) and node.name in names
@@ -696,9 +999,19 @@ def test_restart_splits_a_ticked_old_sampler_name(saved, schedulers, expected):
     webui_info = SimpleNamespace(
         sampler_names=["DPM++ 2M", "DPM++ 2M SDE", "Euler a"],
         scheduler_names=(
-            ["Automatic", "Uniform", "Karras", "Exponential"]
+            ["Automatic", "Uniform", "Karras", "Exponential", "SGM Uniform"]
             if schedulers is None
             else schedulers
+        ),
+        # The label, name and aliases, as the script builds them.
+        scheduler_endings=(
+            [
+                ["Automatic", "automatic"], ["Uniform", "uniform"],
+                ["Karras", "karras"], ["Exponential", "exponential"],
+                ["SGM Uniform", "sgm_uniform", "SGMUniform"],
+            ]
+            if schedulers is None
+            else []
         ),
         checkpoints_list=[], vae_list=[], text_encoders_list=[],
     )
@@ -711,6 +1024,17 @@ def test_restart_splits_a_ticked_old_sampler_name(saved, schedulers, expected):
     )
 
     assert (w.ad_sampler.kwargs["value"], w.ad_scheduler.kwargs["value"]) == expected
+    # A ticked sampler this WebUI does not have is named in the console, as
+    # Load names it in its status.
+    out = capsys.readouterr().out
+    # (Below WebUI 1.9 "DPM++ 2M Karras" is a sampler, missing in this list.)
+    if use and (sampler in ("Res Multistep", "Foo Karras") or schedulers == []):
+        assert out == (
+            f"[-] ADetailer: tab 1 - saved sampler {sampler!r} is NOT in this "
+            f"WebUI's samplers; uses {expected[0]!r} instead.\n"
+        )
+    else:
+        assert "saved sampler" not in out
 
 
 def _paste(fields, params):
@@ -1425,22 +1749,20 @@ def test_load_is_given_the_endings_the_webui_takes_off_a_sampler_name():
     assert value == [["Karras", "karras"], ["SGM Uniform", "sgm_uniform", "SGMUniform"], ["Beta", None]]
 
 
-def test_docs_do_not_say_a_restart_and_pasting_split_a_sampler_as_load_does():
-    # Load splits a ticked sampler name as the WebUI does at Generate and names
-    # a sampler this WebUI does not have; a restart and pasting split a
-    # scheduler's label only. Their comments and the docs said "as Load does".
+def test_restart_and_pasting_split_a_sampler_with_the_load_rule():
+    # Load, a restart and pasting all split a ticked sampler name with the
+    # same rule (split_sampler_name, as the WebUI does at Generate); in beta 2
+    # a restart and pasting split a scheduler's label only and kept or
+    # replaced a missing sampler silently, as its known issues still say.
     root = Path(__file__).resolve().parents[1]
     texts = {
         name: (root / name).read_text(encoding="utf-8")
-        for name in ("README.md", "CHANGELOG.md", "aaaaaa/ui.py", "scripts/!adetailer.py")
+        for name in ("CHANGELOG.md", "aaaaaa/ui.py", "scripts/!adetailer.py")
     }
-    for name, text in texts.items():
-        flat = " ".join(text.replace("#", " ").split())
-        for claim in (
-            "as Load splits it", "split it as Load does",
-            "runs it as, as Load does", "with Karras, as Load does",
-        ):
-            assert claim not in flat, (name, claim)
+    assert texts["aaaaaa/ui.py"].count("split_sampler_name(") == 2  # def + restart
+    assert texts["scripts/!adetailer.py"].count("split_sampler_name(") == 1  # paste
+    for name in ("aaaaaa/ui.py", "scripts/!adetailer.py"):
+        assert "Unlike Load" not in texts[name], name
     beta2 = next(
         section for section in texts["CHANGELOG.md"].split("\n## ")
         if section.startswith("v26.2.0+plus.8.beta.2")
@@ -1497,6 +1819,299 @@ def test_load_keeps_the_detector_when_the_preset_names_one_not_installed(
         assert restored[attr] == {}
     assert result[-1] == {}  # the CLASSES selection is left alone too
     assert restored["ad_prompt"]["value"] == "detailed eyes"
+
+
+@pytest.mark.parametrize("tab", [0, 1])
+def test_load_reads_the_detector_folders_again_for_a_detector_added_since_the_start(
+    callbacks, tab
+):
+    # A detector copied into the folder while the WebUI runs, before any 🔄:
+    # Generate, API requests and pasted parameters found it, but Load said
+    # "not installed" and left out the preset's detector and classes.
+    callbacks["get_preset"] = lambda name: {
+        "ad_model": "new.pt", "ad_model_classes": "face", "ad_prompt": "detailed",
+    }
+    mapping = {"faces.pt": "faces.pt"}
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        mapping["new.pt"] = "faces.pt"  # in place, as refresh_model_mapping
+        return list(mapping)
+
+    dropdown = type("Dropdown", (), {})()  # weakly referenced, as a component
+    dropdown.choices = ["faces.pt", "None"]
+    callbacks["_MODEL_DROPDOWNS"][:] = [weakref.ref(dropdown)]
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(2)]
+    callbacks["_wire_presets"](
+        [widgets(), widgets()], preset_widgets, [Component(), Component()],
+        Component(), 2, mapping, refresh_models=refresh,
+    )
+    status, *result = preset_widgets[tab][1].callback("saved")
+    restored = dict(zip(ALL_ARGS.attrs, result[:-1]))
+
+    assert status == "✅ Loaded 'saved'."
+    assert calls == [1]
+    # Listed in the menu (Gradio 4 shows a value that is not a choice empty).
+    names = ["faces.pt", "new.pt"]
+    assert restored["ad_model"] == {
+        "choices": [*names, "None"] if tab == 0 else ["None", *names],
+        "value": "new.pt",
+    }
+    assert restored["ad_model_classes"]["value"] == "face"
+    assert result[-1]["value"] == ["face"]
+    assert dropdown.choices == [*names, "None"]  # and after a browser reload
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_load_still_says_not_installed_when_the_folders_do_not_have_it(
+    callbacks, fails
+):
+    callbacks["get_preset"] = lambda name: {"ad_model": "eyes.pt"}
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        if fails:
+            raise OSError("no folder")
+        return ["faces.pt"]
+
+    preset_widgets = [tuple(Component() for _ in range(10))]
+    callbacks["_wire_presets"](
+        [widgets()], preset_widgets, [Component()], Component(), 1,
+        {"faces.pt": "faces.pt"}, refresh_models=refresh,
+    )
+    status, *result = preset_widgets[0][1].callback("saved")
+
+    assert "its detector 'eyes.pt' is not installed" in status
+    assert calls == [1]
+    assert dict(zip(ALL_ARGS.attrs, result[:-1]))["ad_model"] == {}
+
+
+@pytest.mark.parametrize("model", ["faces.pt", "None"])
+def test_load_does_not_read_the_folders_for_a_detector_it_knows(callbacks, model):
+    callbacks["get_preset"] = lambda name: {"ad_model": model}
+    calls = []
+    preset_widgets = [tuple(Component() for _ in range(10))]
+    callbacks["_wire_presets"](
+        [widgets()], preset_widgets, [Component()], Component(), 1,
+        {"faces.pt": "faces.pt"}, refresh_models=lambda: calls.append(1) or [],
+    )
+    status, *result = preset_widgets[0][1].callback("saved")
+
+    assert status == "✅ Loaded 'saved'."
+    assert calls == []
+    assert dict(zip(ALL_ARGS.attrs, result[:-1]))["ad_model"] == (
+        {"value": model} if model == "None"
+        else {"choices": ["faces.pt", "None"], "value": model}
+    )
+
+
+def test_a_second_load_lists_a_detector_found_since_the_start(callbacks):
+    # The first Load found new.pt and listed it in its own tab's menu; the
+    # same preset loaded in the second tab sent only the value, which Gradio 4
+    # (Forge, Forge Neo) shows empty in a menu built without it.
+    callbacks["get_preset"] = lambda name: {"ad_model": "new.pt", "ad_prompt": "x"}
+    mapping = {"faces.pt": "faces.pt"}
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        mapping["new.pt"] = "new.pt"
+        return list(mapping)
+
+    dropdown = type("Dropdown", (), {})()
+    dropdown.choices = ["faces.pt", "None"]
+    callbacks["_MODEL_DROPDOWNS"][:] = [weakref.ref(dropdown)]
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(2)]
+    callbacks["_wire_presets"](
+        [widgets(), widgets()], preset_widgets, [Component(), Component()],
+        Component(), 2, mapping, refresh_models=refresh,
+    )
+    names = ["faces.pt", "new.pt"]
+    for tab, choices in ((0, [*names, "None"]), (1, ["None", *names])):
+        status, *result = preset_widgets[tab][1].callback("saved")
+        assert status == "✅ Loaded 'saved'."
+        assert dict(zip(ALL_ARGS.attrs, result[:-1]))["ad_model"] == {
+            "choices": choices, "value": "new.pt",
+        }
+    assert calls == [1]  # the second Load knew it already
+
+
+@pytest.mark.parametrize("model", ["new.pt", "faces.pt", "None"])
+def test_load_lists_a_detector_generate_found_since_the_start(callbacks, model):
+    # Generate, an API request or a paste found new.pt (model_mapping is
+    # updated in place) before the Load: the menu still lacks it. A detector
+    # the menus were built with gets the same list; "None" only its value.
+    callbacks["get_preset"] = lambda name: {"ad_model": model}
+    mapping = {"faces.pt": "faces.pt"}
+    preset_widgets = [tuple(Component() for _ in range(10))]
+    callbacks["_wire_presets"](
+        [widgets()], preset_widgets, [Component()], Component(), 1, mapping,
+        refresh_models=lambda: list(mapping),
+    )
+    mapping["new.pt"] = "new.pt"
+    status, *result = preset_widgets[0][1].callback("saved")
+    restored = dict(zip(ALL_ARGS.attrs, result[:-1]))
+
+    assert status == "✅ Loaded 'saved'."
+    if model != "None":
+        assert restored["ad_model"] == {
+            "choices": ["faces.pt", "new.pt", "None"], "value": model,
+        }
+    else:
+        assert restored["ad_model"] == {"value": model}
+
+
+@pytest.mark.parametrize(("swap", "to_all"), [(False, False), (True, False), (False, True)])
+def test_paste_lists_a_detector_found_since_the_start(callbacks, swap, to_all):
+    # A tab whose Load (or 🔄) listed new.pt copied to another tab, whose
+    # menu was built without it: Paste, Swap and Paste into every tab list it.
+    tabs = 3
+    mapping = {"faces.pt": "faces.pt"}
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs, mapping)
+    mapping["new.pt"] = "new.pt"
+    copied = _snapshot("new.pt", "a face", True)
+    here = _snapshot("faces.pt", "a hand", False)
+    result = paste_buttons[2].callback(
+        (0, list(copied.values())), swap, to_all, *here.values()
+    )
+    names = ["faces.pt", "new.pt"]
+    for tab in (1, 2) if to_all else (2,):
+        pasted = dict(zip(ALL_ARGS.attrs, _paste_tab(result, tab, tabs, tabs)))
+        assert pasted["ad_model"] == {"choices": ["None", *names], "value": "new.pt"}
+    if swap:  # the copied tab gets this tab's detector, one it was built with
+        swapped = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 0, tabs, tabs)))
+        assert swapped["ad_model"] == {"choices": [*names, "None"], "value": "faces.pt"}
+
+
+def test_load_and_paste_list_a_startup_detector_removed_and_put_back(callbacks):
+    # back.pt was there at startup; its file was moved out and 🔄 rebuilt the
+    # menus without it, then the file was put back. The first Load read the
+    # folders and listed it in its own tab only: a second Load, or a Paste,
+    # in another tab sent only the value (the detector was in the startup
+    # list), which Gradio 4 (Forge, Forge Neo) shows empty in that menu.
+    tabs = 3
+    mapping = {"faces.pt": "faces.pt", "back.pt": "back.pt"}
+    disk = ["faces.pt"]
+
+    def refresh():
+        mapping.clear()
+        mapping.update({name: name for name in disk})
+        return list(mapping)
+
+    callbacks["get_preset"] = lambda name: {"ad_model": "back.pt"}
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(tabs)]
+    callbacks["_wire_presets"](
+        [widgets() for _ in range(tabs)], preset_widgets,
+        [Component() for _ in range(tabs)], Component(), tabs, mapping,
+        refresh_models=refresh,
+    )
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs, mapping)
+    refresh()  # 🔄 with the file moved out
+    disk.append("back.pt")  # and put back
+    names = ["faces.pt", "back.pt"]
+    expected = {"choices": ["None", *names], "value": "back.pt"}
+    for tab in (1, 2):  # the 1st Load reads the folders, the 2nd knows it
+        status, *result = preset_widgets[tab][1].callback("saved")
+        assert status == "✅ Loaded 'saved'."
+        assert dict(zip(ALL_ARGS.attrs, result[:-1]))["ad_model"] == expected
+
+    copied = _snapshot("back.pt", "a face", True)
+    here = _snapshot("faces.pt", "a hand", False)
+    result = paste_buttons[2].callback(
+        (1, list(copied.values())), False, False, *here.values()
+    )
+    pasted = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 2, tabs, tabs)))
+    assert pasted["ad_model"] == expected
+
+
+@pytest.mark.parametrize(("swap", "to_all"), [(False, False), (True, False), (False, True)])
+def test_paste_keeps_the_tabs_detector_when_the_copied_one_was_removed(
+    callbacks, swap, to_all
+):
+    # Copy, then the detector file is removed and 🔄 reads the folders again:
+    # the copy still names it, and Paste put it in the tab without a word, so
+    # Generate failed that tab and the ones after it. As Load does, the tab
+    # keeps its detector and class filter and the status says why.
+    tabs = 3
+    mapping = {"faces.pt": "faces.pt", "gone.pt": "gone.pt"}
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs, mapping)
+    copied = _snapshot("gone.pt", "a face", True)
+    copied["ad_model_classes"] = "face"
+    del mapping["gone.pt"]
+    here = _snapshot("faces.pt", "a hand", False)
+
+    result = paste_buttons[2].callback(
+        (0, list(copied.values())), swap, to_all, *here.values()
+    )
+
+    statuses = result[1 + tabs: 1 + 2 * tabs]
+    for tab in (1, 2) if to_all else (2,):
+        pasted = dict(zip(ALL_ARGS.attrs, _paste_tab(result, tab, tabs, tabs)))
+        assert "value" not in pasted["ad_model"]
+        assert "value" not in pasted["ad_model_classes"]
+        # The rest of the copy is pasted.
+        assert pasted["ad_prompt"] == {"value": "a face"}
+    assert "not installed" in statuses[2]
+    assert "'gone.pt'" in statuses[2]
+    if swap:  # the copied tab still gets this tab's values
+        swapped = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 0, tabs, tabs)))
+        assert swapped["ad_model"] == {"choices": ["faces.pt", "None"], "value": "faces.pt"}
+        assert swapped["ad_prompt"] == {"value": "a hand"}
+        assert statuses[0] == "\U0001F501 Swapped with the 3rd tab."
+    # The copy itself is left as it was, for the next Paste.
+    assert copied["ad_model"] == "gone.pt"
+
+
+@pytest.mark.parametrize(("model", "mapping"), [
+    ("None", {"faces.pt": "faces.pt"}),
+    ("faces.pt", {"faces.pt": "faces.pt"}),
+    # No detector list at all: nothing to check against, pasted as before.
+    ("gone.pt", {}),
+])
+def test_paste_still_pastes_an_installed_detector_or_none(callbacks, model, mapping):
+    tabs = 2
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs, mapping)
+    copied = _snapshot(model, "a face", True)
+    here = _snapshot("faces.pt", "a hand", False)
+
+    result = paste_buttons[1].callback(
+        (0, list(copied.values())), False, False, *here.values()
+    )
+
+    pasted = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 1, tabs, tabs)))
+    assert pasted["ad_model"] == (
+        {"choices": ["None", *mapping], "value": model} if model in mapping
+        else {"value": model}
+    )
+    assert "not installed" not in str(result[1 + tabs: 1 + 2 * tabs])
+
+
+def test_the_preset_load_is_given_the_folder_read():
+    # adui hands _wire_presets the same refresh as the 🔄 button.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    calls = [
+        node for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_wire_presets"
+    ]
+    assert len(calls) == 1
+    given = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
+    assert given.get("refresh_models") == "webui_info.refresh_models"
+
+
+@pytest.mark.parametrize("wire", ["_wire_copy_paste", "_wire_presets"])
+def test_paste_and_load_are_given_the_detector_list(wire):
+    # adui hands Paste settings and Load the same dict the 🔄 button updates:
+    # without it they paste a removed detector and miss one found since.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    calls = [
+        node for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == wire
+    ]
+    assert len(calls) == 1
+    given = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
+    assert given.get("model_mapping") == "webui_info.model_mapping"
 
 
 _OVERRIDE_LISTS = {
@@ -1630,7 +2245,10 @@ def test_load_still_sets_an_installed_detector_or_none(callbacks, model):
     status, *result = preset_widgets[0][1].callback("saved")
 
     assert status == "✅ Loaded 'saved'."
-    assert dict(zip(ALL_ARGS.attrs, result))["ad_model"] == {"value": model}
+    assert dict(zip(ALL_ARGS.attrs, result))["ad_model"] == (
+        {"value": model} if model == "None"
+        else {"choices": ["faces.pt", "None"], "value": model}
+    )
 
 
 def test_load_is_given_the_sampler_choices_a_fresh_build_shows():
@@ -1975,10 +2593,11 @@ def test_guide_describes_source_folder_batches_and_the_export_fallback():
     where = next(line for line in presets.splitlines() if "Where files go" in line)
     assert "Save results in the source folder instead" in where
     library = next(line for line in presets.splitlines() if "Preset library" in line)
-    assert "AUTOMATIC1111" in library and "user_presets.json" in library
-    # reForge's main branch ships Gradio 3 too, so the limit is the Gradio
-    # version, not one WebUI.
-    assert "Gradio 3" in library and "reForge" in library
+    # Export now downloads on Gradio 3 too (AUTOMATIC1111, reForge's main
+    # branch): the Guide no longer sends the user to back up the file by hand.
+    assert "**export / import** the library as a file" in library
+    assert "cannot download" not in library
+    assert "user_presets.json" not in library
 
 
 def test_guide_says_merge_joins_every_mask():
@@ -2052,6 +2671,73 @@ def test_detection_resolution_help_names_the_detectors_own_size():
         assert old not in readme
 
 
+def test_guide_says_combine_all_tabs_detects_at_each_detectors_own_size():
+    # The combined preview passes no detection resolution, so every detector
+    # runs at the size stored in its own file, not at a fixed default.
+    _tree, sections = _guide_sections()
+    lines = [
+        line for body in sections.values() for line in body.splitlines()
+        if line.startswith("- **Detection preview**") and "Combine all tabs" in line
+    ]
+    assert len(lines) == 1
+    assert "default resolution" not in lines[0]
+    assert "each detector's own size" in lines[0]
+
+
+def test_guide_out_of_memory_line_names_max_inpaint_size():
+    # The README's "CUDA out of memory" answer names "Max inpaint size": the
+    # Guide tab's line must say the same.
+    _tree, sections = _guide_sections()
+    lines = [
+        line for body in sections.values() for line in body.splitlines()
+        if line.startswith("- **CUDA out of memory**")
+    ]
+    assert len(lines) == 1
+    assert "**Max inpaint size**" in lines[0]
+
+
+def test_guide_names_show_labels_and_the_gallery_previews():
+    # The Guide tab names the "Show labels" switch next to the Detection
+    # preview and the "Show detection previews in the results gallery"
+    # setting next to the other saving options, in plain text, with the
+    # same cap on the previews as the script.
+    import re
+
+    _tree, sections = _guide_sections()
+    tools = next(body for title, body in sections.items() if "run-on-image" in title)
+    presets = next(body for title, body in sections.items() if "Presets" in title)
+    labels = [line for line in tools.splitlines() if line.startswith("- Show labels")]
+    assert len(labels) == 1
+    assert "Run detection preview" in labels[0]
+    assert "with the labels" in labels[0]
+    gallery = [
+        line for line in presets.splitlines()
+        if line.startswith("- Show detection previews in the results gallery")
+    ]
+    assert len(gallery) == 1
+    for line in labels + gallery:
+        assert "**" not in line and "`" not in line
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "!adetailer.py"
+    ).read_text(encoding="utf-8")
+    cap = re.search(r"^_GALLERY_PREVIEWS_MAX = (\d+)$", script, re.M)
+    assert cap
+    assert f"up to {cap.group(1)} per generation" in gallery[0]
+
+
+def test_guide_per_face_prompts_mention_more_sort_orders():
+    # "More sort orders" overrides "Sort bounding boxes by" when it is not
+    # Off, so the per-face [SEP] guide has to say to leave it on Off (or to
+    # pick the order there).
+    _tree, sections = _guide_sections()
+    lines = [
+        line for body in sections.values() for line in body.splitlines()
+        if line.startswith("- **A different prompt or LoRA for each face**")
+    ]
+    assert len(lines) == 1
+    assert "Position (left to right)" in lines[0]
+    assert "More sort orders* on Off" in lines[0]
+
 def test_guide_says_the_mediapipe_detectors_download_their_model_files():
     # The Guide said they work "without a model file": since plus.7 they need
     # MediaPipe's own files, downloaded on first use, so an offline machine
@@ -2103,6 +2789,58 @@ def test_guide_places_the_detection_tools_after_the_detection_section():
     assert order[:3] == [
         "Detection", ["Detection preview", "Run ADetailer on an image"], "Mask Preprocessing"
     ]
+
+
+def test_guide_answers_the_beta2_questions_with_existing_options():
+    # Five frequent questions are answered with what already exists: the
+    # WebUI's callback order and img2img step option, model file safety, the
+    # Quicksettings list and the area-ratio filters.
+    tree, sections = _guide_sections()
+    lines = [line for body in sections.values() for line in body.splitlines()]
+
+    def line(start):
+        found = [x for x in lines if x.startswith(start)]
+        assert len(found) == 1, start
+        return found[0]
+
+    order = line("- **ADetailer and a face-swap extension")
+    assert "Settings → Callbacks" in order
+    assert "script_postprocess_image callback priority" in order
+    assert "!adetailer.py/script_postprocess_image/AfterDetailerScript" in order
+    assert "restart" in order
+    steps = line("- **Why the detail pass runs fewer steps**")
+    assert "steps × denoising strength" in steps
+    assert "With img2img, do exactly the amount of steps the slider specifies" in steps
+    assert "During img2img, do exactly the number of Steps the slider specifies" in steps
+    safety = line("- **Model file safety**")
+    assert "safe-unpickle" in safety and ".names.json" in safety
+    assert "Bingsu/adetailer" in safety
+    quick = line("- **Save images before ADetailer**")
+    assert "Quicksettings list" in quick and "`ad_save_images_before`" in quick
+    assert "`-ad-before`" in quick
+    small = line("- **Small, distant or background faces")
+    assert "Mask min area ratio" in small and "0.05 = 5%" in small
+    assert "0.25, not 0.5" in small
+    assert "Mask only the top k" in small and "Inpaint only these detections" in small
+
+    # The names quoted from this extension match its code.
+    script = (Path(__file__).resolve().parents[1] / "scripts" / "!adetailer.py").read_text(
+        encoding="utf-8"
+    )
+    assert "class AfterDetailerScript(" in script
+    assert 'suffix="-ad-before"' in script
+    assert '"ad_save_images_before"' in script
+    assert 'label="Save images before ADetailer"' in script
+    ui = (Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py").read_text(
+        encoding="utf-8"
+    )
+    for label in ("Mask min area ratio", "Mask only the top k", "Inpaint only these detections"):
+        assert f'label="{label}' in ui
+    # The ratio is the box area over the whole image area.
+    from adetailer.mask import is_in_ratio
+
+    assert is_in_ratio([0, 0, 50, 50], 0.25, 0.25, 100 * 100)
+    assert not is_in_ratio([0, 0, 50, 50], 0.5, 1.0, 100 * 100)
 
 
 def test_guide_getting_started_places_the_detector_and_names_enable_this_tab():
@@ -2315,3 +3053,192 @@ def test_api_default_of_a_tab_is_not_its_remembered_settings():
     assert (first.ad_model, first.ad_tab_enable, first.ad_prompt) == ("face_yolov8n.pt", True, "")
     # With nothing remembered, the fresh build's own values, as before.
     assert build(1, {}).value == remembered[1]
+
+
+@pytest.mark.parametrize(
+    ("field", "low", "high", "default"),
+    [
+        ("ad_x_offset", -512, 512, 0),
+        ("ad_y_offset", -512, 512, 0),
+        ("ad_dilate_erode", -256, 256, 4),
+        ("ad_mask_blur", 0, 256, 4),
+        ("ad_inpaint_only_masked_padding", 0, 512, 32),
+    ],
+)
+def test_mask_sliders_reach_the_higher_limits(field, low, high, default):
+    # The offsets stopped at 200, erosion / dilation at 128, the blur at 64 and
+    # the padding at 256: too little on large pictures.
+    from adetailer.args import ADetailerArgs
+
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    sliders = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "Slider"
+        and any(
+            k.arg == "elem_id" and f"'{field}'" in ast.unparse(k.value)
+            for k in node.keywords
+        )
+    ]
+    assert len(sliders) == 1
+    kw = {k.arg: k.value for k in sliders[0].keywords}
+    step = ast.literal_eval(kw["step"])
+    assert (ast.literal_eval(kw["minimum"]), ast.literal_eval(kw["maximum"])) == (low, high)
+    # Both ends sit on the slider's step, and the default is unchanged.
+    assert low % step == 0
+    assert high % step == 0
+    assert ast.literal_eval(kw["value"].args[1]) == default
+    assert getattr(ADetailerArgs(ad_model="face_yolov8n.pt"), field) == default
+    # A tab's values, from the sliders, the API, a pasted image, a preset or
+    # remembered settings, are checked by ADetailerArgs when it runs: it takes
+    # the whole new range.
+    for value in (low, high):
+        tab = ADetailerArgs(ad_model="face_yolov8n.pt", **{field: value})
+        assert getattr(tab, field) == value
+
+
+def test_the_export_button_is_spelled_export():
+    # The button read "Esport", a typo, on every WebUI. Both branches (Gradio
+    # 4's DownloadButton and Gradio 3's Button) now read "Export".
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    labels = [
+        kw.value.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and "ad_preset_export_btn" in ast.unparse(node)
+        for kw in node.keywords
+        if kw.arg in {"label", "value"} and isinstance(kw.value, ast.Constant)
+    ]
+    assert labels == ["\U0001F4E4 Export", "\U0001F4E4 Export"]
+
+
+def test_guide_explains_the_prompt_token_with_words():
+    _tree, sections = _guide_sections()
+    tokens = next(body for title, body in sections.items() if "Special tokens" in title)
+    line = next(line for line in tokens.splitlines() if line.startswith("- [PROMPT=eyes,hair]"))
+    for words in ("[PROMPT=-dress]", "underscore", "LoRAs", "no part matches"):
+        assert words in line
+    # Plain text: no new inline markdown and no tag the renderer would eat.
+    assert not any(mark in line for mark in ("**", "`", "<", "_"))
+
+
+def test_guide_says_the_script_menu_hides_the_gallery_previews():
+    _tree, sections = _guide_sections()
+    line = next(
+        line
+        for body in sections.values()
+        for line in body.splitlines()
+        if line.startswith("- Show detection previews in the results gallery")
+    )
+    assert "not shown while a script of the Script menu" in line
+    assert not any(mark in line for mark in ("**", "`"))
+
+
+def test_preset_preview_flags_the_prompt_token_with_words(callbacks, monkeypatch):
+    disk = {"eyes": {"ad_prompt": "close-up, [PROMPT=eyes,-dress]", "ad_negative_prompt": ""}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    value = callbacks["_format_preset_preview"]("eyes")["value"]
+    assert "close-up, `[PROMPT=eyes,-dress]`" in value
+    assert "tokens will be expanded" in value
+
+
+def test_preset_preview_says_nothing_of_an_unclosed_prompt_token(callbacks, monkeypatch):
+    # "[PROMPT=eyes" with no "]" is plain text at generation time.
+    disk = {"eyes": {"ad_prompt": "close-up, [PROMPT=eyes", "ad_negative_prompt": ""}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    value = callbacks["_format_preset_preview"]("eyes")["value"]
+    assert "close-up, [PROMPT=eyes" in value
+    assert "will be expanded" not in value
+
+
+@pytest.mark.parametrize(
+    "key", ["ad_prompt", "ad_negative_prompt", "ad_model", "ad_model_classes",
+            "ad_model_classes_excluded"],
+)
+@pytest.mark.parametrize(
+    "text",
+    ["![x](https://example.com/p.gif)", "a\n![x][r]\n\n[r]: https://example.com/p.gif",
+     "<img src=https://example.com/q.gif>", "<style>body{display:none}</style>",
+     "![SEP](https://example.com/p.gif)", "[PROMPT=<img src=x>]"],
+)
+def test_preset_preview_shows_a_preset_s_markup_as_text(callbacks, monkeypatch, key, text):
+    # A preset can come from someone else's library, and Gradio's sanitizer
+    # keeps images: the browser called that server as soon as the preset was
+    # picked in the menu, before Load.
+    disk = {"eyes": {key: text}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    value = callbacks["_format_preset_preview"]("eyes")["value"]
+    assert "<" not in value and ">" not in value
+    assert "![" not in value
+
+
+def test_preset_preview_shows_the_class_of_a_class_prompt_as_text(callbacks, monkeypatch):
+    disk = {"eyes": {"ad_class_prompts": "<img src=x>:blue eyes\n![a](b):red eyes"}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    value = callbacks["_format_preset_preview"]("eyes")["value"]
+    assert "- **Class-specific prompts:** &lt;img src=x&gt;, !\\[a](b)" in value
+
+
+def test_preset_preview_shows_the_name_of_a_preset_as_text(callbacks, monkeypatch):
+    # "!", "[", "]", "(" and ")" are all allowed in a preset name.
+    disk = {"a![x](y.gif)": {"ad_model": "face_yolov8n.pt"}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    assert "![" not in callbacks["_format_preset_preview"]("a![x](y.gif)")["value"]
+    assert "![" not in callbacks["_format_preset_preview"]("b![x](y.gif)")["value"]
+
+
+def test_preset_preview_keeps_the_text_of_an_ordinary_preset(callbacks, monkeypatch):
+    disk = {"eyes": {
+        "ad_model": "face_yolov8n.pt", "ad_model_classes": "face,hand",
+        "ad_prompt": "[SEP] detailed eyes, <lora:eyes:0.8>!",
+        "ad_negative_prompt": "[PROMPT=eyes], blurry",
+    }}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    assert callbacks["_format_preset_preview"]("eyes")["value"].splitlines() == [
+        "**Preview — eyes**",
+        "- **Detector:** face_yolov8n.pt",
+        "- **Classes (include):** face,hand",
+        # Shown as typed (the preview dropped the LoRA's angle brackets).
+        "- **Prompt:** `[SEP]` detailed eyes, &lt;lora:eyes:0.8&gt;!",
+        "- **Negative:** `[PROMPT=eyes]`, blurry",
+        "- _`[SEP]` / `[PROMPT]` tokens will be expanded against the main prompt"
+        " at generation time._",
+    ]
+
+
+def test_preset_preview_shows_a_token_with_a_lora_as_typed(callbacks, monkeypatch):
+    # Between backticks the escaped < and > would show as "&lt;" and "&gt;".
+    disk = {"eyes": {"ad_prompt": "[PROMPT=<lora:eyes:1>], [PROMPT=hair]"}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    value = callbacks["_format_preset_preview"]("eyes")["value"]
+    assert "- **Prompt:** [PROMPT=&lt;lora:eyes:1&gt;], `[PROMPT=hair]`\n" in value
+    assert "tokens will be expanded" in value
+
+
+def test_load_status_shows_a_preset_s_markup_as_text(callbacks):
+    # The status under the preset is Markdown too, and names what the WebUI
+    # does not have: the detector, the sampler, the checkpoint.
+    status, _ = _load_with_lists(callbacks, {
+        "ad_model": "<img src=https://example.com/q.gif>",
+        "ad_use_sampler": True, "ad_sampler": "![s](https://example.com/s.gif)",
+        "ad_checkpoint": "![c](https://example.com/c.gif)",
+    })
+    assert "detector '&lt;img src=https://example.com/q.gif&gt;' is not installed" in status
+    assert "sampler '!\\[s](https://example.com/s.gif)'" in status
+    assert "checkpoint '!\\[c](https://example.com/c.gif)'" in status
+    assert "<" not in status and ">" not in status and "![" not in status
+
+
+def test_guide_says_which_loras_the_prompt_token_brings():
+    _tree, sections = _guide_sections()
+    tokens = next(body for title, body in sections.items() if "Special tokens" in title)
+    line = next(line for line in tokens.splitlines() if line.startswith("- [PROMPT=eyes,hair]"))
+    for words in (
+        "new lines, BREAK and AND",
+        "the numbers of the weights are not searched",
+        "With plain words it never brings the main prompt's LoRAs (Use LoRAs from main prompt adds them)",
+        "with only minus words it keeps them (Strip LoRAs from the detailer prompt removes them)",
+        "[PROMPT=] brings the whole main prompt, like [PROMPT].",
+    ):
+        assert words in line

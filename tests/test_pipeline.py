@@ -14,15 +14,24 @@ import random
 import re
 import sys
 import time
+from collections import OrderedDict
 from contextlib import nullcontext
 from copy import copy
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageFilter
+
+from aaaaaa.p_method import merge_network_hashes, restore_network_hashes
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "!adetailer.py"
+
+# Pure helpers the script imports: every loaded method may reach them.
+_NETWORK_HASHES = {
+    "merge_network_hashes": merge_network_hashes,
+    "restore_network_hashes": restore_network_hashes,
+}
 
 
 def _load_runtime(**host_globals):
@@ -30,8 +39,13 @@ def _load_runtime(**host_globals):
     selected = ast.parse("from __future__ import annotations").body
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in {
-            "_forge_wanted_modules", "_parse_class_prompts", "_class_prompt_for"
+            "_forge_wanted_modules", "_parse_class_prompts", "_class_prompt_for",
+            "_empty_prompt_note", "_strip_host_comments",
         }:
+            selected.append(node)
+        elif isinstance(node, ast.Assign) and any(
+            getattr(target, "id", "") == "_PROMPT_TOKEN_RE" for target in node.targets
+        ):
             selected.append(node)
         elif isinstance(node, ast.ClassDef) and node.name == "AfterDetailerScript":
             node.bases = []
@@ -40,13 +54,14 @@ def _load_runtime(**host_globals):
                 for method in node.body
                 if isinstance(method, ast.FunctionDef)
                 and method.name in {
-                    "process", "set_skip_img2img", "_postprocess_image_inner"
+                    "process", "set_skip_img2img", "_postprocess_image_inner",
+                    "_drop_api_default_tab",
                 }
             ]
             for method in node.body:
                 method.decorator_list = []
             selected.append(node)
-    namespace = {"Path": Path, "sys": sys, **host_globals}
+    namespace = {"Path": Path, "sys": sys, "re": re, **_NETWORK_HASHES, **host_globals}
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_SCRIPT_PATH), "exec"), namespace)
     return SimpleNamespace(**namespace)
@@ -485,7 +500,8 @@ def test_sequential_pass_honours_stop_after_current_image(stop_at, n_calls, kept
 def test_host_error_after_a_cancel_counts_as_the_cancel(cancel_flag):
     # Forge Neo hands back no latent when a cancel lands before the first
     # sampling step, and then fails on it. That is the user's cancel, not a
-    # failure; any other error must still reach the caller.
+    # failure. Any other error fails only its region: with every region
+    # failed the pass is not kept, and nothing is raised to the caller.
     state = SimpleNamespace(
         interrupted=False, skipped=False, job_count=0,
         assign_current_image=lambda _image: None,
@@ -498,10 +514,6 @@ def test_host_error_after_a_cancel_counts_as_the_cancel(cancel_flag):
         raise TypeError(msg)
 
     run, pp, before = _detailer(state, process_images, n_masks=2)
-    if cancel_flag is None:
-        with pytest.raises(TypeError):
-            run()
-        return
     assert run() is False
     assert pp.image.tobytes() == before.tobytes()
 
@@ -530,6 +542,30 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
     Keeps ``@staticmethod`` (the methods call each other through ``self``)
     and drops the other decorators.
     """
+    # The methods that read the tabs drop the host's default tab of a short
+    # API request through this helper: load it with them.
+    if {"process", "postprocess_image", "is_ad_enabled", "get_args"} & set(methods):
+        methods = {*methods, "_drop_api_default_tab"}
+    # And those that set host options for a pass skip the frozen ones.
+    if "get_override_settings" in methods or "_crop_upscaler_usable" in functions:
+        functions = {*functions, "_setting_frozen"}
+        assigns = {*assigns, "_FROZEN_REPORTED"}
+    # And those that read Settings > ADetailer "Max inpaint size".
+    if {"fix_p2", "extra_params"} & set(methods):
+        functions = {*functions, "_max_inpaint_side", "_cap_inpaint_size"}
+    # And the pass, which says when [PROMPT=words] left a prompt empty.
+    if "_postprocess_image_inner" in methods:
+        functions = {*functions, "_empty_prompt_note", "_strip_host_comments"}
+        assigns = {*assigns, "_PROMPT_TOKEN_RE"}
+    # And the "applied ad_prompt" line, which ignores the removed comments.
+    if "compare_prompt" in methods:
+        functions = {*functions, "_strip_host_comments"}
+    # And what looks a detector up, which reads the detector folders again.
+    if "get_ad_model" in methods or "_clear_missing_class_prompts" in functions:
+        functions = {*functions, "_known_model", "refresh_model_mapping"}
+        assigns = {*assigns, "_XYZ_MODEL_LIST"}
+    if "make_axis_on_xyz_grid" in functions:
+        assigns = {*assigns, "_XYZ_MODEL_LIST"}
     tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
     selected = ast.parse("from __future__ import annotations").body
     for node in tree.body:
@@ -538,6 +574,8 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
         elif isinstance(node, ast.Assign) and any(
             getattr(target, "id", "") in assigns for target in node.targets
         ):
+            selected.append(node)
+        elif isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") in assigns:
             selected.append(node)
         elif (
             isinstance(node, ast.ClassDef)
@@ -556,7 +594,7 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
                     if getattr(d, "id", "") == "staticmethod"
                 ]
             selected.append(node)
-    namespace = {"Path": Path, "sys": sys, "re": re, **host_globals}
+    namespace = {"Path": Path, "sys": sys, "re": re, **_NETWORK_HASHES, **host_globals}
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_SCRIPT_PATH), "exec"), namespace)
     return SimpleNamespace(**namespace)
@@ -690,9 +728,156 @@ def test_skip_img2img_keeps_the_users_sampler_and_infotext():
         "Size": f"{p.width}x{p.height}",
         **p.extra_generation_params,
     }
-    assert infotext == {"Steps": 30, "Sampler": "DPM++ 2M", "Size": "1024x768"}
+    # Pasted back, the last key ticks Skip img2img again.
+    assert infotext == {
+        "Steps": 30, "Sampler": "DPM++ 2M", "Size": "1024x768",
+        "ADetailer skip img2img": True,
+    }
     # The throwaway pass, and later batch iterations, keep their values.
     assert (p.steps, p.sampler_name, p.width, p.height) == (1, "Euler", 128, 128)
+
+
+def _skip_img2img_paste_key():
+    """The second item of the Skip img2img paste field of aaaaaa/ui.py."""
+    ui_path = _SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py"
+    source = ast.parse(ui_path.read_text(encoding="utf-8"))
+    key = next(
+        node.args[0].elts[1]
+        for node in ast.walk(source)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "append"
+        and getattr(node.func.value, "id", "") == "infotext_fields"
+        and isinstance(node.args[0], ast.Tuple)
+        and getattr(node.args[0].elts[0], "id", "") == "ad_skip_img2img"
+    )
+    classes = [
+        node for node in source.body
+        if isinstance(node, ast.ClassDef) and node.name.endswith("InfotextKey")
+    ]
+    namespace = {"Any": object}
+    exec(compile(ast.Module(body=classes, type_ignores=[]), "ui.py", "exec"), namespace)
+    return eval(compile(ast.Expression(key), "ui.py", "eval"), namespace)
+
+
+def _host_paste_field(key):
+    """The two attributes of the WebUI's PasteField (modules/infotext_utils.py)."""
+    return (
+        key if isinstance(key, str) else None,
+        key if callable(key) else None,
+    )
+
+
+def _host_api_value(key, params):
+    """Api.apply_infotext (get_field_value, modules/api/api.py) for a script
+    input: the type of the component turns the value into the script's."""
+    label, function = _host_paste_field(key)
+    value = function(params) if function else params.get(label)
+    if value is not None and not isinstance(value, bool):
+        value = bool(value)
+    return value
+
+
+def _host_pasted_value(key, params):
+    """connect_paste (modules/infotext_utils.py) for a checkbox: None leaves
+    the box as it is."""
+    value = key(params) if callable(key) else params.get(key)
+    if value is None:
+        return None
+    return False if value == "False" else bool(value)
+
+
+@pytest.mark.parametrize("skip", [True, False])
+def test_api_infotext_keeps_skip_img2img_as_saved(skip):
+    # The API turned the text of the field into its type with bool(), and
+    # bool("False") is True. An img2img request with the infotext of a picture
+    # made without Skip img2img and the short form of the arguments (nothing
+    # overwrites that index) then skipped the img2img pass.
+    from adetailer.args import SkipImg2ImgOrig
+
+    key = _skip_img2img_paste_key()
+    value = _host_api_value(key, {"ADetailer skip img2img": str(skip)})
+    assert value is skip
+
+    runtime = _load_script(
+        methods={"process", "set_skip_img2img"},
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        SkipImg2ImgOrig=SkipImg2ImgOrig,
+    )
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: True
+    script.get_args = lambda *_args: []
+    script.extra_params = lambda _args: {}
+    p = SimpleNamespace(
+        init_images=[object()], width=1024, height=768, steps=30,
+        sampler_name="DPM++ 2M", extra_generation_params={},
+    )
+    script.process(p, {"ad_model": "face_yolov8n.pt"}, value, {"ad_model": "None"})
+
+    assert (p.steps, p.width, p.height) == ((1, 128, 128) if skip else (30, 1024, 768))
+    assert p.extra_generation_params["ADetailer skip img2img"] is skip
+
+
+def test_skip_img2img_paste_field_still_works_as_a_key():
+    key = _skip_img2img_paste_key()
+    # Pasting from the page: unchanged.
+    for params, expected in (
+        ({"ADetailer skip img2img": "True"}, True),
+        ({"ADetailer skip img2img": "False"}, False),
+        ({"ADetailer skip img2img": True}, True),
+        ({"ADetailer skip img2img": False}, False),
+        ({}, None),  # a txt2img picture, or the key among the disregarded ones
+    ):
+        assert _host_pasted_value(key, params) is expected
+        assert _host_api_value(key, params) is expected
+    # "Disregard fields from pasted infotext" lists the keys that are strings,
+    # and an override setting skips the handled keys by name.
+    label, function = _host_paste_field(key)
+    assert isinstance(label, str)
+    assert function is key
+    assert label == "ADetailer skip img2img"
+    assert "ADetailer skip img2img" in {key: 1}
+    assert "ADetailer skip img2img" in [key]
+
+
+@pytest.mark.parametrize("skip", [True, False])
+def test_pasted_parameters_tick_skip_img2img_again(skip):
+    # PNG Info and Send to left Skip img2img as it was: the infotext never
+    # wrote the key of its paste field.
+    from adetailer.args import SkipImg2ImgOrig
+
+    key = str(_skip_img2img_paste_key())
+    runtime = _load_script(
+        methods={"process", "set_skip_img2img"},
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        SkipImg2ImgOrig=SkipImg2ImgOrig,
+    )
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: True
+    script.get_args = lambda *_args: []
+    script.extra_params = lambda _args: {"ADetailer model": "face_yolov8n.pt"}
+    p = SimpleNamespace(
+        init_images=[object()], width=1024, height=768, steps=30,
+        sampler_name="DPM++ 2M", extra_generation_params={},
+    )
+
+    script.process(p, True, skip, {})
+
+    written = p.extra_generation_params.get(key)
+    # Also False for an img2img picture made without it: pasting it unticks a
+    # ticked box (only the True case was written, and the box stayed ticked).
+    assert written is skip
+    # The WebUI pastes a checkbox's text "True" / "False" as True / False.
+    assert str(written) == ("True" if skip else "False")
+
+    # A txt2img picture writes no key, so pasting it leaves the box alone.
+    t2i = SimpleNamespace(
+        width=1024, height=768, steps=30,
+        sampler_name="DPM++ 2M", extra_generation_params={},
+    )
+    script.process(t2i, True, False, {})
+    assert key not in t2i.extra_generation_params
 
 
 @pytest.mark.parametrize(
@@ -747,7 +932,10 @@ def test_skip_img2img_records_each_batch_files_own_settings(second_file, expecte
         "Size": f"{p.width}x{p.height}",
         **p.extra_generation_params,
     }
-    assert infotext == {"Steps": steps, "Sampler": sampler, "Size": f"{width}x{height}"}
+    assert infotext == {
+        "Steps": steps, "Sampler": sampler, "Size": f"{width}x{height}",
+        "ADetailer skip img2img": True,
+    }
     assert (p.steps, p.sampler_name, p.width, p.height) == (1, "Euler", 128, 128)
     whole = ADetailerArgs(ad_inpaint_only_masked=False)
     assert script.get_width_height(p, whole) == (width, height)
@@ -861,13 +1049,14 @@ _HAND_BOX = (300, 300, 400, 400)
 _CLASS_PROMPT = "detailed, [CLASS=face]smile[/CLASS], [CLASS=hand]five fingers[/CLASS]"
 
 
-def _class_prompt_script():
-    from adetailer.args import BBOX_SORTBY
+def _class_prompt_script(opts_data=None):
+    from adetailer.args import BBOX_SORTBY, BBOX_SORTBY_MORE
     from adetailer.classes import _has_token, build_class_guard
     from adetailer.mask import (
         filter_by_indices,
         filter_by_ratio,
         filter_k_by,
+        filter_overlapping,
         mask_preprocess,
         parse_indices,
         sort_bboxes,
@@ -882,10 +1071,12 @@ def _class_prompt_script():
             "_parse_class_prompts", "_class_prompt_for", "_resolve_inline_class_prompt"
         },
         assigns={"_INLINE_CLASS_RE"},
-        opts=SimpleNamespace(data={}),
+        opts=SimpleNamespace(data=dict(opts_data or {})),
         BBOX_SORTBY=BBOX_SORTBY,
+        BBOX_SORTBY_MORE=BBOX_SORTBY_MORE,
         filter_by_indices=filter_by_indices,
         filter_by_ratio=filter_by_ratio,
+        filter_overlapping=filter_overlapping,
         filter_k_by=filter_k_by,
         mask_preprocess=mask_preprocess,
         parse_indices=parse_indices,
@@ -990,6 +1181,92 @@ def test_inpaint_indices_accept_preview_labels_and_warn_when_unreadable(
     assert ("has no usable number" in out) is warned
     assert ("matched none" in out) is (kept == [])
     assert out.isascii()
+
+
+def _twice_found_face():
+    # One face found twice (nearly the same box, the copy less confident)
+    # plus another face.
+    from adetailer.common import PredictOutput
+
+    boxes = [(10, 10, 110, 110), (12, 10, 112, 110), (150, 10, 250, 110)]
+    masks = []
+    for box in boxes:
+        mask = Image.new("L", (512, 512), 0)
+        mask.paste(255, box)
+        masks.append(mask)
+    return PredictOutput(
+        bboxes=[list(b) for b in boxes],
+        masks=masks,
+        confidences=[0.9, 0.6, 0.8],
+        preview=Image.new("RGB", (512, 512)),
+        class_names=["face", "face", "face"],
+    )
+
+
+@pytest.mark.parametrize("value", [None, 0, 0.0, "", "not a number", [1]])
+def test_drop_overlapping_detections_off_keeps_every_detection(value, capsys):
+    from adetailer.args import ADetailerArgs
+
+    data = {} if value is None else {"ad_drop_overlapping_detections": value}
+    script = _class_prompt_script(data)
+    pred = _twice_found_face()
+
+    masks = script.pred_preprocessing(SimpleNamespace(), pred, ADetailerArgs())
+
+    assert len(masks) == 3
+    assert len(pred.bboxes) == 3
+    assert "overlapping" not in capsys.readouterr().out
+
+
+def test_drop_overlapping_detections_inpaints_a_face_found_twice_once(capsys):
+    from adetailer.args import ADetailerArgs
+
+    script = _class_prompt_script({"ad_drop_overlapping_detections": 0.6})
+    pred = _twice_found_face()
+
+    masks = script.pred_preprocessing(SimpleNamespace(), pred, ADetailerArgs())
+
+    assert pred.bboxes == [[10, 10, 110, 110], [150, 10, 250, 110]]
+    assert pred.confidences == [0.9, 0.8]
+    assert pred.class_names == ["face", "face"]
+    assert len(masks) == 2
+    out = capsys.readouterr().out
+    assert "dropped 1 overlapping detection(s)" in out
+    assert out.isascii()
+
+
+def test_drop_overlapping_detections_runs_after_the_preview_numbers():
+    # "#2" is the less confident copy on the numbered Detection preview. The
+    # number must still pick that box: the overlap filter runs after it, and
+    # with the stronger copy not picked there is nothing left to drop.
+    from adetailer.args import ADetailerArgs
+
+    script = _class_prompt_script({"ad_drop_overlapping_detections": 0.6})
+    pred = _twice_found_face()
+    args = ADetailerArgs(ad_inpaint_indices="2")
+
+    masks = script.pred_preprocessing(SimpleNamespace(), pred, args)
+
+    assert pred.bboxes == [[12, 10, 112, 110]]
+    assert len(masks) == 1
+
+
+def test_drop_overlapping_detections_is_an_option_off_by_default():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    option = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_drop_overlapping_detections"
+    )
+    info = option.args[1]
+    kwargs = {k.arg: k.value for k in info.func.value.keywords}
+    assert ast.literal_eval(kwargs["default"]) == 0
+    assert ast.unparse(kwargs["section"]) == "section"
+    label = ast.literal_eval(kwargs["label"])
+    for text in (label, ast.literal_eval(info.args[0])):
+        assert not re.search(r"\*|`|\[[^\]]*\]\(|\n", text)
 
 
 def test_console_messages_are_ascii():
@@ -1432,12 +1709,31 @@ def test_pasting_parameters_clears_class_prompts_they_leave_out(
     } == {**params, **added}
 
 
+def _ui_split_sampler_name():
+    ui_path = _SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(ui_path.read_text(encoding="utf-8"))
+    nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "split_sampler_name"
+    ]
+    namespace = {}
+    module = ast.Module(body=[tree.body[0], *nodes], type_ignores=[])
+    exec(compile(module, str(ui_path), "exec"), namespace)
+    return namespace["split_sampler_name"]
+
+
 def _paste_callback(
     skipped=(), schedulers=("Automatic", "Uniform", "Karras", "Exponential"),
-    model_mapping=None,
+    model_mapping=None, samplers=("DPM++ 2M", "DPM++ 2M SDE", "Euler", "Euler a"),
+    **host,
 ):
+    # A detector not in model_mapping makes the paste read the detector
+    # folders again: by default they hold the same detectors.
+    host.setdefault("get_models", _detector_folders(list((model_mapping or {}).items()))[0])
+    host.setdefault("adetailer_dir", Path("."))
     return _load_script(
-        functions={"_clear_missing_class_prompts"},
+        **host,
+        functions={"_clear_missing_class_prompts", "_scheduler_endings"},
         assigns={
             "_INFOTEXT_MODEL_KEY",
             "_INFOTEXT_PASTE_DEFAULTS",
@@ -1446,12 +1742,14 @@ def _paste_callback(
         # Empty: no installed-detector check, as for a WebUI without models.
         model_mapping=model_mapping or {},
         shared=SimpleNamespace(
-            opts=SimpleNamespace(infotext_skip_pasting=list(skipped))
+            opts=SimpleNamespace(infotext_skip_pasting=list(skipped), data={})
         ),
-        all_samplers=[
-            SimpleNamespace(name=n) for n in ("DPM++ 2M", "DPM++ 2M SDE", "Euler", "Euler a")
+        all_samplers=[SimpleNamespace(name=n) for n in samplers],
+        # A label, or a scheduler with its name and aliases too.
+        schedulers=[
+            SimpleNamespace(label=x) if isinstance(x, str) else x for x in schedulers
         ],
-        schedulers=[SimpleNamespace(label=label) for label in schedulers],
+        split_sampler_name=_ui_split_sampler_name(),
     )
 
 
@@ -1621,9 +1919,11 @@ def test_paste_defaults_cover_every_key_the_infotext_leaves_out():
 @pytest.mark.parametrize(
     ("choices", "expected"),
     [
-        # Forge / Forge Neo list "None" first: the image's preprocessor.
+        # Forge / Forge Neo list "None" first: as on AUTOMATIC1111, a model
+        # set with "None" gets its default (the change handler cannot tell a
+        # pasted "None" from the empty tab's).
         (["None", "inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"],
-         "None"),
+         "inpaint_global_harmonious"),
         # AUTOMATIC1111 has no "None": the model's default, as when generating.
         (["inpaint_global_harmonious", "inpaint_only", "inpaint_only+lama"],
          "inpaint_global_harmonious"),
@@ -1653,10 +1953,12 @@ def test_pasted_controlnet_module_none_replaces_a_stale_module(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "on_cn_model_update"
     ]
+    common = _SCRIPT_PATH.parents[1] / "controlnet_ext" / "common.py"
     namespace = {
         "gr": SimpleNamespace(update=lambda **kwargs: kwargs),
         "cn_module_choices": {"inpaint": choices},
     }
+    exec(compile(common.read_text(encoding="utf-8"), str(common), "exec"), namespace)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(ui_path), "exec"), namespace)
 
     assert namespace["on_cn_model_update"](_CN_INPAINT, module)["value"] == expected
@@ -1685,6 +1987,93 @@ def test_pasting_parameters_with_a_detector_switches_adetailer_on(
     _paste_callback(skipped)._clear_missing_class_prompts("", pasted)
 
     assert pasted.get("ADetailer enable") == enabled
+
+
+# Schedulers with the name and aliases the WebUI also takes off a sampler name.
+_NAMED_SCHEDULERS = (
+    SimpleNamespace(label="Automatic", name="automatic", aliases=None),
+    SimpleNamespace(label="Karras", name="karras", aliases=None),
+    SimpleNamespace(label="SGM Uniform", name="sgm_uniform", aliases=["SGMUniform"]),
+)
+
+
+def test_pasting_names_a_sampler_this_webui_does_not_have(capsys):
+    # A ticked sampler from another WebUI (Res Multistep from Forge Neo on
+    # AUTOMATIC1111) was pasted as it was: Forge showed the dropdown blank and
+    # Generate ran the first sampler with only a console warning.
+    params = {
+        "ADetailer model": "face_yolov8n.pt",
+        "ADetailer use separate sampler": "True",
+        "ADetailer sampler": "Res Multistep",
+        "ADetailer model 2nd": "hand_yolov8n.pt",
+        "ADetailer use separate sampler 2nd": "True",
+        "ADetailer sampler 2nd": "Euler a",
+    }
+
+    _paste_callback()._clear_missing_class_prompts("", params)
+
+    assert params["ADetailer sampler"] == "DPM++ 2M"
+    assert params["ADetailer sampler 2nd"] == "Euler a"
+    out = capsys.readouterr().out
+    assert out == (
+        "[-] ADetailer: the sampler 'Res Multistep' of the pasted 1st tab is not "
+        "in this WebUI: that tab uses 'DPM++ 2M' instead.\n"
+    )
+    out.encode("ascii")
+    # Unticked, the sampler does not run: nothing is said or changed.
+    params = {
+        "ADetailer model": "face_yolov8n.pt",
+        "ADetailer use separate sampler": "False",
+        "ADetailer sampler": "Res Multistep",
+    }
+    _paste_callback()._clear_missing_class_prompts("", params)
+    assert params["ADetailer sampler"] == "Res Multistep"
+    assert capsys.readouterr().out == ""
+
+
+def test_pasting_splits_a_sampler_name_as_load_does():
+    # Every name: pasted, it shows the sampler and scheduler Load shows.
+    from tests.test_ui_presets import _WEBUI_SAMPLERS, _WEBUI_SCHEDULERS, _webui_runs
+
+    for webui, schedulers in _WEBUI_SCHEDULERS.items():
+        callback = _paste_callback(schedulers=schedulers, samplers=_WEBUI_SAMPLERS)
+        endings = [e for x in schedulers for e in (x.label, x.name, *(x.aliases or ()))]
+        for base in [*_WEBUI_SAMPLERS, "Res Multistep", "Foo", "Euler SGM"]:
+            for tail in [(), *((e,) for e in endings), *((e, f) for e in endings[:6] for f in endings)]:
+                name = " ".join((base, *tail))
+                params = {
+                    "ADetailer model": "face_yolov8n.pt",
+                    "ADetailer use separate sampler": "True",
+                    "ADetailer sampler": name,
+                    "ADetailer scheduler": "Beta",
+                }
+                callback._clear_missing_class_prompts("", params)
+                runs = _webui_runs(name, "Beta", schedulers)
+                shown = (params["ADetailer sampler"], params["ADetailer scheduler"])
+                assert shown == runs[:2], (webui, name)
+
+
+def test_a_restart_is_given_the_endings_the_webui_takes_off_a_sampler_name():
+    # The restart test builds its own WebuiInfo: check that the script hands
+    # it each scheduler's label, name and aliases, as the paste callback uses.
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    call = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "WebuiInfo"
+    )
+    value = next(k.value for k in call.keywords if k.arg == "scheduler_endings")
+    assert ast.unparse(value) == "_scheduler_endings()"
+    runtime = _load_script(
+        functions={"_scheduler_endings"},
+        schedulers=[
+            SimpleNamespace(label="Karras", name="karras", aliases=None),
+            SimpleNamespace(label="SGM Uniform", name="sgm_uniform", aliases=["SGMUniform"]),
+            SimpleNamespace(label="Beta"),
+        ],
+    )
+    assert runtime._scheduler_endings() == [
+        ["Karras", "karras"], ["SGM Uniform", "sgm_uniform", "SGMUniform"], ["Beta", None],
+    ]
 
 
 def test_pasting_splits_an_old_combined_sampler_name():
@@ -1725,12 +2114,20 @@ def test_pasting_splits_an_old_combined_sampler_name():
          ("Use same sampler", "Use same scheduler")),
         (("False", "DPM++ 2M Karras", None), [], None,
          ("DPM++ 2M Karras", "Use same scheduler")),
-        (("True", "Foo Karras", None), [], None, ("Foo Karras", "Use same scheduler")),
-        # Unlike Load, a sampler this WebUI does not have and a scheduler's
-        # other names are kept too (known issues of beta 2).
-        (("True", "Res Multistep", "Karras"), [], None, ("Res Multistep", "Karras")),
-        (("True", "DPM++ 2M karras", None), [], None,
-         ("DPM++ 2M karras", "Use same scheduler")),
+        # As Load: a scheduler's other names are split too.
+        (("True", "DPM++ 2M karras", None), [], _NAMED_SCHEDULERS, ("DPM++ 2M", "Karras")),
+        (("True", "Euler a sgm_uniform", None), [], _NAMED_SCHEDULERS,
+         ("Euler a", "SGM Uniform")),
+        # As Load: a sampler this WebUI does not have takes the first one, and
+        # the scheduler the name ended with is kept.
+        (("True", "Res Multistep", "Karras"), [], None, ("DPM++ 2M", "Karras")),
+        (("True", "Foo Karras", None), [], None, ("DPM++ 2M", "Karras")),
+        (("True", "k_euler_a", None), [], None, ("DPM++ 2M", "Use same scheduler")),
+        (("True", "Res Multistep", "Karras"), ["ADetailer scheduler"], None,
+         ("DPM++ 2M", "Karras")),
+        # Not pasted, so not changed: the WebUI keeps the dropdown as it is.
+        (("True", "Res Multistep", "Karras"), ["ADetailer sampler"], None,
+         ("Res Multistep", "Karras")),
         # Splitting without the scheduler would lose Karras.
         (("True", "DPM++ 2M Karras", None), ["ADetailer scheduler"], None,
          ("DPM++ 2M Karras", None)),
@@ -1747,11 +2144,15 @@ def test_pasting_leaves_other_sampler_names_alone(pasted, skipped, schedulers, e
     }
     if scheduler is not None:
         params["ADetailer scheduler"] = scheduler
-    callback = (
-        _paste_callback(skipped)
-        if schedulers is None
-        else _paste_callback(skipped, schedulers)
-    )
+    if schedulers is None:
+        callback = _paste_callback(skipped)
+    elif schedulers == ():
+        # WebUI < 1.9 lists the combined names as samplers.
+        callback = _paste_callback(
+            skipped, schedulers, samplers=("DPM++ 2M", "DPM++ 2M Karras", "Euler a")
+        )
+    else:
+        callback = _paste_callback(skipped, schedulers)
 
     callback._clear_missing_class_prompts("", params)
 
@@ -1986,6 +2387,7 @@ def test_detailer_pass_keeps_the_distilled_cfg_scale(host, user_value, expected)
         schedulers=None,
         controlnet_type="forge",
         copy_extra_params=dict,
+        opts=SimpleNamespace(),  # the host's own options
     )
     script = runtime.AfterDetailerScript()
     script.get_seed = lambda _p: (1, 1)
@@ -2069,9 +2471,13 @@ _INLINE_PROMPT_METHODS = {
 _INLINE_PROMPT_FUNCTIONS = {
     "_resolve_inline_class_prompt", "_extract_lora_tags", "_extract_lora_triggers",
     "_merge_lora_tags", "_append_lora_triggers", "_strip_lora_tags",
-    "_without_style_loras",
+    "_without_style_loras", "_strip_host_comments",
+    "_filter_main_prompt", "_split_prompt_pieces", "_ad_verbose", "_vprint",
+    "_drop_empty_tokens",
 }
-_INLINE_PROMPT_ASSIGNS = {"_INLINE_CLASS_RE", "_LORA_TAG_RE", "_LORA_TRIGGER_RE"}
+_INLINE_PROMPT_ASSIGNS = {
+    "_INLINE_CLASS_RE", "_LORA_TAG_RE", "_LORA_TRIGGER_RE", "_PROMPT_TOKEN_RE",
+}
 
 
 @pytest.mark.parametrize(
@@ -2323,6 +2729,113 @@ def test_readme_says_how_scale_inpaint_to_bbox_rounds_its_sizes():
     assert scaled(101.3, 1.5) == 152  # a fractional box: 151.95 pixels
 
 
+def test_the_docs_say_that_scale_inpaint_to_bbox_does_not_count_the_padding():
+    # The iris tip advised "Scale inpaint to bbox", and the README said that
+    # small and large regions both get enough detail. But fix_p2 sizes the
+    # canvas from the box alone, while the host crops the box plus the padding,
+    # the dilation and the spread of the mask blur (its kernel reaches
+    # int(2.5 * blur + 0.5) pixels on each side) and resizes that crop to the
+    # canvas: at scale 1.5 a small box is redrawn smaller than it is in the
+    # picture.
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    runtime = _load_script(
+        methods={
+            "fix_p2", "get_dynamic_denoise_strength", "get_optimal_crop_image_size",
+            "get_seed", "get_each_tab_seed",
+        },
+        opts=SimpleNamespace(data={}),
+        shared=SimpleNamespace(opts=SimpleNamespace(data={})),
+        get_i=lambda _p: 0,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    outer = SimpleNamespace(seed=1, subseed=1, all_seeds=[1], all_subseeds=[1])
+
+    def canvas(width, height, scale):
+        p2 = SimpleNamespace(width=1024, height=1024, denoising_strength=0.4, image_mask=None)
+        args = ADetailerArgs(
+            ad_model="mediapipe_face_features", ad_use_resolution_scale=True,
+            ad_resolution_scale=scale,
+        )
+        runtime.AfterDetailerScript().fix_p2(
+            outer, p2, SimpleNamespace(image=Image.new("RGB", (1024, 1024))), args,
+            SimpleNamespace(bboxes=[[10, 10, 10 + width, 10 + height]]), 0,
+        )
+        return p2.width, p2.height
+
+    defaults = ADetailerArgs(ad_model="mediapipe_face_features")
+    around = (
+        2 * defaults.ad_inpaint_only_masked_padding
+        + defaults.ad_dilate_erode
+        + 2 * int(2.5 * defaults.ad_mask_blur + 0.5)
+    )
+    section = _readme_section("### Scale inpaint to bbox", "### Dynamic denoise by area")
+    note = next(
+        flat for flat in map(_flat_doc_text, section.split("\n- "))
+        if "from the box alone" in flat
+    )
+    # The numbers of the note are what the code gives with the default values.
+    assert '"Inpaint only masked padding, pixels"' in note
+    assert '"Inpaint mask blur"' in note
+    limit = int(re.search(r"under about (\d+) pixels", note).group(1))
+    assert canvas(limit - 8, limit - 8, 1.5)[0] < limit - 8 + around
+    assert canvas(limit + 8, limit + 8, 1.5)[0] >= limit + 8 + around
+    width, height, canvas_w, canvas_h, crop_w, crop_h = map(int, re.search(
+        r"a (\d+)x(\d+) box gets (\d+)x(\d+) for a crop of about (\d+)x(\d+)", note
+    ).groups())
+    assert canvas(width, height, 1.5) == (canvas_w, canvas_h)
+    assert crop_w == crop_h == width + around
+    assert canvas_w < crop_w
+    scale, high_w, high_h = map(int, re.search(
+        r"at scale (\d+) the same box gets (\d+)x(\d+)", note
+    ).groups())
+    assert canvas(width, height, scale) == (high_w, high_h)
+    assert high_w > crop_w
+
+    docs = _public_docs()
+    assert "both get enough detail" not in docs["README.md"]
+    assert section.count("the size follows the region") == 1
+    summary = next(
+        line for line in docs["README.md"].splitlines()
+        if line.startswith("- 🟢 **Scale inpaint to bbox**")
+    )
+    assert "the size follows the region" in summary
+    assert "(#scale-inpaint-to-bbox)" in summary
+    # The tip of the iris, in the README and in the entry of beta 2 below.
+    beta2 = docs["CHANGELOG.md"].split("## v26.2.0+plus.9.beta.2", 1)[1]
+    tips = [
+        sentence
+        for text in (docs["README.md"], beta2.split("\n## ", 1)[0])
+        for sentence in re.split(r"(?<=[.]) ", text)
+        if "without moving the gaze" in sentence
+    ]
+    assert len(tips) == 2, tips
+    for tip in tips:
+        assert '"Scale inpaint to bbox" on' not in tip, tip
+        assert "about 4 pixels" in tip
+        assert "0.3 to 0.45" in tip
+    assert 'leave "Scale inpaint to bbox" off' in tips[0]
+
+
+def test_the_readme_says_the_boxes_can_be_clicked_only_on_the_single_tab_preview():
+    # With "Show labels" off the README said that the boxes can still be
+    # clicked also on "Combine all tabs", which has no boxes to click: its
+    # notes on clicking say so, and _preview_boxes_json leaves them out.
+    notes = [
+        line for line in _public_docs()["README.md"].splitlines()
+        if "can still be clicked" in line
+    ]
+    assert len(notes) == 2
+    for line in notes:
+        assert "Show labels" in line
+        assert "Combine all tabs" in line  # the labels are hidden there too
+        assert "single-tab preview, where the boxes can still be clicked" in line
+        assert line.index("can still be clicked") < line.index("Combine all tabs")
+
+
 @pytest.mark.parametrize(
     ("detected", "expected"),
     [
@@ -2331,6 +2844,9 @@ def test_readme_says_how_scale_inpaint_to_bbox_rounds_its_sizes():
         # A part never gets "face", which surrounds it, in its negative.
         ("eyes", ("eyes, detailed", "blurry, mouth, nose, eyebrows")),
         ("mouth", ("mouth, detailed", "blurry, eyes, nose, eyebrows")),
+        # The iris lies inside the eyes: neither is the other's negative, and
+        # the opt-in iris is no other part's negative.
+        ("iris", ("iris, detailed", "blurry, mouth, nose, eyebrows")),
     ],
 )
 def test_class_guard_of_face_features_never_negates_the_face_or_its_parts(
@@ -2361,7 +2877,7 @@ def test_class_guard_of_face_features_never_negates_the_face_or_its_parts(
     )
 
     assert (p2.prompt, p2.negative_prompt) == expected
-    assert len(get_model_class_names(MEDIAPIPE_FACE_FEATURES_MODEL)) == 5
+    assert len(get_model_class_names(MEDIAPIPE_FACE_FEATURES_MODEL)) == 6
 
 
 def test_xyz_prompt_search_replace_writes_the_parameters_before_the_batch_starts():
@@ -2454,8 +2970,11 @@ def _nan_standalone(tmp_path):
     todo = []
 
     def process_images(_p2):
-        if todo.pop(0) == "nan":
+        outcome = todo.pop(0)
+        if outcome == "nan":
             raise nans("A tensor with NaNs was produced in Unet.")
+        if outcome == "error":
+            raise RuntimeError("CUDA out of memory.")
         return SimpleNamespace(images=[result])
 
     def predict(*_args, **_kwargs):
@@ -2854,9 +3373,12 @@ def test_standalone_run_follows_the_global_output_directory(tmp_path, global_dir
     # the standalone tool still wrote next to the img2img folder.
     img2img_dir = tmp_path / "webui" / "outputs" / "img2img-images"
     override = str(tmp_path / "other-drive" / "images") if global_dir else ""
-    saved, shells = [], []
+    saved, shells, names = [], [], []
     script = _load_script(
-        methods={"run_detailer_on_image", "read_params_txt", "write_params_txt"},
+        methods={
+            "run_detailer_on_image", "read_params_txt", "write_params_txt",
+            "_standalone_infotext_p",
+        },
         paths=SimpleNamespace(data_path=str(tmp_path)),
         PARAMS_TXT="params.txt",
         shared=SimpleNamespace(sd_model=None),
@@ -2868,7 +3390,8 @@ def test_standalone_run_follows_the_global_output_directory(tmp_path, global_dir
         all_samplers=[],
         ensure_pil_image=lambda image, _mode: image,
         images=SimpleNamespace(
-            save_image=lambda _image, path, _basename, **_kwargs: saved.append(path)
+            save_image=lambda _image, path, _basename, **kwargs: saved.append(path)
+            or names.append(kwargs["p"])
         ),
         AD_APPLY_SUBDIR="ADetailer-Inpaint",
         pause_total_tqdm=nullcontext,
@@ -2885,6 +3408,11 @@ def test_standalone_run_follows_the_global_output_directory(tmp_path, global_dir
     )
 
     assert "Saved" in status
+    # The result is named with the completed copy of the shell, as the
+    # previews are: a [user] or [denoising] file-name token printed a
+    # traceback for each result.
+    assert names[0] is not shells[0]
+    assert (names[0].user, names[0].denoising_strength) == (None, None)
     if global_dir:
         assert shells[0].outpath_samples == override
         assert saved == [str(Path(override) / "ADetailer-Inpaint")]
@@ -3246,6 +3774,419 @@ def test_readme_says_when_an_added_sidecar_needs_a_restart():
     assert "adding or changing this file" in section
     assert "still empty" in section
     assert "fills an empty CLASSES dropdown without a restart" in readme
+
+
+def test_readme_says_presets_export_as_a_file_on_every_webui():
+    # From plus.9 Export also saves the library as a file on Gradio 3 WebUIs
+    # such as AUTOMATIC1111, but the comparison table and the Delete note
+    # still said it does only on Forge and Forge Neo.
+    ui_text = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    assert "_EXPORT_BLOB_JS" in ui_text  # the Gradio 3 step that saves the file
+    readme = _public_docs()["README.md"]
+    row = next(
+        line for line in readme.splitlines()
+        if line.startswith("| Save a setup and use it again |")
+    )
+    assert "export as a file" in row
+    for stale in ("export as a file on Forge and Forge Neo",
+                  "it on Forge and Forge Neo, or copy"):
+        assert stale not in readme
+
+
+def test_the_stable_release_date_comes_after_the_beta_it_fixes():
+    # The stable section was dated on the day of beta 3 although it adds the
+    # fixes made after beta 3, and the README gave the same date.
+    current = _current_version()
+    if ".beta." in current:
+        return
+    docs = _public_docs()
+    changelog = docs["CHANGELOG.md"]
+    heading = _changelog_stable_heading(changelog, f"v{current}")
+    assert heading is not None
+    date = re.search(r"(\d{4}-\d{2}-\d{2})$", heading).group(1)
+    section = changelog[changelog.index(heading):]
+    section = section[: section.index("\n## ")]
+    fixed = re.search(r"\*\*Fixed since beta (\d+)\*\*", section)
+    if fixed:
+        beta = next(
+            line for line in changelog.splitlines()
+            if line.startswith(f"## v{current}.beta.{fixed.group(1)} ")
+        )
+        assert date > re.search(r"(\d{4}-\d{2}-\d{2})$", beta).group(1)
+    assert f"**v{current}**, released on {date}," in docs["README.md"]
+
+
+def test_readme_faq_names_the_font_ultralytics_may_download():
+    # Every detection draws Ultralytics' own picture of the boxes; with
+    # non-ASCII class names Ultralytics then looks for a Unicode font and,
+    # when it has none, downloads it from GitHub, which the FAQ on what
+    # ADetailer downloads left out.
+    source = (_SCRIPT_PATH.parents[1] / "adetailer" / "ultralytics.py").read_text(encoding="utf-8")
+    assert "pred[0].plot()" in source
+    faq = _readme_section("### Does it upload my images?", "### Is a detector file safe?")
+    sentence = next(s for s in faq.split(". ") if "Arial.Unicode.ttf" in s)
+    assert "non-ASCII" in sentence
+    assert "GitHub" in sentence
+    # Ultralytics draws with the names stored in the detector file, not with
+    # those of a <model>.names.json next to it, which only ADetailer reads.
+    assert "stored in the detector file" in sentence
+    assert "`.names.json`" in sentence
+    classes = (_SCRIPT_PATH.parents[1] / "adetailer" / "classes.py").read_text(encoding="utf-8")
+    assert ".names.json" in classes
+    assert ".names.json" not in source
+
+
+def test_the_upscaler_row_says_a_forge_controlnet_tab_uses_the_chosen_upscaler():
+    # Without a script runner ("Run ADetailer on an image", folder runs) the
+    # region is pasted back after the pass, with the WebUI's upscaler; on
+    # Forge, Forge Neo and reForge a ControlNet model gives the pass a runner,
+    # whose overlay step then runs inside the pass, with the chosen one.
+    forge_cn = (_SCRIPT_PATH.parents[1] / "controlnet_ext" / "controlnet_ext_forge.py").read_text(
+        encoding="utf-8"
+    )
+    assert "p.scripts = copy.copy(scripts.scripts_img2img)" in forge_cn
+    readme = _public_docs()["README.md"]
+    row = next(
+        line for line in readme.splitlines()
+        if line.startswith("| Upscaler for ADetailer's inpaint area")
+    )
+    assert "that last step uses the WebUI's own upscaler" in row
+    assert "with a ControlNet model in the tab" in row
+    changelog = _public_docs()["CHANGELOG.md"]
+    fixed = changelog.split("**Fixed since beta 3**", 1)[1].split("**Known issues**", 1)[0]
+    entry = next(line for line in fixed.splitlines() if "Overlay original for inpaint" in line)
+    assert "Upscaler for ADetailer's inpaint area" in entry
+
+
+def test_the_stable_intro_says_short_api_requests_run_one_pass_per_tab():
+    # plus.9 drops the WebUI's default 1st tab from an API request that sends
+    # only the tabs, so such a request made for plus.8 runs one pass less.
+    source = _SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "def _drop_api_default_tab(" in source
+    changelog = _public_docs()["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    intro = next(line for line in stable.splitlines() if "work as before" in line)
+    assert "short form" in intro
+    assert "one pass per tab it sends" in intro
+
+
+def test_the_privacy_notes_name_the_commandline_row_of_the_error_panel():
+    # The panel that ADetailer prints with an error lists every launch
+    # argument in the "Commandline" row of its "System info" table, so a
+    # password or token passed with --gradio-auth, --api-auth or --ngrok is
+    # there too; the notes named only the "Launching Web UI with arguments"
+    # line.
+    root = _SCRIPT_PATH.parents[1]
+    traceback_source = (root / "aaaaaa" / "traceback.py").read_text(encoding="utf-8")
+    assert '"Commandline": sys.argv' in traceback_source
+    assert '("System info", sys_info())' in traceback_source
+    form = (root / ".github" / "ISSUE_TEMPLATE" / "bug_report.yaml").read_text(encoding="utf-8")
+    readme = _public_docs()["README.md"]
+    notes = [
+        line for text in (form, readme) for line in text.splitlines()
+        if 'token in the "Launching Web UI with arguments" line' in line
+    ]
+    assert len(notes) == 3
+    for line in notes:
+        assert 'and in the "Commandline" row of the "System info" table' in line
+
+
+def test_the_readme_credits_name_every_fork_plus9_took_an_idea_from():
+    # The changelog of plus.9 names the fork each borrowed idea comes from,
+    # but the Credits of the README named only two of them.
+    changelog = _public_docs()["CHANGELOG.md"]
+    plus9 = changelog[: changelog.index("## v26.2.0+plus.8 ")]
+    forks = set(re.findall(r"[Ii]dea (?:from|comes from) the \[?([\w.-]+/[\w.-]+)", plus9))
+    forks |= {
+        f"{owner}/{repo}"
+        for owner, repo in re.findall(r"[Ii]dea from ([\w.-]+)'s ([\w.-]+) fork", plus9)
+    }
+    assert len(forks) >= 7, forks
+    credits = next(
+        line for line in _readme_section("## Credits", "## See also").splitlines()
+        if "plus.9 takes up ideas" in line
+    )
+    for fork in sorted(forks):
+        assert f"[{fork}](https://github.com/{fork})" in credits, fork
+
+
+def test_the_known_issues_say_pasted_parameters_can_show_an_empty_detector_menu():
+    # Pasted parameters keep a detector added while the WebUI runs, but the
+    # WebUI sends the menu only the value, which Gradio 4 shows empty in a
+    # menu built without it; no event handler may be added to list it.
+    ui = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    assert "(getattr(w, attr), name + suffix(n))" in ui  # a plain paste key
+    known = _readme_section("### Known issues", "More symptoms")
+    changelog = _public_docs()["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    for text in (known, stable):
+        line = next(s for s in text.splitlines() if "**Pasted parameters with a detector" in s)
+        assert "Forge Neo" in line and "🔄" in line and "Generate uses it" in line
+        # Only the 🔄 sends the menu its choices again (a reload shows the
+        # startup config), and only Gradio 4 shows the value-only menu empty.
+        assert "reload the page" not in line and "Gradio 4" in line
+
+
+def test_the_docs_say_a_controlnet_tab_runs_only_controlnet_on_forge():
+    # The Forge ControlNet backend gives the pass a runner with ControlNet only,
+    # so reForge's Advanced Model Sampling does not "always" run there.
+    source = (_SCRIPT_PATH.parents[1] / "controlnet_ext" / "controlnet_ext_forge.py").read_text(
+        encoding="utf-8"
+    )
+    assert "p.scripts.alwayson_scripts = []" in source
+    readme = _public_docs()["README.md"]
+    for line in readme.splitlines():
+        if "Advanced Model Sampling" in line and "always run" in line:
+            assert "ControlNet model" in line, line[:80]
+    known = _readme_section("### Known issues", "More symptoms")
+    changelog = _public_docs()["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    for text in (known, stable):
+        line = next(
+            s for s in text.splitlines()
+            if "the detailer pass runs only ControlNet" in s
+        )
+        assert "Advanced Model Sampling" in line and "reForge" in line
+
+
+def test_the_docs_say_the_adetailer_prompt_comments_stay_in_the_parameters():
+    # The WebUI leaves the main prompt's comments out of the saved parameters;
+    # ADetailer saves its boxes as typed, so pasting brings them back: a note
+    # typed there is shared with the picture, and the docs must say so.
+    from adetailer.args import ADetailerArgs
+
+    params = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_prompt="smiling face # note"
+    ).extra_params()
+    assert params["ADetailer prompt"] == "smiling face # note"
+    readme = _public_docs()["README.md"]
+    prompts = _readme_section("### Prompts", "\n## ")
+    faq = _readme_section("### Does it upload my images?", "### Is a detector file safe?")
+    upstream = next(s for s in readme.splitlines() if s.startswith("Prompt comments ("))
+    for text in (prompts, faq, upstream):
+        assert "private notes" in text and "image parameters" in text
+    changelog = _public_docs()["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    assert "comments typed in the ADetailer prompt boxes stay in the image parameters" in stable
+
+
+def test_the_docs_say_the_batch_ti_fix_covers_forge_too():
+    # The main pass's values are put back on shared.sd_model on any WebUI,
+    # and Forge keeps "TI" and "Emphasis" on the model as Forge Neo does,
+    # so the docs of that fix must name Forge too, not Forge Neo only.
+    source = _SCRIPT_PATH.read_text(encoding="utf-8")
+    assert '_model = getattr(shared, "sd_model", None)' in source
+    docs = _public_docs()
+    changelog = docs["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    entry = next(s for s in stable.splitlines() if "With Batch count 2 or more" in s)
+    assert "on Forge and Forge Neo they no longer get" in entry
+    assert 'Forge and Forge Neo write no "TI hashes"' in entry
+    readme = docs["README.md"].splitlines()
+    summary = next(s for s in readme if s.startswith("**v26.2.0+plus.9**, released on"))
+    assert 'on Forge and Forge Neo they no longer get the "TI" and "Emphasis"' in summary
+    bullet = next(s for s in readme if s.startswith("- 🟢 A LoRA or an embedding used only"))
+    assert "On Forge and Forge Neo, the later batches" in bullet
+
+
+def test_the_docs_say_what_full_region_opacity_does():
+    # At 100, the default, no blend is made and each region stays as
+    # inpainted; at 0 the picture stays as it was before that region. The
+    # docs said "at 100 the picture is not touched", unlike the Settings help.
+    source = _SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "if region_opacity < 100 else None" in source
+    assert "100 = the full result, as usual" in source
+    docs = _public_docs()
+    row = next(
+        s for s in docs["README.md"].splitlines() if s.startswith("| Detailed region opacity")
+    )
+    entry = next(
+        s for s in docs["CHANGELOG.md"].splitlines()
+        if s.startswith('- **"Detailed region opacity"**')
+    )
+    for text in (row, entry):
+        assert "not touched" not in text
+        assert "kept as inpainted" in text and "at 0 the picture stays" in text
+
+
+def test_the_docs_do_not_promise_that_the_mirror_never_gets_the_token():
+    # Only ADetailer's own mirror request has token=False: with HF_ENDPOINT
+    # set to the mirror, the request to Hugging Face goes there with the
+    # user's token, so the docs must not say the mirror never receives it.
+    common = (_SCRIPT_PATH.parents[1] / "adetailer" / "common.py").read_text(encoding="utf-8")
+    assert "return hf_hub_download(repo_id, file, etag_timeout=1)\n" in common
+    docs = _public_docs()
+    readme = docs["README.md"]
+    assert "never receives your Hugging Face token" not in readme
+    lines = readme.splitlines()
+    summary = next(s for s in lines if s.startswith("**v26.2.0+plus.9**, released on"))
+    builtin = next(s for s in lines if s.startswith("- The `.pt` detectors in this table"))
+    faq = _readme_section("### Does it upload my images?", "### Is a detector file safe?")
+    changelog = docs["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    entry = next(s for s in stable.splitlines() if s.startswith("- **") and "hf-mirror.com" in s)
+    assert not entry.startswith("- **Your Hugging Face token is no longer sent")
+    for text in (summary, builtin, faq, entry):
+        assert "`HF_ENDPOINT`" in text
+
+
+def test_the_docs_say_forge_removed_the_adetailer_prompt_comments_already():
+    # Forge removes the comments while it applies the styles, also in the
+    # detailer pass, so they never reached the model there: its problem was
+    # what a comment took with it. The plus.8 note must not say otherwise.
+    readme = _public_docs()["README.md"]
+    note = next(
+        s for s in readme.splitlines()
+        if s.startswith("- **Prompt comments typed in the ADetailer prompts reach the model.**")
+    )
+    assert "(on Forge, in the stable plus.9)" not in note
+    assert "Forge removes these comments itself" in note
+    assert "not removed on AUTOMATIC1111, Forge Neo and reForge" in note
+    feature = next(
+        s for s in readme.splitlines()
+        if s.startswith("- 🟢 **Comments left out of the ADetailer prompts**")
+    )
+    assert "In plus.8 they reach the model, except on Forge:" in feature
+    prompts = next(
+        s for s in readme.splitlines()
+        if "In plus.8, comments typed in the ADetailer prompt boxes themselves" in s
+    )
+    assert (
+        "are not removed on AUTOMATIC1111, Forge Neo and reForge"
+        " (Forge removes them itself):"
+    ) in prompts
+
+
+def test_the_readme_says_the_controlnet_axis_ran_without_a_preprocessor():
+    # On Forge, Forge Neo and reForge the axis ran each model without a
+    # preprocessor; "So does", right after AUTOMATIC1111's default, read as
+    # if the axis had used the default already in plus.8.
+    readme = _public_docs()["README.md"]
+    note = next(
+        s for s in readme.splitlines()
+        if s.startswith('- **On Forge, Forge Neo and reForge, choosing a ControlNet model')
+    )
+    assert "So does the X/Y/Z" not in note
+    assert (
+        'the X/Y/Z "[ADetailer] ControlNet model 1st" axis also ran each model'
+        " without a preprocessor"
+    ) in note
+
+
+def test_the_docs_say_the_pid_picture_reaches_the_results():
+    # The stand-in result of postprocess_image() took the PiD picture, so it
+    # never stood next to the previews: the parameters the docs called mixed
+    # up could not be, and the picture itself was what got lost.
+    source = _SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "infotexts.insert(start + k, text)" in source
+    docs = _public_docs()
+    changelog = docs["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    entry = next(s for s in stable.splitlines() if s.startswith("- **") and "PiD Integrated" in s)
+    assert 'the picture of "PiD Integrated" reaches the results' in entry
+    assert "`-pid` suffix" in entry
+    assert "mixed up" not in entry
+    readme = docs["README.md"]
+    bullet = next(
+        s for s in readme.splitlines()
+        if s.startswith("- 🟢 **Detection previews in the results gallery**") and "PiD" in s
+    )
+    assert "they were swapped" not in bullet
+    assert "shifted by one place" not in bullet
+    assert "mixed up" not in bullet
+    assert "the PiD picture comes after them with its own parameters" in bullet
+
+
+def test_the_known_issues_no_longer_list_a_style_on_the_line_of_a_comment():
+    # Applied once from the stable release; plus.8 keeps the limit, marked.
+    readme = _public_docs()["README.md"]
+    current, plus8 = (
+        line for line in readme.splitlines()
+        if line.startswith("- **Styles can still be applied twice.**")
+    )
+    assert "comment" not in current
+    assert "rewrites the main prompts" in current
+    assert "fixed in the stable release of plus.9" in plus8
+
+
+def test_the_changelog_does_not_call_the_controlnet_axis_new():
+    # "[ADetailer] ControlNet model 1st" comes from the original ADetailer:
+    # plus.9 added no ControlNet axis.
+    changelog = _public_docs()["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    entry = next(s for s in stable.splitlines() if "works in every pass" in s)
+    assert "axis of plus.9" not in entry
+    assert "This was in earlier releases too." in entry
+
+
+def test_the_style_comment_sentence_does_not_split_the_typed_comments_ones():
+    # "this works" and "Those comments stay" speak of the comments typed in the
+    # boxes: right after the sentence on Styles they read as said of those,
+    # which Forge always removed and which are not in "ADetailer prompt".
+    paragraph = next(
+        s for s in _public_docs()["README.md"].splitlines()
+        if s.startswith("Prompt comments (")
+    )
+    typed = paragraph.index("a box that holds only a comment counts as blank")
+    forge = paragraph.index("On Forge, which removes the comments")
+    stay = paragraph.index("Those comments stay in the image parameters")
+    style = paragraph.index("a comment written in a selected Style")
+    assert typed < forge < stay < style
+    assert paragraph.index("In plus.8, comments typed") > style
+
+
+def test_the_changelog_says_the_preset_preview_dropped_the_lora_brackets():
+    # Markdown reads <lora:eyes:0.8> as a link, so its text stayed on the page:
+    # only the angle brackets went, the LoRA never vanished.
+    changelog = _public_docs()["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    entry = next(s for s in stable.splitlines() if "shown as text" in s and "preset" in s)
+    assert "where it vanished" not in entry
+    assert "the angle brackets of a `<lora:name:1>`, which the preview dropped" in entry
+
+
+def test_the_changelog_says_the_rich_error_stopped_that_tab_and_the_later_ones():
+    # The tabs run one after the other with no except around them: the tabs
+    # before the one with the token were already applied to the image.
+    changelog = _public_docs()["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    entry = next(s for s in stable.splitlines() if "rich raised an error" in s)
+    assert "all its tabs included" not in entry
+    assert "stopped ADetailer for that image from that tab on" in entry
+
+
+def test_the_docs_quote_the_host_settings_by_the_label_each_host_shows():
+    # Settings are found by their label: a quoted name must be one a host has,
+    # with the Forge Neo label next to it where it differs. Two lists of topics
+    # only mention the overlay setting by name, among other things.
+    docs = _public_docs()
+    readme, changelog = docs["README.md"], docs["CHANGELOG.md"]
+    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    assert '"img2img background colour"' not in readme
+    topic_lists = (
+        'pasted samplers and "Overlay original for inpaint"',
+        'the two about "Overlay original for inpaint"',
+    )
+    for automatic, neo in (
+        ("Disregard fields from pasted infotext", "Ignore fields when reading infotext"),
+        ("Output directory for images", "Output Directory"),
+        (
+            "With img2img, fill transparent parts of the input image with this color",
+            "For img2img, fill the transparent parts of the input image with this color",
+        ),
+        (
+            "Overlay original for inpaint",
+            "For inpainting, overlay the resulting image back onto the original image",
+        ),
+    ):
+        lines = [
+            s for s in (*readme.splitlines(), *stable.splitlines())
+            if f'"{automatic}"' in s
+            and not any(topic in s for topic in topic_lists)
+        ]
+        assert lines
+        for line in lines:
+            assert f'"{neo}"' in line
 
 
 @pytest.mark.parametrize(
@@ -4373,8 +5314,9 @@ def test_the_readme_says_mediapipe_face_full_uses_the_short_range_model():
         (True, False, {"overlay_inpaint": False}, False),
     ],
 )
+@pytest.mark.parametrize("with_scripts", [True, False])
 def test_an_only_masked_pass_keeps_the_host_overlay_on(
-    only_masked, registered, saved, forced
+    only_masked, registered, saved, forced, with_scripts
 ):
     from adetailer.args import ADetailerArgs
 
@@ -4382,19 +5324,259 @@ def test_an_only_masked_pass_keeps_the_host_overlay_on(
     labels = {"overlay_inpaint": object()} if registered else {}
     script = _i2i_script(
         methods={"get_override_settings"},
+        functions={"_keep_host_overlay"},
         opts=SimpleNamespace(data=data, data_labels=labels),
         _is_forge_modules=lambda: False,
         _forge_wanted_modules=lambda _args: None,
     )
+    host_step = lambda _p, _ppmo: None  # noqa: E731
+    runner = SimpleNamespace(postprocess_maskoverlay=host_step)
+    script.script_filter = lambda *_args: (runner if with_scripts else None, [])
     args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_only_masked=only_masked)
 
     i2i = script.get_i2i_p(_txt2img_p(), args, Image.new("RGB", (512, 768)))
 
-    assert i2i.override_settings.get("overlay_inpaint") is (True if forced else None)
-    # The host puts back after the pass only the options in opts.data; the
-    # user's own setting is not touched here.
-    assert set(i2i.override_settings) <= set(data)
+    # Setting the option for the pass left it on in the settings the WebUI
+    # saved during the pass, and the host's opts.set stopped ADetailer with
+    # frozen settings ("not possible to set 'overlay_inpaint'").
+    assert "overlay_inpaint" not in i2i.override_settings
     assert data == saved
+    # Instead the pass gets the host's overlay: through this pass's script
+    # runner, or pasted back after the pass when it has none.
+    wrapped = runner.postprocess_maskoverlay is not host_step
+    assert wrapped is (forced and with_scripts)
+    assert getattr(i2i, "_ad_paste_back", False) is (forced and not with_scripts)
+
+
+@pytest.mark.parametrize(
+    ("controlnet", "replaces", "with_scripts", "overlay_on"),
+    [
+        # Forge / Forge Neo / reForge: the ControlNet backend gives the pass a
+        # fresh copy of the host's img2img runner.
+        (True, True, True, False),
+        (True, True, False, False),
+        # Unchanged: AUTOMATIC1111's backend only changes the script args, no
+        # ControlNet in the tab, the option on.
+        (True, False, True, False),
+        (False, True, True, False),
+        (False, True, False, False),
+        (True, True, True, True),
+    ],
+)
+def test_the_overlay_step_is_on_the_runner_the_pass_uses(
+    controlnet, replaces, with_scripts, overlay_on
+):
+    from adetailer.args import ADetailerArgs
+
+    host_step = lambda _p, _ppmo: None  # noqa: E731
+    first = SimpleNamespace(postprocess_maskoverlay=host_step)
+    fresh = SimpleNamespace(postprocess_maskoverlay=host_step)
+
+    class ControlNet:
+        cn_available = True
+
+        def update_scripts_args(self, p, **_kw):
+            # controlnet_ext_forge: p.scripts = copy.copy(scripts.scripts_img2img)
+            if replaces:
+                p.scripts = fresh
+
+    script = _i2i_script(
+        methods={"get_override_settings", "update_controlnet_args"},
+        functions={"_keep_host_overlay"},
+        opts=SimpleNamespace(
+            data={"overlay_inpaint": overlay_on},
+            data_labels={"overlay_inpaint": object()},
+        ),
+        _is_forge_modules=lambda: False,
+        _forge_wanted_modules=lambda _args: None,
+    )
+    script.controlnet_ext = ControlNet()
+    script.script_filter = lambda *_args: (first if with_scripts else None, [])
+    model = "control_v11p_sd15_inpaint [abc12345]" if controlnet else "None"
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt",
+        ad_inpaint_only_masked=True,
+        ad_controlnet_model=model,
+    )
+
+    i2i = script.get_i2i_p(_txt2img_p(), args, Image.new("RGB", (512, 768)))
+
+    # With the option off the host returns the bare crop, which replaced the
+    # whole picture: the runner the pass really uses needs the overlay step,
+    # or the region is pasted back after the pass.
+    runner = i2i.scripts
+    wrapped = runner is not None and runner.postprocess_maskoverlay is not host_step
+    pasted = getattr(i2i, "_ad_paste_back", False)
+    if overlay_on:
+        assert not wrapped
+        assert not pasted
+    else:
+        assert wrapped or pasted
+        assert pasted is (runner is None)
+    # Only the pass's own copy is changed.
+    if runner is not first:
+        assert first.postprocess_maskoverlay is host_step
+
+
+def test_the_overlay_step_adds_the_host_overlay_as_the_option_does():
+    runtime = _load_script(functions={"_keep_host_overlay"})
+    overlay, soft = object(), object()
+    seen = []
+
+    def host_step(p, ppmo):
+        # The scripts run after the host chose the overlay: soft inpainting
+        # puts its own.
+        seen.append(ppmo.overlay_image)
+        if getattr(p, "soft", False):
+            ppmo.overlay_image = soft
+
+    runner = SimpleNamespace(postprocess_maskoverlay=host_step)
+    assert runtime._keep_host_overlay(runner) is True
+    assert runtime._keep_host_overlay(None) is False
+    assert runtime._keep_host_overlay(SimpleNamespace()) is False
+
+    p = SimpleNamespace(overlay_images=[overlay])
+    ppmo = SimpleNamespace(index=0, overlay_image=None)
+    runner.postprocess_maskoverlay(p, ppmo)
+    assert ppmo.overlay_image is overlay
+
+    p.soft = True
+    ppmo = SimpleNamespace(index=0, overlay_image=None)
+    runner.postprocess_maskoverlay(p, ppmo)
+    assert ppmo.overlay_image is soft
+    assert seen == [overlay, overlay]
+
+    # Unchanged: an overlay the host already chose, and a pass with none.
+    chosen = object()
+    ppmo = SimpleNamespace(index=0, overlay_image=chosen)
+    runner.postprocess_maskoverlay(SimpleNamespace(overlay_images=[overlay]), ppmo)
+    assert ppmo.overlay_image is chosen
+    for q, index in ((SimpleNamespace(), 0), (SimpleNamespace(overlay_images=[overlay]), 1)):
+        ppmo = SimpleNamespace(index=index, overlay_image=None)
+        runner.postprocess_maskoverlay(q, ppmo)
+        assert ppmo.overlay_image is None
+
+
+def test_a_pass_without_scripts_pastes_the_region_back(monkeypatch):
+    runtime = _load_script(functions={"_paste_region_back"})
+    full = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    crop = Image.new("RGB", (32, 32), "red")
+    crop.info["parameters"] = "face"
+    calls = []
+
+    def apply_overlay(image, paste_loc, overlay):
+        calls.append((image, paste_loc, overlay))
+        return Image.new("RGB", (overlay.width, overlay.height), "blue"), image
+
+    processing = SimpleNamespace(apply_overlay=apply_overlay)
+    monkeypatch.setitem(sys.modules, "modules.processing", processing)
+    p2 = SimpleNamespace(overlay_images=[full], paste_to=(8, 8, 32, 32))
+
+    pasted = runtime._paste_region_back(p2, crop)
+
+    assert calls == [(crop, (8, 8, 32, 32), full)]
+    assert pasted.size == (64, 64)
+    assert pasted.info["parameters"] == "face"
+    # As it came back without an overlay, or if the host step fails.
+    assert runtime._paste_region_back(SimpleNamespace(), crop) is crop
+
+    def broken(*_args):
+        msg = "shape mismatch"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(processing, "apply_overlay", broken)
+    assert runtime._paste_region_back(p2, crop) is crop
+
+
+def test_each_region_without_scripts_is_pasted_back_into_the_picture(monkeypatch):
+    # "Run ADetailer on an image" has no script runner: with "Overlay
+    # original for inpaint" off the host returned only the region's crop,
+    # which then fed the next region and became the result.
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", (1000, 1000), "white")
+    mask = Image.new("L", (1000, 1000), 0)
+    pred = SimpleNamespace(
+        preview=image,
+        bboxes=[[0, 0, 316, 316], [500, 500, 816, 816]],
+        class_names=[],
+    )
+    inputs = []
+
+    def process_images(p2):
+        inputs.append(p2.init_images[0].size)
+        return SimpleNamespace(images=[Image.new("RGB", (512, 512), "red")])
+
+    def apply_overlay(region, _paste_loc, overlay):
+        return Image.new("RGB", overlay.size, "blue"), region
+
+    monkeypatch.setitem(
+        sys.modules, "modules.processing", SimpleNamespace(apply_overlay=apply_overlay)
+    )
+    runtime = _load_script(
+        methods={
+            "_postprocess_image_inner", "fix_p2", "get_dynamic_denoise_strength",
+            "get_optimal_crop_image_size", "get_seed", "get_each_tab_seed",
+        },
+        functions={"_paste_region_back"},
+        state=state,
+        shared=SimpleNamespace(
+            state=state, opts=SimpleNamespace(data={}), sd_model=None
+        ),
+        opts=SimpleNamespace(
+            data={
+                "ad_dynamic_denoise_power": 0,
+                "ad_match_inpaint_bbox_size": InpaintBBoxMatchMode.OFF.value,
+            }
+        ),
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+        ordinal=str,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[image], prompt="face", negative_prompt="",
+        close=lambda: None, denoising_strength=0.4, width=512, height=512,
+        _ad_paste_back=True, overlay_images=[image], paste_to=(0, 0, 316, 316),
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [mask, mask]
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+    p = SimpleNamespace(
+        extra_generation_params={}, seed=1, subseed=1, all_seeds=[1], all_subseeds=[1]
+    )
+    pp = SimpleNamespace(image=image)
+
+    processed = script._postprocess_image_inner(
+        p, pp, ADetailerArgs(ad_model="face_yolov8n.pt")
+    )
+
+    assert processed is True
+    assert inputs == [(1000, 1000), (1000, 1000)]
+    assert pp.image.size == (1000, 1000)
 
 
 def test_region_after_a_nan_error_gets_its_own_color_correction():
@@ -5182,8 +6364,13 @@ def test_the_docs_quote_each_frozen_settings_error():
     # Only --freeze-settings says "changing settings is disabled": the other
     # two options name the setting. The error stops ADetailer for the image,
     # so its later tabs do not run either, and the earlier tabs are kept.
+    # From plus.9 beta 1 the pass no longer sets that option, so the plus.9
+    # notes say that frozen settings no longer stop ADetailer, and the
+    # README's known issue keeps the quote for plus.8 only.
     docs = _public_docs()
-    beta2 = docs["CHANGELOG.md"].split("## v26.2.0+plus.8.beta.1", 1)[0]
+    changelog = docs["CHANGELOG.md"]
+    plus9, rest = changelog.split("## v26.2.0+plus.8 ", 1)
+    beta2 = rest.split("## v26.2.0+plus.8.beta.1", 1)[0]
     for text in (docs["README.md"], beta2):
         line = next(
             line for line in text.splitlines()
@@ -5192,6 +6379,13 @@ def test_the_docs_quote_each_frozen_settings_error():
         assert "not possible to set 'overlay_inpaint'" in line
         assert "later tabs" in line
         assert "leave the image undetailed" not in line
+        if text is docs["README.md"]:
+            assert "Fixed in plus.9 beta 1" in line
+    fix = next(
+        line for line in plus9.splitlines()
+        if "--freeze-specific-settings overlay_inpaint" in line
+    )
+    assert "the setting is never changed" in fix
 
 
 @pytest.mark.parametrize(
@@ -5715,7 +6909,10 @@ def test_a_saved_standalone_result_records_the_passs_parameters(
     # PNG, and Send to put "None" in the prompt box.
     saved = []
     script = _load_script(
-        methods={"run_detailer_on_image", "read_params_txt", "write_params_txt"},
+        methods={
+            "run_detailer_on_image", "read_params_txt", "write_params_txt",
+            "_standalone_infotext_p",
+        },
         paths=SimpleNamespace(data_path=str(tmp_path)),
         PARAMS_TXT="params.txt",
         shared=SimpleNamespace(sd_model=None),
@@ -5833,7 +7030,10 @@ def test_a_saved_standalone_result_keeps_the_passs_working_size(tmp_path):
     parameters = "detailed face\nSteps: 28, Sampler: DPM++ 2M, Size: 848x480"
     saved = []
     script = _load_script(
-        methods={"run_detailer_on_image", "read_params_txt", "write_params_txt"},
+        methods={
+            "run_detailer_on_image", "read_params_txt", "write_params_txt",
+            "_standalone_infotext_p",
+        },
         paths=SimpleNamespace(data_path=str(tmp_path)),
         PARAMS_TXT="params.txt",
         shared=SimpleNamespace(sd_model=None),
@@ -6097,13 +7297,19 @@ def test_a_summary_points_at_the_changelog_section_of_its_release():
     # "The details are in" pointer must name it; headings and wording may
     # change. When the README is that of a stable release, a pointer outside
     # any beta's heading or paragraph describes that release: it must name,
-    # or "the top" must be, the section of the version in __version__.py.
+    # or "the top" must be, the section of the version in __version__.py,
+    # or, under the "What is new in plus.N" heading of an earlier stable
+    # release kept below it, the section of that release.
     changelog = _public_docs()["CHANGELOG.md"]
     current = _current_version()
     stable = None if ".beta." in current else f"v{current}"
     heading_beta = None
+    release = None
     checked = []
     for line in _public_docs()["README.md"].splitlines():
+        if line.startswith("## "):
+            shown = re.match(r"## What is new in (plus\.\d+)\b", line)
+            release = shown.group(1) if shown else None
         if re.match(r"#{1,3} ", line):
             found = re.search(r"\bbeta (\d+)\b", line, re.IGNORECASE)
             heading_beta = found.group(1) if found else None
@@ -6120,10 +7326,11 @@ def test_a_summary_points_at_the_changelog_section_of_its_release():
         if beta is None:
             if stable is None:
                 continue
-            assert _changelog_stable_heading(changelog, stable, version), (
-                f"{stable}: {line}"
+            described = stable if release is None else re.sub(r"plus\.\d+$", release, stable)
+            assert _changelog_stable_heading(changelog, described, version), (
+                f"{described}: {line}"
             )
-            checked.append(stable)
+            checked.append(described)
             continue
         assert _changelog_beta_heading(changelog, beta, version), (
             f"beta {beta}: {line}"
@@ -6145,6 +7352,10 @@ def test_a_summary_points_at_the_changelog_section_of_its_release():
     assert not _changelog_stable_heading(released, "v1.0+plus.9", "v1.0+plus.9.beta.3")
     assert not _changelog_stable_heading(released, "v1.0+plus.8")
     assert not _changelog_stable_heading(sample, "v1.0+plus.9")
+    # ... and on the section of an earlier stable release below the newest.
+    older = "# Changelog\n\n## v1.0+plus.9 — x\n\n## v1.0+plus.8 — y\n"
+    assert _changelog_stable_heading(older, "v1.0+plus.8", "v1.0+plus.8")
+    assert not _changelog_stable_heading(older, "v1.0+plus.8")
 
 
 def test_the_readme_puts_a_beta_on_the_beta_branch_only_while_the_branch_holds_it():
@@ -6645,8 +7856,12 @@ def test_the_selected_styles_reach_the_detailer_pass_once_with_prompt_comments(
         assert positive == p.all_prompts[0]
 
 
-def test_prompt_comments_leave_the_styles_check_alone_without_the_comments_script():
+def test_prompt_comments_leave_the_styles_check_alone_without_the_comments_script(
+    monkeypatch,
+):
     from adetailer.args import ADetailerArgs
+
+    monkeypatch.delitem(sys.modules, _FORGE_COMMENTS, raising=False)
 
     db = _StyleDatabase()
     styles = ["cinematic"]
@@ -6665,6 +7880,502 @@ def test_prompt_comments_leave_the_styles_check_alone_without_the_comments_scrip
     p.all_prompts = [_a1111_strip_comments(p.all_prompts[0])]
     missing = _comments_runtime(db, None)
     assert missing.AfterDetailerScript().get_prompt(p, args)[0] == p.all_prompts
+
+
+@pytest.mark.parametrize(
+    ("strip", "comment"),
+    [(_a1111_strip_comments, "# old idea"), (_neo_strip_comments, "// old idea")],
+)
+def test_comments_typed_in_an_adetailer_prompt_do_not_reach_the_model(strip, comment):
+    # With "Apply only selected scripts to ADetailer" on (the default) the
+    # detailer pass runs without the WebUI's Comments script, so a comment
+    # typed in an ADetailer prompt box reached the model as prompt text.
+    from adetailer.args import ADetailerArgs
+
+    script = _comments_runtime(None, strip).AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="a woman in a park", negative_prompt="ugly", styles=[],
+        all_prompts=["a woman in a park"], all_negative_prompts=["ugly"],
+    )
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt",
+        ad_prompt=f"detailed face {comment}\n[SEP] {comment}\n[SEP] [SKIP] {comment}",
+        ad_negative_prompt=f"blurry {comment}",
+        ad_prompt_append=f"sharp eyes {comment}",
+        ad_negative_prompt_append=f"{comment}",
+    )
+
+    prompts, negatives = script.get_prompt(p, args)
+
+    assert len(prompts) == 3
+    assert all("old idea" not in text for text in [*prompts, *negatives])
+    assert prompts[0].split() == ["detailed", "face,", "sharp", "eyes"]
+    # A segment with only a comment is blank: it takes the main prompt.
+    assert prompts[1] == "a woman in a park, sharp eyes"
+    # [SKIP] with a comment is still the control token.
+    assert prompts[2] == "[SKIP]"
+    assert negatives[0].split() == ["blurry"]
+    # The X/Y/Z record keeps the text as typed.
+    raw, _ = script.get_prompt(p, args, keep_comments=True)
+    assert "old idea" in raw[0]
+
+
+def test_adetailer_prompt_comments_follow_the_webui_option(monkeypatch):
+    from adetailer.args import ADetailerArgs
+
+    monkeypatch.delitem(sys.modules, _FORGE_COMMENTS, raising=False)
+
+    p = SimpleNamespace(
+        prompt="a woman", negative_prompt="", styles=[],
+        all_prompts=["a woman"], all_negative_prompts=[""],
+    )
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="detailed face # note")
+    # "Enable comments" off, or a WebUI without the Comments script: as typed.
+    off = _comments_runtime(None, _a1111_strip_comments, {"enable_prompt_comments": False})
+    assert off.AfterDetailerScript().get_prompt(p, args)[0] == ["detailed face # note"]
+    missing = _comments_runtime(None, None)
+    assert missing.AfterDetailerScript().get_prompt(p, args)[0] == ["detailed face # note"]
+
+
+@pytest.mark.parametrize("strip", [_a1111_strip_comments, _neo_strip_comments])
+def test_a_lora_commented_out_in_an_adetailer_prompt_is_not_applied(strip):
+    # Issue #7: LoRAs toggled off with `#` lines in a tab's prompt were still
+    # loaded, because the comment reached the model with the LoRA tag in it.
+    from adetailer.args import ADetailerArgs
+
+    script = _comments_runtime(None, strip).AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="a woman", negative_prompt="", styles=[],
+        all_prompts=["a woman"], all_negative_prompts=[""],
+    )
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt",
+        ad_prompt="detailed face\n<lora:kept:1>\n# <lora:off:1>\n#<lora:off2:0.8>",
+    )
+
+    prompt = script.get_prompt(p, args)[0][0]
+
+    assert "<lora:kept:1>" in prompt
+    assert "lora:off" not in prompt
+
+
+# lllyasviel Forge (since 2024-09) has no Comments script: its styles code
+# imports this module and strips the comments of every pass with it.
+_FORGE_COMMENTS = "modules.processing_scripts.comments"
+
+
+class _ForgeStyleDatabase(_StyleDatabase):
+    """lllyasviel Forge's StyleDatabase: the prompt comments go before the
+    styles are merged, for the main prompts and for the detailer pass, and
+    those of each style as it is merged."""
+
+    @staticmethod
+    def _merge(prompt, style):
+        return _StyleDatabase._merge(prompt, _a1111_strip_comments(style).strip())
+
+    def apply_styles_to_prompt(self, prompt, styles):
+        return super().apply_styles_to_prompt(_a1111_strip_comments(prompt).strip(), styles)
+
+    def apply_negative_styles_to_prompt(self, prompt, styles):
+        return super().apply_negative_styles_to_prompt(
+            _a1111_strip_comments(prompt).strip(), styles
+        )
+
+
+def test_adetailer_prompt_comments_are_removed_on_forge_without_the_comments_script(
+    monkeypatch,
+):
+    # Nothing found the comments on lllyasviel Forge, so the host removed them
+    # only from the prompt ADetailer had built: a box with only a comment
+    # became an empty prompt and the text after a comment (append, LoRAs) or
+    # a [SEP] in a comment was lost with it.
+    from adetailer.args import ADetailerArgs
+
+    monkeypatch.setitem(
+        sys.modules, _FORGE_COMMENTS, SimpleNamespace(strip_comments=_a1111_strip_comments)
+    )
+    script = _comments_runtime(None, None).AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="a woman <lora:style:0.8>", negative_prompt="ugly", styles=[],
+        all_prompts=["a woman <lora:style:0.8>"], all_negative_prompts=["ugly"],
+    )
+
+    def run(**kw):
+        return script.get_prompt(p, ADetailerArgs(ad_model="face_yolov8n.pt", **kw))
+
+    # A box with only a comment is blank: it takes the main prompts.
+    assert run(ad_prompt="# try freckles later", ad_negative_prompt="# old") == (
+        ["a woman <lora:style:0.8>"], ["ugly"],
+    )
+    prompts = run(ad_prompt="detailed face # subtle", ad_prompt_append="smile")[0]
+    assert prompts[0].split() == ["detailed", "face,", "smile"]
+    prompts = run(ad_prompt="detailed face # subtle", ad_use_main_loras=True)[0]
+    assert "<lora:style:0.8>" in prompts[0]
+    assert "subtle" not in prompts[0]
+    assert len(run(ad_prompt="face # old [SEP] hands")[0]) == 1
+    # The X/Y/Z record keeps the text as typed.
+    raw = script.get_prompt(
+        p, ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="face # old"),
+        keep_comments=True,
+    )[0]
+    assert raw == ["face # old"]
+    # "Enable comments" off: as typed.
+    off = _comments_runtime(None, None, {"enable_prompt_comments": False})
+    assert off.AfterDetailerScript().get_prompt(
+        p, ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="face # old")
+    )[0] == ["face # old"]
+    # A WebUI with the Comments script (AUTOMATIC1111, Forge Neo) uses it.
+    neo = _comments_runtime(None, _neo_strip_comments).AfterDetailerScript()
+    assert neo.get_prompt(
+        p, ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="face // old # note")
+    )[0] == ["face"]
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "append", "kept"),
+    [
+        ("close-up, [PROMPT=eyes,beach]", "", "green eyes"),
+        ("[PROMPT], detailed face", "", "detailed face"),
+        ("", "smile", "smile"),
+    ],
+)
+def test_the_main_prompt_reaches_the_pass_without_its_comments_on_forge_with_styles(
+    monkeypatch, ad_prompt, append, kept
+):
+    # Forge's styles code strips the comments, so the typed prompt gave back
+    # the styled main prompt and was used WITH its comments: the host then
+    # removed the comment and everything after it on the same line.
+    from adetailer.args import ADetailerArgs
+
+    monkeypatch.setitem(
+        sys.modules, _FORGE_COMMENTS, SimpleNamespace(strip_comments=_a1111_strip_comments)
+    )
+    db = _ForgeStyleDatabase()
+    styles = ["cinematic"]
+    script = _comments_runtime(db, None).AfterDetailerScript()
+    typed = "a woman, beach # holiday\ngreen eyes # note"
+    p = SimpleNamespace(
+        prompt=typed, negative_prompt="ugly", styles=styles,
+        all_prompts=[db.apply_styles_to_prompt(typed, styles)],
+        all_negative_prompts=[db.apply_negative_styles_to_prompt("ugly", styles)],
+    )
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_prompt=ad_prompt, ad_prompt_append=append
+    )
+
+    prompts = script.get_prompt(p, args)[0]
+
+    # What the detailer pass gets once the host has applied the styles.
+    positive = db.apply_styles_to_prompt(prompts[0], styles)
+    assert kept in positive
+    assert "holiday" not in positive
+    assert "note" not in positive
+    assert positive.count("cinematic still of") == 1
+
+
+def _styled_passes(
+    db, strip, typed, *, negative="", styles=("noted",), data=None, nan_first=False,
+    class_prompt=None, **options,
+):
+    """What the model gets in each region: the real get_prompt and region
+    loop, the main prompts as the host's Comments script leaves them."""
+    from adetailer.args import ADetailerArgs
+
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", (8, 8), "white")
+    mask = Image.new("L", (8, 8), 255)
+    pred = SimpleNamespace(preview=image, bboxes=[], class_names=[])
+    nans = type("NansException", (Exception,), {})
+    styles = list(styles)
+    sent = []
+
+    def process_images(p2):
+        # What the host generates with: the styles left on p2 applied.
+        sent.append(
+            (
+                db.apply_styles_to_prompt(p2.prompt, p2.styles),
+                db.apply_negative_styles_to_prompt(p2.negative_prompt, p2.styles),
+                list(p2.styles),
+            )
+        )
+        if nan_first and len(sent) == 1:
+            raise nans("NaN in the first region")
+        return SimpleNamespace(images=[image])
+
+    comments = SimpleNamespace(
+        script_class=type("ScriptStripComments", (), {"__module__": "comments.py"}),
+        module=SimpleNamespace(strip_comments=strip),
+    )
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS | {"_postprocess_image_inner", "i2i_prompts_replace"},
+        functions=_INLINE_PROMPT_FUNCTIONS | {"_strip_host_comments", "_strip_lora_tags"},
+        assigns=_INLINE_PROMPT_ASSIGNS | {"_LORA_TAG_RE"},
+        state=state,
+        shared=SimpleNamespace(state=state, prompt_styles=db),
+        opts=SimpleNamespace(data=data or {}),
+        scripts=SimpleNamespace(scripts_data=[comments] if strip else []),
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=process_images,
+        NansException=nans,
+        ordinal=str,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[image], prompt="", negative_prompt="", styles=styles,
+        close=lambda: None, denoising_strength=0.4, width=512, height=512,
+    )
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [mask, mask]
+    script.save_image = lambda *_args, **_kwargs: None
+
+    def class_row(p2, *_args):
+        if class_prompt:
+            p2.prompt = class_prompt
+
+    script._apply_inline_class_prompts = class_row
+    script._apply_auto_class_guard = lambda *_args: None
+    script.fix_p2 = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    main = strip if strip and (data or {}).get("enable_prompt_comments", True) else str
+    p = SimpleNamespace(
+        prompt=typed, negative_prompt=negative, styles=styles,
+        all_prompts=[main(db.apply_styles_to_prompt(typed, styles))],
+        all_negative_prompts=[main(db.apply_negative_styles_to_prompt(negative, styles))],
+        extra_generation_params={},
+    )
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", **options)
+    assert script._postprocess_image_inner(p, SimpleNamespace(image=image), args) is True
+    return sent
+
+
+def _noted_styles(positive, negative=""):
+    db = _StyleDatabase()
+    db.styles = {"noted": (positive, negative)}
+    return db
+
+
+_STYLE_COMMENTS = [
+    (_a1111_strip_comments, "# my note"),
+    (_neo_strip_comments, "# my note"),
+    (_neo_strip_comments, "// my note"),
+    (_neo_strip_comments, "/* my note */"),
+]
+
+
+@pytest.mark.parametrize("ad_prompt", ["", "[PROMPT]"])
+@pytest.mark.parametrize(("strip", "comment"), _STYLE_COMMENTS)
+def test_a_style_with_a_comment_reaches_the_detailer_pass_once_and_without_it(
+    strip, comment, ad_prompt
+):
+    # The WebUI's Comments script takes the comment out of the styled main
+    # prompt, so the styles never gave that prompt back: the pass took it, the
+    # WebUI styled it again, and nothing took the comment out of the pass.
+    db = _noted_styles(f"masterpiece {comment}", f"lowres {comment}")
+    sent = _styled_passes(
+        db, strip, "1girl, green eyes", negative="ugly", ad_prompt=ad_prompt
+    )
+    assert len(sent) == 2
+    for positive, negative, styles in sent:
+        assert positive.split() == "1girl, green eyes, masterpiece".split()
+        assert negative.split() == "ugly, lowres".split()
+        assert styles == []
+
+
+@pytest.mark.parametrize("nan_first", [False, True])
+@pytest.mark.parametrize(("strip", "comment"), _STYLE_COMMENTS)
+def test_a_style_with_a_comment_leaves_the_tabs_own_prompt_without_it(
+    strip, comment, nan_first
+):
+    # p2 comes again from i2i after a NaN: the second region gets the same.
+    db = _noted_styles(f"masterpiece {comment}")
+    sent = _styled_passes(db, strip, "1girl", ad_prompt="face", nan_first=nan_first)
+    assert [text.split() for text, _negative, _styles in sent] == [
+        "face, masterpiece".split()
+    ] * 2
+
+
+def test_a_comment_in_the_negative_part_of_a_style_stays_out_of_the_pass():
+    db = _noted_styles("masterpiece", "lowres # my note")
+    for positive, negative, _styles in _styled_passes(
+        db, _a1111_strip_comments, "1girl", negative="ugly", ad_prompt="face"
+    ):
+        assert positive == "face, masterpiece"
+        assert negative.split() == "ugly, lowres".split()
+
+
+@pytest.mark.parametrize("ad_prompt", ["", "face"])
+def test_a_style_comment_inside_the_style_keeps_the_rest_of_the_style(ad_prompt):
+    db = _noted_styles("{prompt}, masterpiece # quality tags\n, 35mm film")
+    positive = _styled_passes(db, _a1111_strip_comments, "1girl", ad_prompt=ad_prompt)[0][0]
+    assert positive.count("masterpiece") == 1
+    assert positive.count("35mm film") == 1
+    assert "quality tags" not in positive
+
+
+def test_a_lora_commented_out_in_a_style_is_not_loaded_by_the_pass():
+    # The comment hides the tag from the main pass. The host reads the extra
+    # networks from the text as it is, so the pass would load it.
+    db = _noted_styles("masterpiece # <lora:old_look:1>")
+    for positive, _negative, _styles in _styled_passes(
+        db, _a1111_strip_comments, "1girl", ad_prompt="face"
+    ):
+        assert "<lora:" not in positive
+
+
+def test_a_lora_typed_in_the_main_prompt_stays_when_a_style_only_comments_it():
+    # The tag in the style's comment reaches no pass: it does not stand for
+    # the one of the main prompt that "Use LoRAs from main prompt" brings.
+    db = _noted_styles("masterpiece # <lora:look:1>")
+    for positive, _negative, _styles in _styled_passes(
+        db, _a1111_strip_comments, "1girl <lora:look:1>", ad_prompt="face",
+        ad_use_main_loras=True,
+    ):
+        assert positive.count("<lora:look:1>") == 1
+        assert "#" not in positive
+
+
+def test_strip_loras_also_strips_the_comment_of_a_style():
+    db = _noted_styles("<lora:detail:1>, masterpiece # my note")
+    for positive, _negative, _styles in _styled_passes(
+        db, _a1111_strip_comments, "1girl", ad_prompt="face", ad_strip_loras=True
+    ):
+        assert positive.split() == "face, masterpiece".split()
+
+
+@pytest.mark.parametrize("ad_prompt", ["", "[PROMPT]"])
+@pytest.mark.parametrize(
+    ("strip", "typed"),
+    [
+        (_a1111_strip_comments, "a woman # holiday"),
+        (_neo_strip_comments, "a woman // holiday"),
+    ],
+)
+def test_a_style_that_adds_its_text_on_the_line_of_a_comment_is_applied_once(
+    strip, typed, ad_prompt
+):
+    # The comment of the typed prompt took the end of the style out of the
+    # main prompt, so the styles gave it back neither with nor without the
+    # comment: the pass took the main prompt and the WebUI styled it again.
+    db = _StyleDatabase()
+    sent = _styled_passes(db, strip, typed, styles=["cinematic"], ad_prompt=ad_prompt)
+    for positive, _negative, styles in sent:
+        assert positive.count("cinematic still of") == 1
+        assert "holiday" not in positive
+        assert styles == ["cinematic"]  # no comment in the style: the host's job
+
+
+@pytest.mark.parametrize("ad_prompt", ["", "face"])
+def test_a_style_without_a_comment_is_left_to_the_host(ad_prompt):
+    db = _noted_styles("masterpiece", "lowres")
+    for positive, negative, styles in _styled_passes(
+        db, _a1111_strip_comments, "1girl", negative="ugly", ad_prompt=ad_prompt
+    ):
+        assert positive == f"{ad_prompt or '1girl'}, masterpiece"
+        assert negative == "ugly, lowres"
+        assert styles == ["noted"]
+
+
+def test_strip_loras_leaves_a_hash_of_a_class_row_with_a_style_without_comments():
+    # A per-class prompt keeps its text as before: with no comment in the
+    # styles nothing is stripped, or that "#" would take the style with it.
+    db = _noted_styles("<lora:detail:1>, masterpiece")
+    for positive, _negative, _styles in _styled_passes(
+        db, _a1111_strip_comments, "1girl", class_prompt="face #2", ad_strip_loras=True
+    ):
+        assert positive == "face #2, masterpiece"
+
+
+def test_a_style_comment_stays_where_the_webui_keeps_comments(monkeypatch):
+    # "Enable comments" off, or a WebUI without the Comments script: the main
+    # prompt keeps the comment, so does the pass, and the host styles it.
+    monkeypatch.delitem(sys.modules, _FORGE_COMMENTS, raising=False)
+    db = _noted_styles("masterpiece # my note")
+    for strip, data in (
+        (_a1111_strip_comments, {"enable_prompt_comments": False}),
+        (None, None),
+    ):
+        for positive, _negative, styles in _styled_passes(
+            db, strip, "1girl", ad_prompt="face", data=data
+        ):
+            assert positive == "face, masterpiece # my note"
+            assert styles == ["noted"]
+
+
+def test_a_style_comment_is_left_to_forge_which_strips_it_itself(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, _FORGE_COMMENTS, SimpleNamespace(strip_comments=_a1111_strip_comments)
+    )
+    db = _ForgeStyleDatabase()
+    db.styles = {"noted": ("masterpiece # my note", "")}
+    for positive, _negative, styles in _styled_passes(db, None, "1girl", ad_prompt="face"):
+        assert positive.split() == "face, masterpiece".split()
+        assert styles == ["noted"]
+
+
+def test_the_applied_prompt_line_ignores_the_comments_on_forge_too(monkeypatch, capsys):
+    # Issue #7 on lllyasviel Forge, which has no Comments script.
+    monkeypatch.setitem(
+        sys.modules, _FORGE_COMMENTS, SimpleNamespace(strip_comments=_a1111_strip_comments)
+    )
+    runtime = _load_script(
+        methods={"compare_prompt"}, ordinal=str, suffix=_ui_suffix(),
+        opts=SimpleNamespace(data={}), scripts=SimpleNamespace(scripts_data=[]),
+    )
+
+    runtime.AfterDetailerScript.compare_prompt(
+        {"ADetailer prompt": "detailed face # subtle"},
+        SimpleNamespace(all_prompts=["detailed face"], all_negative_prompts=[""]),
+    )
+
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    ("tab", "expected"),
+    [
+        # An API request without a preprocessor: the backend picks the default.
+        ({"ad_model": "face_yolov8n.pt", "ad_controlnet_model": "control_openpose"}, None),
+        # "None" sent on purpose (the UI always sends the module) stays.
+        ({"ad_model": "face_yolov8n.pt", "ad_controlnet_model": "control_openpose",
+          "ad_controlnet_module": "None"}, "None"),
+        ({"ad_model": "face_yolov8n.pt", "ad_controlnet_model": "control_openpose",
+          "ad_controlnet_module": "openpose_hand"}, "openpose_hand"),
+    ],
+)
+def test_an_api_request_without_a_controlnet_preprocessor_gets_the_default(tab, expected):
+    # On Forge, Forge Neo and reForge the missing module was read as "None",
+    # so the ControlNet model ran on the raw crop.
+    from adetailer.args import ADetailerArgs
+
+    calls = []
+    runtime = _load_script(methods={"update_controlnet_args"})
+    script = runtime.AfterDetailerScript()
+    script.controlnet_ext = SimpleNamespace(
+        cn_available=True,
+        update_scripts_args=lambda _p, **kwargs: calls.append(kwargs),
+    )
+
+    script.update_controlnet_args(SimpleNamespace(), ADetailerArgs(**tab))
+    # A sequential class pass copies the tab: still a missing module.
+    script.update_controlnet_args(
+        SimpleNamespace(), ADetailerArgs(**tab).copy(update={"ad_model_classes": "face"})
+    )
+
+    assert [c["module"] for c in calls] == [expected, expected]
+    assert calls[0]["model"] == "control_openpose"
 
 
 _INSTALLED = {"face_yolov8n.pt": "face_yolov8n.pt", "hand_yolov8n.pt": "hand_yolov8n.pt"}
@@ -6701,7 +8412,7 @@ def test_pasting_a_detector_that_is_not_installed_leaves_its_tab_and_adetailer_o
         *(ADetailerArgs(ad_model=m, ad_model_classes=c, ad_prompt="a face") for m, c in tabs)
     )
 
-    _paste_callback(model_mapping=_INSTALLED)._clear_missing_class_prompts("", params)
+    _paste_callback(model_mapping=dict(_INSTALLED))._clear_missing_class_prompts("", params)
 
     assert params.get("ADetailer enable") == enabled
     assert kept <= set(params)
@@ -6715,6 +8426,334 @@ def test_pasting_a_detector_that_is_not_installed_leaves_its_tab_and_adetailer_o
     out = capsys.readouterr().out
     assert out.isascii()
     assert out.count("is not installed") == len(dropped)
+    # The folders were read again for the missing detector, without errors.
+    assert "couldn't read the detector folders" not in out
+
+
+def _detector_folders(fresh):
+    # get_models as the folders are now; records whether it went online,
+    # and in get_models.dirs the folders it was asked to read.
+    calls = []
+
+    def get_models(*dirs, huggingface=True):
+        calls.append(huggingface)
+        get_models.dirs.append(dirs)
+        if isinstance(fresh, BaseException):
+            raise fresh
+        return OrderedDict(fresh)
+
+    get_models.dirs = []
+    return get_models, calls
+
+
+def test_a_detector_added_while_the_webui_runs_is_found(tmp_path, capsys):
+    # Issue #8: a detector copied into the folders after the start failed
+    # Generate ("not found") until a restart or Settings > Reload UI.
+    mapping = OrderedDict([("face_yolov8n.pt", "a/face_yolov8n.pt")])
+    get_models, calls = _detector_folders(
+        [("face_yolov8n.pt", "a/face_yolov8n.pt"), ("new.pt", "b/new.pt")]
+    )
+    runtime = _load_script(
+        methods={"get_ad_model"},
+        model_mapping=mapping,
+        get_models=get_models,
+        adetailer_dir=tmp_path,
+        shared=SimpleNamespace(opts=SimpleNamespace(data={"ad_extra_models_dir": "x|y"})),
+    )
+    runtime._XYZ_MODEL_LIST[:] = ["None", "face_yolov8n.pt"]
+
+    assert runtime.AfterDetailerScript().get_ad_model("new.pt") == "b/new.pt"
+    # Read again without the network, into the same dict the UI and the API
+    # hold, and into the X/Y/Z axes' list.
+    assert calls == [False]
+    # The extra folders of the setting are read again too, as at startup.
+    assert get_models.dirs == [(tmp_path, "x", "y")]
+    assert runtime.model_mapping is mapping
+    assert list(mapping) == ["face_yolov8n.pt", "new.pt"]
+    assert runtime._XYZ_MODEL_LIST == ["None", "face_yolov8n.pt", "new.pt"]
+    # A known detector does not read the folders.
+    runtime.AfterDetailerScript().get_ad_model("face_yolov8n.pt")
+    assert calls == [False]
+    with pytest.raises(ValueError, match="not found"):
+        runtime.AfterDetailerScript().get_ad_model("typo.pt")
+
+
+def test_a_detector_removed_while_the_webui_runs_leaves_the_list(tmp_path):
+    # A detector deleted from the folders leaves the menu and the X/Y/Z axes
+    # after the 🔄: kept, Generate would load a file that is gone.
+    mapping = OrderedDict(
+        [("face_yolov8n.pt", "a/face_yolov8n.pt"), ("old.pt", "b/old.pt")]
+    )
+    get_models, _calls = _detector_folders([("face_yolov8n.pt", "a/face_yolov8n.pt")])
+    runtime = _load_script(
+        methods={"get_ad_model"},
+        model_mapping=mapping,
+        get_models=get_models,
+        adetailer_dir=tmp_path,
+        shared=SimpleNamespace(opts=SimpleNamespace(data={})),
+    )
+    runtime._XYZ_MODEL_LIST[:] = ["None", "face_yolov8n.pt", "old.pt"]
+
+    assert runtime.refresh_model_mapping() == ["face_yolov8n.pt"]
+    assert runtime.model_mapping is mapping
+    assert list(mapping) == ["face_yolov8n.pt"]
+    assert runtime._XYZ_MODEL_LIST == ["None", "face_yolov8n.pt"]
+    with pytest.raises(ValueError, match="not found"):
+        runtime.AfterDetailerScript().get_ad_model("old.pt")
+
+
+def test_a_failed_folder_read_keeps_the_detector_list(tmp_path, capsys):
+    mapping = OrderedDict([("face_yolov8n.pt", "a/face_yolov8n.pt")])
+    get_models, _calls = _detector_folders(OSError("disk"))
+    runtime = _load_script(
+        methods={"get_ad_model"},
+        model_mapping=mapping,
+        get_models=get_models,
+        adetailer_dir=tmp_path,
+        shared=SimpleNamespace(opts=SimpleNamespace(data={})),
+    )
+
+    assert runtime.refresh_model_mapping() == ["face_yolov8n.pt"]
+    # No extra folders set: only the detector folder (as at startup).
+    assert get_models.dirs == [(tmp_path, "")]
+    assert list(mapping) == ["face_yolov8n.pt"]
+    assert "couldn't read the detector folders again" in capsys.readouterr().out
+
+
+def test_a_detector_replaced_by_one_of_the_same_name_gets_its_new_classes(tmp_path):
+    # The class names are kept per path for the session: after the 🔄 a
+    # detector replaced by a file of the same name kept the old names, and a
+    # class filter "hand" picked the id of another class of the new model.
+    from adetailer.classes import get_model_class_names, resolve_class_ids
+
+    pt = tmp_path / "parts.pt"
+    pt.write_bytes(b"x")
+    sidecar = tmp_path / "parts.names.json"
+    sidecar.write_text('["face", "hand"]', encoding="utf-8")
+    mapping = OrderedDict([("parts.pt", str(pt))])
+
+    def runtime_with(fresh):
+        get_models, _calls = _detector_folders(fresh)
+        return _load_script(
+            functions={"refresh_model_mapping"},
+            assigns={"_XYZ_MODEL_LIST"},
+            model_mapping=mapping,
+            get_models=get_models,
+            get_model_class_names=get_model_class_names,
+            adetailer_dir=tmp_path,
+            shared=SimpleNamespace(opts=SimpleNamespace(data={})),
+        )
+
+    get_model_class_names.cache_clear()
+    try:
+        assert resolve_class_ids(str(pt), ["hand"]) == [1]
+        sidecar.write_text('["eyes", "mouth", "hand"]', encoding="utf-8")
+        # A failed folder read changes nothing, the names neither.
+        runtime_with(OSError("disk")).refresh_model_mapping()
+        assert get_model_class_names(str(pt)) == ["face", "hand"]
+
+        runtime_with([("parts.pt", str(pt))]).refresh_model_mapping()
+
+        assert get_model_class_names(str(pt)) == ["eyes", "mouth", "hand"]
+        assert resolve_class_ids(str(pt), ["hand"]) == [2]
+    finally:
+        get_model_class_names.cache_clear()
+
+
+def test_reload_ui_reads_the_class_names_again(tmp_path):
+    # Settings → Reload UI runs this file again but keeps the adetailer
+    # package, and with it the class names read before: a detector replaced
+    # by a file of the same name kept its old names until the 🔄 or a
+    # restart, and a class filter "hand" picked another class of the new one.
+    from adetailer.classes import get_model_class_names, resolve_class_ids
+
+    pt = tmp_path / "parts.pt"
+    pt.write_bytes(b"x")
+    sidecar = tmp_path / "parts.names.json"
+    sidecar.write_text('["face", "hand"]', encoding="utf-8")
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    assigned = [
+        getattr(node.targets[0], "id", "") if isinstance(node, ast.Assign) else None
+        for node in tree.body
+    ]
+    startup = tree.body[
+        assigned.index("no_huggingface"):assigned.index("txt2img_submit_button")
+    ]
+    code = compile(
+        ast.fix_missing_locations(ast.Module(body=startup, type_ignores=[])),
+        str(_SCRIPT_PATH), "exec",
+    )
+
+    def load_scripts():
+        namespace = {
+            "Path": Path,
+            "cmd_opts": SimpleNamespace(),
+            "paths": SimpleNamespace(models_path=str(tmp_path)),
+            "safe_mkdir": lambda path: None,
+            "shared": SimpleNamespace(opts=SimpleNamespace(data={})),
+            "get_models": lambda *dirs, huggingface: OrderedDict([("parts.pt", str(pt))]),
+            "get_model_class_names": get_model_class_names,
+        }
+        exec(code, namespace)
+        return namespace
+
+    get_model_class_names.cache_clear()
+    try:
+        load_scripts()  # the WebUI's start, nothing read yet
+        assert resolve_class_ids(str(pt), ["hand"]) == [1]
+        sidecar.write_text('["eyes", "mouth", "hand"]', encoding="utf-8")
+
+        assert load_scripts()["model_mapping"] == {"parts.pt": str(pt)}
+
+        assert get_model_class_names(str(pt)) == ["eyes", "mouth", "hand"]
+        assert resolve_class_ids(str(pt), ["hand"]) == [2]
+    finally:
+        get_model_class_names.cache_clear()
+
+
+def test_the_refresh_button_is_given_the_folder_read():
+    # Without refresh_models the 🔄 only lists the names already in memory,
+    # and a detector copied into the folders stays missing (issue #8).
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    call = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "WebuiInfo"
+    )
+    keywords = {k.arg: ast.unparse(k.value) for k in call.keywords}
+    assert keywords.get("refresh_models") == "refresh_model_mapping"
+    assert keywords.get("model_mapping") == "model_mapping"
+
+
+def test_public_docs_describe_the_refresh_button_and_the_prompt_line_as_they_work():
+    # Beta 3's notes said the 🔄 has no hover text on a translated interface
+    # (its English tooltip is kept), that a Prompt S/R alone prints the
+    # "applied 1st ad_prompt" line (the saved prompt already has it), and the
+    # troubleshooting entry still asked for a restart after adding a detector.
+    docs = _public_docs()
+    readme, changelog = docs["README.md"], docs["CHANGELOG.md"]
+    beta3 = changelog[: changelog.index("## v26.2.0+plus.9.beta.2")]
+    tooltips = (_SCRIPT_PATH.parents[1] / "javascript" / "button-tooltips.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "adetailer_ad_model_refresh" in tooltips
+    for text in (readme, beta3):
+        assert "no hover text on a translated" not in text
+        assert "without a hover text on a translated" not in text
+    assert "hover text stays in English on a translated interface" in beta3
+    assert "hover text stays in English on a translated interface" in readme
+    assert "a Prompt S/R or the text appended" not in beta3
+    assert "such as `[SEP]`, a wildcard or the text appended to it" in beta3
+    folder = next(
+        line for line in readme.splitlines()
+        if line.startswith("- The file must be in `models/adetailer`")
+    )
+    assert "click 🔄" in folder
+    # The class-name file is read again after the 🔄 too, and the beta 3
+    # notes, the users' requests table and the features list name the 🔄.
+    sidecar = next(
+        line for line in readme.splitlines()
+        if line.startswith("- Class names are looked up once per session")
+    )
+    assert "🔄" in sidecar
+    fixed = readme.split("#### Fixed in plus.9 beta 3", 1)[1].split("\n### ", 1)[0]
+    assert ".zip" in fixed
+    assert any(
+        line.startswith("| [#8](https://github.com/xXIlRizzoXx/adetailer-ultimate/issues/8)")
+        for line in readme.splitlines()
+    )
+    assert any(
+        line.startswith("| [#7](https://github.com/xXIlRizzoXx/adetailer-ultimate/issues/7)")
+        and "(#prompts)" in line
+        for line in readme.splitlines()
+    )
+    # The extra model folders are read again by the 🔄 and by an unknown
+    # detector name, not only by Reload UI.
+    reset = next(
+        line for line in readme.splitlines()
+        if line.startswith("| 🔄 Reset ADetailer settings to defaults")
+    )
+    assert "extra model folders change only after" not in reset
+    assert "🔄" in reset.split("Max tabs", 1)[1]
+    features = readme.split("### Detection and classes", 1)[1].split("\n### ", 1)[0]
+    assert "🔄" in features
+
+
+def test_pasting_a_detector_added_while_the_webui_runs_keeps_it(tmp_path, capsys):
+    from adetailer.args import ADetailerArgs
+
+    mapping = OrderedDict(_INSTALLED)
+    get_models, _calls = _detector_folders([*_INSTALLED.items(), ("face_yolov9c.pt", "b")])
+    params = _infotext(ADetailerArgs(ad_model="face_yolov9c.pt", ad_prompt="a face"))
+
+    _paste_callback(
+        model_mapping=mapping, get_models=get_models, adetailer_dir=tmp_path
+    )._clear_missing_class_prompts("", params)
+
+    assert params["ADetailer model"] == "face_yolov9c.pt"
+    assert "is not installed" not in capsys.readouterr().out
+
+
+def test_the_applied_prompt_line_leaves_out_a_prompt_that_only_lost_its_comments(capsys):
+    # With the comments removed from the ADetailer prompts (plus.9 beta 1),
+    # every pass printed "applied 1st ad_prompt: '...\n\n...'" for a prompt
+    # that differed only by the user's own notes (issue #7).
+    comments = SimpleNamespace(
+        script_class=type("ScriptStripComments", (), {"__module__": "comments.py"}),
+        module=SimpleNamespace(strip_comments=_neo_strip_comments),
+    )
+    runtime = _load_script(
+        methods={"compare_prompt"}, ordinal=str, suffix=_ui_suffix(),
+        opts=SimpleNamespace(data={}), scripts=SimpleNamespace(scripts_data=[comments]),
+    )
+    typed = {
+        "ADetailer prompt": "<lora:a:1>\n# <lora:b:1>\ndetailed face",
+        "ADetailer negative prompt": "blurry // old",
+    }
+
+    runtime.AfterDetailerScript.compare_prompt(
+        typed, SimpleNamespace(all_prompts=["<lora:a:1>\n\ndetailed face"],
+                               all_negative_prompts=["blurry"]),
+    )
+    assert capsys.readouterr().out == ""
+
+    # Any other change is still printed.
+    runtime.AfterDetailerScript.compare_prompt(
+        typed, SimpleNamespace(all_prompts=["<lora:a:1>\n\ndetailed face, sharp eyes"],
+                               all_negative_prompts=["blurry"]),
+    )
+    out = capsys.readouterr().out
+    assert "ad_prompt: '<lora:a:1>\\n\\ndetailed face, sharp eyes'" in out
+    assert "ad_negative_prompt" not in out
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [
+        # A tab with empty prompts: the parameters have neither key.
+        ({}, []),
+        ({"ADetailer negative prompt": "sharp"}, []),
+        ({"ADetailer negative prompt": "blurry"}, ["ad_negative_prompt"]),
+        ({"ADetailer prompt": "face, sharp"}, []),
+        ({"ADetailer prompt": "face"}, ["ad_prompt"]),
+    ],
+    ids=["no-prompts", "negative-same", "negative-changed", "prompt-same", "prompt-changed"],
+)
+def test_the_applied_prompt_line_skips_a_prompt_the_tab_does_not_have(typed, expected, capsys):
+    # This runs after every region: a missing key must not fail the region.
+    runtime = _load_script(
+        methods={"compare_prompt"}, ordinal=str, suffix=_ui_suffix(),
+        opts=SimpleNamespace(data={}), scripts=SimpleNamespace(scripts_data=[]),
+    )
+
+    runtime.AfterDetailerScript.compare_prompt(
+        typed, SimpleNamespace(all_prompts=["face, sharp"], all_negative_prompts=["sharp"]),
+    )
+
+    out = capsys.readouterr().out
+    assert [
+        name for name in ("ad_prompt", "ad_negative_prompt") if f" {name}: " in out
+    ] == expected
 
 
 def _readme_section(start, end):
@@ -6745,17 +8784,6 @@ def test_the_readme_says_which_base_settings_a_standalone_run_uses():
     assert f"CFG scale {shell['cfg_scale']:g}" in section
     for option in ("Use separate steps", "Use separate CFG scale", "Use separate sampler"):
         assert f'"{option}"' in section
-
-
-def test_the_readme_says_that_a_forge_controlnet_preprocessor_list_starts_with_none():
-    # On Forge-based WebUIs the list starts with "None" (the image as it is),
-    # which choosing a model keeps or falls back to: the README said the
-    # preprocessor was set automatically everywhere.
-    ui_text = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
-    assert "current_module if current_module in choices else choices[0]" in ui_text
-    section = _readme_section("**ControlNet** (at the bottom of each tab)", "\n## Models")
-    assert 'the preprocessor list starts with "None"' in section
-    assert "pick the preprocessor yourself" in section
 
 
 def test_the_readme_says_when_the_styles_still_reach_the_pass_twice():
@@ -6811,6 +8839,9 @@ def test_the_beta_1_notes_name_only_reforges_gradio_4_branches_for_the_reset_reg
 def test_the_readme_says_that_comments_typed_in_an_adetailer_prompt_reach_the_model():
     # The detailer pass keeps only these scripts by default, and not the
     # WebUI's Comments script, which removes the comments of the main prompt.
+    # In plus.8 the comments typed in the ADetailer prompts therefore reached
+    # the model; from plus.9 beta 1 ADetailer removes them itself, and the
+    # README note says both.
     from adetailer.args import BUILTIN_SCRIPT, SCRIPT_DEFAULT
 
     kept = {name.strip() for name in f"{SCRIPT_DEFAULT},{BUILTIN_SCRIPT}".split(",")}
@@ -6820,6 +8851,421 @@ def test_the_readme_says_that_comments_typed_in_an_adetailer_prompt_reach_the_mo
     assert '"Apply only selected scripts to ADetailer"' in note
     assert '"Script names to apply to ADetailer"' in note
     assert "append text" in note
+    fixed, plus8 = note.split("In plus.8,", 1)
+    assert "From plus.9, comments typed in the ADetailer prompt" in fixed
+    assert "are removed too" in fixed
+    assert "their text reaches the model" in plus8
+
+
+@pytest.mark.parametrize("saved_names", [None, "dynamic_prompting", ""])
+def test_the_detailer_pass_keeps_reforges_advanced_model_sampling_scripts(saved_names):
+    # With "Apply only selected scripts to ADetailer" on, reForge's Advanced
+    # Model Sampling script was dropped from the detailer pass, so a
+    # v-prediction or flow model came out broken there. It is now always
+    # kept, also when the user saved their own list of script names, and the
+    # other scripts are still filtered as before.
+    from adetailer.args import BUILTIN_SCRIPT, SCRIPT_DEFAULT
+
+    data = {"ad_only_selected_scripts": True}
+    if saved_names is not None:
+        data["ad_script_names"] = saved_names
+    runtime = _load_script(
+        methods={"script_filter", "script_args_copy"},
+        copy=copy,
+        opts=SimpleNamespace(data=data),
+        SCRIPT_DEFAULT=SCRIPT_DEFAULT,
+        BUILTIN_SCRIPT=BUILTIN_SCRIPT,
+    )
+    files = [
+        "ext/reForge-advanced_model_sampling/scripts/advanced_model_sampling_script.py",
+        "ext/reForge-advanced_model_sampling_backported/scripts/"
+        "advanced_model_sampling_script_backported.py",
+        "ext/some-extension/scripts/some_other_script.py",
+        "ext/sd-dynamic-prompts/scripts/dynamic_prompting.py",
+    ]
+    runner = SimpleNamespace(
+        alwayson_scripts=[SimpleNamespace(filename=name) for name in files]
+    )
+    p = SimpleNamespace(scripts=runner, script_args=[])
+    args = SimpleNamespace(ad_controlnet_model="None")
+
+    filtered, _ = runtime.AfterDetailerScript().script_filter(p, args)
+
+    kept = [Path(s.filename).stem for s in filtered.alwayson_scripts]
+    assert "advanced_model_sampling_script" in kept
+    assert "advanced_model_sampling_script_backported" in kept
+    assert "some_other_script" not in kept
+    assert ("dynamic_prompting" in kept) is (saved_names != "")
+    assert len(runner.alwayson_scripts) == len(files)
+
+
+def test_network_hashes_of_a_detailer_pass_join_the_images_without_repeats():
+    params = {"Lora hashes": "style: aaa111, detail: bbb222", "Steps": 20}
+    pass_params = {
+        "Lora hashes": "detail: bbb222, eyes: ccc333",
+        "TI hashes": "bad_hands: ddd444",
+    }
+
+    record = merge_network_hashes(params, pass_params)
+
+    assert params == {
+        "Lora hashes": "style: aaa111, detail: bbb222, eyes: ccc333",
+        "TI hashes": "bad_hands: ddd444",
+        "Steps": 20,
+    }
+    # The same pass again (another region, another tab) adds nothing.
+    record = merge_network_hashes(params, dict(pass_params), record)
+    assert params["Lora hashes"] == "style: aaa111, detail: bbb222, eyes: ccc333"
+    # A pass without hashes, or a WebUI that writes none, changes nothing.
+    before = dict(params)
+    record = merge_network_hashes(params, {"Steps": 30}, record)
+    assert params == before
+    # A second tab on the same image with another LoRA joins too, and the
+    # record keeps the host's own hashes, not those of the first tab.
+    record = merge_network_hashes(params, {"Lora hashes": "hands: eee555"}, record)
+    assert params["Lora hashes"] == "style: aaa111, detail: bbb222, eyes: ccc333, hands: eee555"
+
+    # The next image of the batch starts from the host's own hashes again.
+    restore_network_hashes(params, record)
+    assert params == {"Lora hashes": "style: aaa111, detail: bbb222", "Steps": 20}
+
+
+def test_restoring_network_hashes_keeps_what_the_host_wrote_since():
+    params = {"Lora hashes": "style: aaa111"}
+    record = merge_network_hashes(params, {"Lora hashes": "eyes: ccc333"})
+    params["Lora hashes"] = "other: eee555"  # the next batch's own LoRA
+
+    restore_network_hashes(params, record)
+    assert params == {"Lora hashes": "other: eee555"}
+    # A record of another dict (an earlier job) never touches this one.
+    other = {"Lora hashes": "style: aaa111, eyes: ccc333"}
+    restore_network_hashes(other, merge_network_hashes({}, {"Lora hashes": "x: 1"}))
+    assert other == {"Lora hashes": "style: aaa111, eyes: ccc333"}
+    # The first pass of a new job starts its own record: the one left by the
+    # last pass of the earlier job is for that job's dict.
+    old = {"Lora hashes": "style: aaa111"}
+    record = merge_network_hashes(old, {"Lora hashes": "eyes: ccc333"})
+    new = {"Lora hashes": "other: eee555"}
+    record = merge_network_hashes(new, {"Lora hashes": "hands: fff666"}, record)
+    assert new == {"Lora hashes": "other: eee555, hands: fff666"}
+    restore_network_hashes(new, record)
+    assert new == {"Lora hashes": "other: eee555"}
+    assert old == {"Lora hashes": "style: aaa111, eyes: ccc333"}
+
+
+def test_a_lora_used_only_in_the_adetailer_prompt_reaches_the_saved_hashes():
+    # The host lists in "Lora hashes" / "TI hashes" only the networks of the
+    # main prompt, so a LoRA or an embedding used only in an ADetailer prompt
+    # was missing from the saved image and sites such as Civitai did not
+    # recognise it. The detailer pass's own hashes are now added.
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", (1000, 1000), "white")
+    mask = Image.new("L", (1000, 1000), 0)
+    pred = SimpleNamespace(
+        preview=image, bboxes=[[0, 0, 316, 316], [500, 500, 816, 816]],
+        class_names=[],
+    )
+
+    def process_images(p2):
+        # What the host's LoRA and embedding code write for the pass's prompt.
+        p2.extra_generation_params["Lora hashes"] = "eyes: ccc333"
+        p2.extra_generation_params["TI hashes"] = "bad_hands: ddd444"
+        return SimpleNamespace(images=[image])
+
+    runtime = _load_script(
+        methods={
+            "_postprocess_image_inner", "fix_p2", "get_dynamic_denoise_strength",
+            "get_optimal_crop_image_size", "get_seed", "get_each_tab_seed",
+        },
+        state=state,
+        shared=SimpleNamespace(
+            state=state, opts=SimpleNamespace(data={}), sd_model=None
+        ),
+        opts=SimpleNamespace(
+            data={
+                "ad_dynamic_denoise_power": 0,
+                "ad_match_inpaint_bbox_size": InpaintBBoxMatchMode.OFF.value,
+            }
+        ),
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+        ordinal=str,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    p = SimpleNamespace(
+        extra_generation_params={"Lora hashes": "style: aaa111", "Steps": 20},
+        seed=1, subseed=1, all_seeds=[1], all_subseeds=[1],
+    )
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[image], prompt="face", negative_prompt="",
+        close=lambda: None, denoising_strength=0.4, width=512, height=512,
+        extra_generation_params=dict(p.extra_generation_params),
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [mask, mask]
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    processed = script._postprocess_image_inner(
+        p, SimpleNamespace(image=image), ADetailerArgs(ad_model="face_yolov8n.pt")
+    )
+
+    assert processed is True
+    assert p.extra_generation_params == {
+        "Lora hashes": "style: aaa111, eyes: ccc333",
+        "TI hashes": "bad_hands: ddd444",
+        "Steps": 20,
+    }
+
+
+@pytest.mark.parametrize("host", ["hijack", "fails", "no_params", "none"])
+def test_the_next_batch_keeps_the_main_prompts_embedding_hashes(monkeypatch, host):
+    # AUTOMATIC1111 and reForge: process_images(p2) gave the WebUI's prompt
+    # hijack a new dict with only the pass's "TI hashes". The next batch of a
+    # same-prompt generation reuses its cached conds and copies that dict into
+    # the main parameters, so its images lost the main prompt's embedding.
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    main = {"TI hashes": "main_emb: aaa111"}
+    hijack = SimpleNamespace(extra_generation_params=main)
+    if host == "no_params":
+        del hijack.extra_generation_params
+    if host != "none":
+        monkeypatch.setitem(
+            sys.modules, "modules.sd_hijack", SimpleNamespace(model_hijack=hijack)
+        )
+    else:
+        monkeypatch.delitem(sys.modules, "modules.sd_hijack", raising=False)
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", (1000, 1000), "white")
+    mask = Image.new("L", (1000, 1000), 0)
+    pred = SimpleNamespace(
+        preview=image, bboxes=[[0, 0, 316, 316], [500, 500, 816, 816]],
+        class_names=[],
+    )
+
+    def process_images(p2):
+        # The host's clear_comments() and the pass prompt's tokenization.
+        hijack.extra_generation_params = {"TI hashes": "ad_emb: bbb222"}
+        p2.extra_generation_params.update(hijack.extra_generation_params)
+        if host == "fails":
+            raise RuntimeError("out of memory")
+        return SimpleNamespace(images=[image])
+
+    runtime = _load_script(
+        methods={
+            "_postprocess_image_inner", "fix_p2", "get_dynamic_denoise_strength",
+            "get_optimal_crop_image_size", "get_seed", "get_each_tab_seed",
+        },
+        state=state,
+        shared=SimpleNamespace(
+            state=state, opts=SimpleNamespace(data={}), sd_model=None
+        ),
+        opts=SimpleNamespace(
+            data={
+                "ad_dynamic_denoise_power": 0,
+                "ad_match_inpaint_bbox_size": InpaintBBoxMatchMode.OFF.value,
+            }
+        ),
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+        ordinal=str,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    p = SimpleNamespace(
+        extra_generation_params=dict(main),
+        seed=1, subseed=1, all_seeds=[1], all_subseeds=[1],
+    )
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[image], prompt="face", negative_prompt="",
+        close=lambda: None, denoising_strength=0.4, width=512, height=512,
+        extra_generation_params={},
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [mask, mask]
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    processed = script._postprocess_image_inner(
+        p, SimpleNamespace(image=image), ADetailerArgs(ad_model="face_yolov8n.pt")
+    )
+
+    assert processed is (host != "fails")
+    if host in ("hijack", "fails"):
+        # The main pass's own dict is back, for the next batch to copy.
+        assert hijack.extra_generation_params is main
+        assert main == {"TI hashes": "main_emb: aaa111"}
+    if host != "fails":  # the image still lists both embeddings
+        assert p.extra_generation_params == {
+            "TI hashes": "main_emb: aaa111, ad_emb: bbb222",
+        }
+
+
+@pytest.mark.parametrize("host", ["neo", "fails", "no_params", "none"])
+def test_the_next_batch_on_forge_neo_keeps_the_main_prompts_ti_and_emphasis(host):
+    # Forge Neo keeps that dict on the model (shared.sd_model), not on a
+    # prompt hijack: process_images(p2) gave the model a new dict with the
+    # pass's "TI" and "Emphasis", and the next batch copied them into the
+    # main parameters, as if the main prompt had used them.
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    main = {"Emphasis": "Original"}
+    if host == "none":
+        sd_model = None
+    else:
+        sd_model = SimpleNamespace(extra_generation_params=main)
+        if host == "no_params":
+            del sd_model.extra_generation_params
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", (1000, 1000), "white")
+    mask = Image.new("L", (1000, 1000), 0)
+    pred = SimpleNamespace(
+        preview=image, bboxes=[[0, 0, 316, 316], [500, 500, 816, 816]],
+        class_names=[],
+    )
+
+    def process_images(p2):
+        # Forge Neo's process_images resets the model's dict, and the pass
+        # prompt's text encoding writes into the new one.
+        if sd_model is not None:
+            sd_model.extra_generation_params = {"TI": "badhand", "Emphasis": "No norm"}
+        if host == "fails":
+            raise RuntimeError("out of memory")
+        return SimpleNamespace(images=[image])
+
+    runtime = _load_script(
+        methods={
+            "_postprocess_image_inner", "fix_p2", "get_dynamic_denoise_strength",
+            "get_optimal_crop_image_size", "get_seed", "get_each_tab_seed",
+        },
+        state=state,
+        shared=SimpleNamespace(
+            state=state, opts=SimpleNamespace(data={}), sd_model=sd_model
+        ),
+        opts=SimpleNamespace(
+            data={
+                "ad_dynamic_denoise_power": 0,
+                "ad_match_inpaint_bbox_size": InpaintBBoxMatchMode.OFF.value,
+            }
+        ),
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+        ordinal=str,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    p = SimpleNamespace(
+        extra_generation_params=dict(main),
+        seed=1, subseed=1, all_seeds=[1], all_subseeds=[1],
+    )
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[image], prompt="face", negative_prompt="",
+        close=lambda: None, denoising_strength=0.4, width=512, height=512,
+        extra_generation_params={},
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [mask, mask]
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    processed = script._postprocess_image_inner(
+        p, SimpleNamespace(image=image), ADetailerArgs(ad_model="face_yolov8n.pt")
+    )
+
+    assert processed is (host != "fails")
+    if host in ("neo", "fails"):
+        # The main pass's own dict is back, for the next batch to copy.
+        assert sd_model.extra_generation_params is main
+        assert main == {"Emphasis": "Original"}
+    if host == "no_params":  # no dict to put back: none is added
+        assert sd_model.extra_generation_params == {
+            "TI": "badhand", "Emphasis": "No norm",
+        }
+    # The current image's own parameters are not changed.
+    assert p.extra_generation_params == {"Emphasis": "Original"}
+
+
+def test_the_next_image_does_not_keep_the_previous_images_detailer_hashes():
+    # The next image of a batch, the next batch and the next X/Y/Z cell share
+    # the dict: one where ADetailer adds nothing (or does not run) must not
+    # keep the LoRA of the previous image's ADetailer prompt.
+    script = _load_script(methods={"postprocess_image"}).AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: False
+    params = {"Lora hashes": "style: aaa111"}
+    script._ad_network_hashes = merge_network_hashes(
+        params, {"Lora hashes": "eyes: ccc333"}
+    )
+    assert params == {"Lora hashes": "style: aaa111, eyes: ccc333"}
+
+    script.postprocess_image(
+        SimpleNamespace(extra_generation_params=params), SimpleNamespace(image=None)
+    )
+
+    assert params == {"Lora hashes": "style: aaa111"}
 
 
 class _HostI2I:
@@ -6928,3 +9374,3488 @@ def test_a_standalone_result_keeps_its_passs_parameters_when_the_tab_cannot_be_r
 
     assert shells == [{}]
     assert "Nothing detected" in status
+
+
+def _mask_run(state, opts_data, process_images, masks, prompts=None):
+    """A `_detailer` runner whose script records every save_image call."""
+    run, pp, before = _detailer(
+        state, process_images, n_masks=len(masks), Image=Image,
+        opts=SimpleNamespace(data=opts_data),
+    )
+    script = _script_of(run)
+    script.pred_preprocessing = lambda *_args: list(masks)
+    if prompts:
+
+        def replace(p2, _pos, _neg, j):
+            p2.prompt = prompts[j]
+
+        script.i2i_prompts_replace = replace
+    saved = []
+    script.extensions = {}
+
+    def save_image(_p, image, *, condition, suffix, extension=None):
+        saved.append((condition, suffix, image))
+        script.extensions[suffix] = extension
+
+    script.save_image = save_image
+    return run, pp, saved
+
+
+def _region_masks(n, size=(8, 8)):
+    masks = []
+    for k in range(n):
+        mask = Image.new("L", size, 0)
+        mask.paste(255, (k, k, k + 3, k + 3))
+        masks.append(mask)
+    return masks
+
+
+def _mask_state():
+    return SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+
+
+def test_save_inpaint_masks_saves_the_mask_each_region_is_inpainted_with():
+    # "Save inpaint masks" saves the black and white mask given to img2img,
+    # one per region inpainted: a [SKIP] region is not inpainted and saves
+    # none, and a mask resized to the whole-picture canvas is saved resized.
+    used = []
+
+    def process_images(p2):
+        used.append(p2.image_mask.copy())
+        # Whole-picture inpaint returns the region at the canvas size.
+        return SimpleNamespace(images=[Image.new("RGB", (16, 16), "red")])
+
+    run, pp, saved = _mask_run(
+        _mask_state(), {"ad_save_inpaint_masks": True}, process_images,
+        _region_masks(3), prompts=["face", "[SKIP]", "face"],
+    )
+
+    assert run() is True
+    masks = [(s, im) for c, s, im in saved if c == "ad_save_inpaint_masks"]
+    assert [s for s, _im in masks] == ["-ad-mask-1-1", "-ad-mask-1-3"]
+    # Premise: the 3rd mask was resized to the canvas before img2img.
+    assert [m.size for m in used] == [(8, 8), (16, 16)]
+    for (_s, image), mask in zip(masks, used):
+        assert image.mode == "L"
+        assert image.size == mask.size
+        assert image.tobytes() == mask.convert("L").tobytes()
+    # The mask preview of the pass is saved as before.
+    assert [s for c, s, _im in saved if c == "ad_save_previews"] == ["-ad-preview-1"]
+
+
+def test_save_inpaint_masks_names_each_sequential_class_pass():
+    # Sequential mode: named like that pass's preview, plus the region.
+    run, _pp, saved = _mask_run(
+        _mask_state(), {"ad_save_inpaint_masks": True},
+        lambda _p2: SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")]),
+        _region_masks(1),
+    )
+
+    assert run(classes="face,hand", sequential=True) is True
+    assert [s for c, s, _im in saved if c == "ad_save_inpaint_masks"] == [
+        "-ad-mask-1-1-face-1", "-ad-mask-1-2-hand-1",
+    ]
+    assert [s for c, s, _im in saved if c == "ad_save_previews"] == [
+        "-ad-preview-1-1-face", "-ad-preview-1-2-hand",
+    ]
+
+
+@pytest.mark.parametrize("tab", [0, 2])
+def test_save_inpaint_masks_names_the_tab(tab):
+    # "Run ADetailer on an image" and folder runs pass the tab they were
+    # started from as n, as a generation does.
+    run, pp, saved = _mask_run(
+        _mask_state(), {"ad_save_inpaint_masks": True},
+        lambda _p2: SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")]),
+        _region_masks(2),
+    )
+    script = _script_of(run)
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+    )
+
+    p = SimpleNamespace(extra_generation_params={}, _ad_standalone=True)
+    assert script._postprocess_image_inner(p, pp, args, n=tab) is True
+    assert [s for c, s, _im in saved if c == "ad_save_inpaint_masks"] == [
+        f"-ad-mask-{tab + 1}-1", f"-ad-mask-{tab + 1}-2",
+    ]
+
+
+def test_save_inpaint_masks_is_off_by_default():
+    run, _pp, saved = _mask_run(
+        _mask_state(), {},
+        lambda _p2: SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")]),
+        _region_masks(2),
+    )
+
+    assert run() is True
+    assert [c for c, _s, _im in saved] == ["ad_save_previews"]
+    # The option is declared off, among ADetailer's settings.
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    option = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_save_inpaint_masks"
+    )
+    info = option.args[1]
+    assert ast.literal_eval(info.args[0]).count("-ad-mask-N-K") == 1
+    kwargs = {k.arg: k.value for k in info.func.value.keywords}
+    assert ast.literal_eval(kwargs["default"]) is False
+    assert ast.literal_eval(kwargs["label"]) == "Save inpaint masks"
+    assert ast.unparse(kwargs["section"]) == "section"
+
+
+def test_a_failed_inpaint_mask_save_never_stops_the_pass(capsys):
+    result = Image.new("RGB", (8, 8), "red")
+    calls = []
+
+    def process_images(p2):
+        calls.append(p2)
+        return SimpleNamespace(images=[result])
+
+    run, pp, saved = _mask_run(
+        _mask_state(), {"ad_save_inpaint_masks": True}, process_images,
+        _region_masks(2),
+    )
+    script = _script_of(run)
+
+    def save_image(_p, _image, *, condition, suffix, extension=None):
+        if condition == "ad_save_inpaint_masks":
+            raise OSError("disk full")
+        saved.append((condition, suffix, _image))
+
+    script.save_image = save_image
+
+    assert run() is True
+    assert len(calls) == 2
+    assert pp.image is result
+    err = capsys.readouterr().err
+    assert err.count("couldn't save the inpaint mask (disk full)") == 2
+
+
+# X/Y/Z axes for every tab and an Enable axis.
+
+
+_OLD_XYZ_LABELS = [
+    "[ADetailer] ADetailer model 1st",
+    "[ADetailer] ADetailer prompt 1st",
+    "[ADetailer] ADetailer negative prompt 1st",
+    "[ADetailer] Prompt S/R (AD 1st)",
+    "[ADetailer] Prompt S/R (AD 1st and main prompt)",
+    "[ADetailer] Mask erosion / dilation 1st",
+    "[ADetailer] Inpaint denoising strength 1st",
+    "[ADetailer] CFG scale 1st",
+    "[ADetailer] Inpaint only masked 1st",
+    "[ADetailer] Inpaint only masked padding 1st",
+    "[ADetailer] ADetailer sampler 1st",
+    "[ADetailer] ADetailer scheduler 1st",
+    "[ADetailer] noise multiplier 1st",
+    "[ADetailer] ControlNet model 1st",
+]
+
+
+def _ui_ordinal():
+    return _ui_suffix().__globals__["ordinal"]
+
+
+def _xyz_runtime(data, with_grid=True):
+    """make_axis_on_xyz_grid with a stand-in for the WebUI's xyz_grid.py."""
+    from functools import partial
+
+    class AxisOption:
+        def __init__(self, label, type, apply, choices=None, **_kwargs):  # noqa: A002
+            self.label, self.type, self.apply, self.choices = label, type, apply, choices
+
+    grid = SimpleNamespace(
+        AxisOption=AxisOption,
+        axis_options=[AxisOption("Nothing", str, lambda *_a: None)],
+    )
+    script_class = type("Script", (), {"__module__": "xyz_grid.py"})
+    scripts_data = [SimpleNamespace(script_class=script_class, module=grid)]
+    runtime = _load_script(
+        functions={
+            "make_axis_on_xyz_grid", "set_value", "set_enable",
+            "search_and_replace_prompt",
+        },
+        scripts=SimpleNamespace(scripts_data=scripts_data if with_grid else []),
+        partial=partial,
+        model_mapping={"face_yolov8n.pt": "face_yolov8n.pt"},
+        all_samplers=[],
+        schedulers=[],
+        get_cn_models=list,
+        opts=SimpleNamespace(data=data),
+        ordinal=_ui_ordinal(),
+    )
+    return runtime, grid
+
+
+@pytest.mark.parametrize(("data", "tabs"), [({"ad_max_models": 3}, 3), ({}, 4)])
+def test_xyz_axes_reach_every_tab_and_keep_the_old_labels(data, tabs):
+    # The X/Y/Z axes reached only the 1st tab, and there was no axis to
+    # compare a grid with and without ADetailer.
+    runtime, grid = _xyz_runtime(data)
+    runtime.make_axis_on_xyz_grid()
+    labels = [x.label for x in grid.axis_options[1:]]
+
+    # The labels saved grids and presets use come first, as they were.
+    assert labels[: len(_OLD_XYZ_LABELS)] == _OLD_XYZ_LABELS
+    assert "[ADetailer] Enable" in labels
+    for name in ("Detection confidence threshold", "Inpaint mask blur", "Steps"):
+        assert f"[ADetailer] {name} 1st" in labels
+    ordinal = _ui_ordinal()
+    for n in range(2, tabs + 1):
+        for name in (
+            "ADetailer model", "ADetailer prompt", "ADetailer negative prompt",
+            "Detection confidence threshold", "Mask erosion / dilation",
+            "Inpaint mask blur", "Inpaint denoising strength",
+            "Inpaint only masked padding", "CFG scale", "Steps",
+        ):
+            assert f"[ADetailer] {name} {ordinal(n)}" in labels
+    assert not [x for x in labels if x.endswith(f" {ordinal(tabs + 1)}")]
+    expected = len(_OLD_XYZ_LABELS) + 1 + 3 + 10 * (tabs - 1)
+    assert len(labels) == len(set(labels)) == expected
+
+    # Called again (a UI reload), it adds nothing twice.
+    runtime.make_axis_on_xyz_grid()
+    assert [x.label for x in grid.axis_options[1:]] == labels
+
+    # The 2nd tab's axes write the 2nd tab's values only.
+    axis = {x.label: x for x in grid.axis_options}
+    pc = SimpleNamespace()
+    axis["[ADetailer] Inpaint denoising strength 2nd"].apply(pc, 0.6, [0.6])
+    axis["[ADetailer] ADetailer model 2nd"].apply(pc, "face_yolov8n.pt", [])
+    assert pc._ad_xyz_tabs == {
+        1: {"ad_denoising_strength": 0.6, "ad_model": "face_yolov8n.pt"}
+    }
+    assert not hasattr(pc, "_ad_xyz")
+    assert "face_yolov8n.pt" in axis["[ADetailer] ADetailer model 3rd"].choices()
+    # Unchanged: the 1st tab's axes.
+    axis["[ADetailer] Inpaint denoising strength 1st"].apply(pc, 0.3, [0.3])
+    assert pc._ad_xyz == {"ad_denoising_strength": 0.3}
+    enable = axis["[ADetailer] Enable"]
+    assert enable.choices() == ["False", "True"]
+    for value, expected_value in (("False", False), ("True", True), ("true", True)):
+        enable.apply(pc, value, ["False", "True"])
+        assert pc._ad_xyz_enable is expected_value
+
+
+def test_xyz_detector_axes_list_the_detectors_found_by_the_refresh(tmp_path):
+    # Issue #8: the X/Y/Z detector axes list the detectors that the 🔄 or a
+    # detector name not in the list found, without a restart.
+    from functools import partial
+
+    class AxisOption:
+        def __init__(self, label, type, apply, choices=None, **_kwargs):  # noqa: A002
+            self.label, self.choices = label, choices
+
+    grid = SimpleNamespace(
+        AxisOption=AxisOption,
+        axis_options=[AxisOption("Nothing", str, lambda *_a: None)],
+    )
+    script_class = type("Script", (), {"__module__": "xyz_grid.py"})
+    get_models, calls = _detector_folders(
+        [("face_yolov8n.pt", "a/face_yolov8n.pt"), ("new.pt", "b/new.pt")]
+    )
+    mapping = OrderedDict([("face_yolov8n.pt", "a/face_yolov8n.pt")])
+    runtime = _load_script(
+        functions={
+            "make_axis_on_xyz_grid", "set_value", "set_enable",
+            "search_and_replace_prompt", "refresh_model_mapping",
+        },
+        scripts=SimpleNamespace(
+            scripts_data=[SimpleNamespace(script_class=script_class, module=grid)]
+        ),
+        partial=partial,
+        model_mapping=mapping,
+        all_samplers=[],
+        schedulers=[],
+        get_cn_models=list,
+        opts=SimpleNamespace(data={"ad_max_models": 2}),
+        ordinal=_ui_ordinal(),
+        get_models=get_models,
+        adetailer_dir=tmp_path,
+        shared=SimpleNamespace(opts=SimpleNamespace(data={})),
+    )
+    runtime.make_axis_on_xyz_grid()
+    axis = {x.label: x for x in grid.axis_options}
+    labels = ["[ADetailer] ADetailer model 1st", "[ADetailer] ADetailer model 2nd"]
+    for label in labels:
+        assert axis[label].choices() == ["None", "face_yolov8n.pt"]
+
+    runtime.refresh_model_mapping()
+
+    assert calls == [False]
+    for label in labels:
+        assert axis[label].choices() == ["None", "face_yolov8n.pt", "new.pt"]
+
+
+def test_xyz_axes_are_skipped_without_the_xyz_script():
+    runtime, grid = _xyz_runtime({}, with_grid=False)
+    runtime.make_axis_on_xyz_grid()
+    assert [x.label for x in grid.axis_options] == ["Nothing"]
+
+
+def _xyz_process_runtime():
+    from adetailer.args import ADetailerArgs, SkipImg2ImgOrig
+
+    return _load_script(
+        methods={
+            "process", "postprocess_image", "is_ad_enabled", "set_skip_img2img",
+            "get_args", "extra_params",
+        },
+        functions={"set_value", "set_enable"},
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        ADetailerArgs=ADetailerArgs,
+        SkipImg2ImgOrig=SkipImg2ImgOrig,
+        suffix=_ui_suffix(),
+        ordinal=_ui_ordinal(),
+        __version__="test",
+    )
+
+
+class _ReachedError(Exception):
+    pass
+
+
+def _reach(*_args):
+    raise _ReachedError
+
+
+def test_an_xyz_axis_for_the_2nd_tab_reaches_only_that_tab():
+    runtime = _xyz_process_runtime()
+    script = runtime.AfterDetailerScript()
+    script.get_i2i_init_image = _reach
+    tabs = (
+        {"ad_model": "face_yolov8n.pt"}, {"ad_model": "None"},
+        {"ad_model": "hand_yolov8n.pt"},
+    )
+    p = SimpleNamespace(
+        prompt="a photo", negative_prompt="", init_images=None,
+        extra_generation_params={},
+    )
+
+    pc = copy(p)
+    runtime.set_value(pc, 0.6, [0.6], field="ad_denoising_strength", tab=1)
+    runtime.set_value(pc, "eyes_yolov8n.pt", [], field="ad_model", tab=1)
+    # A tab this run does not have is left alone.
+    runtime.set_value(pc, 0.2, [0.2], field="ad_denoising_strength", tab=5)
+    args = script.get_args(pc, True, False, *tabs)
+    assert [a.ad_model for a in args] == [
+        "face_yolov8n.pt", "eyes_yolov8n.pt", "hand_yolov8n.pt"
+    ]
+    assert [a.ad_denoising_strength for a in args] == [0.4, 0.6, 0.4]
+
+    # A detector axis runs a 2nd tab left on None, as the 1st tab's does.
+    off = (True, False, {"ad_model": "None"}, {"ad_model": "None"})
+    script.process(pc, *off)
+    assert not getattr(pc, "_ad_disabled", False)
+    assert pc.extra_generation_params["ADetailer model 2nd"] == "eyes_yolov8n.pt"
+    with pytest.raises(_ReachedError):
+        script.postprocess_image(pc, SimpleNamespace(image=None), *off)
+    # The next cell, without it, records nothing of this one.
+    nxt = copy(p)
+    runtime.set_value(nxt, "None", [], field="ad_model", tab=1)
+    script.process(nxt, *off)
+    assert nxt._ad_disabled
+    assert not [k for k in nxt.extra_generation_params if k.startswith("ADetailer ")]
+
+
+def test_a_short_api_request_with_the_enable_axis_does_not_count_the_default_tab():
+    # A short API request [{...}] puts the host's default 1st tab (a face
+    # detector, on) in the 3rd place. With the "[ADetailer] Enable" axis,
+    # process() built its tab list without dropping it: ADetailer counted as
+    # on although every tab the request sent was None.
+    runtime = _xyz_process_runtime()
+    script = runtime.AfterDetailerScript()
+    script.get_i2i_init_image = _reach
+    default = {"ad_model": "face_yolov8n.pt", "ad_tab_enable": True}
+    script._ad_api_default_tab = default
+    p = SimpleNamespace(
+        prompt="a photo", negative_prompt="", init_images=None,
+        extra_generation_params={},
+    )
+    # [{"ad_model": "None"}]: the host fills the 2nd place with Skip img2img
+    # (False) and the 3rd with its default 1st tab.
+    request = ({"ad_model": "None"}, False, dict(default))
+
+    pc = copy(p)
+    runtime.set_enable(pc, "True", ["False", "True"])
+    script.process(pc, *request)
+    assert pc._ad_disabled
+
+
+def test_the_xyz_enable_axis_switches_adetailer_for_the_cell():
+    runtime = _xyz_process_runtime()
+    script = runtime.AfterDetailerScript()
+    script.get_i2i_init_image = _reach
+    tab = {"ad_model": "face_yolov8n.pt"}
+    p = SimpleNamespace(
+        prompt="a photo", negative_prompt="", init_images=None,
+        extra_generation_params={"Hires upscale": 2},
+    )
+
+    for checkbox in (True, False):
+        cells = []
+        for value in ("True", "False"):
+            pc = copy(p)
+            runtime.set_enable(pc, value, ["False", "True"])
+            script.process(pc, checkbox, False, tab)
+            cells.append((pc, dict(pc.extra_generation_params)))
+        (on, on_params), (off, off_params) = cells
+        assert not getattr(on, "_ad_disabled", False)
+        assert on_params["ADetailer model"] == "face_yolov8n.pt"
+        with pytest.raises(_ReachedError):
+            script.postprocess_image(
+                on, SimpleNamespace(image=None), checkbox, False, tab
+            )
+        # The cell without ADetailer keeps nothing of the cell before.
+        assert off._ad_disabled
+        assert not [k for k in off_params if k.startswith("ADetailer ")]
+        assert off_params["Hires upscale"] == 2
+
+    # postprocess_image reads the axis too.
+    pc = copy(p)
+    runtime.set_enable(pc, "False", ["False", "True"])
+    image = SimpleNamespace(image=None)
+    assert script.postprocess_image(pc, image, True, False, tab) is None
+    # Switched on with every tab on None, there is still nothing to run.
+    pc = copy(p)
+    runtime.set_enable(pc, "True", ["False", "True"])
+    script.process(pc, False, False, {"ad_model": "None"})
+    assert pc._ad_disabled
+    # Unchanged without the axis: the checkbox decides.
+    plain = copy(p)
+    script.process(plain, False, False, tab)
+    assert plain._ad_disabled
+
+
+def test_save_inpaint_masks_skips_a_region_that_was_not_inpainted():
+    # The mask was saved before img2img ran: a region cancelled while it was
+    # being inpainted (or one that failed) still left its mask file.
+    state = _mask_state()
+    calls = []
+
+    def process_images(_p2):
+        calls.append(1)
+        if len(calls) == 2:
+            state.interrupted = True
+            msg = "cancelled before the first step"
+            raise RuntimeError(msg)
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")])
+
+    run, _pp, saved = _mask_run(
+        state, {"ad_save_inpaint_masks": True}, process_images, _region_masks(3)
+    )
+
+    assert run() is False
+    assert len(calls) == 2
+    assert [s for c, s, _im in saved if c == "ad_save_inpaint_masks"] == ["-ad-mask-1-1"]
+
+
+def test_a_new_xyz_cell_drops_the_previous_cells_detailer_hashes_before_its_params_txt():
+    # The WebUI writes params.txt for a cell before ADetailer's
+    # postprocess_image runs: the previous cell's ADetailer-only LoRA was still
+    # listed there. process() runs first in every cell and takes it out.
+    script = _load_script(methods={"process"}).AfterDetailerScript()
+    params = {"Lora hashes": "style: aaa111"}
+    script._ad_network_hashes = merge_network_hashes(
+        params, {"Lora hashes": "eyes: ccc333"}
+    )
+
+    script.process(SimpleNamespace(extra_generation_params=params, _ad_disabled=True))
+
+    assert params == {"Lora hashes": "style: aaa111"}
+
+
+
+def test_save_inpaint_masks_saves_png_whatever_the_image_format():
+    # In the Settings' image format (often JPEG) a mask got blurred edges.
+    run, _pp, saved = _mask_run(
+        _mask_state(), {"ad_save_inpaint_masks": True, "ad_save_previews": True},
+        lambda _p2: SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")]),
+        _region_masks(1),
+    )
+
+    assert run() is True
+    extensions = _script_of(run).extensions
+    assert extensions["-ad-mask-1-1"] == "png"
+    # The previews keep the Settings' format.
+    assert extensions["-ad-preview-1"] is None
+
+
+@pytest.mark.parametrize(("tab", "field", "use"), [
+    (0, "ad_cfg_scale", "ad_use_cfg_scale"),
+    (0, "ad_steps", "ad_use_steps"),
+    (2, "ad_steps", "ad_use_steps"),
+    (1, "ad_cfg_scale", "ad_use_cfg_scale"),
+])
+def test_an_xyz_steps_or_cfg_axis_ticks_the_tabs_use_separate_box(tab, field, use):
+    # Without "Use separate steps / CFG scale" ticked in the tab, every cell
+    # of a Steps or CFG scale grid came out the same: the axis ticks it.
+    runtime = _load_script(functions={"set_value"})
+    p = SimpleNamespace()
+
+    runtime.set_value(p, 12, [12, 40], field=field, tab=tab)
+
+    values = p._ad_xyz_tabs[tab] if tab else p._ad_xyz
+    assert values == {field: 12, use: True}
+
+
+def test_other_xyz_axes_tick_nothing_else():
+    runtime = _load_script(functions={"set_value"})
+    p = SimpleNamespace()
+
+    runtime.set_value(p, 0.5, [0.5], field="ad_denoising_strength")
+
+    assert p._ad_xyz == {"ad_denoising_strength": 0.5}
+
+
+@pytest.mark.parametrize(("tab", "axes", "expected"), [
+    # No axis: the main generation's sampler and scheduler, no noise multiplier.
+    ({}, [], ("DPM++ 2M", "Automatic", None)),
+    # A sampler axis on a tab with "Use separate sampler" off: the axis's
+    # sampler, the main generation's scheduler (not the tab's unused one).
+    ({}, [("ad_sampler", "Euler")], ("Euler", "Automatic", None)),
+    ({"ad_scheduler": "Exponential"}, [("ad_sampler", "Euler")], ("Euler", "Automatic", None)),
+    # A scheduler axis: the main generation's sampler, not the tab's default
+    # "DPM++ 2M Karras" or the one left in its box.
+    ({}, [("ad_scheduler", "Karras")], ("DPM++ 2M", "Karras", None)),
+    ({"ad_sampler": "Euler a"}, [("ad_scheduler", "Karras")], ("DPM++ 2M", "Karras", None)),
+    # Both axes, in either order.
+    ({}, [("ad_sampler", "Euler"), ("ad_scheduler", "Karras")], ("Euler", "Karras", None)),
+    ({}, [("ad_scheduler", "Karras"), ("ad_sampler", "Euler")], ("Euler", "Karras", None)),
+    # A tab that uses its own sampler keeps the half the axis does not set.
+    (
+        {"ad_use_sampler": True, "ad_sampler": "Euler a"},
+        [("ad_scheduler", "Karras")], ("Euler a", "Karras", None),
+    ),
+    (
+        {"ad_use_sampler": True, "ad_scheduler": "Exponential"},
+        [("ad_sampler", "Euler")], ("Euler", "Exponential", None),
+    ),
+    # A noise multiplier axis on a tab with its box off.
+    ({}, [("ad_noise_multiplier", 1.3)], ("DPM++ 2M", "Automatic", 1.3)),
+])
+def test_an_xyz_sampler_scheduler_or_noise_axis_changes_the_pass(tab, axes, expected):
+    # Without "Use separate sampler / noise multiplier" ticked in the tab,
+    # every cell of a sampler, scheduler or noise multiplier grid came out the
+    # same, and the images' parameters did not list the axis's value.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods={"get_args", "get_sampler", "get_scheduler", "get_initial_noise_multiplier"},
+        functions={"set_value"}, ADetailerArgs=ADetailerArgs, ordinal=str,
+    )
+    script = runtime.AfterDetailerScript()
+    p = SimpleNamespace(sampler_name="DPM++ 2M", scheduler="Automatic")
+    for field, value in axes:
+        runtime.set_value(p, value, [value], field=field)
+    first = {"ad_model": "face_yolov8n.pt", **tab}
+
+    [args] = script.get_args(p, True, False, first)
+
+    used = (
+        script.get_sampler(p, args),
+        script.get_scheduler(p, args)["scheduler"],
+        script.get_initial_noise_multiplier(p, args),
+    )
+    assert used == expected
+    # The tab's own dict is left as it was.
+    assert first == {"ad_model": "face_yolov8n.pt", **tab}
+    params = args.extra_params()
+    for field, value in axes:
+        name = {
+            "ad_sampler": "ADetailer sampler",
+            "ad_scheduler": "ADetailer scheduler",
+            "ad_noise_multiplier": "ADetailer noise multiplier",
+        }[field]
+        assert params[name] == value
+
+
+@pytest.mark.parametrize(("tab", "axis", "expected"), [
+    # The tab's ControlNet model is "None" (or "Passthrough"): its hidden
+    # preprocessor menu holds "None", not a choice of the user. Forge, Forge
+    # Neo and reForge ran every cell of the grid without a preprocessor; the
+    # backend now picks the model's default, as on AUTOMATIC1111.
+    ({"ad_controlnet_model": "None", "ad_controlnet_module": "None"},
+     {"ad_controlnet_model": "control_v11p_sd15_openpose"}, None),
+    ({"ad_controlnet_model": "Passthrough", "ad_controlnet_module": "None"},
+     {"ad_controlnet_model": "control_v11f1p_sd15_depth"}, None),
+    # A preprocessor the user picked with a real model stays, "None" too.
+    ({"ad_controlnet_model": "control_v11p_sd15_openpose",
+      "ad_controlnet_module": "openpose_full"},
+     {"ad_controlnet_model": "control_v11p_sd15_openpose"}, "openpose_full"),
+    ({"ad_controlnet_model": "control_v11p_sd15_openpose",
+      "ad_controlnet_module": "None"},
+     {"ad_controlnet_model": "control_v11p_sd15_openpose"}, "None"),
+    # No ControlNet axis: the tab as it is.
+    ({"ad_controlnet_model": "control_v11p_sd15_openpose",
+      "ad_controlnet_module": "openpose_full"}, {}, "openpose_full"),
+])
+def test_an_xyz_controlnet_model_axis_gets_the_models_default_preprocessor(
+    tab, axis, expected
+):
+    from adetailer.args import ADetailerArgs
+
+    calls = []
+    runtime = _load_script(
+        methods={"get_args", "update_controlnet_args"},
+        functions={"set_value"}, ADetailerArgs=ADetailerArgs, ordinal=str,
+    )
+    script = runtime.AfterDetailerScript()
+    script.controlnet_ext = SimpleNamespace(
+        cn_available=True,
+        update_scripts_args=lambda _p, **kwargs: calls.append(kwargs),
+    )
+    for n in (0, 1):  # the 1st tab's axis, and a 2nd tab's
+        p = SimpleNamespace()
+        for field, value in axis.items():
+            runtime.set_value(p, value, [value], field=field, tab=n)
+        tabs = [{"ad_model": "face_yolov8n.pt", **tab} for _ in range(2)]
+
+        args = script.get_args(p, True, False, *tabs)
+        script.update_controlnet_args(SimpleNamespace(), args[n])
+
+        model = axis.get("ad_controlnet_model", tab["ad_controlnet_model"])
+        assert calls[-1]["model"] == model
+        assert calls[-1]["module"] == expected
+        # The tab's own dict is left as it was.
+        assert tabs[n] == {"ad_model": "face_yolov8n.pt", **tab}
+
+
+# What create_infotext reads straight from p on AUTOMATIC1111 1.10 and Forge
+# Neo 2.30 (modules/processing.py, and sd_samplers_common for "Eta noise seed
+# delta"), besides the lists it is given.
+_INFOTEXT_READS = (
+    "all_negative_prompts", "batch_size", "cfg_scale", "distilled_cfg_scale",
+    "extra_generation_params", "height", "is_using_inpainting_conditioning",
+    "main_negative_prompt", "main_prompt", "restore_faces", "sampler_name",
+    "scheduler", "sd_model", "sd_model_hash", "sd_model_name", "sd_vae_hash",
+    "sd_vae_name", "seed_resize_from_h", "seed_resize_from_w", "steps",
+    "subseed_strength", "tiling", "user", "width", "eta", "sampler",
+)
+
+
+def _standalone_shell():
+    # The keys of run_detailer_on_image's p-shell.
+    return SimpleNamespace(
+        sd_model=None, prompt="", negative_prompt="", all_prompts=[""],
+        all_negative_prompts=[""], seed=1, subseed=2, all_seeds=[1],
+        all_subseeds=[2], subseed_strength=0.0, seed_resize_from_h=0,
+        seed_resize_from_w=0, iteration=0, batch_index=0, batch_size=1, n_iter=1,
+        width=512, height=512, steps=28, cfg_scale=7.0, sampler_name="Euler a",
+        scheduler="Automatic", styles=[], tiling=False, restore_faces=False,
+        outpath_samples="", outpath_grids="",
+        extra_generation_params={"ADetailer model": "face_yolov8n.pt"},
+        scripts=None, script_args=[], override_settings={}, _ad_standalone=True,
+    )
+
+
+def test_standalone_previews_and_masks_get_their_parameters(capsys):
+    # The previews, step images and masks of "Run ADetailer on an image" and
+    # folder runs were saved with no parameters: create_infotext read
+    # p.get_token_merging_ratio and other generation fields the p-shell does
+    # not have, and the console said "create_infotext failed" for each one.
+    def create_infotext(p, *_args):
+        values = {name: getattr(p, name) for name in _INFOTEXT_READS}
+        ratio = p.get_token_merging_ratio()
+        return f"Steps: {values['steps']}, ToMe: {ratio}, " + ", ".join(
+            f"{k}: {v}" for k, v in values["extra_generation_params"].items()
+        )
+
+    script = _load_script(
+        methods={"infotext", "_standalone_infotext_p"},
+        create_infotext=create_infotext, get_i=lambda _p: 0,
+        shared=SimpleNamespace(sd_model=None),
+    ).AfterDetailerScript()
+    shell = _standalone_shell()
+    before = dict(vars(shell))
+
+    info = script.infotext(shell)
+
+    assert info == "Steps: 28, ToMe: 0, ADetailer model: face_yolov8n.pt"
+    assert "create_infotext failed" not in capsys.readouterr().err
+    # The detailer pass reads the shell itself: it is left as it was.
+    assert vars(shell) == before
+
+
+def test_standalone_files_are_named_with_the_completed_shell(tmp_path):
+    # A file-name pattern with [user] or [denoising] read those fields of the
+    # p-shell, which it does not have: the WebUI printed a traceback for each
+    # preview, step image and mask of "Run ADetailer on an image".
+    named = []
+
+    def save_image(*, p, **_kwargs):
+        named.append((p.user, p.denoising_strength))
+
+    script = _load_script(
+        methods={"save_image", "infotext", "_standalone_infotext_p"},
+        create_infotext=lambda *_args: "", get_i=lambda _p: 0,
+        shared=SimpleNamespace(sd_model=None),
+        opts=SimpleNamespace(
+            data={"ad_save_previews": True, "ad_save_images_dir": str(tmp_path)},
+            samples_format="png", save_to_dirs=False,
+        ),
+        images=SimpleNamespace(save_image=save_image),
+        AD_EXTRA_SUBDIR="adetailer-steps",
+    ).AfterDetailerScript()
+    script.get_seed = lambda _p: (1, 2)
+    shell = _standalone_shell()
+    before = dict(vars(shell))
+
+    script.save_image(
+        shell, Image.new("RGB", (4, 4)), condition="ad_save_previews",
+        suffix="-ad-preview-1",
+    )
+
+    assert named == [(None, None)]
+    assert vars(shell) == before
+
+
+
+@pytest.mark.parametrize(("img2img", "base", "expected"), [
+    (0.5, 0.3, 0.5), (0, 0.3, 0.3), (0, 0, 0),
+])
+def test_standalone_preview_parameters_record_the_settings_token_merging(
+    img2img, base, expected
+):
+    # The detailer pass, an img2img pass, uses the Settings' img2img token
+    # merging ratio, else the base one; the parameters of its previews said 0.
+    def create_infotext(p, *_args):
+        return f"ToMe: {p.get_token_merging_ratio()}"
+
+    script = _load_script(
+        methods={"infotext", "_standalone_infotext_p"},
+        create_infotext=create_infotext, get_i=lambda _p: 0,
+        shared=SimpleNamespace(sd_model=None),
+        opts=SimpleNamespace(
+            token_merging_ratio=base, token_merging_ratio_img2img=img2img
+        ),
+    ).AfterDetailerScript()
+
+    assert script.infotext(_standalone_shell()) == f"ToMe: {expected}"
+
+
+def _load_install(monkeypatch):
+    import importlib.util
+
+    # install.py runs install() at import unless launch says to skip it.
+    launch = ModuleType("launch")
+    launch.args = SimpleNamespace(skip_install=True)
+    monkeypatch.setitem(sys.modules, "launch", launch)
+    path = Path(__file__).resolve().parents[1] / "install.py"
+    spec = importlib.util.spec_from_file_location("_adetailer_install", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_install_keeps_going_when_mediapipe_has_no_wheel(monkeypatch, capsys):
+    # Linux aarch64 on Python 3.13 has no mediapipe 0.10.x: with one pip
+    # command for everything, that failure also left ultralytics uninstalled.
+    import subprocess
+
+    install = _load_install(monkeypatch)
+    calls = []
+
+    def fake_pip(*args):
+        calls.append(args)
+        if any(a.startswith("mediapipe") for a in args):
+            raise subprocess.CalledProcessError(1, "pip")
+
+    monkeypatch.setattr(install, "run_pip", fake_pip)
+    monkeypatch.setattr(install, "is_installed", lambda *a: False)
+    monkeypatch.setattr(install, "numpy_pin", lambda: [])
+
+    install.install()
+
+    assert calls == [
+        ("ultralytics>=8.3.75", "rich>=13.0.0"),
+        ("mediapipe>=0.10.13,<=0.10.99",),
+    ]
+    err = capsys.readouterr().err
+    assert "could not install mediapipe" in err
+
+
+def test_install_keeps_numpy_1_in_both_pip_commands(monkeypatch):
+    # On AUTOMATIC1111 (NumPy 1) the separate MediaPipe command must keep
+    # NumPy 1 too, or it drags NumPy 2 in and breaks the WebUI.
+    install = _load_install(monkeypatch)
+    calls = []
+    monkeypatch.setattr(install, "run_pip", lambda *args: calls.append(args))
+    monkeypatch.setattr(install, "is_installed", lambda *a: False)
+    monkeypatch.setattr(install, "numpy_pin", lambda: ["numpy<2"])
+
+    install.install()
+
+    assert calls == [
+        ("ultralytics>=8.3.75", "rich>=13.0.0", "numpy<2"),
+        ("mediapipe>=0.10.13,<=0.10.99", "numpy<2"),
+    ]
+
+
+def test_install_still_fails_loudly_when_ultralytics_cannot_install(monkeypatch):
+    import subprocess
+
+    install = _load_install(monkeypatch)
+
+    def fake_pip(*args):
+        raise subprocess.CalledProcessError(1, "pip")
+
+    monkeypatch.setattr(install, "run_pip", fake_pip)
+    monkeypatch.setattr(install, "is_installed", lambda *a: False)
+    monkeypatch.setattr(install, "numpy_pin", lambda: [])
+
+    with pytest.raises(subprocess.CalledProcessError):
+        install.install()
+
+
+def _color_runtime(monkeypatch, **host):
+    calls = []
+
+    def setup(image):
+        calls.append(("setup", image.size, image.getpixel((0, 0))))
+        return "target"
+
+    def apply(target, image):
+        calls.append(("apply", target, image.size))
+        return Image.new("RGB", image.size, (0, 0, 255))
+
+    funcs = {"setup_color_correction": setup, "apply_color_correction": apply, **host}
+    monkeypatch.setitem(sys.modules, "modules.processing", SimpleNamespace(**funcs))
+    return _load_script(functions={"_match_region_colors"}), calls
+
+
+def _region_mask(size, box):
+    mask = Image.new("L", size, 0)
+    mask.paste(255, box)
+    return mask
+
+
+def test_match_region_colors_corrects_only_the_region(monkeypatch):
+    # A face inpainted paler or with another tint: its box, with the padding
+    # around it, is matched to the same box before the pass, as the host's
+    # own color correction does, and only the masked pixels change.
+    runtime, calls = _color_runtime(monkeypatch)
+    before = Image.new("RGB", (40, 40), (100, 100, 100))
+    after = Image.new("RGB", (40, 40), (255, 0, 0))
+    after.info["parameters"] = "face"
+    mask = _region_mask((40, 40), (10, 10, 20, 20))
+
+    out = runtime._match_region_colors(before, after, mask, 4, 0)
+
+    assert calls == [("setup", (18, 18), (100, 100, 100)), ("apply", "target", (18, 18))]
+    assert out.getpixel((15, 15)) == (0, 0, 255)
+    assert out.getpixel((8, 8)) == (255, 0, 0)  # in the box, outside the mask
+    assert out.getpixel((30, 30)) == (255, 0, 0)
+    assert out.info["parameters"] == "face"
+    assert after.getpixel((15, 15)) == (255, 0, 0)  # the input is not changed
+
+
+def test_match_region_colors_blurs_the_edge_and_stops_at_the_border(monkeypatch):
+    runtime, calls = _color_runtime(monkeypatch)
+    before = Image.new("RGB", (40, 40), (100, 100, 100))
+    after = Image.new("RGB", (40, 40), (255, 0, 0))
+
+    mask = _region_mask((40, 40), (0, 0, 10, 10))
+    out = runtime._match_region_colors(before, after, mask, 10, 3)
+
+    # Around the blurred mask, as the host crops; the padding stops at the
+    # image border.
+    right, bottom = mask.filter(ImageFilter.GaussianBlur(3)).getbbox()[2:]
+    assert calls[0][1] == (min(right + 10, 40), min(bottom + 10, 40))
+    edge = out.getpixel((10, 5))  # first pixel outside the mask
+    assert edge not in ((255, 0, 0), (0, 0, 255))
+    assert out.getpixel((4, 4)) != (255, 0, 0)
+
+
+def test_match_region_colors_has_no_straight_edge_without_padding(monkeypatch):
+    # With the box taken around the sharp mask, a padding of 0 cut the
+    # blurred edge at the box: the correction jumped from about half to
+    # nothing along a straight line, the very box the option should hide.
+    runtime, _calls = _color_runtime(monkeypatch)
+    before = Image.new("RGB", (60, 60), (100, 100, 100))
+    after = Image.new("RGB", (60, 60), (255, 0, 0))
+
+    out = runtime._match_region_colors(before, after, _region_mask((60, 60), (20, 20, 40, 40)), 0, 4)
+
+    row = [out.getpixel((x, 30))[2] for x in range(60)]
+    assert row[30] > 200  # the middle of the region is corrected
+    assert row[0] == 0 and row[59] == 0
+    assert max(abs(a - b) for a, b in zip(row, row[1:])) < 40
+
+
+def test_match_region_colors_is_an_option_off_by_default():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    option = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_match_region_colors"
+    )
+    info = option.args[1]
+    kwargs = {k.arg: k.value for k in info.func.value.keywords}
+    assert ast.literal_eval(kwargs["default"]) is False
+    assert ast.unparse(kwargs["section"]) == "section"
+    label = ast.literal_eval(kwargs["label"])
+    assert label == "Match the colors of each inpainted region to the picture"
+    # One plain block each, for the WebUI's localizer and Language Diffusion.
+    for text in (label, ast.literal_eval(info.args[0])):
+        assert not re.search(r"\*|`|\[[^\]]*\]\(|\n", text)
+
+
+def test_match_region_colors_keeps_the_result_when_it_cannot_run(monkeypatch):
+    runtime, calls = _color_runtime(monkeypatch)
+    before = Image.new("RGB", (40, 40), (100, 100, 100))
+    after = Image.new("RGB", (40, 40), (255, 0, 0))
+    assert runtime._match_region_colors(before, after, None, 32, 4) is after
+    empty = Image.new("L", (40, 40), 0)
+    assert runtime._match_region_colors(before, after, empty, 32, 4) is after
+    assert calls == []
+
+    # Whole-picture inpaint can come back on a canvas rounded to 8 pixels:
+    # the picture before is resized to it, so a region at the right border
+    # is matched to that picture, not to the black PIL adds past its edge.
+    crops = []
+    runtime, calls = _color_runtime(
+        monkeypatch, setup_color_correction=lambda image: crops.append(image) or "target"
+    )
+    small = Image.new("RGB", (36, 36), (200, 200, 200))
+    small_mask = _region_mask((36, 36), (30, 10, 36, 20))
+    out = runtime._match_region_colors(small, after, small_mask, 0, 0)
+    assert out.size == (40, 40)
+    left, top, right, bottom = small_mask.resize((40, 40)).getbbox()
+    assert right == 40
+    assert len(crops) == 1
+    assert crops[0].size == (right - left, bottom - top)
+    assert crops[0].getextrema() == ((200, 200),) * 3  # no black past the edge
+    assert calls == [("apply", "target", crops[0].size)]
+    assert out.getpixel((38, 15)) == (0, 0, 255)
+
+    def broken(*_args):
+        msg = "bad shape"
+        raise ValueError(msg)
+
+    runtime, _calls = _color_runtime(monkeypatch, apply_color_correction=broken)
+    mask = _region_mask((40, 40), (10, 10, 20, 20))
+    assert runtime._match_region_colors(before, after, mask, 4, 0) is after
+    monkeypatch.setitem(sys.modules, "modules.processing", SimpleNamespace())
+    assert runtime._match_region_colors(before, after, mask, 4, 0) is after
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "matched"),
+    [
+        ({"ad_match_region_colors": True}, True),
+        ({}, False),
+        # The host's own color correction already matched the region.
+        ({"ad_match_region_colors": True, "img2img_color_correction": True}, False),
+    ],
+    ids=["on", "off-by-default", "host-correction-on"],
+)
+def test_match_region_colors_runs_after_each_region(opts_data, matched):
+    seen = []
+    inputs = []
+
+    def match(before, after, mask, padding, blur):
+        seen.append((before, mask, padding, blur))
+        return Image.new("RGB", after.size, "blue")
+
+    def process_images(p2):
+        inputs.append(p2.init_images[0])
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")])
+
+    masks = _region_masks(2)
+    run, pp, before = _detailer(
+        _mask_state(), process_images, n_masks=2, Image=Image,
+        opts=SimpleNamespace(data=opts_data), _match_region_colors=match,
+    )
+    script = _script_of(run)
+    script.pred_preprocessing = lambda *_args: list(masks)
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4,
+    )
+
+    p = SimpleNamespace(extra_generation_params={})
+    assert script._postprocess_image_inner(p, pp, args) is True
+
+    if matched:
+        assert [(m, pad, blur) for _b, m, pad, blur in seen] == [
+            (masks[0], 32, 4), (masks[1], 32, 4),
+        ]
+        assert seen[0][0] is before  # the picture before the 1st region
+        # The 2nd region starts from the 1st region's matched result.
+        assert inputs[1].getpixel((0, 0)) == (0, 0, 255)
+        assert pp.image.getpixel((0, 0)) == (0, 0, 255)
+    else:
+        assert seen == []
+        assert pp.image.getpixel((0, 0)) == (255, 0, 0)
+
+
+# A region that fails with an error leaves the others running.
+
+
+def _failing_regions(outcomes, capsys=None, process_error=None):
+    """Run one tab whose regions succeed ("ok") or raise ("error") in
+    order. Returns the result, the final image, the p2 values each call saw
+    and the images the successful regions returned."""
+    state = _mask_state()
+    seen = []
+    results = []
+
+    def process_images(p2):
+        seen.append((p2.denoising_strength, p2.width, p2.color_corrections))
+        outcome = outcomes[len(seen) - 1]
+        # As the host and fix_p2 would: values derived for this region.
+        p2.denoising_strength, p2.width = 0.9, 768
+        p2.color_corrections = ["this region"]
+        if outcome == "error":
+            if process_error is not None:
+                process_error()
+            raise RuntimeError(f"broken region {len(seen)}")
+        image = Image.new("RGB", (8, 8), (len(seen) * 40, 0, 0))
+        results.append(image)
+        return SimpleNamespace(images=[image])
+
+    run, pp, before = _detailer(state, process_images, n_masks=len(outcomes))
+    script = _script_of(run)
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[pp.image], prompt="face", close=lambda: None,
+        denoising_strength=0.4, width=512, height=512, color_corrections=None,
+    )
+    return run(), pp.image, before, seen, results
+
+
+@pytest.mark.parametrize(
+    "outcomes",
+    [
+        ["error", "ok"], ["ok", "error"], ["ok", "error", "ok"],
+        ["error", "ok", "error"],
+    ],
+)
+def test_a_region_that_fails_leaves_the_other_regions_detailed(outcomes):
+    processed, image, _before, seen, results = _failing_regions(outcomes)
+
+    # Every region was tried, each from the tab's own values.
+    assert seen == [(0.4, 512, None)] * len(outcomes)
+    # The last region that succeeded is the result, even when a later
+    # one failed.
+    assert processed is True
+    assert image is results[-1]
+
+
+def test_a_pass_whose_regions_all_fail_keeps_the_image():
+    processed, image, before, seen, _results = _failing_regions(["error", "error"])
+
+    assert len(seen) == 2
+    assert processed is False
+    assert image is before
+
+
+def test_a_failed_region_prints_the_traceback_once_then_one_line(capsys):
+    _failing_regions(["error", "ok", "error"])
+
+    err = capsys.readouterr().err
+    assert err.count("Traceback") == 1
+    assert "region 1 of tab 1 failed (RuntimeError: broken region 1)" in err
+    assert "region 3 of tab 1 failed (RuntimeError: broken region 3)" in err
+    # It is the traceback of the first failure, printed before its short line.
+    before_first_line = err[: err.index("region 1 of tab 1 failed")]
+    assert "Traceback" in before_first_line
+    assert "RuntimeError: broken region 1" in before_first_line
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "region"),
+    [(["error"], 1), (["error", "ok"], 1), (["ok", "error"], 2), (["ok", "ok", "error"], 3)],
+)
+def test_a_single_failed_region_prints_its_traceback(outcomes, region, capsys):
+    # The first region that fails, which need not be the first region.
+    _failing_regions(outcomes)
+
+    err = capsys.readouterr().err
+    assert err.count("Traceback") == 1
+    before_line = err[: err.index(f"region {region} of tab 1 failed")]
+    assert "Traceback" in before_line
+    assert f"RuntimeError: broken region {region}" in before_line
+
+
+def test_a_failed_region_is_reported_on_one_line(capsys, monkeypatch):
+    # torch and CUDA errors often have a text on several lines: the line per
+    # region must stay one line.
+    def broken(*_args):
+        msg = "CUDA out of memory.\nTried to allocate 2.00 GiB"
+        raise RuntimeError(msg)
+
+    _failing_regions(["error", "error"], process_error=broken)
+
+    lines = [x for x in capsys.readouterr().err.splitlines() if "failed (" in x]
+    assert lines
+    for line in lines:
+        assert "(RuntimeError: CUDA out of memory.); left unchanged" in line
+
+
+def test_standalone_run_reports_regions_that_failed_with_an_error(tmp_path):
+    run, image = _nan_standalone(tmp_path)
+
+    result, status = run(["error", "error"])
+    assert result is None
+    # The reason of the first failure, as before plus.9: a folder run shows it.
+    assert status == (
+        "⚠️ ADetailer run failed: error while inpainting "
+        "(RuntimeError: CUDA out of memory.)."
+    )
+
+    result, status = run(["error", "ok"])
+    assert result is not None
+    assert status == (
+        "✅ ADetailer pass complete. 1 region(s) failed with an error and "
+        "were left unchanged (see console)."
+    )
+    # Nothing carried over from the runs above.
+    assert run(["ok"])[1] == "✅ ADetailer pass complete."
+    assert run(None) == (image, "ℹ️ Nothing detected — image unchanged.")
+
+
+# Settings -> ADetailer -> "Detailed region opacity".
+
+
+def _blend_runtime():
+    return _load_script(functions={"_blend_region"}, Image=Image)
+
+
+def test_blend_region_mixes_the_result_with_the_picture_before():
+    blend = _blend_runtime()._blend_region
+    before = Image.new("RGB", (8, 8), (0, 0, 0))
+    after = Image.new("RGB", (8, 8), (200, 100, 50))
+    after.info["parameters"] = "face"
+
+    half = blend(before, after, 50)
+    assert half.getpixel((3, 3)) == (100, 50, 25)
+    assert half.info["parameters"] == "face"
+    assert blend(before, after, 0).tobytes() == before.tobytes()
+
+    # A canvas rounded to 8 pixels and another mode are matched first.
+    out = blend(Image.new("RGBA", (6, 6), (0, 0, 0, 255)), after, 50)
+    assert out.size == (8, 8)
+    assert out.getpixel((0, 0)) == (100, 50, 25)
+    # Anything that cannot be blended keeps the result.
+    assert blend(None, after, 50) is after
+
+
+def _opacity_run(opts_data, outcomes=None, skip=(), **host_globals):
+    """One tab with len(outcomes) regions; each returns its own colour.
+    Returns the blend calls, the final image, the start image and the
+    region results."""
+    outcomes = outcomes or ["ok", "ok"]
+    calls = []
+    results = []
+
+    def blend(before, after, opacity):
+        calls.append((before, after, opacity))
+        return Image.new("RGB", after.size, (0, 255, 0))
+
+    state = _mask_state()
+    done = []
+
+    def process_images(p2):
+        done.append(p2.init_images[0])
+        if outcomes[len(done) - 1] == "error":
+            raise RuntimeError("broken region")
+        image = Image.new("RGB", (8, 8), (len(done) * 40, 0, 0))
+        results.append(image)
+        return SimpleNamespace(images=[image])
+
+    run, pp, before = _detailer(
+        state, process_images, n_masks=len(outcomes) + len(skip), Image=Image,
+        opts=SimpleNamespace(data=opts_data), _blend_region=blend, **host_globals,
+    )
+    script = _script_of(run)
+    script.i2i_prompts_replace = lambda p2, _pos, _neg, j: setattr(
+        p2, "prompt", "[SKIP]" if j in skip else "face"
+    )
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4,
+    )
+    p = SimpleNamespace(extra_generation_params={})
+    assert script._postprocess_image_inner(p, pp, args) is True
+    return calls, pp.image, before, results, done
+
+
+@pytest.mark.parametrize("opts_data", [{}, {"ad_region_opacity": 100}, {"ad_region_opacity": 100.0}])
+def test_full_region_opacity_leaves_the_result_untouched(opts_data):
+    calls, image, _before, results, _done = _opacity_run(opts_data)
+
+    assert calls == []
+    assert image is results[-1]
+
+
+def test_region_opacity_blends_each_region_with_the_picture_before_it():
+    calls, image, before, results, done = _opacity_run({"ad_region_opacity": 50.0})
+
+    assert [(b, a, o) for b, a, o in calls] == [
+        (before, results[0], 50), (done[1], results[1], 50),
+    ]
+    # The 2nd region starts from the 1st region's blended result.
+    assert done[1].getpixel((0, 0)) == (0, 255, 0)
+    assert image.getpixel((0, 0)) == (0, 255, 0)
+
+
+def test_region_opacity_blends_after_the_color_match():
+    order = []
+
+    def match(_before, after, *_args):
+        order.append("match")
+        return Image.new("RGB", after.size, (0, 0, 255))
+
+    calls, _image, _before, _results, _done = _opacity_run(
+        {"ad_region_opacity": 30, "ad_match_region_colors": True},
+        outcomes=["ok"], _match_region_colors=match,
+    )
+
+    order += ["blend"] * len(calls)
+    assert order == ["match", "blend"]
+    # The blend gets the color-matched result.
+    assert calls[0][1].getpixel((0, 0)) == (0, 0, 255)
+
+
+def test_region_opacity_skips_regions_that_were_not_inpainted():
+    # A [SKIP] region and a region that failed are left as they were: there
+    # is nothing to blend.
+    calls, _image, before, results, done = _opacity_run(
+        {"ad_region_opacity": 50}, outcomes=["error", "ok"], skip=(0,),
+    )
+
+    assert len(done) == 2  # the [SKIP] region never reached the host
+    assert [(b, a) for b, a, _o in calls] == [(before, results[0])]
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "written"),
+    [({}, None), ({"ad_region_opacity": 100}, None), ({"ad_region_opacity": 40.0}, 40)],
+)
+def test_region_opacity_is_written_to_the_parameters_only_below_100(opts_data, written):
+    runtime = _load_script(
+        methods={"extra_params"},
+        opts=SimpleNamespace(data=opts_data),
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    params = runtime.AfterDetailerScript().extra_params([])
+    assert params.get("ADetailer region opacity") == written
+
+
+def test_region_opacity_is_a_settings_slider_at_100_by_default():
+    script_text = _SCRIPT_PATH.read_text(encoding="utf-8")
+    option = script_text[script_text.index('        "ad_region_opacity",'):]
+    option = option[: option.index("shared.opts.add_option")]
+    assert "default=100," in option
+    assert '"minimum": 0, "maximum": 100, "step": 1' in option
+    assert "component=gr.Slider" in option
+
+
+_API_DEFAULT_TABS = {
+    # "Remember last-used settings" on: ui.py gives the API a fresh setup.
+    "remembered": (
+        {"ad_model": "face_yolov8n.pt", "ad_tab_enable": True},
+        {"ad_model": "None", "ad_tab_enable": False},
+    ),
+    # Off: the built widgets' own values, a fresh setup too.
+    "fresh": (
+        {"ad_model": "face_yolov8n.pt", "ad_tab_enable": True, "ad_prompt": ""},
+        {"ad_model": "None", "ad_tab_enable": False, "ad_prompt": ""},
+    ),
+}
+
+
+@pytest.mark.parametrize("build", sorted(_API_DEFAULT_TABS))
+@pytest.mark.parametrize(
+    ("request_args", "passes"),
+    [
+        # The short form of the upstream wiki: one pass per tab sent (#485).
+        ([{"ad_model": "hand_yolov8n.pt"}], ["hand_yolov8n.pt"]),
+        (
+            [{"ad_model": "hand_yolov8n.pt"}, {"ad_model": "eyes.pt"}],
+            ["hand_yolov8n.pt", "eyes.pt"],
+        ),
+        # Three tabs: the 3rd place holds a tab sent, not the default one.
+        (
+            [
+                {"ad_model": "hand_yolov8n.pt"},
+                {"ad_model": "eyes.pt"},
+                {"ad_model": "face_yolov8n.pt"},
+            ],
+            ["hand_yolov8n.pt", "eyes.pt", "face_yolov8n.pt"],
+        ),
+        # The short form sending exactly the default tab: still one pass.
+        ([{"ad_model": "face_yolov8n.pt", "ad_tab_enable": True}], ["face_yolov8n.pt"]),
+        # The documented form, unchanged.
+        ([True, False, {"ad_model": "hand_yolov8n.pt"}], ["hand_yolov8n.pt"]),
+        # No tab sent: a fresh setup's 1st tab, unchanged.
+        ([True], ["face_yolov8n.pt"]),
+        # The panel's own default is off: nothing runs, unchanged.
+        ([], []),
+        ([False], []),
+    ],
+)
+def test_an_api_request_runs_one_pass_per_tab_it_sends(build, request_args, passes):
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods={"is_ad_enabled", "get_args"}, ADetailerArgs=ADetailerArgs,
+        ordinal=lambda n: str(n),
+    )
+    script = runtime.AfterDetailerScript()
+    first, second = _API_DEFAULT_TABS[build]
+    script._ad_api_default_tab = first
+    # modules/api/api.py init_script_args: every input the request leaves out
+    # keeps its default (the panel off, Skip img2img off, then each tab).
+    defaults = [False, False, first, second]
+    args = [*request_args, *defaults[len(request_args):]]
+
+    ran = []
+    if script.is_ad_enabled(*args):
+        ran = [a.ad_model for a in script.get_args(SimpleNamespace(), *args) if not a.need_skip()]
+    assert ran == passes
+
+
+def test_adui_records_the_api_default_of_the_first_tab():
+    # get_args compares with what the host's API reads: the 1st tab's .value.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    adui = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "adui"
+    )
+    assigns = [
+        ast.unparse(node) for node in ast.walk(adui) if isinstance(node, ast.Assign)
+    ]
+    assert "script._ad_api_default_tab = states[0].value" in assigns
+
+
+def _crop_upscaler_runtime(data, *, labels=None, upscalers=("None", "Lanczos", "R-ESRGAN 4x+"), flags=None):
+    shared = SimpleNamespace(cmd_opts=flags or SimpleNamespace())
+    if upscalers is not None:
+        shared.sd_upscalers = [SimpleNamespace(name=n) for n in upscalers]
+    if labels is None:
+        labels = {"upscaler_for_img2img": SimpleNamespace(section=("upscaling", "Upscaling"))}
+    return _load_script(
+        methods={"get_override_settings"},
+        functions={"_crop_upscaler_usable", "_crop_upscaler_choices", "_is_forge_modules"},
+        assigns={"AD_CROP_UPSCALER_WEBUI"},
+        shared=shared,
+        opts=SimpleNamespace(data=data, data_labels=labels),
+        _forge_wanted_modules=lambda _args: None,
+    )
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        SimpleNamespace(freeze_settings=True),
+        SimpleNamespace(freeze_specific_settings="CLIP_stop_at_last_layers, sd_vae"),
+        SimpleNamespace(freeze_settings_in_sections="sd"),
+    ],
+    ids=["all", "specific", "section"],
+)
+def test_frozen_settings_leave_the_tabs_own_clip_skip_out(flags, capsys):
+    # With --freeze-settings the host refuses to set an option for the pass
+    # and raises: every region of a tab with "Use separate CLIP skip" failed.
+    from adetailer.args import ADetailerArgs
+
+    labels = {
+        "upscaler_for_img2img": SimpleNamespace(section=("upscaling", "Upscaling")),
+        "CLIP_stop_at_last_layers": SimpleNamespace(section=("sd", "Stable Diffusion")),
+    }
+    runtime = _crop_upscaler_runtime({}, labels=labels, flags=flags)
+    runtime._FROZEN_REPORTED.clear()
+    script = runtime.AfterDetailerScript()
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_use_clip_skip=True, ad_clip_skip=2)
+
+    assert script.get_override_settings(None, args) == {}
+    assert script.get_override_settings(None, args) == {}
+    err = capsys.readouterr().err
+    assert err.count("settings are frozen") == 1  # once a session
+    assert "'CLIP_stop_at_last_layers'" in err
+
+
+def test_unfrozen_settings_keep_the_tabs_own_clip_skip():
+    from adetailer.args import ADetailerArgs
+
+    runtime = _crop_upscaler_runtime({}, flags=SimpleNamespace(freeze_settings=False))
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_use_clip_skip=True, ad_clip_skip=2)
+    assert runtime.AfterDetailerScript().get_override_settings(None, args) == {
+        "CLIP_stop_at_last_layers": 2
+    }
+
+
+# Lists of frozen options that leave CLIP skip and the upscaler out, among them
+# names that only contain the option or its section ("sd", "upscaling").
+_OTHER_OPTIONS_FROZEN = [
+    SimpleNamespace(freeze_specific_settings="sd_model_checkpoint, sd_vae"),
+    SimpleNamespace(freeze_specific_settings="CLIP_stop_at_last_layers_x, upscaler_for_img2img_x"),
+    SimpleNamespace(freeze_settings_in_sections="ui"),
+    SimpleNamespace(freeze_settings_in_sections="sd_extra, upscaling_extra"),
+    SimpleNamespace(
+        freeze_settings=False,
+        freeze_specific_settings="sd_vae",
+        freeze_settings_in_sections="ui",
+    ),
+]
+_OTHER_OPTIONS_IDS = ["specific", "specific-longer-name", "section", "section-longer-name", "both"]
+
+
+@pytest.mark.parametrize("flags", _OTHER_OPTIONS_FROZEN, ids=_OTHER_OPTIONS_IDS)
+def test_settings_frozen_by_name_leave_the_tabs_own_clip_skip_free(flags, capsys):
+    # Only the options in the lists are frozen: with any other one the tab
+    # would lose its CLIP skip for a list that does not name it.
+    from adetailer.args import ADetailerArgs
+
+    labels = {
+        "upscaler_for_img2img": SimpleNamespace(section=("upscaling", "Upscaling")),
+        "CLIP_stop_at_last_layers": SimpleNamespace(section=("sd", "Stable Diffusion")),
+    }
+    runtime = _crop_upscaler_runtime({}, labels=labels, flags=flags)
+    runtime._FROZEN_REPORTED.clear()
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_use_clip_skip=True, ad_clip_skip=2)
+
+    assert runtime.AfterDetailerScript().get_override_settings(None, args) == {
+        "CLIP_stop_at_last_layers": 2
+    }
+    assert "settings are frozen" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags", _OTHER_OPTIONS_FROZEN, ids=_OTHER_OPTIONS_IDS)
+def test_settings_frozen_by_name_leave_the_crop_upscaler_free(flags, capsys):
+    from adetailer.args import ADetailerArgs
+
+    runtime = _crop_upscaler_runtime({"ad_crop_upscaler": "R-ESRGAN 4x+"}, flags=flags)
+    runtime._FROZEN_REPORTED.clear()
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_only_masked=True)
+
+    override = runtime.AfterDetailerScript().get_override_settings(None, args)
+    assert override["upscaler_for_img2img"] == "R-ESRGAN 4x+"
+    assert "settings are frozen" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("only_masked", [True, False])
+def test_crop_upscaler_setting_gives_the_pass_its_upscaler(only_masked):
+    # The host enlarges the area a pass inpaints with "Upscaler for img2img".
+    from adetailer.args import ADetailerArgs
+
+    runtime = _crop_upscaler_runtime({"ad_crop_upscaler": "R-ESRGAN 4x+"})
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_only_masked=only_masked)
+    override = runtime.AfterDetailerScript().get_override_settings(None, args)
+    assert override["upscaler_for_img2img"] == "R-ESRGAN 4x+"
+
+
+@pytest.mark.parametrize(
+    ("data", "kwargs"),
+    [
+        ({}, {}),  # never saved: the first choice
+        ({"ad_crop_upscaler": "Use the WebUI's img2img upscaler"}, {}),
+        # An upscaler that is no longer installed.
+        ({"ad_crop_upscaler": "4x-Removed"}, {}),
+        # A host without the option, or without the list of upscalers.
+        ({"ad_crop_upscaler": "R-ESRGAN 4x+"}, {"labels": {}}),
+        ({"ad_crop_upscaler": "R-ESRGAN 4x+"}, {"upscalers": None}),
+        # Frozen settings: the host's opts.set would stop the pass.
+        ({"ad_crop_upscaler": "R-ESRGAN 4x+"}, {"flags": SimpleNamespace(freeze_settings=True)}),
+        (
+            {"ad_crop_upscaler": "R-ESRGAN 4x+"},
+            {"flags": SimpleNamespace(freeze_specific_settings="sd_vae, upscaler_for_img2img")},
+        ),
+        (
+            {"ad_crop_upscaler": "R-ESRGAN 4x+"},
+            {"flags": SimpleNamespace(freeze_settings_in_sections="upscaling")},
+        ),
+    ],
+)
+def test_crop_upscaler_setting_keeps_the_webui_upscaler_otherwise(data, kwargs):
+    from adetailer.args import ADetailerArgs
+
+    runtime = _crop_upscaler_runtime(data, **kwargs)
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_only_masked=True)
+    override = runtime.AfterDetailerScript().get_override_settings(None, args)
+    assert "upscaler_for_img2img" not in override
+
+
+@pytest.mark.parametrize(
+    ("upscalers", "expected"),
+    [
+        (("None", "Lanczos", "R-ESRGAN 4x+"), ["None", "Lanczos", "R-ESRGAN 4x+"]),
+        ((), []),
+        (None, []),
+    ],
+)
+def test_crop_upscaler_menu_lists_the_webui_upscalers(upscalers, expected):
+    runtime = _crop_upscaler_runtime({}, upscalers=upscalers)
+    choices = runtime._crop_upscaler_choices()["choices"]
+    assert choices == ["Use the WebUI's img2img upscaler", *expected]
+
+
+def test_crop_upscaler_option_is_registered_with_the_first_choice():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    settings = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "on_ui_settings"
+    )
+    call = next(
+        node for node in ast.walk(settings)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_crop_upscaler"
+    )
+    info = ast.unparse(call.args[1])
+    assert "default=AD_CROP_UPSCALER_WEBUI" in info
+    assert "component_args=_crop_upscaler_choices" in info
+
+
+def test_gallery_previews_option_says_the_script_menu_hides_them():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    settings = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "on_ui_settings"
+    )
+    call = next(
+        node for node in ast.walk(settings)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_gallery_previews"
+    )
+    info = next(
+        node.args[0].value for node in ast.walk(call.args[1])
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "info"
+    )
+    assert "not shown while a script of the Script menu is selected" in info
+    # One plain text block.
+    assert not any(mark in info for mark in ("**", "`", "[", "\n"))
+
+
+def test_api_tab_with_an_empty_model_is_off_like_none():
+    # An API request may send "ad_model": "" for a tab it does not use. That
+    # tab is off, like "None": alone it leaves ADetailer off, and next to a
+    # real tab it does not count (it used to fail with "Model '' not found"
+    # and stop the tabs after it).
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(methods={"is_ad_enabled"}, ADetailerArgs=ADetailerArgs)
+    script = runtime.AfterDetailerScript()
+
+    assert script.is_ad_enabled(True, False, {"ad_model": ""}) is False
+    assert script.is_ad_enabled({"ad_model": "  "}) is False
+    assert script.is_ad_enabled(
+        True, False, {"ad_model": ""}, {"ad_model": "face_yolov8n.pt"}
+    ) is True
+
+
+@pytest.mark.parametrize(
+    ("flags", "system", "expect"),
+    [
+        # AUTOMATIC1111 / Forge: --use-cpu all (or adetailer) runs it on CPU.
+        ({"use_cpu": ["all"]}, "Windows", "cpu"),
+        ({"use_cpu": ["adetailer"]}, "Windows", "cpu"),
+        ({"use_cpu": "all"}, "Windows", "cpu"),
+        ({"use_cpu": ["all"]}, "Darwin", "cpu"),
+        ({"use_cpu": ["sd", "interrogate"]}, "Windows", ""),
+        # Forge Neo has no use_cpu; --cpu runs everything on CPU there.
+        ({"cpu": True}, "Windows", "cpu"),
+        ({"cpu": True}, "Darwin", "cpu"),
+        # Forge: --always-cpu.
+        ({"always_cpu": True}, "Windows", "cpu"),
+        # Unchanged: the low-VRAM flags, macOS, and a GPU WebUI.
+        ({"lowvram": True}, "Windows", "cpu"),
+        # Forge Neo: --novram, like lowvram (macOS keeps its default).
+        ({"novram": True}, "Windows", "cpu"),
+        ({"novram": True}, "Darwin", ""),
+        ({"medvram": True}, "Darwin", ""),
+        ({"cpu": False, "use_cpu": None}, "Windows", ""),
+        ({}, "Windows", ""),
+    ],
+)
+def test_detector_runs_on_cpu_when_the_whole_webui_does(flags, system, expect):
+    cmd_opts = SimpleNamespace(**flags)
+    runtime = _load_script(
+        methods={"get_ultralytics_device"},
+        shared=SimpleNamespace(cmd_opts=cmd_opts),
+        cmd_opts=cmd_opts,
+        platform=SimpleNamespace(system=lambda: system),
+    )
+
+    assert runtime.AfterDetailerScript.get_ultralytics_device() == expect
+
+
+# Settings -> ADetailer -> "Max inpaint size, pixels per side (0 = no limit)".
+
+
+def _cap_runtime():
+    return _load_script(functions={"_cap_inpaint_size"})._cap_inpaint_size
+
+
+@pytest.mark.parametrize(
+    ("size", "max_side", "capped"),
+    [
+        ((4800, 3200), 0, (4800, 3200)),  # 0 = no limit
+        ((1024, 768), 1024, (1024, 768)),  # already fits
+        ((4800, 3200), 2048, (2048, 1360)),  # landscape
+        ((3200, 4800), 2048, (1360, 2048)),  # portrait
+        ((4096, 128), 1024, (1024, 64)),  # never below 64
+        ((128, 4096), 1024, (64, 1024)),  # never below 64, on the width too
+    ],
+)
+def test_cap_inpaint_size_keeps_the_shape_and_multiples_of_8(size, max_side, capped, capsys):
+    assert _cap_runtime()(*size, max_side) == capped
+    out = capsys.readouterr().out
+    if capped == size:
+        assert out == ""
+    else:
+        line = f"[-] ADetailer: inpaint size {size[0]}x{size[1]} -> {capped[0]}x{capped[1]}"
+        assert line in out
+        assert out.isascii()
+
+
+def test_cap_inpaint_size_longer_side_is_exactly_the_limit():
+    from fractions import Fraction
+
+    cap = _cap_runtime()
+    for longest in range(1032, 6000, 8):
+        for other in (64, 520, 1000, longest):
+            w, h = cap(longest, other, 1024)
+            assert w == 1024
+            assert h == max(64, int(Fraction(other * 1024, longest)) // 8 * 8)
+            assert h % 8 == 0
+
+
+def _max_side_fix_p2(opts_data, **arg_values):
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    runtime = _load_script(
+        methods={
+            "fix_p2", "get_dynamic_denoise_strength", "get_optimal_crop_image_size",
+            "get_seed", "get_each_tab_seed",
+        },
+        opts=SimpleNamespace(data=opts_data),
+        shared=SimpleNamespace(opts=SimpleNamespace(data={}), sd_model=None),
+        get_i=lambda _p: 0,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    p2 = SimpleNamespace(width=1024, height=1024, denoising_strength=0.4)
+    args = ADetailerArgs(ad_model="person_yolov8n-seg.pt", **arg_values)
+    outer = SimpleNamespace(seed=1, subseed=1, all_seeds=[1], all_subseeds=[1])
+    # A 600 x 400 detection on a 1536 x 1536 picture.
+    pred = SimpleNamespace(bboxes=[[100, 100, 700, 500]])
+    runtime.AfterDetailerScript().fix_p2(
+        outer, p2, SimpleNamespace(image=Image.new("RGB", (1536, 1536))), args, pred, 0
+    )
+    return p2.width, p2.height
+
+
+_SCALE_8 = {"ad_use_resolution_scale": True, "ad_resolution_scale": 8.0}
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "arg_values", "size"),
+    [
+        # Off by default: Scale inpaint to bbox 8x asks for 4800 x 3200.
+        ({}, _SCALE_8, (4800, 3200)),
+        ({"ad_max_inpaint_side": 0}, _SCALE_8, (4800, 3200)),
+        ({"ad_max_inpaint_side": "x"}, _SCALE_8, (4800, 3200)),
+        # Capped, with the same shape.
+        ({"ad_max_inpaint_side": 2048}, _SCALE_8, (2048, 1360)),
+        ({"ad_max_inpaint_side": 2048.0}, _SCALE_8, (2048, 1360)),
+        # The size from the inpaint size (and bbox matching) is capped too.
+        ({"ad_max_inpaint_side": 768}, {}, (768, 768)),
+        (
+            {"ad_max_inpaint_side": 512, "ad_match_inpaint_bbox_size": "Free"},
+            {},
+            (512, 344),
+        ),
+        # A size the user set, or whole-picture inpaint, is left alone.
+        (
+            {"ad_max_inpaint_side": 512},
+            {"ad_use_inpaint_width_height": True, **_SCALE_8},
+            (1024, 1024),
+        ),
+        (
+            {"ad_max_inpaint_side": 512},
+            {"ad_inpaint_only_masked": False, **_SCALE_8},
+            (1024, 1024),
+        ),
+    ],
+)
+def test_max_inpaint_size_caps_the_region_canvas(opts_data, arg_values, size):
+    assert _max_side_fix_p2(opts_data, **arg_values) == size
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "written"),
+    [({}, None), ({"ad_max_inpaint_side": 0}, None), ({"ad_max_inpaint_side": 2048.0}, 2048)],
+)
+def test_max_inpaint_size_is_written_to_the_parameters_only_when_set(opts_data, written):
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods={"extra_params"},
+        opts=SimpleNamespace(data=opts_data),
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    tab = ADetailerArgs(ad_model="face_yolov8n.pt")
+    params = runtime.AfterDetailerScript().extra_params([tab])
+    assert params.get("ADetailer max inpaint size") == written
+
+
+@pytest.mark.parametrize(
+    ("tabs", "written"),
+    [
+        # No tab the limit applies to: not written.
+        ([], None),
+        ([{"ad_model": "face_yolov8n.pt", "ad_use_inpaint_width_height": True}], None),
+        ([{"ad_model": "face_yolov8n.pt", "ad_inpaint_only_masked": False}], None),
+        ([{"ad_model": "None"}], None),
+        ([{"ad_model": "face_yolov8n.pt", "ad_tab_enable": False}], None),
+        # One running tab it applies to is enough.
+        (
+            [
+                {"ad_model": "face_yolov8n.pt", "ad_use_inpaint_width_height": True},
+                {"ad_model": "hand_yolov8n.pt"},
+            ],
+            1024,
+        ),
+    ],
+)
+def test_max_inpaint_size_is_written_only_when_a_running_tab_uses_it(tabs, written):
+    # The limit applies only with "Inpaint only masked" and without "Use
+    # separate width/height": the parameters must not claim it otherwise.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods={"extra_params"},
+        opts=SimpleNamespace(data={"ad_max_inpaint_side": 1024}),
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    arg_list = [ADetailerArgs(**values) for values in tabs]
+    params = runtime.AfterDetailerScript().extra_params(arg_list)
+    assert params.get("ADetailer max inpaint size") == written
+
+
+def test_max_inpaint_size_is_a_settings_slider_off_by_default():
+    script_text = _SCRIPT_PATH.read_text(encoding="utf-8")
+    option = script_text[script_text.index('        "ad_max_inpaint_side",'):]
+    option = option[: option.index("shared.opts.add_option")]
+    assert "default=0," in option
+    assert '"minimum": 0, "maximum": 4096, "step": 64' in option
+    assert "component=gr.Slider" in option
+
+
+# Settings -> ADetailer -> "Hide detection boxes from the live preview".
+
+
+def _live_preview_run(opts_data):
+    shown = []
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=shown.append,
+    )
+    saved = []
+
+    def process_images(p2):
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")])
+
+    run, pp, before = _detailer(
+        state, process_images, n_masks=1, Image=Image,
+        opts=SimpleNamespace(data=opts_data),
+    )
+    script = _script_of(run)
+    script.save_image = lambda _p, image, **kwargs: saved.append(
+        (image, kwargs.get("condition"))
+    )
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4,
+    )
+    p = SimpleNamespace(extra_generation_params={})
+    assert script._postprocess_image_inner(p, pp, args) is True
+    # The preview with the boxes is the detector's preview image.
+    return shown, saved, before
+
+
+@pytest.mark.parametrize(
+    "opts_data", [{}, {"ad_hide_live_preview_boxes": False}]
+)
+def test_live_preview_shows_the_detection_boxes_by_default(opts_data):
+    shown, saved, boxes = _live_preview_run(opts_data)
+    assert shown == [boxes]
+    assert (boxes, "ad_save_previews") in saved
+
+
+def test_hide_detection_boxes_keeps_them_out_of_the_live_preview():
+    shown, saved, boxes = _live_preview_run({"ad_hide_live_preview_boxes": True})
+    assert shown == []
+    # "Save mask previews" still gets the preview with the boxes.
+    assert (boxes, "ad_save_previews") in saved
+
+
+def test_hide_detection_boxes_is_a_settings_checkbox_off_by_default():
+    script_text = _SCRIPT_PATH.read_text(encoding="utf-8")
+    option = script_text[script_text.index('        "ad_hide_live_preview_boxes",'):]
+    option = option[: option.index("shared.opts.add_option")]
+    assert "default=False," in option
+    assert "component=" not in option
+
+
+# Settings -> ADetailer -> "Show detection previews in the results gallery".
+
+
+def _gallery_preview_run(opts_data, p):
+    # One detailer pass on a fake detector: returns the detector's preview.
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+
+    def process_images(p2):
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")])
+
+    run, pp, before = _detailer(
+        state, process_images, n_masks=1, Image=Image,
+        opts=SimpleNamespace(data=opts_data),
+        _GALLERY_PREVIEWS_MAX=_gallery_previews_max(),
+    )
+    script = _script_of(run)
+    script.infotext = lambda _p: "face, Steps: 20, Seed: 7"
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4,
+    )
+    assert script._postprocess_image_inner(p, pp, args) is True
+    return before
+
+
+@pytest.mark.parametrize("opts_data", [{}, {"ad_gallery_previews": False}])
+def test_gallery_previews_are_not_kept_when_the_option_is_off(opts_data):
+    p = SimpleNamespace(extra_generation_params={})
+    _gallery_preview_run(opts_data, p)
+    assert not hasattr(p, "_ad_gallery_previews")
+
+
+@pytest.mark.parametrize("hide_boxes", [False, True])
+def test_gallery_previews_keep_each_preview_with_its_parameters(hide_boxes):
+    # "Hide detection boxes from the live preview" does not change them.
+    p = SimpleNamespace(extra_generation_params={})
+    opts_data = {"ad_gallery_previews": True, "ad_hide_live_preview_boxes": hide_boxes}
+    boxes = _gallery_preview_run(opts_data, p)
+    assert p._ad_gallery_previews == [(boxes, "face, Steps: 20, Seed: 7")]
+    # A second pass (the next tab or the next image) is added after it.
+    _gallery_preview_run(opts_data, p)
+    assert len(p._ad_gallery_previews) == 2
+
+
+@pytest.mark.parametrize("flag", ["is_api", "_ad_standalone"])
+def test_gallery_previews_are_not_kept_for_api_or_standalone_runs(flag):
+    p = SimpleNamespace(extra_generation_params={}, **{flag: True})
+    _gallery_preview_run({"ad_gallery_previews": True}, p)
+    assert not hasattr(p, "_ad_gallery_previews")
+
+
+@pytest.mark.parametrize(
+    ("script_args", "kept"),
+    [
+        # The Script menu on None (0, or None as the host reads it too):
+        # kept as before.
+        ((0, 512, True), 1),
+        ([], 1),
+        ((None, 512), 1),
+        # A script picked there (SD upscale, Prompt matrix...) reads the
+        # result by position: nothing kept, also when the value is unclear.
+        ((3, 512, True), 0),
+        (("x", 512), 0),
+    ],
+)
+def test_gallery_previews_are_not_kept_with_a_script_of_the_script_menu(
+    script_args, kept
+):
+    p = SimpleNamespace(extra_generation_params={}, script_args=script_args)
+    _gallery_preview_run({"ad_gallery_previews": True}, p)
+    assert len(getattr(p, "_ad_gallery_previews", [])) == kept
+
+
+@pytest.mark.parametrize(
+    ("script_args", "added"), [((0, 1), 1), ((None, 1), 1), ((3, 1), 0), (("x", 1), 0)]
+)
+def test_gallery_postprocess_adds_nothing_with_a_script_of_the_script_menu(
+    script_args, added
+):
+    p = SimpleNamespace(
+        script_args=script_args,
+        _ad_gallery_previews=[(Image.new("RGB", (8, 8)), "params")],
+    )
+    processed = _processed()
+    _gallery_postprocess().postprocess(p, processed)
+    assert len(processed.images) == len(processed.infotexts) == 2 + added
+    assert p._ad_gallery_previews == []
+
+
+def _gallery_previews_max():
+    # The module-level limit, read from the script (the tests load only some
+    # of its names).
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            getattr(target, "id", "") == "_GALLERY_PREVIEWS_MAX"
+            for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    return 32
+
+
+def test_gallery_previews_stop_at_the_limit_and_say_so_once(capsys):
+    assert _gallery_previews_max() == 32
+    p = SimpleNamespace(extra_generation_params={})
+    for _ in range(34):
+        _gallery_preview_run({"ad_gallery_previews": True}, p)
+    # The others are not kept in memory.
+    assert len(p._ad_gallery_previews) == 32
+    lines = [
+        line for line in capsys.readouterr().out.splitlines()
+        if "results gallery" in line
+    ]
+    assert len(lines) == 1
+    assert "first 32 detection previews" in lines[0]
+    assert "'Save mask previews'" in lines[0]
+    assert lines[0].isascii()
+    # The next generation starts again from zero and may say it again.
+    processed = _processed()
+    _gallery_postprocess().postprocess(p, processed)
+    assert len(processed.images) == 2 + 32
+    assert p._ad_gallery_previews == []
+    assert not p._ad_gallery_previews_full
+
+
+def _gallery_postprocess(pnginfo=True):
+    runtime = _load_script(
+        methods={"postprocess"},
+        opts=SimpleNamespace(data={}, enable_pnginfo=pnginfo),
+    )
+    return runtime.AfterDetailerScript()
+
+
+def _processed(n_images=2, grid=False, infotexts=None):
+    images = [Image.new("RGB", (8, 8), "blue") for _ in range(n_images)]
+    texts = [f"image {i}" for i in range(n_images)]
+    if grid:
+        images.insert(0, Image.new("RGB", (16, 8), "green"))
+        texts.insert(0, "grid")
+    return SimpleNamespace(
+        images=images,
+        infotexts=texts if infotexts is None else infotexts,
+        info=texts[0],
+        index_of_first_image=1 if grid else 0,
+    )
+
+
+def test_gallery_postprocess_leaves_the_result_alone_without_previews():
+    processed = _processed(grid=True)
+    images, texts = list(processed.images), list(processed.infotexts)
+    _gallery_postprocess().postprocess(SimpleNamespace(), processed)
+    assert processed.images == images
+    assert processed.infotexts == texts
+    assert processed.index_of_first_image == 1
+
+
+def test_gallery_postprocess_adds_the_previews_after_the_images():
+    first = Image.new("RGB", (8, 8), "white")
+    second = Image.new("RGB", (8, 8), "black")
+    p = SimpleNamespace(
+        _ad_gallery_previews=[(first, "image 0 params"), (second, "")]
+    )
+    processed = _processed(grid=True)
+    generated = list(processed.images)
+    _gallery_postprocess().postprocess(p, processed)
+    # The grid and the generated images keep their places.
+    assert processed.images == [*generated, first, second]
+    assert processed.index_of_first_image == 1
+    # Each preview has its parameters at the same index; one without its own
+    # takes the job's, so Save and Send to can still read a seed.
+    assert processed.infotexts == [
+        "grid", "image 0", "image 1", "image 0 params", "grid"
+    ]
+    assert first.info["parameters"] == "image 0 params"
+    # Shown once: the next job starts empty.
+    assert p._ad_gallery_previews == []
+
+
+def test_gallery_postprocess_keeps_the_parameters_out_of_the_previews_without_pnginfo():
+    # "Save text information about generation parameters" off: AUTOMATIC1111
+    # writes every text of image.info into the gallery's temporary PNG, so
+    # the previews carry none; the gallery still gets their parameters.
+    first = Image.new("RGB", (8, 8), "white")
+    second = Image.new("RGB", (8, 8), "black")
+    p = SimpleNamespace(
+        _ad_gallery_previews=[(first, "image 0 params"), (second, "")]
+    )
+    processed = _processed(grid=True)
+    generated = list(processed.images)
+    _gallery_postprocess(pnginfo=False).postprocess(p, processed)
+    assert "parameters" not in first.info
+    assert "parameters" not in second.info
+    assert processed.images == [*generated, first, second]
+    assert processed.infotexts == [
+        "grid", "image 0", "image 1", "image 0 params", "grid"
+    ]
+    assert p._ad_gallery_previews == []
+
+
+def test_gallery_postprocess_fills_the_parameters_of_returned_masks():
+    # AUTOMATIC1111 returns an inpainting mask with no parameters of its own.
+    preview = Image.new("RGB", (8, 8), "white")
+    p = SimpleNamespace(_ad_gallery_previews=[(preview, "preview params")])
+    processed = _processed(n_images=2, infotexts=["image 0"])
+    _gallery_postprocess().postprocess(p, processed)
+    assert len(processed.infotexts) == len(processed.images) == 3
+    assert processed.infotexts[-1] == "preview params"
+
+
+def test_gallery_postprocess_keeps_the_parameters_of_another_scripts_extra_images():
+    # A script that ran first left its picture in processed.extra_images and
+    # its parameters at the end of infotexts, as postprocess() itself does
+    # for Forge Neo's "PiD Integrated" (see the stand-in tests below). The
+    # gallery shows images + extra_images, so the previews' parameters go
+    # after the images' ones, not after the extra picture's.
+    first = Image.new("RGB", (8, 8), "white")
+    second = Image.new("RGB", (8, 8), "black")
+    p = SimpleNamespace(
+        _ad_gallery_previews=[(first, "preview 0"), (second, "preview 1")]
+    )
+    processed = _processed(n_images=1, infotexts=["image 0", "pid pass"])
+    pid = Image.new("RGB", (32, 32), "red")
+    processed.extra_images = [pid]
+    generated = list(processed.images)
+    _gallery_postprocess().postprocess(p, processed)
+    gallery = processed.images + processed.extra_images
+    assert gallery == [*generated, first, second, pid]
+    assert list(zip(gallery, processed.infotexts)) == [
+        (generated[0], "image 0"), (first, "preview 0"), (second, "preview 1"),
+        (pid, "pid pass"),
+    ]
+
+
+def test_gallery_postprocess_adds_nothing_to_an_api_response():
+    p = SimpleNamespace(
+        is_api=True,
+        _ad_gallery_previews=[(Image.new("RGB", (8, 8)), "params")],
+    )
+    processed = _processed()
+    images, texts = list(processed.images), list(processed.infotexts)
+    _gallery_postprocess().postprocess(p, processed)
+    assert processed.images == images
+    assert processed.infotexts == texts
+    assert p._ad_gallery_previews == []
+
+
+def test_gallery_postprocess_keeps_the_previews_for_the_stand_in_result():
+    # postprocess_image() restarts the other scripts with an empty stand-in
+    # result on a copy of p, which shares the list: the real result needs it.
+    kept = [(Image.new("RGB", (8, 8)), "params")]
+    real_p = SimpleNamespace(_ad_gallery_previews=kept)
+    dummy = SimpleNamespace(images=[], infotexts=[], info="")
+    _gallery_postprocess().postprocess(copy(real_p), dummy)
+    assert dummy.images == []
+    assert real_p._ad_gallery_previews is kept
+    assert len(kept) == 1
+
+
+class _NeoProcessed:
+    # Forge Neo modules/processing.py: one default list for every result that
+    # is not given its own, as the stand-in result of postprocess_image() is.
+    def __init__(
+        self, p, images_list, seed=-1, info="", infotexts=None, extra_images_list=[]  # noqa: B006
+    ):
+        self.images = images_list
+        self.extra_images = extra_images_list
+        self.info = info
+        self.infotexts = infotexts or [info] * len(images_list)
+
+
+class _A1111Processed:
+    # AUTOMATIC1111 1.10 modules/processing.py: no extra images at all.
+    def __init__(self, p, images_list, seed=-1, info="", infotexts=None):
+        self.images = images_list
+        self.info = info
+        self.infotexts = infotexts or [info] * len(images_list)
+
+
+class _PiD:
+    # Forge Neo's built-in "PiD Integrated" (sd_forge_pid/scripts/pid.py): a
+    # picture made in post_sample waits for the first postprocess to come.
+    def __init__(self):
+        self.results = []
+
+    def postprocess(self, _p, processed, *_args):
+        for image, info in self.results:
+            processed.extra_images.append(image)
+            processed.infotexts.append(info)
+        self.results.clear()
+
+
+def _generate_with_pid(
+    enabled=True, previews=True, batches=1, batch_size=1, result=_NeoProcessed,
+    masks=0, **fields,
+):
+    """A job in the host's order of hooks: post_sample, postprocess_image of
+    each image, the real result, postprocess. Returns it, the PiD pictures
+    and p."""
+    from aaaaaa.p_method import need_call_postprocess, need_call_process
+
+    runtime = _load_script(
+        methods={"postprocess_image", "postprocess"},
+        paths=SimpleNamespace(data_path="."),
+        PARAMS_TXT="nothing-here.txt",
+        opts=SimpleNamespace(data={"ad_gallery_previews": previews}, enable_pnginfo=True),
+        ensure_pil_image=lambda image, _mode: image,
+        copy=copy,
+        _verbose_gen_header=lambda *_args: None,
+        need_call_postprocess=need_call_postprocess,
+        need_call_process=need_call_process,
+        Processed=result,
+        preserve_prompts=lambda _p: nullcontext(),
+        CNHijackRestore=nullcontext,
+        pause_total_tqdm=nullcontext,
+        cn_allow_script_control=nullcontext,
+        _should_skip_for_hires_only=lambda _p, _args: False,
+        is_skip_img2img=lambda _p: False,
+    )
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: enabled
+    script.get_i2i_init_image = lambda _p, pp: pp.image
+    script.get_args = lambda *_args: [SimpleNamespace(need_skip=lambda: False)]
+    script._will_run_sequential = lambda _args: False
+    script.save_image = lambda *_args, **_kwargs: None
+    script.read_params_txt = lambda: ""
+    script.write_params_txt = lambda _content: None
+
+    def inner(p, _pp, _args, n=0):
+        if previews:
+            p._ad_gallery_previews = getattr(p, "_ad_gallery_previews", None) or []
+            shown = len(p._ad_gallery_previews)
+            p._ad_gallery_previews.append(
+                (Image.new("RGB", (8, 8), "yellow"), f"preview {shown}")
+            )
+        return True
+
+    script._postprocess_image_inner = inner
+    pid = _PiD()
+
+    class Runner:  # PiD is a built-in extension: it runs before ADetailer.
+        def postprocess(self, p, processed):
+            if result is _NeoProcessed:
+                pid.postprocess(p, processed)
+            script.postprocess(p, processed)
+
+        def before_process(self, *_args):
+            pass
+
+        def process(self, *_args):
+            pass
+
+    p = SimpleNamespace(
+        batch_size=batch_size, seed=1, scripts=Runner(), extra_generation_params={},
+        script_args=[0], extra_result_images=[],
+    )
+    vars(p).update(fields)
+    pid_images, images, texts = [], [], []
+    for iteration in range(batches):
+        p.iteration = iteration
+        picture = Image.new("RGB", (32, 32), "red")
+        pid_images.append(picture)
+        pid.results.append((picture, f"pid pass {iteration}"))
+        for index in range(batch_size):
+            p.batch_index = index
+            pp = SimpleNamespace(image=Image.new("RGB", (8, 8), "blue"))
+            script.postprocess_image(p, pp, True, {})
+            images.append(pp.image)
+            texts.append(f"image {len(texts)}")
+    images += [Image.new("L", (8, 8)) for _ in range(masks)]
+    extra = {"extra_images_list": p.extra_result_images} if result is _NeoProcessed else {}
+    processed = result(p, images, 1, texts[0], infotexts=texts, **extra)
+    p.scripts.postprocess(p, processed)
+    return processed, pid_images, p
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("previews", [True, False])
+def test_a_picture_handed_to_the_stand_in_result_reaches_the_real_one(enabled, previews):
+    # postprocess_image() restarts the other scripts with a stand-in result
+    # before its pass, and PiD gives its picture and empties its list at the
+    # first postprocess it sees: the gallery never got the picture.
+    processed, (picture,), p = _generate_with_pid(enabled=enabled, previews=previews)
+    assert processed.extra_images == [picture]
+    shown = previews and enabled
+    assert len(processed.images) == (2 if shown else 1)
+    assert processed.infotexts == (
+        ["image 0", "preview 0", "pid pass 0"] if shown else ["image 0", "pid pass 0"]
+    )
+    # Once: nothing stays for a later job on the same p.
+    assert not getattr(p, "_ad_script_extras", None)
+
+
+@pytest.mark.parametrize(("batches", "batch_size"), [(2, 1), (2, 2), (1, 2)])
+def test_each_batch_keeps_the_picture_it_handed_to_the_stand_in_result(batches, batch_size):
+    # The stand-in result comes back at the first image of every batch, when
+    # the pictures of the earlier batches are waiting for the real result.
+    processed, pictures, _p = _generate_with_pid(batches=batches, batch_size=batch_size)
+    total = batches * batch_size
+    assert processed.extra_images == pictures
+    assert processed.infotexts == [
+        *(f"image {n}" for n in range(total)),
+        *(f"preview {n}" for n in range(total)),
+        *(f"pid pass {n}" for n in range(batches)),
+    ]
+
+
+def test_the_stand_in_result_keeps_nothing_in_the_default_list_of_the_host():
+    # The default list lives as long as the WebUI: the PiD pictures, four
+    # times the size of the image, stayed there.
+    _generate_with_pid(batches=2)
+    assert _NeoProcessed.__init__.__defaults__[-1] == []
+
+
+@pytest.mark.parametrize("fields", [{"is_api": True}, {"script_args": [1]}])
+def test_a_handed_over_picture_stays_where_the_previews_are_left_out(fields):
+    # An API response and a script of the Script menu show no preview, but
+    # the picture of another script is theirs as without ADetailer.
+    processed, (picture,), _p = _generate_with_pid(**fields)
+    assert processed.extra_images == [picture]
+    assert len(processed.images) == 1
+    assert processed.infotexts == ["image 0", "pid pass 0"]
+
+
+def test_a_handed_over_picture_gets_its_parameters_after_returned_masks():
+    # A returned mask has no parameters of its own: fill its place first, as
+    # the gallery shows images + extra_images.
+    processed, (picture,), _p = _generate_with_pid(previews=False, masks=1)
+    assert (processed.images + processed.extra_images)[-1] is picture
+    assert processed.infotexts == ["image 0", "image 0", "pid pass 0"]
+
+
+def test_a_result_without_extra_images_stays_as_it_is():
+    # AUTOMATIC1111: Processed has no extra_images, and the stand-in gets none.
+    processed, _pictures, p = _generate_with_pid(result=_A1111Processed)
+    assert not hasattr(processed, "extra_images")
+    assert processed.infotexts == ["image 0", "preview 0"]
+    assert not getattr(p, "_ad_script_extras", None)
+
+
+def test_gallery_previews_is_a_settings_checkbox_off_by_default():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    settings = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "on_ui_settings"
+    )
+    calls = [
+        node for node in ast.walk(settings)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+    ]
+    calls.sort(key=lambda node: node.lineno)
+    keys = [node.args[0].value for node in calls]
+    # Next to "Save mask previews".
+    assert keys[keys.index("ad_save_previews") + 1] == "ad_gallery_previews"
+    option = calls[keys.index("ad_gallery_previews")]
+    info_call = option.args[1]
+    kwargs = {kw.arg: kw.value for kw in info_call.func.value.keywords}
+    assert ast.literal_eval(kwargs["default"]) is False
+    assert ast.unparse(kwargs["section"]) == "section"
+    label = ast.literal_eval(kwargs["label"])
+    info = ast.literal_eval(info_call.args[0])
+    assert label == "Show detection previews in the results gallery"
+    for text in (label, info):
+        assert not any(mark in text for mark in ("**", "`", "["))
+
+
+# Settings -> ADetailer -> "More sort orders (overrides Sort bounding boxes by)".
+
+
+def _sorted_by_settings(opts_data):
+    from adetailer.args import BBOX_SORTBY, BBOX_SORTBY_MORE
+    from adetailer.common import PredictOutput
+    from adetailer.mask import sort_bboxes
+
+    runtime = _load_script(
+        methods={"sort_bboxes"},
+        opts=SimpleNamespace(data=opts_data),
+        BBOX_SORTBY=BBOX_SORTBY,
+        BBOX_SORTBY_MORE=BBOX_SORTBY_MORE,
+        sort_bboxes=sort_bboxes,
+    )
+    # Left, middle and right boxes; the middle one is the most confident.
+    bboxes = [[10, 50, 60, 100], [100, 10, 150, 60], [200, 30, 250, 80]]
+    pred = PredictOutput(
+        bboxes=[list(b) for b in bboxes],
+        masks=[Image.new("L", (300, 300), n) for n in (1, 2, 3)],
+        confidences=[0.5, 0.9, 0.7],
+        preview=Image.new("RGB", (300, 300)),
+    )
+    pred = runtime.AfterDetailerScript().sort_bboxes(pred)
+    return [bboxes.index(b) for b in pred.bboxes]
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "order"),
+    [
+        # Off (also missing, unknown or unreadable): Sort bounding boxes by.
+        ({}, [0, 1, 2]),
+        ({"ad_bbox_sortby_more": "Off"}, [0, 1, 2]),
+        ({"ad_bbox_sortby": "Position (center to edge)"}, [1, 2, 0]),
+        (
+            {"ad_bbox_sortby": "Position (center to edge)", "ad_bbox_sortby_more": "Off"},
+            [1, 2, 0],
+        ),
+        (
+            {"ad_bbox_sortby": "Position (center to edge)", "ad_bbox_sortby_more": "Sideways"},
+            [1, 2, 0],
+        ),
+        (
+            {"ad_bbox_sortby": "Position (center to edge)", "ad_bbox_sortby_more": ["x"]},
+            [1, 2, 0],
+        ),
+        ({"ad_bbox_sortby_more": None}, [0, 1, 2]),
+        # Any other choice is used instead of Sort bounding boxes by.
+        (
+            {"ad_bbox_sortby": "Position (left to right)",
+             "ad_bbox_sortby_more": "Position (right to left)"},
+            [2, 1, 0],
+        ),
+        ({"ad_bbox_sortby_more": "Position (top to bottom)"}, [1, 2, 0]),
+        ({"ad_bbox_sortby_more": "Area (small to large)"}, [0, 1, 2]),
+        ({"ad_bbox_sortby_more": "Confidence (high to low)"}, [1, 2, 0]),
+    ],
+)
+def test_more_sort_orders_override_sort_bounding_boxes_by(opts_data, order):
+    assert _sorted_by_settings(opts_data) == order
+
+
+def test_more_sort_orders_is_a_settings_radio_off_by_default():
+    script_text = _SCRIPT_PATH.read_text(encoding="utf-8")
+    start = script_text.index('        "ad_bbox_sortby",')
+    sortby = script_text[start:]
+    sortby = sortby[: sortby.index("shared.opts.add_option")]
+    # The original setting is unchanged, and the new one comes right after.
+    assert "component_args={\"choices\": BBOX_SORTBY}," in sortby
+    rest = script_text[start + len(sortby):]
+    option = rest[rest.index("(") + 1:]
+    option = option[: option.index("shared.opts.add_option")]
+    assert option.lstrip().startswith('"ad_bbox_sortby_more",')
+    assert 'default="Off",' in option
+    assert "component=gr.Radio" in option
+    assert "BBOX_SORTBY_MORE" in option
+
+
+def _bind_nans_exception(devices):
+    # Run the script's top-level statement that binds NansException against
+    # a stand-in for modules.devices.
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    stmt = next(
+        node
+        for node in tree.body
+        if "NansException" in ast.unparse(node)
+        and isinstance(node, (ast.ImportFrom, ast.Try))
+    )
+    modules = ModuleType("modules")
+    modules.devices = devices
+    saved = {name: sys.modules.get(name) for name in ("modules", "modules.devices")}
+    sys.modules.update({"modules": modules, "modules.devices": devices})
+    try:
+        namespace = {}
+        exec(compile(ast.Module(body=[stmt], type_ignores=[]), str(_SCRIPT_PATH), "exec"), namespace)
+    finally:
+        for name, old in saved.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+    return namespace["NansException"]
+
+
+def test_the_script_loads_on_a_webui_without_nans_exception():
+    # Forge Neo or another host could drop modules.devices.NansException: a
+    # plain import stopped the whole extension from loading there.
+    nans = _bind_nans_exception(ModuleType("modules.devices"))
+    # A class of its own, which nothing raises: it never catches a real error.
+    assert issubclass(nans, Exception)
+    assert nans is not Exception
+
+
+def test_the_script_keeps_the_hosts_nans_exception():
+    devices = ModuleType("modules.devices")
+
+    class NansException(Exception):  # noqa: N818
+        pass
+
+    devices.NansException = NansException
+    assert _bind_nans_exception(devices) is NansException
+
+
+# [PROMPT=words]: only some parts of the main prompt in the tab's prompt.
+
+
+def _prompt_filter_script(verbose_lines=None, **host_globals):
+    """The prompt methods with the [PROMPT=...] helpers; `verbose_lines`,
+    when given, turns the verbose log on and collects its lines."""
+    functions = set(_INLINE_PROMPT_FUNCTIONS)
+    if verbose_lines is not None:
+        functions -= {"_ad_verbose", "_vprint"}
+        host_globals.update(_ad_verbose=lambda: True, _vprint=verbose_lines.append)
+    return _load_script(
+        methods=_INLINE_PROMPT_METHODS,
+        functions=functions,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        get_i=lambda p: getattr(p, "_i", 0),
+        **host_globals,
+    )
+
+
+def _filter_prompt(ad_prompt, main, *, negative="", ad_negative="", i=0,
+                   all_prompts=None, **args):
+    from adetailer.args import ADetailerArgs
+
+    script = _prompt_filter_script().AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt=main, all_prompts=all_prompts or [main],
+        negative_prompt=negative, all_negative_prompts=[negative],
+        styles=[], _i=i,
+    )
+    return script.get_prompt(
+        p, ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt=ad_prompt,
+                         ad_negative_prompt=ad_negative, **args)
+    )
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "main", "expected"),
+    [
+        # The two examples of the request: keep only, and drop.
+        (
+            "close-up, detailed iris, [PROMPT=eyes]",
+            "1girl, green eyes, red dress, <lora:body:0.8>",
+            "close-up, detailed iris, green eyes",
+        ),
+        (
+            "[PROMPT=-beach,-heels]",
+            "masterpiece, black hair, (freckles:1.2), beach, high heels",
+            "masterpiece, black hair, (freckles:1.2)",
+        ),
+        # Several words, weights kept, a comma inside brackets does not split.
+        (
+            "[PROMPT=eyes,hair], sharp",
+            "1girl, (green eyes:1.2), [long|short] hair, (red dress, lace:1.1)",
+            "(green eyes:1.2), [long|short] hair, sharp",
+        ),
+        (
+            "[PROMPT=dress]",
+            "1girl, (red dress, lace:1.1), green eyes",
+            "(red dress, lace:1.1)",
+        ),
+        # Whole word, any case, "_" counts as a space (in both).
+        ("[PROMPT=EYES]", "blue_eyes, eyeshadow, Green Eyes", "blue_eyes, Green Eyes"),
+        ("[PROMPT=eye], face", "blue eyes, eyeshadow", "face"),
+        ("[PROMPT=green_eyes]", "green  eyes, green dress", "green  eyes"),
+        # A weight around the token is kept (the WebUI multiplies them).
+        ("([PROMPT=eyes]:1.2), face", "1girl, green eyes", "(green eyes:1.2), face"),
+        # Mixed: a part must name a plain word and no "-" one.
+        (
+            "[PROMPT=eyes,-dress]",
+            "green eyes, eyes like a red dress, red dress",
+            "green eyes",
+        ),
+        # No word at all is the plain [PROMPT].
+        ("[PROMPT=], face", "1girl, <lora:a:1>", "1girl, <lora:a:1>, face"),
+        ("[PROMPT= - ], face", "1girl", "1girl, face"),
+        # Next to the plain token.
+        ("[PROMPT=eyes] / [PROMPT]", "1girl, green eyes", "green eyes / 1girl, green eyes"),
+    ],
+)
+def test_prompt_token_with_words_brings_only_those_parts(ad_prompt, main, expected):
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+def test_prompt_token_gives_each_sep_part_its_own_words():
+    main = "1girl, green eyes, black hair, red dress"
+    prompts, _ = _filter_prompt(
+        "[PROMPT=eyes] [SEP] [PROMPT=hair], braids [SEP] [SKIP]", main
+    )
+    assert prompts == ["green eyes", "black hair, braids", "[SKIP]"]
+
+
+def test_prompt_token_follows_each_image_of_a_batch():
+    # A wildcard picked another value for each image: all_prompts[i].
+    batch = [
+        "1girl, green eyes, red dress",
+        "1girl, blue eyes, red dress",
+        "1girl, (brown eyes:1.1), red dress",
+    ]
+    got = [
+        _filter_prompt("close-up, [PROMPT=eyes]", "1girl, __eyes__ eyes",
+                       i=i, all_prompts=batch)[0][0]
+        for i in range(4)
+    ]
+    assert got == [
+        "close-up, green eyes", "close-up, blue eyes",
+        "close-up, (brown eyes:1.1)", "close-up, green eyes",
+    ]
+
+
+def test_prompt_token_works_in_the_negative_prompt():
+    _, negative = _filter_prompt(
+        "face", "1girl", negative="blurry, bad hands, lowres",
+        ad_negative="[PROMPT=-hands]",
+    )
+    assert negative == ["blurry, lowres"]
+
+
+def test_prompt_token_inside_a_class_block():
+    from adetailer.args import ADetailerArgs
+
+    script = _prompt_filter_script().AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="1girl, green eyes, red dress",
+        all_prompts=["1girl, green eyes, red dress"],
+        negative_prompt="", all_negative_prompts=[""], styles=[],
+    )
+    args = ADetailerArgs(
+        ad_model="faces.pt",
+        ad_prompt="detailed, [CLASS=face] [PROMPT=eyes] [/CLASS]"
+        "[CLASS=hand] five fingers [/CLASS]",
+    )
+    prompts, negatives = script.get_prompt(p, args)
+    pred = SimpleNamespace(class_names=["face", "hand"])
+    regions = []
+    for j in range(2):
+        p2 = SimpleNamespace()
+        script.i2i_prompts_replace(p2, prompts, negatives, j)
+        script._apply_inline_class_prompts(p2, pred, j, 2, False, p, args)
+        regions.append(p2.prompt)
+    assert regions == ["detailed, green eyes", "detailed, five fingers"]
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "expected"),
+    [
+        # Keep only: LoRAs never come along, also inside a kept part.
+        ("[PROMPT=eyes]", "green eyes"),
+        ("face, [PROMPT=body]", "face"),
+        ("[PROMPT=eyes,-dress]", "green eyes"),
+        # Drop: they all stay, also those of a dropped part.
+        ("[PROMPT=-eyes]", "1girl, <lora:body:0.8>, <lyco:eyes:1>, red dress"),
+        ("[PROMPT=-dress]", "1girl, <lora:body:0.8>, green eyes <lyco:eyes:1>"),
+    ],
+)
+def test_prompt_token_loras(ad_prompt, expected):
+    main = "1girl, <lora:body:0.8>, green eyes <lyco:eyes:1>, red dress"
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+def test_prompt_token_with_loras_from_main_prompt_still_adds_them():
+    main = "1girl, <lora:body:0.8>, green eyes"
+    got = _filter_prompt("[PROMPT=eyes]", main, ad_use_main_loras=True)[0][0]
+    assert got == "green eyes <lora:body:0.8>"
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "expected"),
+    [
+        ("close-up, [PROMPT=hat], detailed", "close-up, detailed"),
+        ("[PROMPT=hat], close-up", "close-up"),
+        ("close-up, [PROMPT=hat]", "close-up"),
+        ("[PROMPT=hat]", ""),
+        # An emptied weight or group goes too, not only its comma.
+        ("close-up, ([PROMPT=hat]:1.2), detailed", "close-up, detailed"),
+        ("close-up, [[PROMPT=hat]]", "close-up"),
+    ],
+)
+def test_prompt_token_matching_nothing_is_empty(ad_prompt, expected):
+    assert _filter_prompt(ad_prompt, "1girl, green eyes")[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "main", "expected"),
+    [
+        # Nested weights around an empty token go too.
+        ("close-up, (([PROMPT=hat]:1.2):1.1), detailed", "1girl", "close-up, detailed"),
+        ("close-up, [([PROMPT=hat]:1.2)]", "1girl", "close-up"),
+        # Only where the token was: the rest of the tab's text stays as typed,
+        # and so does the text a plain [PROMPT] brings.
+        ("[PROMPT=hat], a,, b", "1girl", "a,, b"),
+        ("close-up, () [PROMPT=hat], b", "1girl", "close-up, (), b"),
+        ("[PROMPT=hat], [PROMPT]", "1girl,, green eyes", "1girl,, green eyes"),
+        ("([PROMPT=hat], shiny:1.2), b", "1girl", "(shiny:1.2), b"),
+        # A BREAK or AND it leaves at the start or the end goes with it.
+        ("[PROMPT=hat] BREAK close-up", "1girl", "close-up"),
+        ("close-up AND [PROMPT=hat]", "1girl", "close-up"),
+        ("a BREAK [PROMPT=hat] BREAK b", "1girl", "a BREAK b"),
+        ("close-up\n[PROMPT=hat]", "1girl", "close-up"),
+        # Text after it in the same part keeps the separator before it.
+        ("close-up, [PROMPT=hat] detailed eyes", "1girl", "close-up, detailed eyes"),
+        ("x BREAK [PROMPT=hat] y", "1girl", "x BREAK y"),
+        ("a cat AND [PROMPT=hat] dog", "1girl", "a cat AND dog"),
+        # Negative or several weights and braces go too; prompt editing stays.
+        ("close-up, ([PROMPT=hat]:-1), b", "1girl", "close-up, b"),
+        ("close-up, ([PROMPT=hat]:1.2:1), b", "1girl", "close-up, b"),
+        ("close-up, {[PROMPT=hat]}, b", "1girl", "close-up, b"),
+        ("close-up, [[PROMPT=hat]:x:5], b", "1girl", "close-up, [:x:5], b"),
+        ("close-up, <[PROMPT=hat]>, b", "1girl", "close-up, <>, b"),
+        # Between two separators, AND stays before BREAK, as between parts.
+        ("a AND [PROMPT=hat] BREAK b", "1girl", "a AND b"),
+        ("a BREAK [PROMPT=hat] AND b", "1girl", "a AND b"),
+        ("a, [PROMPT=hat] BREAK b", "1girl", "a BREAK b"),
+        # Last in a group or weight: the comma before it goes too.
+        ("close-up, (detailed eyes, [PROMPT=hat]:1.2), b", "1girl", "close-up, (detailed eyes:1.2), b"),
+        ("a, (b, [PROMPT=hat])", "1girl", "a, (b)"),
+        ("a, [detailed eyes, [PROMPT=hat]:x:5]", "1girl", "a, [detailed eyes:x:5]"),
+    ],
+)
+def test_an_empty_prompt_token_is_tidied_only_where_it_was(ad_prompt, main, expected):
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "main", "expected"),
+    [
+        # Brackets that never close: every comma splits.
+        ("[PROMPT=eyes]", "i <3 cats, green eyes, red dress", "green eyes"),
+        ("[PROMPT=-dress]", "i <3 cats, green eyes, red dress", "i <3 cats, green eyes"),
+        # A new line, BREAK and AND separate parts, and are never a part.
+        ("[PROMPT=eyes]", "1girl\ngreen eyes BREAK red dress AND sky", "green eyes"),
+        (
+            "[PROMPT=-dress]",
+            "1girl\ngreen eyes BREAK red dress AND sky",
+            "1girl, green eyes AND sky",
+        ),
+        ("[PROMPT=BREAK]", "1girl BREAK green eyes", ""),
+        # Only the whole uppercase words, outside brackets.
+        ("[PROMPT=eyes]", "BREAKFAST, cats and green eyes", "cats and green eyes"),
+        ("[PROMPT=eyes]", "(cats AND green eyes:1.1), hat", "(cats AND green eyes:1.1)"),
+        ("[PROMPT=logo]", "BRAND logo, red hat", "BRAND logo"),
+        ("[PROMPT=logo]", "OUTBREAK logo, red hat", "OUTBREAK logo"),
+        # At the very start of the prompt the keyword splits; after a lower
+        # case letter, a digit or an underscore it is part of the word.
+        ("[PROMPT=eyes]", "BREAK green eyes, hat", "green eyes"),
+        ("[PROMPT=eyes]", "AND green eyes, hat", "green eyes"),
+        ("[PROMPT=eyes]", "logoAND green eyes, hat", "logoAND green eyes"),
+        ("[PROMPT=eyes]", "my_AND green eyes, hat", "my_AND green eyes"),
+        ("[PROMPT=eyes]", "1BREAK green eyes, hat", "1BREAK green eyes"),
+        # After punctuation it splits, as the WebUI's \bAND\b and \bBREAK\b do;
+        # after any letter it does not, also a non-ASCII one.
+        ("[PROMPT=eyes]", "red hat,BREAK green eyes", "green eyes"),
+        ("[PROMPT=eyes]", "(red hat)AND green eyes", "green eyes"),
+        ("[PROMPT=eyes]", "caf\u00e9AND green eyes, hat", "caf\u00e9AND green eyes"),
+        # A backslash escapes the next character: a bracket that does not close
+        # the part, and a comma that does not split.
+        ("[PROMPT=lace]", r"(red dress\), lace:1.2), hat", r"(red dress\), lace:1.2)"),
+        ("[PROMPT=lace]", r"red dress\, lace, hat", r"red dress\, lace"),
+        # The numbers of the weights are not searched; the part keeps its weight.
+        ("[PROMPT=1]", "(green eyes:1.2), [hat:1], <lora:a:1>", ""),
+        ("[PROMPT=eyes]", "(green eyes:1.2), red dress", "(green eyes:1.2)"),
+        ("[PROMPT=2b]", "2b, red dress", "2b"),
+    ],
+)
+def test_prompt_token_parts(ad_prompt, main, expected):
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "main", "expected"),
+    [
+        # Two kept parts are joined by the separator that was between them.
+        ("[PROMPT=-beach]", "a cat AND a dog, beach", "a cat AND a dog"),
+        ("[PROMPT=-beach]", "a cat BREAK a dog, beach", "a cat BREAK a dog"),
+        ("[PROMPT=-beach]", "a cat, beach BREAK a dog", "a cat BREAK a dog"),
+        ("[PROMPT=-beach]", "a cat, beach, sky", "a cat, sky"),
+        ("[PROMPT=-beach]", "a cat\nbeach\nsky", "a cat, sky"),
+        # AND wins over BREAK (the host splits at AND first).
+        ("[PROMPT=-beach]", "a cat BREAK beach AND sky", "a cat AND sky"),
+        ("[PROMPT=-beach]", "a cat AND beach BREAK sky", "a cat AND sky"),
+        # The same for plain words.
+        ("[PROMPT=cat,dog]", "a cat AND a dog, beach", "a cat AND a dog"),
+        ("[PROMPT=cat,dog]", "a cat, beach BREAK a dog", "a cat BREAK a dog"),
+    ],
+)
+def test_prompt_token_keeps_and_and_break_between_parts(ad_prompt, main, expected):
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "expected"),
+    [
+        # Like the LoRAs: never brought by plain words, not searched by name,
+        # kept by the minus form.
+        ("[PROMPT=eyes]", "green eyes"),
+        ("face, [PROMPT=skin]", "face"),
+        ("face, [PROMPT=hypernet]", "face"),
+        ("[PROMPT=-eyes]", "1girl, <hypernet:skin:1>, <hypernet:soft:0.5>"),
+    ],
+)
+def test_prompt_token_hypernetworks(ad_prompt, expected):
+    main = "1girl, <hypernet:skin:1>, green eyes <hypernet:soft:0.5>"
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+def _empty_prompt_pass(
+    p, ad_prompt, prompts, n=0, apply=None, n_masks=1, **host_globals
+):
+    # One detailer pass whose tab prompt came out as `prompts`; `apply`, when
+    # given, resolves the [CLASS=...] blocks of each region.
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+
+    def process_images(p2):
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")])
+
+    run, pp, _before = _detailer(
+        state, process_images, n_masks=n_masks, Image=Image,
+        opts=SimpleNamespace(data={}), **host_globals,
+    )
+    script = _script_of(run)
+    script.get_prompt = lambda *_args: (prompts, [""])
+    if apply is not None:
+        script._apply_inline_class_prompts = apply
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4, ad_prompt=ad_prompt,
+    )
+    script._postprocess_image_inner(p, pp, args, n=n)
+
+
+def test_a_prompt_left_empty_by_the_token_is_said_once_per_tab(capsys):
+    p = SimpleNamespace(extra_generation_params={})
+    for _ in range(3):  # three images of the batch
+        _empty_prompt_pass(p, "[PROMPT=hat]", [""])
+    _empty_prompt_pass(p, "close-up [SEP] [PROMPT=cap, -x]", ["close-up", ""], n=1)
+    lines = [
+        line for line in capsys.readouterr().out.splitlines() if "is empty" in line
+    ]
+    assert lines == [
+        "[-] ADetailer: tab 1 prompt is empty: [PROMPT=hat] matched no part "
+        "of the main prompt.",
+        "[-] ADetailer: tab 2 prompt is empty: [PROMPT=cap, -x] matched no part "
+        "of the main prompt.",
+    ]
+
+
+@pytest.mark.parametrize("token", ["[PROMPT=[hat]", "[PROMPT=eyes [/i]"])
+def test_the_empty_prompt_note_is_printed_as_typed(capsys, token):
+    # The script prints with rich, which read a "[" in the token as markup:
+    # "[hat]" vanished from the line and "[/i]" raised a MarkupError that
+    # stopped ADetailer for that image.
+    rich = pytest.importorskip("rich")
+    _empty_prompt_pass(
+        SimpleNamespace(extra_generation_params={}), token, [""], print=rich.print
+    )
+    assert capsys.readouterr().out.splitlines() == [
+        f"[-] ADetailer: tab 1 prompt is empty: {token} matched no part "
+        "of the main prompt.",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "prompts"),
+    [
+        ("face, [PROMPT=hat]", ["face"]),  # not empty
+        ("", [""]),  # no token
+        ("[PROMPT]", [""]),  # an empty main prompt
+        ("[PROMPT=]", [""]),
+    ],
+)
+def test_a_prompt_not_emptied_by_the_token_says_nothing(capsys, ad_prompt, prompts):
+    _empty_prompt_pass(SimpleNamespace(extra_generation_params={}), ad_prompt, prompts)
+    assert "is empty" not in capsys.readouterr().out
+
+
+def _comments_note_runtime(strip):
+    # get_prompt and the pass's note, with the host's Comments script.
+    comments = SimpleNamespace(
+        script_class=type("ScriptStripComments", (), {"__module__": "comments.py"}),
+        module=SimpleNamespace(strip_comments=strip),
+    )
+    return _load_script(
+        methods=_INLINE_PROMPT_METHODS,
+        functions=_INLINE_PROMPT_FUNCTIONS | {"_empty_prompt_note"},
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        get_i=lambda _p: 0,
+        shared=SimpleNamespace(prompt_styles=None),
+        opts=SimpleNamespace(data={}),
+        scripts=SimpleNamespace(scripts_data=[comments]),
+    )
+
+
+@pytest.mark.parametrize(
+    ("strip", "typed", "parts", "said"),
+    [
+        # A [SEP] inside a comment before the part the token left empty.
+        (_a1111_strip_comments, "a # [SEP] x\n[SEP] [PROMPT=zzz]", ["a", ""], True),
+        (_neo_strip_comments, "a /* [SEP] x */ [SEP] [PROMPT=zzz]", ["a", ""], True),
+        (_neo_strip_comments, "a // [SEP] x\n[SEP] [PROMPT=zzz]", ["a", ""], True),
+        # The same parts without comments, and a [SEP] hidden after it.
+        (_a1111_strip_comments, "a [SEP] [PROMPT=zzz]", ["a", ""], True),
+        (_a1111_strip_comments, "[PROMPT=zzz] # hidden [SEP] y", [""], True),
+        # A token written only inside a comment is not in the pass.
+        (_a1111_strip_comments, "a\n# [SEP] [PROMPT=zzz]", ["a\n"], False),
+    ],
+)
+def test_the_empty_prompt_note_reads_the_prompt_without_its_comments(
+    strip, typed, parts, said
+):
+    # The pass splits the tab prompt at [SEP] once its comments are gone: the
+    # note split the text as typed, so a [SEP] in a comment before the empty
+    # part moved it onto another part, and the console said nothing.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _comments_note_runtime(strip)
+    p = SimpleNamespace(
+        prompt="a photo", all_prompts=["a photo"],
+        negative_prompt="", all_negative_prompts=[""], styles=[],
+    )
+    args = ADetailerArgs(ad_model="faces.pt", ad_prompt=typed)
+    prompts, _ = runtime.AfterDetailerScript().get_prompt(p, args)
+    assert prompts == parts
+
+    note = runtime._empty_prompt_note(typed, prompts, 0)
+    assert note == (
+        "[-] ADetailer: tab 1 prompt is empty: [PROMPT=zzz] matched no part "
+        "of the main prompt."
+        if said else ""
+    )
+
+
+def test_a_class_block_left_empty_by_the_token_is_said_once_per_tab(capsys):
+    # "[CLASS=face][PROMPT=zzz][/CLASS]" leaves the tab prompt
+    # "[CLASS=face][/CLASS]", not empty, and the face regions with no prompt.
+    def apply(p2, *_args):
+        p2.prompt = ""
+        return "[PROMPT=zzz]"  # the face block, as typed
+
+    p = SimpleNamespace(extra_generation_params={})
+    for _ in range(2):  # two images, two face regions each
+        _empty_prompt_pass(
+            p, "[CLASS=face][PROMPT=zzz][/CLASS]", ["[CLASS=face][/CLASS]"],
+            apply=apply, n_masks=2,
+        )
+    lines = [
+        line for line in capsys.readouterr().out.splitlines() if "is empty" in line
+    ]
+    assert lines == [
+        "[-] ADetailer: tab 1 prompt is empty: [PROMPT=zzz] matched no part "
+        "of the main prompt.",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "regions", "typed"),
+    [
+        (
+            "[CLASS=face][PROMPT=zzz][/CLASS]",
+            ["", "a photo"], ["[PROMPT=zzz]", None],
+        ),
+        (
+            "[CLASS=face] [PROMPT=zzz] [/CLASS] [CLASS=hand] five fingers [/CLASS]",
+            ["", "five fingers"], ["[PROMPT=zzz]", None],
+        ),
+        # Only the region's own block: the hand's token found its words.
+        (
+            "[CLASS=face][PROMPT=zzz][/CLASS][CLASS=hand][PROMPT=photo][/CLASS]",
+            ["", "a photo"], ["[PROMPT=zzz]", None],
+        ),
+        # Text outside the blocks: the region is not empty.
+        (
+            "detailed, [CLASS=face] ([PROMPT=zzz]:1.2) [/CLASS]",
+            ["detailed", "detailed"], [None, None],
+        ),
+        # A token that matches.
+        ("[CLASS=face][PROMPT=photo][/CLASS]", ["a photo", "a photo"], [None, None]),
+    ],
+)
+def test_a_class_block_gives_back_its_text_when_the_token_empties_the_region(
+    ad_prompt, regions, typed
+):
+    from adetailer.args import ADetailerArgs
+
+    script = _prompt_filter_script().AfterDetailerScript()
+    p = SimpleNamespace(
+        prompt="a photo", all_prompts=["a photo"],
+        negative_prompt="", all_negative_prompts=[""], styles=[],
+    )
+    args = ADetailerArgs(ad_model="faces.pt", ad_prompt=ad_prompt)
+    prompts, negatives = script.get_prompt(p, args)
+    pred = SimpleNamespace(class_names=["face", "hand"])
+    got, back = [], []
+    for j in range(2):
+        p2 = SimpleNamespace()
+        script.i2i_prompts_replace(p2, prompts, negatives, j)
+        back.append(script._apply_inline_class_prompts(p2, pred, j, 2, False, p, args))
+        got.append(p2.prompt)
+    assert got == regions
+    assert back == typed
+
+
+def test_prompt_token_matching_nothing_logs_only_with_verbose(capsys):
+    from adetailer.args import ADetailerArgs
+
+    p = SimpleNamespace(
+        prompt="1girl", all_prompts=["1girl"], negative_prompt="",
+        all_negative_prompts=[""], styles=[],
+    )
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="face, [PROMPT=hat]")
+    lines = []
+    script = _prompt_filter_script(verbose_lines=lines).AfterDetailerScript()
+    assert script.get_prompt(p, args)[0] == ["face"]
+    assert len(lines) == 1
+    assert "[PROMPT=hat]" in lines[0]
+    assert lines[0].isascii()
+    # Verbose off (the default): nothing printed.
+    script = _prompt_filter_script().AfterDetailerScript()
+    assert script.get_prompt(p, args)[0] == ["face"]
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    "ad_prompt",
+    [
+        "  close-up ,, sharp  [PROMPT] ,  x ",
+        "[PROMPT=eyes",
+        "[prompt=eyes], face",
+        "a [PROMPT ] b",
+    ],
+)
+def test_a_prompt_without_the_token_is_unchanged(ad_prompt):
+    # The old [PROMPT] path, byte for byte.
+    main = "1girl, green eyes"
+    expected = main.join(ad_prompt.split("[PROMPT]"))
+    assert _filter_prompt(ad_prompt, main)[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "s", "r", "main", "expected"),
+    [
+        # "(AD 1st)": the token's words are not replaced; the replacement
+        # reaches the text it brings, as with [PROMPT].
+        ("[PROMPT=eyes]", "eyes", "hair", False, "green hair"),
+        # "(AD 1st and main prompt)": the main prompt is already replaced,
+        # the tab's own text once.
+        ("[PROMPT=smile], smile", "smile", "big smile", True, "big smile, big smile"),
+        ("[PROMPT=smile], smile", "smile", "big smile", False, "big smile, big smile"),
+    ],
+)
+def test_prompt_sr_leaves_the_token_alone(ad_prompt, s, r, main, expected):
+    from adetailer.args import ADetailerArgs
+
+    runtime = _prompt_sr_script()
+    script = runtime.AfterDetailerScript()
+    p = SimpleNamespace(prompt="1girl, green eyes, smile", negative_prompt="", styles=[])
+    runtime.search_and_replace_prompt(p, r, [s, r], replace_in_main_prompt=main)
+    p.all_prompts, p.all_negative_prompts = [p.prompt], [p.negative_prompt]
+    positive, _ = script.get_prompt(
+        p, ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt=ad_prompt)
+    )
+    assert positive == [expected]
+
+
+@pytest.mark.parametrize(
+    ("sr", "ad_prompt", "ad_negative", "saved", "saved_negative"),
+    [
+        # A part the token leaves empty is saved as typed, or pasting it
+        # back would read a blank part: the whole main prompt.
+        (
+            ("blue", "red"), "[PROMPT=hat] [SEP] blue eyes", "[PROMPT=hat]",
+            "[PROMPT=hat] [SEP] red eyes", "[PROMPT=hat]",
+        ),
+        # The S/R reaches the text around the token, not its words.
+        (("1.2", "1.5"), "([PROMPT=hat]:1.2)", "", "([PROMPT=hat]:1.5)", "blurry"),
+        (("hat", "cap"), "[PROMPT=hat]", "", "[PROMPT=hat]", "blurry"),
+        # Not empty: as before.
+        (("blue", "red"), "close-up, [PROMPT=hat]", "", "close-up", "blurry"),
+    ],
+)
+def test_xyz_prompt_sr_saves_a_part_the_token_left_empty_as_typed(
+    sr, ad_prompt, ad_negative, saved, saved_negative
+):
+    from aaaaaa.p_method import get_i
+    from adetailer.args import ADetailerArgs
+
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS | {"process", "extra_params", "_record_xyz_prompt_sr"},
+        functions=_INLINE_PROMPT_FUNCTIONS,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        get_i=get_i,
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: True
+    script.set_skip_img2img = lambda *_args: None
+    script.get_args = lambda *_args: [
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=ad_prompt,
+            ad_negative_prompt=ad_negative,
+        )
+    ]
+    p = SimpleNamespace(
+        iteration=0, batch_size=1, prompt="a photo", negative_prompt="blurry",
+        all_prompts=["a photo"], all_negative_prompts=["blurry"],
+        extra_generation_params={},
+        _ad_xyz_prompt_sr=[SimpleNamespace(s=sr[0], r=sr[1])],
+    )
+
+    script.process(p, True, False, {})
+
+    params = p.extra_generation_params
+    assert params["ADetailer prompt"] == saved
+    assert params.get("ADetailer negative prompt", "") == saved_negative
+
+
+def _xyz_record_runtime(strip=None):
+    from aaaaaa.p_method import get_i
+
+    comments = SimpleNamespace(
+        script_class=type("ScriptStripComments", (), {"__module__": "comments.py"}),
+        module=SimpleNamespace(strip_comments=strip),
+    )
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS | {"process", "extra_params", "_record_xyz_prompt_sr"},
+        functions=_INLINE_PROMPT_FUNCTIONS,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        opts=SimpleNamespace(data={}),
+        scripts=SimpleNamespace(scripts_data=[comments] if strip else []),
+        is_img2img_inpaint=lambda _p: False,
+        get_i=get_i,
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: True
+    script.set_skip_img2img = lambda *_args: None
+    return script
+
+
+def _xyz_record_photo(sr):
+    return SimpleNamespace(
+        iteration=0, batch_size=1, prompt="a photo", negative_prompt="blurry",
+        all_prompts=["a photo"], all_negative_prompts=["blurry"],
+        extra_generation_params={},
+        _ad_xyz_prompt_sr=[SimpleNamespace(s=sr[0], r=sr[1])],
+    )
+
+
+def test_xyz_prompt_sr_saves_as_typed_a_part_left_with_only_a_comment():
+    # The pass removes the comment, so the part is empty there: saved as
+    # typed, not as the comment alone (pasted back, a blank part).
+    from adetailer.args import ADetailerArgs
+
+    script = _xyz_record_runtime(_a1111_strip_comments)
+    script.get_args = lambda *_args: [
+        ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="[PROMPT=hat]\n# note")
+    ]
+    p = _xyz_record_photo(("blue", "red"))
+
+    script.process(p, True, False, {})
+
+    assert p.extra_generation_params["ADetailer prompt"] == "[PROMPT=hat]\n# note"
+
+
+@pytest.mark.parametrize(
+    ("strip", "comment"),
+    [(_a1111_strip_comments, "# note"), (_neo_strip_comments, "// note"), (None, "")],
+)
+def test_xyz_prompt_sr_keeps_the_line_break_that_ends_a_comment_before_sep(strip, comment):
+    # "blue face # note\n[SEP] blue eyes" was saved on one line: pasted
+    # back, the comment ran to the end of the line and took "[SEP] red eyes"
+    # with it, so the second detection got the first one's prompt.
+    from types import SimpleNamespace as NS
+
+    from adetailer.args import ADetailerArgs
+
+    script = _xyz_record_runtime(strip)
+    script.get_args = lambda *_args: [
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt",
+            ad_prompt=f"blue face {comment}\n[SEP] blue eyes",
+            ad_negative_prompt=f"blue hands {comment}\n[SEP] blue ears",
+        )
+    ]
+    p = _xyz_record_photo(("blue", "red"))
+
+    script.process(p, True, False, {})
+
+    params = p.extra_generation_params
+    if not comment:
+        # Without a comment the saved text is as before.
+        assert params["ADetailer prompt"] == "red face [SEP] red eyes"
+        assert params["ADetailer negative prompt"] == "red hands [SEP] red ears"
+        return
+    assert params["ADetailer prompt"] == f"red face {comment}\n[SEP] red eyes"
+    assert params["ADetailer negative prompt"] == f"red hands {comment}\n[SEP] red ears"
+    # Pasted back, the pass gets both segments again.
+    pasted = _comments_runtime(None, strip).AfterDetailerScript()
+    photo = NS(
+        prompt="a", negative_prompt="", styles=[], all_prompts=["a"],
+        all_negative_prompts=[""],
+    )
+    positive, negative = pasted.get_prompt(
+        photo,
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt",
+            ad_prompt=params["ADetailer prompt"],
+            ad_negative_prompt=params["ADetailer negative prompt"],
+        ),
+    )
+    assert [s.strip() for s in positive] == ["red face", "red eyes"]
+    assert [s.strip() for s in negative] == ["red hands", "red ears"]
+
+
+@pytest.mark.parametrize(
+    ("strip", "comment"), [(_a1111_strip_comments, "#"), (_neo_strip_comments, "//")]
+)
+def test_xyz_prompt_sr_leaves_a_sep_commented_out_on_the_same_line_inactive(strip, comment):
+    # In "blue face # [SEP] blue eyes" the comment hides the [SEP] too: the
+    # pass uses one segment. Saved as "red face #\n[SEP] red eyes", it pasted
+    # back as two, so the second detection got a prompt the picture never had.
+    from types import SimpleNamespace as NS
+
+    from adetailer.args import ADetailerArgs
+
+    typed = f"blue face {comment} [SEP] blue eyes"
+    typed_negative = f"blue hands {comment} [SEP] blue ears"
+    photo = NS(
+        prompt="a", negative_prompt="", styles=[], all_prompts=["a"],
+        all_negative_prompts=[""],
+    )
+    run = _comments_runtime(None, strip).AfterDetailerScript()
+    positive, negative = run.get_prompt(
+        photo,
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=typed, ad_negative_prompt=typed_negative
+        ),
+    )
+    assert [s.strip() for s in positive] == ["blue face"]
+    assert [s.strip() for s in negative] == ["blue hands"]
+
+    script = _xyz_record_runtime(strip)
+    script.get_args = lambda *_args: [
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=typed, ad_negative_prompt=typed_negative
+        )
+    ]
+    p = _xyz_record_photo(("blue", "red"))
+
+    script.process(p, True, False, {})
+
+    params = p.extra_generation_params
+    assert params["ADetailer prompt"] == f"red face {comment} [SEP] red eyes"
+    assert params["ADetailer negative prompt"] == f"red hands {comment} [SEP] red ears"
+    # Pasted back, one segment, as in the generation.
+    pasted = _comments_runtime(None, strip).AfterDetailerScript()
+    positive, negative = pasted.get_prompt(
+        photo,
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt",
+            ad_prompt=params["ADetailer prompt"],
+            ad_negative_prompt=params["ADetailer negative prompt"],
+        ),
+    )
+    assert [s.strip() for s in positive] == ["red face"]
+    assert [s.strip() for s in negative] == ["red hands"]
+
+
+_SR_PHOTO = SimpleNamespace(
+    prompt="a photo", negative_prompt="blurry", styles=[],
+    all_prompts=["a photo"], all_negative_prompts=["blurry"],
+)
+
+
+def _sr_pass(strip, prompt, negative, pairs=()):
+    # The segments the detailer pass uses, with the S/R pairs of the cell.
+    from adetailer.args import ADetailerArgs
+
+    photo = copy(_SR_PHOTO)
+    if pairs:
+        photo._ad_xyz_prompt_sr = list(pairs)
+    return _comments_runtime(None, strip).AfterDetailerScript().get_prompt(
+        photo,
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=prompt, ad_negative_prompt=negative
+        ),
+    )
+
+
+def _sr_saved(strip, prompt, negative, pairs):
+    # The ADetailer prompts an X/Y/Z Prompt S/R cell saves.
+    from adetailer.args import ADetailerArgs
+
+    script = _xyz_record_runtime(strip)
+    script.get_args = lambda *_args: [
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=prompt, ad_negative_prompt=negative
+        )
+    ]
+    p = _xyz_record_photo(("", ""))
+    p._ad_xyz_prompt_sr = list(pairs)
+    script.process(p, True, False, {})
+    params = p.extra_generation_params
+    return params.get("ADetailer prompt", ""), params.get("ADetailer negative prompt", "")
+
+
+_SR_BLUE = (SimpleNamespace(s="blue", r="red", main=False),)
+_SR_BLUE_MAIN = (SimpleNamespace(s="blue", r="red", main=True),)
+_SR_A1111 = (_a1111_strip_comments, "#")
+_SR_NEO = (_neo_strip_comments, "//")
+_SR_BOTH_HOSTS = (
+    # A [SEP] a comment hides, with other parts on the next lines.
+    "blue face\n{c} [SEP] blue eyes\n[SEP] blue hands",
+    "blue face {c} note [SEP] blue eyes\n[SEP] blue hands",
+    "blue face {c} note\n[SEP] blue eyes",
+    "blue face {c} [SEP] blue eyes",
+    "blue face\n[SEP] blue eyes {c} n\n[SEP] blue hands",
+    "blue face {c} a [SEP] b [SEP] c\n[SEP] blue eyes {c} d [SEP] e\n[SEP] blue hands",
+    "blue face [SEP]\n{c} [SEP] hidden\nblue eyes",
+    "blue face {c} note\r\n[SEP] blue eyes {c} x [SEP] y\r\n[SEP] blue hands",
+    "{c} [SEP] only comment\nblue face [SEP] blue eyes",
+    "blue face [SEP] blue eyes {c} trailing",
+    "blue face {c} [SEP]",
+    "blue face\n{c} note\n[SEP] blue eyes",
+    "[PROMPT=hat] {c} x [SEP] y\n[SEP] blue eyes",
+    # An empty [PROMPT=...] token takes the line break that ends a comment.
+    "blue face {c} note\n[PROMPT=hat], smile",
+    "blue face {c}old[PROMPT=hat]\nsmile",
+    # [SEP] next to each other, first, last, with [SKIP].
+    "blue face {c} x [SEP][SEP] y\n[SEP] blue eyes",
+    "[SEP] blue face {c} x [SEP] y\n[SEP] blue eyes",
+    "blue face {c} x [SEP] y\n[SEP]",
+    "blue face {c} x [SEP] y\n[SEP] [SKIP]\n[SEP] blue eyes",
+    # A lone carriage return does not end a comment.
+    "blue face {c} x\r[SEP] blue eyes",
+    # Tokens inside a comment.
+    "blue face {c} [PROMPT=a]\n[SEP] blue eyes",
+    "blue face {c} x [SEP] y\n[SEP] [PROMPT], blue eyes",
+)
+
+
+@pytest.mark.parametrize(
+    ("strip", "typed", "pairs"),
+    [
+        *[
+            (strip, typed.format(c=c), pairs)
+            for strip, c in (_SR_A1111, _SR_NEO)
+            for typed in _SR_BOTH_HOSTS
+            for pairs in (_SR_BLUE, _SR_BLUE_MAIN)
+        ],
+        *[
+            (strip, f"blue face {c} a [SEP] b\n[SEP] blue eyes",
+             (SimpleNamespace(s="a [SEP] b", r="q", main=False),))
+            for strip, c in (_SR_A1111, _SR_NEO)
+        ],
+        (_a1111_strip_comments, " eyes # [SEP] [SEP] #[PROMPT=hat]\r\n // face", _SR_BLUE),
+        (_a1111_strip_comments, "blue face #[SEP]# y\n[SEP] blue eyes", _SR_BLUE),
+        (_a1111_strip_comments, "blue face a#b [SEP] c\n[SEP] blue eyes", _SR_BLUE),
+        # '//' is not a comment on AUTOMATIC1111.
+        (_a1111_strip_comments, "blue face // x [SEP] blue eyes", _SR_BLUE),
+        # Forge Neo: block comments, '#' comments, URLs.
+        (_neo_strip_comments, "blue face /* x [SEP] y\n z */ [SEP] blue eyes", _SR_BLUE),
+        (_neo_strip_comments, "blue face /* [SEP] */ blue eyes [SEP] blue hands", _SR_BLUE),
+        (
+            _neo_strip_comments,
+            "blue face /* a */ [SEP] blue eyes // b [SEP] c\n[SEP] blue hands", _SR_BLUE,
+        ),
+        (_neo_strip_comments, "blue face # x [SEP] y\n[SEP] blue eyes", _SR_BLUE),
+        (_neo_strip_comments, "blue face /* open [SEP] blue eyes", _SR_BLUE),
+        (_neo_strip_comments, "blue face\t//\tx\t[SEP]\ty \n \t[SEP]\tblue eyes", _SR_BLUE),
+        (_neo_strip_comments, "blue face /[SEP]/ y [SEP] blue eyes", _SR_BLUE),
+        (_neo_strip_comments, "blue face /[SEP]* y */ [SEP] blue eyes", _SR_BLUE),
+        (
+            _neo_strip_comments,
+            "blue face // x /* y\n[SEP] z */ [SEP] blue eyes\n[SEP] blue hands", _SR_BLUE,
+        ),
+        (
+            _neo_strip_comments,
+            "blue face <lora:x:0.8> http://a.b/c [SEP] d\n[SEP] blue eyes", _SR_BLUE,
+        ),
+        # Without the Comments script (or with its option off).
+        (None, "blue face # x [SEP] blue eyes\n[SEP] blue hands", _SR_BLUE),
+    ],
+)
+def test_xyz_prompt_sr_saved_prompt_pastes_back_as_the_generation_parts(strip, typed, pairs):
+    # The host's own comment rules decide which [SEP] split the pass; the
+    # saved text, pasted back (PNG Info, Send to), gives the same parts.
+    used_positive, used_negative = _sr_pass(strip, typed, typed, pairs)
+    saved_positive, saved_negative = _sr_saved(strip, typed, typed, pairs)
+    pasted_positive, pasted_negative = _sr_pass(strip, saved_positive, saved_negative)
+    assert [s.strip() for s in pasted_positive] == [s.strip() for s in used_positive], (
+        saved_positive
+    )
+    assert [s.strip() for s in pasted_negative] == [s.strip() for s in used_negative], (
+        saved_negative
+    )
+
+
+@pytest.mark.parametrize(
+    ("strip", "typed", "negative", "saved", "saved_negative"),
+    [
+        # As before: no comments, no [SEP], or no Comments script.
+        (_a1111_strip_comments, "blue face [SEP] blue eyes", "", "red face [SEP] red eyes", "blurry"),
+        (
+            _neo_strip_comments, "blue face\n[SEP]  blue eyes [SEP] blue hands", "x",
+            "red face [SEP] red eyes [SEP] red hands", "x",
+        ),
+        (None, "blue face # note\n[SEP] blue eyes", "", "red face # note [SEP] red eyes", "blurry"),
+        (_a1111_strip_comments, "blue face", "", "red face", "blurry"),
+        (_a1111_strip_comments, "blue face # note", "", "red face # note", "blurry"),
+        (
+            _a1111_strip_comments, "blue face # note\n[SEP] blue eyes", "",
+            "red face # note\n[SEP] red eyes", "blurry",
+        ),
+        (
+            _neo_strip_comments, "blue face // note\n[SEP] blue eyes", "",
+            "red face // note\n[SEP] red eyes", "blurry",
+        ),
+        (
+            _a1111_strip_comments, "blue face # [SEP] blue eyes", "",
+            "red face # [SEP] red eyes", "blurry",
+        ),
+        (
+            _neo_strip_comments, "blue face // [SEP] blue eyes", "",
+            "red face // [SEP] red eyes", "blurry",
+        ),
+        (_a1111_strip_comments, "[PROMPT=hat]\n# note", "", "[PROMPT=hat]\n# note", "blurry"),
+        (_a1111_strip_comments, "blue face [SEP] ", "", "red face [SEP] a photo", "blurry"),
+        # A control character already typed stays as it is.
+        (
+            _a1111_strip_comments, "blue face \x04 x [SEP] blue eyes", "",
+            "red face \x04 x [SEP] red eyes", "blurry",
+        ),
+        (
+            _neo_strip_comments, "blue face \x04 x [SEP] blue eyes", "",
+            "red face \x04 x [SEP] red eyes", "blurry",
+        ),
+        # Without its comment this part would not give the pass's text: it
+        # is saved as the pass used it, the other parts keep their comments.
+        (
+            _a1111_strip_comments, "blue face # note\n[PROMPT=hat], smile", "",
+            "red face, smile", "blurry",
+        ),
+        (
+            _neo_strip_comments, "blue face // note\n[PROMPT=hat], smile [SEP] blue eyes # x",
+            "", "red face, smile [SEP] red eyes # x", "blurry",
+        ),
+        # A part left with only a comment is not swapped for the main prompt.
+        (_a1111_strip_comments, "blue face [SEP] # c", "", "red face [SEP] # c", "blurry"),
+        (_neo_strip_comments, "blue face [SEP] // c", "", "red face [SEP] // c", "blurry"),
+    ],
+)
+def test_xyz_prompt_sr_saved_prompt_text(strip, typed, negative, saved, saved_negative):
+    assert _sr_saved(strip, typed, negative, _SR_BLUE) == (saved, saved_negative)
+
+
+@pytest.mark.parametrize("strip", [None, _a1111_strip_comments, _neo_strip_comments])
+@pytest.mark.parametrize(
+    ("sr", "ad_prompt", "ad_negative", "saved", "saved_negative"),
+    [
+        (
+            ("blue", "red"), "[PROMPT=hat] [SEP] blue eyes", "[PROMPT=hat]",
+            "[PROMPT=hat] [SEP] red eyes", "[PROMPT=hat]",
+        ),
+        (("1.2", "1.5"), "([PROMPT=hat]:1.2)", "", "([PROMPT=hat]:1.5)", "blurry"),
+        (("hat", "cap"), "[PROMPT=hat]", "", "[PROMPT=hat]", "blurry"),
+        (("blue", "red"), "close-up, [PROMPT=hat]", "", "close-up", "blurry"),
+    ],
+)
+def test_xyz_prompt_sr_saved_token_parts_on_every_comment_rule(
+    strip, sr, ad_prompt, ad_negative, saved, saved_negative
+):
+    pairs = (SimpleNamespace(s=sr[0], r=sr[1], main=False),)
+    assert _sr_saved(strip, ad_prompt, ad_negative, pairs) == (saved, saved_negative)
+
+
+def test_xyz_prompt_sr_leaves_the_tokens_of_the_class_prompts_alone():
+    from adetailer.args import ADetailerArgs
+
+    script = _xyz_record_runtime()
+    script.get_args = lambda *_args: [
+        ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt="detailed",
+            ad_class_prompts="face: hat, [PROMPT=hat] hat",
+        )
+    ]
+    p = _xyz_record_photo(("hat", "cap"))
+
+    script.process(p, True, False, {})
+
+    assert p.extra_generation_params["ADetailer class prompts"] == (
+        "face: cap, [PROMPT=hat] cap"
+    )
+
+
+@pytest.mark.parametrize(
+    ("orig", "expected"),
+    [
+        # Skip img2img runs the host pass at 128x128 and keeps the picture's
+        # own size in p._ad_orig: the header showed 128x128.
+        (SimpleNamespace(width=1216, height=832), "size=1216x832"),
+        (None, "size=128x128"),
+    ],
+)
+def test_verbose_header_shows_the_picture_size_with_skip_img2img(orig, expected):
+    printed = []
+    runtime = _load_script(
+        functions={"_verbose_gen_header", "_vfmt", "_vwrap"},
+        assigns={"_V_LINE"},
+        _ad_verbose=lambda: True,
+        _vprint=printed.append,
+        shared=SimpleNamespace(sd_model=None, opts=SimpleNamespace(data_labels={}, data={})),
+    )
+    p = SimpleNamespace(width=128, height=128, seed=777)
+    if orig is not None:
+        p._ad_orig = orig
+    runtime._verbose_gen_header(p, [])
+    assert expected in printed[0]

@@ -62,6 +62,7 @@ _AD_OVERRIDE_KEYS = (
     "sd_model_checkpoint",
     "sd_vae",
     "forge_additional_modules",
+    "upscaler_for_img2img",
 )
 
 
@@ -81,7 +82,15 @@ def pause_total_tqdm():
     # it is saved once, the detailer's modules stayed loaded, and a separate
     # VAE was sent as sd_vae, which Forge Neo fails to load.
     seeded = {}
-    for key in ("CLIP_stop_at_last_layers", "sd_vae", "forge_additional_modules"):
+    # The same for "Upscaler for img2img" (Settings > ADetailer "Upscaler for
+    # ADetailer's inpaint area"): AUTOMATIC1111's default is None, so a registered one
+    # is seeded with it too, and the chosen upscaler never outlives the pass.
+    for key in (
+        "CLIP_stop_at_last_layers",
+        "sd_vae",
+        "forge_additional_modules",
+        "upscaler_for_img2img",
+    ):
         if key in absent:
             try:
                 default = opts.get_default(key)
@@ -91,6 +100,10 @@ def pause_total_tqdm():
                 default = list(default)  # never the option's own list
             if default is not None:
                 data[key] = seeded[key] = default
+            elif key == "upscaler_for_img2img" and key in (
+                getattr(opts, "data_labels", None) or {}
+            ):
+                data[key] = seeded[key] = None
     data["multiple_tqdm"] = False
     try:
         yield
