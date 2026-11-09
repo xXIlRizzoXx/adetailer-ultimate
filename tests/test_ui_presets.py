@@ -40,7 +40,8 @@ def callbacks():
         "_do_import", "suffix", "_class_filter_infotext_fields",
         "_skipped_infotext_keys", "_tab_infotext_fields", "on_cn_model_update",
         "_do_export", "_do_export_status", "_format_preset_preview",
-        "_sync_preset_choices",
+        "_sync_preset_choices", "_model_choices", "_sync_model_choices",
+        "_added_model_update", "_md_safe",
     }
     functions = [
         node for node in ast.walk(source)
@@ -48,7 +49,9 @@ def callbacks():
         or (
             isinstance(node, (ast.Assign, ast.AnnAssign))
             and any(
-                getattr(t, "id", "") in {"_CLASS_FILTER_DEFAULTS", "_PRESET_DROPDOWNS"}
+                getattr(t, "id", "") in {
+                    "_CLASS_FILTER_DEFAULTS", "_PRESET_DROPDOWNS", "_MODEL_DROPDOWNS",
+                }
                 for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
             )
         )
@@ -1818,6 +1821,299 @@ def test_load_keeps_the_detector_when_the_preset_names_one_not_installed(
     assert restored["ad_prompt"]["value"] == "detailed eyes"
 
 
+@pytest.mark.parametrize("tab", [0, 1])
+def test_load_reads_the_detector_folders_again_for_a_detector_added_since_the_start(
+    callbacks, tab
+):
+    # A detector copied into the folder while the WebUI runs, before any 🔄:
+    # Generate, API requests and pasted parameters found it, but Load said
+    # "not installed" and left out the preset's detector and classes.
+    callbacks["get_preset"] = lambda name: {
+        "ad_model": "new.pt", "ad_model_classes": "face", "ad_prompt": "detailed",
+    }
+    mapping = {"faces.pt": "faces.pt"}
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        mapping["new.pt"] = "faces.pt"  # in place, as refresh_model_mapping
+        return list(mapping)
+
+    dropdown = type("Dropdown", (), {})()  # weakly referenced, as a component
+    dropdown.choices = ["faces.pt", "None"]
+    callbacks["_MODEL_DROPDOWNS"][:] = [weakref.ref(dropdown)]
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(2)]
+    callbacks["_wire_presets"](
+        [widgets(), widgets()], preset_widgets, [Component(), Component()],
+        Component(), 2, mapping, refresh_models=refresh,
+    )
+    status, *result = preset_widgets[tab][1].callback("saved")
+    restored = dict(zip(ALL_ARGS.attrs, result[:-1]))
+
+    assert status == "✅ Loaded 'saved'."
+    assert calls == [1]
+    # Listed in the menu (Gradio 4 shows a value that is not a choice empty).
+    names = ["faces.pt", "new.pt"]
+    assert restored["ad_model"] == {
+        "choices": [*names, "None"] if tab == 0 else ["None", *names],
+        "value": "new.pt",
+    }
+    assert restored["ad_model_classes"]["value"] == "face"
+    assert result[-1]["value"] == ["face"]
+    assert dropdown.choices == [*names, "None"]  # and after a browser reload
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_load_still_says_not_installed_when_the_folders_do_not_have_it(
+    callbacks, fails
+):
+    callbacks["get_preset"] = lambda name: {"ad_model": "eyes.pt"}
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        if fails:
+            raise OSError("no folder")
+        return ["faces.pt"]
+
+    preset_widgets = [tuple(Component() for _ in range(10))]
+    callbacks["_wire_presets"](
+        [widgets()], preset_widgets, [Component()], Component(), 1,
+        {"faces.pt": "faces.pt"}, refresh_models=refresh,
+    )
+    status, *result = preset_widgets[0][1].callback("saved")
+
+    assert "its detector 'eyes.pt' is not installed" in status
+    assert calls == [1]
+    assert dict(zip(ALL_ARGS.attrs, result[:-1]))["ad_model"] == {}
+
+
+@pytest.mark.parametrize("model", ["faces.pt", "None"])
+def test_load_does_not_read_the_folders_for_a_detector_it_knows(callbacks, model):
+    callbacks["get_preset"] = lambda name: {"ad_model": model}
+    calls = []
+    preset_widgets = [tuple(Component() for _ in range(10))]
+    callbacks["_wire_presets"](
+        [widgets()], preset_widgets, [Component()], Component(), 1,
+        {"faces.pt": "faces.pt"}, refresh_models=lambda: calls.append(1) or [],
+    )
+    status, *result = preset_widgets[0][1].callback("saved")
+
+    assert status == "✅ Loaded 'saved'."
+    assert calls == []
+    assert dict(zip(ALL_ARGS.attrs, result[:-1]))["ad_model"] == (
+        {"value": model} if model == "None"
+        else {"choices": ["faces.pt", "None"], "value": model}
+    )
+
+
+def test_a_second_load_lists_a_detector_found_since_the_start(callbacks):
+    # The first Load found new.pt and listed it in its own tab's menu; the
+    # same preset loaded in the second tab sent only the value, which Gradio 4
+    # (Forge, Forge Neo) shows empty in a menu built without it.
+    callbacks["get_preset"] = lambda name: {"ad_model": "new.pt", "ad_prompt": "x"}
+    mapping = {"faces.pt": "faces.pt"}
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        mapping["new.pt"] = "new.pt"
+        return list(mapping)
+
+    dropdown = type("Dropdown", (), {})()
+    dropdown.choices = ["faces.pt", "None"]
+    callbacks["_MODEL_DROPDOWNS"][:] = [weakref.ref(dropdown)]
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(2)]
+    callbacks["_wire_presets"](
+        [widgets(), widgets()], preset_widgets, [Component(), Component()],
+        Component(), 2, mapping, refresh_models=refresh,
+    )
+    names = ["faces.pt", "new.pt"]
+    for tab, choices in ((0, [*names, "None"]), (1, ["None", *names])):
+        status, *result = preset_widgets[tab][1].callback("saved")
+        assert status == "✅ Loaded 'saved'."
+        assert dict(zip(ALL_ARGS.attrs, result[:-1]))["ad_model"] == {
+            "choices": choices, "value": "new.pt",
+        }
+    assert calls == [1]  # the second Load knew it already
+
+
+@pytest.mark.parametrize("model", ["new.pt", "faces.pt", "None"])
+def test_load_lists_a_detector_generate_found_since_the_start(callbacks, model):
+    # Generate, an API request or a paste found new.pt (model_mapping is
+    # updated in place) before the Load: the menu still lacks it. A detector
+    # the menus were built with gets the same list; "None" only its value.
+    callbacks["get_preset"] = lambda name: {"ad_model": model}
+    mapping = {"faces.pt": "faces.pt"}
+    preset_widgets = [tuple(Component() for _ in range(10))]
+    callbacks["_wire_presets"](
+        [widgets()], preset_widgets, [Component()], Component(), 1, mapping,
+        refresh_models=lambda: list(mapping),
+    )
+    mapping["new.pt"] = "new.pt"
+    status, *result = preset_widgets[0][1].callback("saved")
+    restored = dict(zip(ALL_ARGS.attrs, result[:-1]))
+
+    assert status == "✅ Loaded 'saved'."
+    if model != "None":
+        assert restored["ad_model"] == {
+            "choices": ["faces.pt", "new.pt", "None"], "value": model,
+        }
+    else:
+        assert restored["ad_model"] == {"value": model}
+
+
+@pytest.mark.parametrize(("swap", "to_all"), [(False, False), (True, False), (False, True)])
+def test_paste_lists_a_detector_found_since_the_start(callbacks, swap, to_all):
+    # A tab whose Load (or 🔄) listed new.pt copied to another tab, whose
+    # menu was built without it: Paste, Swap and Paste into every tab list it.
+    tabs = 3
+    mapping = {"faces.pt": "faces.pt"}
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs, mapping)
+    mapping["new.pt"] = "new.pt"
+    copied = _snapshot("new.pt", "a face", True)
+    here = _snapshot("faces.pt", "a hand", False)
+    result = paste_buttons[2].callback(
+        (0, list(copied.values())), swap, to_all, *here.values()
+    )
+    names = ["faces.pt", "new.pt"]
+    for tab in (1, 2) if to_all else (2,):
+        pasted = dict(zip(ALL_ARGS.attrs, _paste_tab(result, tab, tabs, tabs)))
+        assert pasted["ad_model"] == {"choices": ["None", *names], "value": "new.pt"}
+    if swap:  # the copied tab gets this tab's detector, one it was built with
+        swapped = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 0, tabs, tabs)))
+        assert swapped["ad_model"] == {"choices": [*names, "None"], "value": "faces.pt"}
+
+
+def test_load_and_paste_list_a_startup_detector_removed_and_put_back(callbacks):
+    # back.pt was there at startup; its file was moved out and 🔄 rebuilt the
+    # menus without it, then the file was put back. The first Load read the
+    # folders and listed it in its own tab only: a second Load, or a Paste,
+    # in another tab sent only the value (the detector was in the startup
+    # list), which Gradio 4 (Forge, Forge Neo) shows empty in that menu.
+    tabs = 3
+    mapping = {"faces.pt": "faces.pt", "back.pt": "back.pt"}
+    disk = ["faces.pt"]
+
+    def refresh():
+        mapping.clear()
+        mapping.update({name: name for name in disk})
+        return list(mapping)
+
+    callbacks["get_preset"] = lambda name: {"ad_model": "back.pt"}
+    preset_widgets = [tuple(Component() for _ in range(10)) for _ in range(tabs)]
+    callbacks["_wire_presets"](
+        [widgets() for _ in range(tabs)], preset_widgets,
+        [Component() for _ in range(tabs)], Component(), tabs, mapping,
+        refresh_models=refresh,
+    )
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs, mapping)
+    refresh()  # 🔄 with the file moved out
+    disk.append("back.pt")  # and put back
+    names = ["faces.pt", "back.pt"]
+    expected = {"choices": ["None", *names], "value": "back.pt"}
+    for tab in (1, 2):  # the 1st Load reads the folders, the 2nd knows it
+        status, *result = preset_widgets[tab][1].callback("saved")
+        assert status == "✅ Loaded 'saved'."
+        assert dict(zip(ALL_ARGS.attrs, result[:-1]))["ad_model"] == expected
+
+    copied = _snapshot("back.pt", "a face", True)
+    here = _snapshot("faces.pt", "a hand", False)
+    result = paste_buttons[2].callback(
+        (1, list(copied.values())), False, False, *here.values()
+    )
+    pasted = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 2, tabs, tabs)))
+    assert pasted["ad_model"] == expected
+
+
+@pytest.mark.parametrize(("swap", "to_all"), [(False, False), (True, False), (False, True)])
+def test_paste_keeps_the_tabs_detector_when_the_copied_one_was_removed(
+    callbacks, swap, to_all
+):
+    # Copy, then the detector file is removed and 🔄 reads the folders again:
+    # the copy still names it, and Paste put it in the tab without a word, so
+    # Generate failed that tab and the ones after it. As Load does, the tab
+    # keeps its detector and class filter and the status says why.
+    tabs = 3
+    mapping = {"faces.pt": "faces.pt", "gone.pt": "gone.pt"}
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs, mapping)
+    copied = _snapshot("gone.pt", "a face", True)
+    copied["ad_model_classes"] = "face"
+    del mapping["gone.pt"]
+    here = _snapshot("faces.pt", "a hand", False)
+
+    result = paste_buttons[2].callback(
+        (0, list(copied.values())), swap, to_all, *here.values()
+    )
+
+    statuses = result[1 + tabs: 1 + 2 * tabs]
+    for tab in (1, 2) if to_all else (2,):
+        pasted = dict(zip(ALL_ARGS.attrs, _paste_tab(result, tab, tabs, tabs)))
+        assert "value" not in pasted["ad_model"]
+        assert "value" not in pasted["ad_model_classes"]
+        # The rest of the copy is pasted.
+        assert pasted["ad_prompt"] == {"value": "a face"}
+    assert "not installed" in statuses[2]
+    assert "'gone.pt'" in statuses[2]
+    if swap:  # the copied tab still gets this tab's values
+        swapped = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 0, tabs, tabs)))
+        assert swapped["ad_model"] == {"choices": ["faces.pt", "None"], "value": "faces.pt"}
+        assert swapped["ad_prompt"] == {"value": "a hand"}
+        assert statuses[0] == "\U0001F501 Swapped with the 3rd tab."
+    # The copy itself is left as it was, for the next Paste.
+    assert copied["ad_model"] == "gone.pt"
+
+
+@pytest.mark.parametrize(("model", "mapping"), [
+    ("None", {"faces.pt": "faces.pt"}),
+    ("faces.pt", {"faces.pt": "faces.pt"}),
+    # No detector list at all: nothing to check against, pasted as before.
+    ("gone.pt", {}),
+])
+def test_paste_still_pastes_an_installed_detector_or_none(callbacks, model, mapping):
+    tabs = 2
+    _, paste_buttons, _, _ = _wired_paste(callbacks, tabs, mapping)
+    copied = _snapshot(model, "a face", True)
+    here = _snapshot("faces.pt", "a hand", False)
+
+    result = paste_buttons[1].callback(
+        (0, list(copied.values())), False, False, *here.values()
+    )
+
+    pasted = dict(zip(ALL_ARGS.attrs, _paste_tab(result, 1, tabs, tabs)))
+    assert pasted["ad_model"] == (
+        {"choices": ["None", *mapping], "value": model} if model in mapping
+        else {"value": model}
+    )
+    assert "not installed" not in str(result[1 + tabs: 1 + 2 * tabs])
+
+
+def test_the_preset_load_is_given_the_folder_read():
+    # adui hands _wire_presets the same refresh as the 🔄 button.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    calls = [
+        node for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_wire_presets"
+    ]
+    assert len(calls) == 1
+    given = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
+    assert given.get("refresh_models") == "webui_info.refresh_models"
+
+
+@pytest.mark.parametrize("wire", ["_wire_copy_paste", "_wire_presets"])
+def test_paste_and_load_are_given_the_detector_list(wire):
+    # adui hands Paste settings and Load the same dict the 🔄 button updates:
+    # without it they paste a removed detector and miss one found since.
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    calls = [
+        node for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == wire
+    ]
+    assert len(calls) == 1
+    given = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
+    assert given.get("model_mapping") == "webui_info.model_mapping"
+
+
 _OVERRIDE_LISTS = {
     "checkpoint_names": ["detail [abc1234567]"],
     "vae_names": ["Automatic", "None", "detail.vae.pt"],
@@ -1949,7 +2245,10 @@ def test_load_still_sets_an_installed_detector_or_none(callbacks, model):
     status, *result = preset_widgets[0][1].callback("saved")
 
     assert status == "✅ Loaded 'saved'."
-    assert dict(zip(ALL_ARGS.attrs, result))["ad_model"] == {"value": model}
+    assert dict(zip(ALL_ARGS.attrs, result))["ad_model"] == (
+        {"value": model} if model == "None"
+        else {"choices": ["faces.pt", "None"], "value": model}
+    )
 
 
 def test_load_is_given_the_sampler_choices_a_fresh_build_shows():
@@ -2851,6 +3150,84 @@ def test_preset_preview_says_nothing_of_an_unclosed_prompt_token(callbacks, monk
     value = callbacks["_format_preset_preview"]("eyes")["value"]
     assert "close-up, [PROMPT=eyes" in value
     assert "will be expanded" not in value
+
+
+@pytest.mark.parametrize(
+    "key", ["ad_prompt", "ad_negative_prompt", "ad_model", "ad_model_classes",
+            "ad_model_classes_excluded"],
+)
+@pytest.mark.parametrize(
+    "text",
+    ["![x](https://example.com/p.gif)", "a\n![x][r]\n\n[r]: https://example.com/p.gif",
+     "<img src=https://example.com/q.gif>", "<style>body{display:none}</style>",
+     "![SEP](https://example.com/p.gif)", "[PROMPT=<img src=x>]"],
+)
+def test_preset_preview_shows_a_preset_s_markup_as_text(callbacks, monkeypatch, key, text):
+    # A preset can come from someone else's library, and Gradio's sanitizer
+    # keeps images: the browser called that server as soon as the preset was
+    # picked in the menu, before Load.
+    disk = {"eyes": {key: text}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    value = callbacks["_format_preset_preview"]("eyes")["value"]
+    assert "<" not in value and ">" not in value
+    assert "![" not in value
+
+
+def test_preset_preview_shows_the_class_of_a_class_prompt_as_text(callbacks, monkeypatch):
+    disk = {"eyes": {"ad_class_prompts": "<img src=x>:blue eyes\n![a](b):red eyes"}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    value = callbacks["_format_preset_preview"]("eyes")["value"]
+    assert "- **Class-specific prompts:** &lt;img src=x&gt;, !\\[a](b)" in value
+
+
+def test_preset_preview_shows_the_name_of_a_preset_as_text(callbacks, monkeypatch):
+    # "!", "[", "]", "(" and ")" are all allowed in a preset name.
+    disk = {"a![x](y.gif)": {"ad_model": "face_yolov8n.pt"}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    assert "![" not in callbacks["_format_preset_preview"]("a![x](y.gif)")["value"]
+    assert "![" not in callbacks["_format_preset_preview"]("b![x](y.gif)")["value"]
+
+
+def test_preset_preview_keeps_the_text_of_an_ordinary_preset(callbacks, monkeypatch):
+    disk = {"eyes": {
+        "ad_model": "face_yolov8n.pt", "ad_model_classes": "face,hand",
+        "ad_prompt": "[SEP] detailed eyes, <lora:eyes:0.8>!",
+        "ad_negative_prompt": "[PROMPT=eyes], blurry",
+    }}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    assert callbacks["_format_preset_preview"]("eyes")["value"].splitlines() == [
+        "**Preview — eyes**",
+        "- **Detector:** face_yolov8n.pt",
+        "- **Classes (include):** face,hand",
+        # Shown as typed (the preview dropped the LoRA's angle brackets).
+        "- **Prompt:** `[SEP]` detailed eyes, &lt;lora:eyes:0.8&gt;!",
+        "- **Negative:** `[PROMPT=eyes]`, blurry",
+        "- _`[SEP]` / `[PROMPT]` tokens will be expanded against the main prompt"
+        " at generation time._",
+    ]
+
+
+def test_preset_preview_shows_a_token_with_a_lora_as_typed(callbacks, monkeypatch):
+    # Between backticks the escaped < and > would show as "&lt;" and "&gt;".
+    disk = {"eyes": {"ad_prompt": "[PROMPT=<lora:eyes:1>], [PROMPT=hair]"}}
+    monkeypatch.setattr("adetailer.presets.get_preset", lambda name: disk.get(name, {}))
+    value = callbacks["_format_preset_preview"]("eyes")["value"]
+    assert "- **Prompt:** [PROMPT=&lt;lora:eyes:1&gt;], `[PROMPT=hair]`\n" in value
+    assert "tokens will be expanded" in value
+
+
+def test_load_status_shows_a_preset_s_markup_as_text(callbacks):
+    # The status under the preset is Markdown too, and names what the WebUI
+    # does not have: the detector, the sampler, the checkpoint.
+    status, _ = _load_with_lists(callbacks, {
+        "ad_model": "<img src=https://example.com/q.gif>",
+        "ad_use_sampler": True, "ad_sampler": "![s](https://example.com/s.gif)",
+        "ad_checkpoint": "![c](https://example.com/c.gif)",
+    })
+    assert "detector '&lt;img src=https://example.com/q.gif&gt;' is not installed" in status
+    assert "sampler '!\\[s](https://example.com/s.gif)'" in status
+    assert "checkpoint '!\\[c](https://example.com/c.gif)'" in status
+    assert "<" not in status and ">" not in status and "![" not in status
 
 
 def test_guide_says_which_loras_the_prompt_token_brings():

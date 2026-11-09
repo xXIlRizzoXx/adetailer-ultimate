@@ -358,6 +358,17 @@ def build_guide_blocks():
     return blocks
 
 
+def _md_safe(text: str) -> str:
+    """A value of a preset, shown as plain text in a gr.Markdown.
+
+    A preset can come from someone else's library, and Gradio's sanitizer
+    keeps images: `<img src=...>` or `![](...)` would make the browser call
+    that server as soon as the preset is picked. A link needs a click, so it
+    stays as it is.
+    """
+    return text.replace("<", "&lt;").replace(">", "&gt;").replace("![", "!\\[")
+
+
 def _format_preset_preview(name: str | None):
     """Build a compact markdown summary of a preset's contents for the
     live preview area below the preset dropdown.
@@ -384,7 +395,7 @@ def _format_preset_preview(name: str | None):
     data = get_preset(name)
     if not data:
         return gr.update(
-            value=f"_(preset '{name}' not found on disk)_", visible=True
+            value=f"_(preset '{_md_safe(name)}' not found on disk)_", visible=True
         )
 
     def _trunc(s: str, n: int = 140) -> str:
@@ -394,24 +405,26 @@ def _format_preset_preview(name: str | None):
     def _flag_tokens(s: str) -> str:
         # Wrap [SEP]/[PROMPT]/[PROMPT=words] in backticks so they're visually
         # distinct — note to the user that these are placeholders, not literals.
+        # A token with an escaped < or > stays plain: a code span would show
+        # the escape.
         import re
 
         return re.sub(
-            r"\[PROMPT=[^\]`]*\]",
+            r"\[PROMPT=[^\]`&]*\]",
             lambda m: f"`{m.group(0)}`",
             (s or "")
             .replace("[SEP]", "`[SEP]`")
             .replace("[PROMPT]", "`[PROMPT]`"),
         )
 
-    pos = _flag_tokens(_trunc(data.get("ad_prompt", "")))
-    neg = _flag_tokens(_trunc(data.get("ad_negative_prompt", "")))
-    model = (data.get("ad_model") or "").strip() or "_(not set)_"
-    classes = (data.get("ad_model_classes") or "").strip()
-    excluded = (data.get("ad_model_classes_excluded") or "").strip()
+    pos = _flag_tokens(_md_safe(_trunc(data.get("ad_prompt", ""))))
+    neg = _flag_tokens(_md_safe(_trunc(data.get("ad_negative_prompt", ""))))
+    model = _md_safe((data.get("ad_model") or "").strip()) or "_(not set)_"
+    classes = _md_safe((data.get("ad_model_classes") or "").strip())
+    excluded = _md_safe((data.get("ad_model_classes_excluded") or "").strip())
     seq = bool(data.get("ad_classes_sequential", False))
 
-    lines: list[str] = [f"**Preview — {name}**"]
+    lines: list[str] = [f"**Preview — {_md_safe(name)}**"]
     lines.append(f"- **Detector:** {model}")
     if classes:
         lines.append(f"- **Classes (include):** {classes}")
@@ -427,7 +440,7 @@ def _format_preset_preview(name: str | None):
     class_prompts = (data.get("ad_class_prompts") or "").strip()
     if class_prompts:
         first_classes = [
-            line.split(":", 1)[0].strip()
+            _md_safe(line.split(":", 1)[0].strip())
             for line in class_prompts.splitlines()
             if ":" in line
         ][:5]
@@ -696,6 +709,21 @@ _CLASS_FILTER_DEFAULTS = {
 }
 
 
+class _BoolInfotextKey(str):
+    """The infotext key of a checkbox that is also an input of the script.
+
+    The WebUI's API turns the text of such a field into the checkbox's type
+    with bool(), and bool("False") is True. Called with the parameters, like
+    a paste field that is a function, it gives a real bool, or None when the
+    key is missing. It stays a str: "Disregard fields from pasted infotext"
+    lists only the keys that are strings.
+    """
+
+    def __call__(self, params: dict[str, Any]) -> bool | None:
+        value = params.get(str(self))
+        return None if value is None else str(value).strip() == "True"
+
+
 def _skipped_infotext_keys() -> set[str]:
     """Keys the user asked the WebUI to disregard when pasting infotext.
 
@@ -895,7 +923,9 @@ def adui(
             )
 
         infotext_fields.append((ad_enable, "ADetailer enable"))
-        infotext_fields.append((ad_skip_img2img, "ADetailer skip img2img"))
+        infotext_fields.append(
+            (ad_skip_img2img, _BoolInfotextKey("ADetailer skip img2img"))
+        )
 
         # Shared clipboard for per-tab copy/paste. Tuple of (source_tab_idx,
         # list_of_values_in_copyable_attrs_order). source_tab_idx == -1 means
@@ -971,6 +1001,8 @@ def adui(
             vae_names=webui_info.vae_list,
             text_encoder_names=webui_info.text_encoders_list,
             cn_model_names=_cn_models,
+            # Load finds a detector added since the start, as Generate does.
+            refresh_models=webui_info.refresh_models,
         )
         # Cross-tab Detection-preview wiring (also a post-loop "second pass"):
         # lets each tab's "Combine all tabs" checkbox run every tab's detector.
@@ -1906,6 +1938,22 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             # path takes priority over the single dropped image.
             folder = (folder or "").strip().strip('"').strip("'")
             if folder:
+                # A WebUI started with --hide-ui-dir-config (a shared one) blocks
+                # its own folder batches. Do the same, before touching the path,
+                # so the answer doesn't tell whether a folder exists either.
+                try:
+                    from modules import shared as _sh
+
+                    hide_dirs = getattr(
+                        getattr(_sh, "cmd_opts", None), "hide_ui_dir_config", False
+                    )
+                except Exception:  # noqa: BLE001 — no host flag: nothing to respect
+                    hide_dirs = False
+                if hide_dirs:
+                    return (
+                        None,
+                        "⚠️ Folder batch is disabled: the WebUI was started with --hide-ui-dir-config.",
+                    )
                 return _run_folder(folder, same_folder, *flat)
             img, status = _run(image, False, True, save, *flat)
             return ([img] if img is not None else None), status
@@ -2016,6 +2064,21 @@ def _sync_model_choices(dropdowns: list, names: list[str]) -> None:
             pass
 
 
+def _added_model_update(update, model, n: int, model_mapping) -> Any:
+    # A detector found since the menus were built (🔄, Load, Generate, an API
+    # request, a paste), or removed by a 🔄 and put back, may not be one of
+    # this menu's choices: list the detectors, as 🔄 does, or Gradio 4 shows
+    # a value that is not a choice empty.
+    if (
+        model_mapping
+        and isinstance(model, str)
+        and model != "None"
+        and model in model_mapping
+    ):
+        return gr.update(choices=_model_choices(list(model_mapping), n), value=model)
+    return update
+
+
 def _wire_model_refresh(all_widgets, webui_info, num_models):
     """The 🔄 button next to each tab's detector menu: read the detector
     folders again and update the menu of every tab.
@@ -2026,6 +2089,12 @@ def _wire_model_refresh(all_widgets, webui_info, num_models):
     """
     dropdowns = [w.ad_model for w in all_widgets[:num_models]]
 
+    def one_per_output(updates):
+        # With "Max tabs" at 1 there is one output, and Gradio wraps what it
+        # gets in a list by itself: a list here would reach the menu as its
+        # value.
+        return updates[0] if len(updates) == 1 else updates
+
     def refresh(*current):
         try:
             if callable(webui_info.refresh_models):
@@ -2033,7 +2102,7 @@ def _wire_model_refresh(all_widgets, webui_info, num_models):
             else:
                 names = list(webui_info.model_mapping)
         except Exception:  # noqa: BLE001 — keep the menus as they are
-            return [gr.update() for _ in current]
+            return one_per_output([gr.update() for _ in current])
         live = [ref() for ref in list(_MODEL_DROPDOWNS)]
         _sync_model_choices([dd for dd in live if dd is not None], names)
         updates = []
@@ -2041,7 +2110,7 @@ def _wire_model_refresh(all_widgets, webui_info, num_models):
             choices = _model_choices(names, n)
             keep = value if value in choices else choices[0]
             updates.append(gr.update(choices=choices, value=keep))
-        return updates
+        return one_per_output(updates)
 
     for w in all_widgets[:num_models]:
         w.ad_model_refresh.click(
@@ -2175,6 +2244,44 @@ def _wire_copy_paste(
                                     )
                     else:
                         targets = {idx: copied}
+                # A detector removed since the Copy (🔄 no longer lists it)
+                # would fail the pass: as Load does, the tab keeps its
+                # detector and class filter. A copy for each tab: "Paste into
+                # every tab" gives them all the same dict.
+                for i, state in list(targets.items()):
+                    model = state.get("ad_model")
+                    if (
+                        model_mapping
+                        and "ad_model" in state
+                        and (
+                            not isinstance(model, str)
+                            or (model != "None" and model not in model_mapping)
+                        )
+                    ):
+                        targets[i] = {
+                            k: v for k, v in state.items()
+                            if k not in ("ad_model", *_CLASS_FILTER_DEFAULTS)
+                        }
+                        if not status_updates:
+                            continue
+                        if swap:
+                            other = source_idx if i == idx else idx
+                            status_updates[i] = (
+                                f"⚠️ Swapped with the {ordinal(other + 1)} tab, "
+                                f"but the detector '{model}' is not installed: "
+                                "this tab keeps its detector and classes."
+                            )
+                        elif to_all:
+                            status_updates[idx] = (
+                                "⚠️ Pasted into every tab, but the detector "
+                                f"'{model}' is not installed: the tabs keep "
+                                "their detector and classes."
+                            )
+                        else:
+                            status_updates[idx] = (
+                                f"⚠️ Pasted, but the detector '{model}' is not "
+                                "installed: the tab keeps its detector and classes."
+                            )
                 # Flattened tab-major to match all_widget_refs. Built
                 # separately for each tab: Gradio 4 pops "value" out of an
                 # update dict in place, so shared dicts would reach only the
@@ -2186,6 +2293,14 @@ def _wire_copy_paste(
                         restored = _restored_tab_updates(
                             targets[i], attrs, model_mapping
                         )
+                        if "ad_model" in attrs:
+                            k = attrs.index("ad_model")
+                            restored[k] = _added_model_update(
+                                restored[k],
+                                targets[i].get("ad_model"),
+                                i,
+                                model_mapping,
+                            )
                         widget_updates.extend(restored[:-1])
                         dropdown_updates.append(restored[-1])
                     else:
@@ -2234,6 +2349,7 @@ def _wire_presets(
     text_encoder_names: list[str] | None = None,
     cn_model_names: list[str] | None = None,
     scheduler_endings: list[list[str | None]] | None = None,
+    refresh_models: Any = None,
 ) -> None:
     """Wire each tab's preset Load/Save/Delete/Rename/Reset buttons.
 
@@ -2466,6 +2582,23 @@ def _wire_presets(
                 # Export/Import, a model deleted or renamed) would fail the
                 # pass: the tab keeps its detector and class filter instead.
                 _model = state.get("ad_model")
+                # A detector added while the WebUI runs: read the detector
+                # folders again first, as Generate does (model_mapping is
+                # updated in place).
+                _names = None
+                if (
+                    model_mapping
+                    and isinstance(_model, str)
+                    and _model != "None"
+                    and _model not in model_mapping
+                    and callable(refresh_models)
+                ):
+                    try:
+                        _names = list(refresh_models())
+                    except Exception:  # noqa: BLE001 — never cost Load its result
+                        _names = None
+                    if _model not in model_mapping:
+                        _names = None
                 if model_mapping and (
                     not isinstance(_model, str)
                     or (_model != "None" and _model not in model_mapping)
@@ -2492,10 +2625,24 @@ def _wire_presets(
                         if status.startswith("⚠️")
                         else f"⚠️ Loaded '{selected}', but this WebUI {_note}"
                     )
-                return [
-                    status,
-                    *_restored_tab_updates(state, attrs, model_mapping),
-                ]
+                updates = _restored_tab_updates(state, attrs, model_mapping)
+                if _names is not None:
+                    # Its menu lists the detectors read now, as after 🔄 (on
+                    # Gradio 4 a value that is not a choice shows empty).
+                    live = [ref() for ref in list(_MODEL_DROPDOWNS)]
+                    _sync_model_choices([dd for dd in live if dd is not None], _names)
+                    updates[attrs.index("ad_model")] = gr.update(
+                        choices=_model_choices(_names, idx), value=_model
+                    )
+                else:
+                    updates[attrs.index("ad_model")] = _added_model_update(
+                        updates[attrs.index("ad_model")],
+                        state.get("ad_model"),
+                        idx,
+                        model_mapping,
+                    )
+                # It names what the preset says: a value of the preset.
+                return [_md_safe(status), *updates]
 
             return _load
 

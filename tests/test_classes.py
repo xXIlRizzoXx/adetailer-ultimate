@@ -224,7 +224,7 @@ def test_the_readme_says_only_automatic1111_waits_for_the_first_detection():
     assert hosts[-1] == "AUTOMATIC1111", hosts
     after = paragraph[paragraph.index("after its first detection"):]
     assert "in plus.8" in after.split(",", 1)[0]
-    assert "from plus.9 beta 1 it lists them straight away" in after
+    assert "from plus.9, it lists them straight away" in after
 
 
 def test_sidecar_added_after_names_were_found_waits_for_a_restart(
@@ -288,6 +288,23 @@ def test_undecodable_sidecar_falls_through_to_the_next_one(tmp_path, monkeypatch
     _fake_ultralytics(monkeypatch, _unreadable)
 
     assert get_model_class_names(str(pt)) == ["face", "hand"]
+
+
+def test_names_json_wins_over_a_valid_older_json(tmp_path, monkeypatch):
+    # The older <model>.json works alone; a <model>.names.json added next to it
+    # is the one read after the refresh button, which clears the names found.
+    pt = tmp_path / "x.pt"
+    pt.write_bytes(b"x")
+    (tmp_path / "x.json").write_bytes(b'["face","hand"]')
+    fake = _fake_ultralytics(monkeypatch, _unreadable)
+
+    assert get_model_class_names(str(pt)) == ["face", "hand"]
+
+    (tmp_path / "x.names.json").write_bytes(b'["eyes","mouth"]')
+    get_model_class_names.cache_clear()
+    assert get_model_class_names(str(pt)) == ["eyes", "mouth"]
+    assert resolve_class_ids(str(pt), ["mouth"]) == [1]
+    assert len(fake.calls) == 0
 
 
 def test_undecodable_legacy_json_does_not_raise(tmp_path, monkeypatch):
@@ -384,9 +401,12 @@ def _fake_checkpoint(path, monkeypatch, *, names, ema=False, old_format=False):
     """Write a .pt laid out like torch.save's zip: <dir>/data.pkl, the weights
     in <dir>/data/<n> (referenced by persistent id), and a version entry. The
     pickle names a model class of a module only present while it is written,
-    a tensor rebuild function, and a function that must never run."""
+    a tensor rebuild function, and a function that must never run. Like a
+    real nn.Module the model holds an OrderedDict, which the pickle fills
+    item by item (SETITEMS) on whatever stands for that class."""
     import pickle
     import zipfile
+    from collections import OrderedDict
 
     tasks = ModuleType("ultralytics.nn.tasks")
     rebuild = ModuleType("torch_like._utils")
@@ -428,6 +448,7 @@ def _fake_checkpoint(path, monkeypatch, *, names, ema=False, old_format=False):
         m.__dict__.update({
             "training": False,
             "_parameters": {"w": Tensor(n)},
+            "_modules": OrderedDict([("0", Tensor(n))]),
             "names": names,
             "yaml": {"nc": len(names) if names else 0},
             "hook": Hook(),
@@ -548,6 +569,68 @@ def test_checkpoint_without_usable_names_gives_none(tmp_path, monkeypatch, case)
     assert get_model_class_names(str(pt)) == []
     assert fake.calls == []
     assert _RAN == []
+
+
+def _checkpoint_with_pickle(path, stream):
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("x/data.pkl", stream)
+
+
+@pytest.mark.parametrize(
+    "put",
+    [b"r" + (1 << 22).to_bytes(4, "little"), b"p%d\n" % (1 << 22)],
+    ids=["LONG_BINPUT", "PUT"],
+)
+def test_memo_index_of_a_checkpoint_asks_for_no_memory(tmp_path, monkeypatch, put):
+    # The Unpickler grows its memo table to the index it is handed (16 bytes
+    # each), whatever the size of the stream: a 9-byte pickle, within the size
+    # limit, could ask for tens of GB as soon as the detector was picked.
+    import tracemalloc
+
+    pt = tmp_path / "memo.pt"
+    _checkpoint_with_pickle(pt, b"\x80\x02N" + put + b".")
+    _fake_host(monkeypatch)
+    fake = _fake_ultralytics(monkeypatch, _unreadable)
+
+    tracemalloc.start()
+    try:
+        assert get_model_class_names(str(pt)) == []
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 16 * 1024 * 1024  # 67 MB without the check, at this index
+    assert fake.calls == []
+
+
+def test_checkpoint_with_a_large_memo_keeps_its_names(tmp_path, monkeypatch):
+    # Past 255 entries a real pickle writes LONG_BINPUT too, and a name may
+    # hold the byte of that opcode: only the opcodes themselves are read.
+    names = {i: f"r\xff\uffff{i}" for i in range(300)}
+    pt = tmp_path / "many.pt"
+    _fake_checkpoint(pt, monkeypatch, names=names)
+    _fake_host(monkeypatch)
+    fake = _fake_ultralytics(monkeypatch, _unreadable)
+
+    assert get_model_class_names(str(pt)) == list(names.values())
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [b"", b"\x80\x02", b"\x80\x02X\xff\xff\xff\x7fabc.", b"\x80\x02\xff."],
+    ids=["empty", "no-stop", "length-past-the-end", "unknown-opcode"],
+)
+def test_checkpoint_with_a_broken_pickle_gives_none(tmp_path, monkeypatch, stream):
+    pt = tmp_path / "broken.pt"
+    _checkpoint_with_pickle(pt, stream)
+    _fake_host(monkeypatch)
+    fake = _fake_ultralytics(monkeypatch, _unreadable)
+
+    assert get_model_class_names(str(pt)) == []
+    assert fake.calls == []
 
 
 def test_ui_still_loads_the_pt_where_the_webui_allows_it(tmp_path, monkeypatch):

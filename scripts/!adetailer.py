@@ -164,6 +164,13 @@ model_mapping = get_models(
     *extra_models_dirs.split("|"),
     huggingface=not no_huggingface,
 )
+# Reload UI runs this file again but keeps the adetailer package: drop the
+# class names read before, as the 🔄 does, for a detector replaced by a file
+# of the same name.
+try:
+    get_model_class_names.cache_clear()
+except Exception:  # noqa: BLE001
+    pass
 
 txt2img_submit_button = img2img_submit_button = None
 txt2img_submit_button = cast(gr.Button, txt2img_submit_button)
@@ -276,7 +283,9 @@ def _without_style_loras(tags: list[str], p) -> list[str]:
     if not tags or not styles:
         return tags
     try:
-        added = _extract_lora_tags(shared.prompt_styles.apply_styles_to_prompt("", styles))
+        added = _extract_lora_tags(
+            _strip_host_comments(shared.prompt_styles.apply_styles_to_prompt("", styles))
+        )
     except Exception:  # noqa: BLE001 — every tag is kept, as before
         return tags
     tags = list(tags)
@@ -291,8 +300,9 @@ def _strip_host_comments(text: str) -> str:
 
     That script (modules/processing_scripts/comments.py) removes prompt
     comments from the main prompts after the styles are applied. Found like
-    xyz_grid, never imported again; without it, or with its option off, the
-    text is returned unchanged.
+    xyz_grid, never imported again; without it (and without the module
+    Forge strips them with), or with its option off, the text is returned
+    unchanged.
     """
     try:
         if not opts.data.get("enable_prompt_comments", True):
@@ -302,6 +312,12 @@ def _strip_host_comments(text: str) -> str:
                 strip = getattr(script.module, "strip_comments", None)
                 if callable(strip):
                     return strip(text)
+        # lllyasviel Forge has no such script: its styles code strips the
+        # comments of every pass with this module, already imported there.
+        module = sys.modules.get("modules.processing_scripts.comments")
+        strip = getattr(module, "strip_comments", None)
+        if callable(strip):
+            return strip(text)
     except Exception:  # noqa: BLE001 - a different host: leave the text
         pass
     return text
@@ -653,8 +669,9 @@ def _drop_empty_tokens(text: str) -> str:
 
 def _empty_prompt_note(ad_prompt: str, prompts: list[str], n: int) -> str:
     """The console line for tab `n` when a part of its prompt came out empty
-    because its [PROMPT=words] tokens matched nothing; "" otherwise."""
-    raw = re.split(r"\s*\[SEP\]\s*", ad_prompt or "")
+    because its [PROMPT=words] tokens matched nothing; "" otherwise. The
+    parts are those of the pass: split once the prompt comments are gone."""
+    raw = re.split(r"\s*\[SEP\]\s*", _strip_host_comments(ad_prompt or ""))
     for k, out in enumerate(prompts):
         if k >= len(raw) or (out or "").strip():
             continue
@@ -1297,12 +1314,33 @@ class AfterDetailerScript(scripts.Script):
             message = f"[-] ADetailer: Invalid arguments passed to ADetailer: {args_!r}"
             raise ValueError(message)
 
+        # "Use separate sampler" covers the sampler and the scheduler: when an
+        # axis ticks it on a tab that had it off, the half the axes do not
+        # set stays the main generation's, not the one left in the tab.
+        def merged(tab, values):
+            if values.get("ad_use_sampler") and not tab.get("ad_use_sampler"):
+                same = {"ad_sampler": "Use same sampler", "ad_scheduler": "Use same scheduler"}
+                values = {**same, **values}
+            merged_tab = {**tab, **values}
+            # A ControlNet model axis on a tab whose model is "None" or
+            # "Passthrough": its hidden preprocessor holds "None", not a
+            # choice. Left out, the backend picks the model's default (Forge
+            # ran the cell without a preprocessor), as for a request.
+            if (
+                "ad_controlnet_model" in values
+                and "ad_controlnet_module" not in values
+                and tab.get("ad_controlnet_model") in ("None", "Passthrough")
+                and tab.get("ad_controlnet_module") == "None"
+            ):
+                merged_tab.pop("ad_controlnet_module", None)
+            return merged_tab
+
         if hasattr(p, "_ad_xyz"):
-            args[0] = {**args[0], **p._ad_xyz}
+            args[0] = merged(args[0], p._ad_xyz)
         # The axes of the 2nd tab on; a tab this run does not have is skipped.
         for n, values in getattr(p, "_ad_xyz_tabs", {}).items():
             if n < len(args):
-                args[n] = {**args[n], **values}
+                args[n] = merged(args[n], values)
 
         all_inputs: list[ADetailerArgs] = []
 
@@ -1549,8 +1587,13 @@ class AfterDetailerScript(scripts.Script):
                         else db.apply_styles_to_prompt
                     )
                     styled = self.prompt_blank_replacement(all_prompts, i, typed)
-                    if apply(typed, styles) == styled:
-                        return [typed]
+                    # Without comments too: the WebUI removes them from the
+                    # styled text, also those of a style and a style's text
+                    # that lands on the line of a comment of the prompt.
+                    applied = apply(typed, styles)
+                    if styled in (applied, _strip_host_comments(applied)):
+                        # Forge's styles strip the comments themselves.
+                        return [_strip_host_comments(typed)]
                     # The WebUI removed the prompt comments after styling: take
                     # the text without them (by default the detailer pass runs
                     # without the Comments script, so nothing strips them).
@@ -1669,7 +1712,8 @@ class AfterDetailerScript(scripts.Script):
         # chosen one instead. The host puts its own back at the end of
         # process_images (pause_total_tqdm also drops the default it seeded),
         # so _paste_region_back (no script runner:
-        # "Run ADetailer on an image") uses the host's own.
+        # "Run ADetailer on an image") uses the host's own; a Forge ControlNet
+        # tab gets a runner there, so the host's overlay uses the chosen one.
         upscaler = (getattr(opts, "data", None) or {}).get("ad_crop_upscaler")
         if (
             isinstance(upscaler, str)
@@ -1982,20 +2026,6 @@ class AfterDetailerScript(scripts.Script):
         i2i.cached_c = [None, None]
         i2i.cached_uc = [None, None]
         i2i.scripts, i2i.script_args = self.script_filter(p, args)
-        # "Inpaint only masked" gets the whole picture back only through the
-        # host's "Overlay original for inpaint" option: with it off the host
-        # returns the bare crop, which then replaced the image. Setting the
-        # option for the pass (override_settings) left it on in the settings
-        # the WebUI saved meanwhile, and stopped ADetailer with frozen
-        # settings: give the pass the host's overlay instead, as the option
-        # does. Only a host that has the option (AUTOMATIC1111 1.8 and
-        # later, Forge Neo) leaves the overlay out.
-        if (
-            args.ad_inpaint_only_masked
-            and "overlay_inpaint" in getattr(opts, "data_labels", {})
-            and not opts.data.get("overlay_inpaint", True)
-        ):
-            i2i._ad_paste_back = not _keep_host_overlay(i2i.scripts)
         # Assigning script_args runs the scripts' setup, and the host's
         # built-in Sampler script (kept when "Apply only selected scripts" is
         # off) copies the main steps, sampler and scheduler onto the pass:
@@ -2014,6 +2044,23 @@ class AfterDetailerScript(scripts.Script):
             self.update_controlnet_args(i2i, args)
         elif args.ad_controlnet_model == "None":
             i2i.control_net_enabled = False
+
+        # "Inpaint only masked" gets the whole picture back only through the
+        # host's "Overlay original for inpaint" option: with it off the host
+        # returns the bare crop, which then replaced the image. Setting the
+        # option for the pass (override_settings) left it on in the settings
+        # the WebUI saved meanwhile, and stopped ADetailer with frozen
+        # settings: give the pass the host's overlay instead, as the option
+        # does. Only a host that has the option (AUTOMATIC1111 1.8 and
+        # later, Forge Neo) leaves the overlay out. After ControlNet: on
+        # Forge, Forge Neo and reForge its backend gives the pass a new
+        # script runner.
+        if (
+            args.ad_inpaint_only_masked
+            and "overlay_inpaint" in getattr(opts, "data_labels", {})
+            and not opts.data.get("overlay_inpaint", True)
+        ):
+            i2i._ad_paste_back = not _keep_host_overlay(i2i.scripts)
 
         return i2i
 
@@ -2680,7 +2727,7 @@ class AfterDetailerScript(scripts.Script):
         inverted: bool = False,
         p=None,
         args: ADetailerArgs | None = None,
-    ) -> None:
+    ) -> str | None:
         """Resolve inline ``[CLASS=name]...[/CLASS]`` blocks in mask ``j``'s
         prompt against the class the detector found on that mask.
 
@@ -2695,7 +2742,9 @@ class AfterDetailerScript(scripts.Script):
         classes it holds, and is skipped only when every one of them is.
         Given the generation ``p`` and the tab's ``args``, a region the blocks
         leave with no text of its own gets the main prompt, as a blank prompt
-        does, instead of an empty one.
+        does, instead of an empty one. A region its own block leaves with an
+        empty prompt gives back that block as typed (for the console note of
+        a [PROMPT=words] token that matched nothing); None otherwise.
         """
         try:
             cn = getattr(pred, "class_names", None)
@@ -2780,6 +2829,7 @@ class AfterDetailerScript(scripts.Script):
             if args is None:
                 return
             blank = None
+            typed_own = None
             for field, attr, k in (
                 ("ad_prompt", "prompt", 0),
                 ("ad_negative_prompt", "negative_prompt", 1),
@@ -2792,14 +2842,19 @@ class AfterDetailerScript(scripts.Script):
                     continue
                 own = _resolve_inline_class_prompt(raw, cls)
                 if re.sub(r"\[SKIP\]|[\s,]", "", own, flags=re.IGNORECASE):
+                    if k == 0:
+                        typed_own = own
                     continue
                 if blank is None:
                     blank = self.get_prompt(
                         p, args.copy(update={"ad_prompt": "", "ad_negative_prompt": ""})
                     )
                 setattr(p2, attr, blank[k][0])
+            if typed_own and not (p2.prompt or "").strip():
+                return typed_own
         except Exception:  # noqa: BLE001
-            return
+            return None
+        return None
 
     def _apply_auto_class_guard(
         self,
@@ -3375,15 +3430,20 @@ class AfterDetailerScript(scripts.Script):
         ad_prompts, ad_negatives = self.get_prompt(p, args)
         # A [PROMPT=words] token that left the whole prompt empty: said
         # once per tab and generation, also without the verbose log.
-        note = _empty_prompt_note(getattr(args, "ad_prompt", ""), ad_prompts, n)
-        if note:
-            noted = getattr(p, "_ad_empty_prompt_noted", None)
-            if not isinstance(noted, set):
-                noted = set()
-                p._ad_empty_prompt_noted = noted
-            if n not in noted:
-                noted.add(n)
-                print(note)
+        # The same for a region its own [CLASS=...] block leaves empty, below.
+        def say_empty(note: str) -> None:
+            if note:
+                noted = getattr(p, "_ad_empty_prompt_noted", None)
+                if not isinstance(noted, set):
+                    noted = set()
+                    p._ad_empty_prompt_noted = noted
+                if n not in noted:
+                    noted.add(n)
+                    # sys.stdout, not the rich print: a token can hold a
+                    # "[" that rich would read as markup.
+                    sys.stdout.write(note + "\n")
+
+        say_empty(_empty_prompt_note(getattr(args, "ad_prompt", ""), ad_prompts, n))
 
         is_mediapipe = args.is_mediapipe()
 
@@ -3517,6 +3577,16 @@ class AfterDetailerScript(scripts.Script):
         except Exception:  # noqa: BLE001
             region_opacity = 100
         region_opacity = min(max(region_opacity, 0), 100)
+        # process_images(p2) gives the WebUI's prompt hijack a new dict with
+        # only this pass's "TI hashes"; the next batch of a same-prompt
+        # generation reuses its cached conds and copies that dict into the
+        # main parameters. Put the main pass's dict back after each region
+        # (AUTOMATIC1111, reForge; nothing to do where there is none).
+        _hijack = getattr(sys.modules.get("modules.sd_hijack"), "model_hijack", None)
+        _hijack_params = getattr(_hijack, "extra_generation_params", None)
+        # Forge and Forge Neo keep that dict, with "TI" and "Emphasis", on the model.
+        _model = getattr(shared, "sd_model", None)
+        _model_params = getattr(_model, "extra_generation_params", None)
         p2 = copy(i2i)
         for j in range(steps):
             # The host resets Skip when process_images starts another batch.
@@ -3543,7 +3613,7 @@ class AfterDetailerScript(scripts.Script):
             # Resolve inline [CLASS=name]…[/CLASS] blocks against this mask's
             # detected class BEFORE the [SKIP] check, so `[CLASS=hand] [SKIP]
             # [/CLASS]` skips only hand regions.
-            self._apply_inline_class_prompts(
+            own_block = self._apply_inline_class_prompts(
                 p2,
                 pred,
                 j,
@@ -3552,6 +3622,8 @@ class AfterDetailerScript(scripts.Script):
                 p,
                 args,
             )
+            if isinstance(own_block, str):
+                say_empty(_empty_prompt_note(own_block, [""], n))
 
             if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
                 if _v:
@@ -3565,20 +3637,37 @@ class AfterDetailerScript(scripts.Script):
             self.fix_p2(p, p2, pp, args, pred, j)
 
             # The host adds the selected styles after Strip LoRAs, a style's
-            # <lora:...> included: apply them here instead, where the host
-            # would, and strip them too. From i2i: p2 is reused after a NaN.
+            # <lora:...> included, and by default the pass runs without the
+            # Comments script, which would remove a comment written in a
+            # style: apply them here instead, where the host would, and strip
+            # those too. From i2i: p2 is reused after a NaN.
             ad_styles = getattr(i2i, "styles", None) or []
-            if ad_styles and getattr(args, "ad_strip_loras", False):
+            if ad_styles:
                 p2.styles = ad_styles
                 try:
                     db = shared.prompt_styles
-                    styled = db.apply_styles_to_prompt(p2.prompt, ad_styles)
-                    styled_neg = db.apply_negative_styles_to_prompt(
-                        p2.negative_prompt, ad_styles
+                    strip_loras = getattr(args, "ad_strip_loras", False)
+                    commented = any(
+                        _strip_host_comments(text) != text
+                        for text in (
+                            db.apply_styles_to_prompt("", ad_styles),
+                            db.apply_negative_styles_to_prompt("", ad_styles),
+                        )
                     )
-                    p2.prompt = _strip_lora_tags(styled)
-                    p2.negative_prompt = _strip_lora_tags(styled_neg)
-                    p2.styles = []
+                    if strip_loras or commented:
+                        styled = db.apply_styles_to_prompt(p2.prompt, ad_styles)
+                        styled_neg = db.apply_negative_styles_to_prompt(
+                            p2.negative_prompt, ad_styles
+                        )
+                        if commented:
+                            styled = _strip_host_comments(styled)
+                            styled_neg = _strip_host_comments(styled_neg)
+                        if strip_loras:
+                            styled = _strip_lora_tags(styled)
+                            styled_neg = _strip_lora_tags(styled_neg)
+                        p2.prompt = styled
+                        p2.negative_prompt = styled_neg
+                        p2.styles = []
                 except Exception:  # noqa: BLE001 — the host applies them, as before
                     pass
 
@@ -3684,6 +3773,16 @@ class AfterDetailerScript(scripts.Script):
                 break
             finally:
                 p2.close()
+                if isinstance(_hijack_params, dict):
+                    try:
+                        _hijack.extra_generation_params = _hijack_params
+                    except Exception:  # noqa: BLE001
+                        pass
+                if isinstance(_model_params, dict):
+                    try:
+                        _model.extra_generation_params = _model_params
+                    except Exception:  # noqa: BLE001
+                        pass
 
             if _v:
                 _reg["inp_ms"] = (time.perf_counter() - _t_inp) * 1000
@@ -3826,8 +3925,21 @@ class AfterDetailerScript(scripts.Script):
 
         if need_call_postprocess(p):
             dummy = Processed(p, [], p.seed, "")
+            # Its own list: on Forge the default one is shared by all results
+            # and lives as long as the WebUI. AUTOMATIC1111 has none.
+            if isinstance(getattr(dummy, "extra_images", None), list):
+                dummy.extra_images = []
             with preserve_prompts(p):
                 p.scripts.postprocess(copy(p), dummy)
+            # A script that hands over its pictures only once (Forge Neo's
+            # PiD) has just given them to the stand-in: postprocess() passes
+            # them on to the real result, with their parameters.
+            handed_over = getattr(dummy, "extra_images", None)
+            if isinstance(handed_over, list) and handed_over:
+                kept = getattr(p, "_ad_script_extras", None) or ([], [])
+                kept[0].extend(handed_over)
+                kept[1].extend(getattr(dummy, "infotexts", None) or [])
+                p._ad_script_extras = kept
 
         # A tab that raises (a missing model, out of memory) must still
         # restart the scripts shut down above and restore params.txt.
@@ -3887,6 +3999,23 @@ class AfterDetailerScript(scripts.Script):
             self.write_params_txt(params_txt_content)
 
     def postprocess(self, p, processed, *args_):  # noqa: ARG002
+        # The pictures that another script gave to the stand-in result of
+        # postprocess_image() belong to the real one: that has images. Their
+        # parameters come after those of the images, as without ADetailer.
+        kept = getattr(p, "_ad_script_extras", None)
+        if (
+            kept
+            and getattr(processed, "images", None)
+            and isinstance(getattr(processed, "extra_images", None), list)
+        ):
+            p._ad_script_extras = None
+            processed.extra_images.extend(kept[0])
+            texts = getattr(processed, "infotexts", None)
+            if isinstance(texts, list):
+                missing = len(processed.images) - len(texts)
+                texts.extend([getattr(processed, "info", "") or ""] * missing)
+                texts.extend(kept[1])
+
         # Settings > ADetailer "Show detection previews in the results
         # gallery": add the previews kept during the job after the generated
         # images (and the grid), each with its own parameters at the same
@@ -3919,7 +4048,11 @@ class AfterDetailerScript(scripts.Script):
         # own: fill those places, or the previews would read the wrong ones.
         if len(infotexts) < len(images_list):
             infotexts.extend([info] * (len(images_list) - len(infotexts)))
-        for image, text in previews:
+        # Right after the images' parameters: those another script added for
+        # its processed.extra_images (Forge Neo's PiD) stay after them, as
+        # the gallery shows images + extra_images.
+        start = len(images_list)
+        for k, (image, text) in enumerate(previews):
             text = text or info
             try:
                 if text and getattr(opts, "enable_pnginfo", True):
@@ -3927,7 +4060,7 @@ class AfterDetailerScript(scripts.Script):
             except Exception:  # noqa: BLE001
                 pass
             images_list.append(image)
-            infotexts.append(text)
+            infotexts.insert(start + k, text)
 
 
 def _is_forge_modules() -> bool:
@@ -4189,6 +4322,9 @@ def on_ui_settings():
             default="",
             label="Extra paths to scan adetailer models separated by vertical bars(|)",
             component=gr.Textbox,
+            # As the WebUI's own folders: hidden and refused by the WebUI's
+            # setter on a WebUI started with --hide-ui-dir-config.
+            component_args=getattr(shared, "hide_dirs", None),
             section=section,
         )
         .info("eg. path\\to\\models|C:\\path\\to\\models|another/path/to/models")
@@ -4201,6 +4337,7 @@ def on_ui_settings():
             default="",
             label="Output directory for adetailer images",
             component=gr.Textbox,
+            component_args=getattr(shared, "hide_dirs", None),
             section=section,
         ),
     )
@@ -4519,10 +4656,17 @@ def set_value(p, x: Any, xs: Any, *, field: str, tab: int = 0):
             p._ad_xyz = {}
         values = p._ad_xyz
     values[field] = x
-    # A tab uses its own steps or CFG scale only with its "Use separate ..."
-    # box ticked: an axis for one of them ticks it for the cell, or every cell
-    # of the grid came out the same.
-    use = {"ad_steps": "ad_use_steps", "ad_cfg_scale": "ad_use_cfg_scale"}.get(field)
+    # A tab uses its own steps, CFG scale, sampler, scheduler or noise
+    # multiplier only with its "Use separate ..." box ticked: an axis for one
+    # of them ticks it for the cell, or every cell of the grid came out the
+    # same (get_args keeps the main sampler or scheduler for the other half).
+    use = {
+        "ad_steps": "ad_use_steps",
+        "ad_cfg_scale": "ad_use_cfg_scale",
+        "ad_sampler": "ad_use_sampler",
+        "ad_scheduler": "ad_use_sampler",
+        "ad_noise_multiplier": "ad_use_noise_multiplier",
+    }.get(field)
     if use:
         values[use] = True
 

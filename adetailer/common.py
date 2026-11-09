@@ -75,9 +75,15 @@ def hf_download(file: str, repo_id: str = REPO_ID, check_remote: bool = True) ->
         except Exception as e:  # noqa: BLE001
             error = e
 
+        # token=False: the mirror is not Hugging Face, so the user's saved
+        # Hugging Face token is not sent to it (the repos are public).
         try:
             return hf_hub_download(
-                repo_id, file, etag_timeout=1, endpoint="https://hf-mirror.com"
+                repo_id,
+                file,
+                etag_timeout=1,
+                endpoint="https://hf-mirror.com",
+                token=False,
             )
         except Exception as e:  # noqa: BLE001
             error = error or e

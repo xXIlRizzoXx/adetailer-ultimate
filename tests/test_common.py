@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from PIL import Image, ImageDraw
 
 from adetailer.common import create_bbox_from_mask, create_mask_from_bbox
@@ -178,12 +179,57 @@ def test_hf_download_says_why_the_model_failed(monkeypatch):
     assert calls == [
         {"local_files_only": True},
         {"etag_timeout": 1},
-        {"etag_timeout": 1, "endpoint": "https://hf-mirror.com"},
+        {"etag_timeout": 1, "endpoint": "https://hf-mirror.com", "token": False},
     ]
     assert printed == [
         "[-] ADetailer: Failed to load model 'face_yolov8n.pt' from huggingface"
         " (OSError: [Errno 11001] getaddrinfo failed)"
     ]
+
+
+def test_hf_download_does_not_send_the_hugging_face_token_to_the_mirror(monkeypatch):
+    # hf-mirror.com is not Hugging Face: the user's saved token (or HF_TOKEN)
+    # must not reach it. The detector repos are public, so it is not needed.
+    from adetailer import common
+
+    calls, _printed = _fake_hub(
+        monkeypatch,
+        FileNotFoundError("not in the cache"),
+        OSError("huggingface.co unreachable"),
+        OSError("mirror unreachable"),
+    )
+
+    assert common.hf_download("face_yolov8n.pt") == "INVALID"
+
+    mirror = [c for c in calls if c.get("endpoint") == "https://hf-mirror.com"]
+    assert len(mirror) == 1
+    assert mirror[0].get("token", "missing") is False
+    # The cache and huggingface.co calls are unchanged.
+    assert calls[0] == {"local_files_only": True}
+    assert calls[1] == {"etag_timeout": 1}
+
+
+def test_token_false_sends_no_authorization_header(monkeypatch):
+    # What token=False means for the installed huggingface_hub: no
+    # "authorization" header, even when a token is set.
+    pytest.importorskip("huggingface_hub")
+    from huggingface_hub.utils import build_hf_headers
+
+    # huggingface_hub 1.x looks up the agent running it for the User-Agent
+    # header: it fetches a list from huggingface.co and saves it in HF_HOME.
+    # An offline test does neither.
+    lookups = []
+    monkeypatch.setattr(
+        "huggingface_hub.utils._headers.detect_agent",
+        lambda: lookups.append(1),
+        raising=False,  # not in the 0.x versions of the hosts
+    )
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_DISABLE_TELEMETRY", True)
+
+    monkeypatch.setenv("HF_TOKEN", "hf_FAKEtokenFORtest0000000000")
+    headers = {k.lower(): v for k, v in build_hf_headers(token=False).items()}
+    assert "authorization" not in headers
+    assert lookups == []
 
 
 def test_hf_download_reason_is_short_ascii_and_not_markup(monkeypatch):
@@ -249,11 +295,82 @@ def test_hf_download_uses_the_cached_model_without_the_network(monkeypatch):
     assert printed == []
 
 
+_BUILTIN_MODELS = (
+    "face_yolov8n.pt",
+    "face_yolov8s.pt",
+    "hand_yolov8n.pt",
+    "person_yolov8n-seg.pt",
+    "person_yolov8s-seg.pt",
+    "yolov8x-worldv2.pt",
+)
+
+
+def _failing_hub(monkeypatch):
+    """Replace hf_hub_download with one that finds nothing, as with an empty
+    cache and no connection; collect (repo_id, file, kwargs) of each call."""
+    from adetailer import common
+
+    calls = []
+
+    def fake(repo_id, file, **kwargs):
+        calls.append((repo_id, file, kwargs))
+        raise OSError("not available")
+
+    monkeypatch.setattr(common, "hf_hub_download", fake)
+    monkeypatch.setattr(common, "print", lambda *a, **k: None)
+    return calls
+
+
+def _repo_of(name):
+    from adetailer import common
+
+    return "Bingsu/yolo-world-mirror" if name == "yolov8x-worldv2.pt" else common.REPO_ID
+
+
+def test_get_models_without_hugging_face_only_reads_the_local_cache(
+    tmp_path, monkeypatch
+):
+    # The refresh button (and Load, Paste or Generate with an unknown detector
+    # through it) and --ad-no-huggingface: a built-in model missing from the
+    # folders is looked up in the local cache, with no request to Hugging Face
+    # or its mirror.
+    from adetailer import common
+
+    calls = _failing_hub(monkeypatch)
+
+    models = common.get_models(tmp_path, huggingface=False)
+
+    assert sorted(file for _repo, file, _kwargs in calls) == sorted(_BUILTIN_MODELS)
+    assert all(kwargs == {"local_files_only": True} for _r, _f, kwargs in calls)
+    assert all(repo == _repo_of(file) for repo, file, _kwargs in calls)
+    assert not set(_BUILTIN_MODELS) & set(models)
+
+
+def test_get_models_by_default_tries_hugging_face_and_its_mirror(tmp_path, monkeypatch):
+    # The start of the WebUI: the same lookup goes on to the network.
+    from adetailer import common
+
+    calls = _failing_hub(monkeypatch)
+
+    models = common.get_models(tmp_path)
+
+    for name in _BUILTIN_MODELS:
+        steps = [kwargs for _repo, file, kwargs in calls if file == name]
+        assert steps == [
+            {"local_files_only": True},
+            {"etag_timeout": 1},
+            {"etag_timeout": 1, "endpoint": "https://hf-mirror.com", "token": False},
+        ]
+    assert all(repo == _repo_of(file) for repo, file, _kwargs in calls)
+    assert not set(_BUILTIN_MODELS) & set(models)
+
+
 def test_builtin_model_in_the_model_folder_is_used_without_hugging_face(
     tmp_path, monkeypatch
 ):
     # face_yolov8n.pt already in models/adetailer (or an extra folder): that
-    # file is used and only the missing built-in models are looked up.
+    # file is used and only the missing built-in models are looked up. With a
+    # copy in both folders, the one in the first folder given wins.
     import adetailer.common as common
 
     main = tmp_path / "adetailer"
@@ -261,6 +378,7 @@ def test_builtin_model_in_the_model_folder_is_used_without_hugging_face(
     main.mkdir()
     extra.mkdir()
     (main / "face_yolov8n.pt").write_bytes(b"x")
+    (extra / "face_yolov8n.pt").write_bytes(b"x")
     (extra / "hand_yolov8n.pt").write_bytes(b"x")
     (main / "my_eyes.pt").write_bytes(b"x")
     asked = []

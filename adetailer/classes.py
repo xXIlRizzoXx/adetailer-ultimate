@@ -241,7 +241,9 @@ def _names_from_checkpoint(p: Path) -> list[str]:
     are taken where Ultralytics takes them (the "ema" model, else "model") and
     normalized as Ultralytics does. [] for anything else, e.g. a file in the
     old non-zip format."""
+    import io
     import pickle
+    import pickletools
     import zipfile
 
     class _Reader(pickle.Unpickler):
@@ -257,7 +259,16 @@ def _names_from_checkpoint(p: Path) -> list[str]:
             if len(entries) != 1 or entries[0].file_size > _MAX_CHECKPOINT_PICKLE:
                 return []
             with z.open(entries[0]) as f:
-                ckpt = _Reader(f).load()
+                data = f.read()
+        # The Unpickler grows its memo table to the index it is handed (16
+        # bytes each), whatever the size of the stream. A real index counts
+        # entries of the stream, so it is always below its length.
+        if any(
+            op.name in ("PUT", "BINPUT", "LONG_BINPUT") and arg >= len(data)
+            for op, arg, _pos in pickletools.genops(data)
+        ):
+            return []
+        ckpt = _Reader(io.BytesIO(data)).load()
         if not isinstance(ckpt, dict):
             return []
         model = ckpt.get("ema") or ckpt.get("model")

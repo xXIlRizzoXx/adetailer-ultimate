@@ -152,7 +152,53 @@ def test_no_event_forces_the_gradio_queue():
     assert forced == []
 
 
-_EVENTS = {"click", "change", "input", "select", "upload", "submit", "release", "then"}
+# The events of Gradio 3.41 and 4.40, and what chains or joins them.
+_EVENTS = {
+    "blur", "change", "click", "delete", "edit", "focus", "input", "key_up", "like",
+    "load", "on", "pause", "pause_recording", "play", "release", "select",
+    "start_recording", "stop", "stop_recording", "stream", "submit", "success",
+    "then", "tick", "unload", "upload",
+}
+# "clear", "end" and "apply" are Gradio events too, but also methods of dicts,
+# regular expression matches and other objects: such a call counts when it has
+# arguments. dict.clear() and re.Match.end() take none here; the one other call
+# with arguments, the WebUI's FilenameGenerator.apply() (namegen), is left out
+# by name.
+_LISTENER_ARGS = {"fn", "inputs", "outputs"}
+_PLAIN_RECEIVERS = {"namegen"}
+
+
+def _event_name(node):
+    # w.button.click(...) or getattr(w.button, "click")(...)
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr, getattr(node.func.value, "id", "")
+    if (
+        isinstance(node.func, ast.Call)
+        and getattr(node.func.func, "id", "") == "getattr"
+        and len(node.func.args) >= 2
+        and isinstance(node.func.args[1], ast.Constant)
+    ):
+        return node.func.args[1].value, ""
+    return None, ""
+
+
+def _is_listener_call(node):
+    name, receiver = _event_name(node)
+    if name is None:
+        return False
+    if name in _EVENTS or any(k.arg in _LISTENER_ARGS for k in node.keywords):
+        return True
+    if name in ("clear", "end", "apply") and receiver not in _PLAIN_RECEIVERS:
+        return bool(node.args or node.keywords)
+    return False
+
+
+def _listener_calls(source):
+    return [
+        f"{node.lineno}:{_event_name(node)[0]}"
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and _is_listener_call(node)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -168,15 +214,62 @@ def test_no_new_gradio_event_listener(relpath, expected):
     # also counts a comment in ui.py, hence its 29); a call inside a loop,
     # such as the per-setting .change of ALL_ARGS, counts once here, which is
     # why tests/test_args.py pins ALL_ARGS too.
-    tree = ast.parse((_UI_PATH.parents[1] / relpath).read_text(encoding="utf-8"))
-    calls = [
-        f"{node.lineno}:{node.func.attr}"
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _EVENTS
-    ]
+    calls = _listener_calls((_UI_PATH.parents[1] / relpath).read_text(encoding="utf-8"))
     assert len(calls) == expected, calls
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        "blur", "change", "click", "delete", "edit", "focus", "input", "key_up",
+        "like", "load", "on", "pause", "pause_recording", "play", "release", "select",
+        "start_recording", "stop", "stop_recording", "stream", "submit", "success",
+        "then", "tick", "unload", "upload",
+    ],
+)
+def test_the_listener_count_sees_every_gradio_event(event):
+    # A listener of a kind the project does not use yet shifts fn_index all
+    # the same.
+    assert len(_listener_calls(f"w.ad_model.{event}(fn=None)")) == 1
+    assert len(_listener_calls(f"w.ad_model.{event}(print, None, None)")) == 1
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "w.ad_model.clear(fn=None)",
+        "w.ad_model.end(inputs=[])",
+        "w.ad_model.apply(outputs=[])",
+        "gr.on(triggers=[w.ad_model.change], fn=None)",
+        # The same events with the handler given by position or inside **.
+        "w.ad_preview.clear(print, None, None)",
+        "w.ad_preview.clear(queue=False, **wiring)",
+        "w.ad_preview.clear(_js='f')",
+        "w.ad_model.end(print, None, None)",
+        "w.ad_model.apply(print, w.ad_model, None)",
+        "w.ad_preview.end(print)",
+        "w.ad_preview.apply(print)",
+        "w.ad_preview.end(*wiring)",
+        'getattr(w.ad_preview, "click")(print, None, None)',
+    ],
+)
+def test_the_listener_count_sees_a_call_with_the_arguments_of_a_listener(source):
+    assert len(_listener_calls(source)) == 1
+
+
+def test_the_listener_count_sees_each_link_of_a_chain():
+    assert len(_listener_calls("w.button.click(fn=None).then(fn=None).success(fn=None)")) == 3
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "names.clear()", "word.end()", "copy.copy(data)", "namegen.apply(text)",
+        "x.sort(key=len)", 'inspect.signature(getattr(button, "click"))',
+    ],
+)
+def test_the_listener_count_leaves_out_the_plain_methods_of_the_same_name(source):
+    assert _listener_calls(source) == []
 
 
 def _wired_apply(monkeypatch, script):
@@ -493,6 +586,98 @@ def test_wired_same_folder_console_line_prints_on_a_legacy_code_page(
         assert b"\\u9854.png: no free '-ad' file name left." in console
 
 
+_HIDDEN_DIRS = "⚠️ Folder batch is disabled: the WebUI was started with --hide-ui-dir-config."
+
+
+def _hide_dirs(hidden):
+    sys.modules["modules.shared"].cmd_opts = SimpleNamespace(hide_ui_dir_config=hidden)
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_is_refused_with_hide_ui_dir_config(
+    host, monkeypatch, tmp_path, same_folder
+):
+    # The WebUI blocks its own folder batches with this flag, the one a shared
+    # WebUI is started with: a guest must not read or write a server folder here.
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "private.png")
+    _hide_dirs(True)
+    calls = []
+
+    def detail(image, _args, save, tab=0):
+        calls.append(image)
+        return image, "✅ ADetailer pass complete."
+
+    callback = _wired_apply(monkeypatch, SimpleNamespace(run_detailer_on_image=detail))
+    tab = ("face.pt", "", "", False, 0.3, "face.pt")
+
+    assert callback(None, str(tmp_path), same_folder, True, *tab) == (None, _HIDDEN_DIRS)
+    # The folder wins over a dropped image, as it does without the flag.
+    dropped = Image.new("RGB", (8, 8), "white")
+    assert callback(dropped, f'"{tmp_path}"', same_folder, True, *tab) == (None, _HIDDEN_DIRS)
+    assert calls == []
+    assert [f.name for f in tmp_path.iterdir()] == ["private.png"]
+
+
+def test_hide_ui_dir_config_does_not_tell_whether_a_folder_exists(
+    host, monkeypatch, tmp_path
+):
+    _hide_dirs(True)
+    callback = _wired_apply(monkeypatch, SimpleNamespace())
+    tab = ("face.pt", "", "", False, 0.3, "face.pt")
+
+    missing = callback(None, str(tmp_path / "missing"), False, True, *tab)
+    assert missing == callback(None, str(tmp_path), False, True, *tab)
+    assert missing == (None, _HIDDEN_DIRS)
+
+
+def test_hide_ui_dir_config_keeps_the_single_image_run(host, monkeypatch):
+    _hide_dirs(True)
+    calls = []
+
+    def detail(image, _args, save, tab=0):
+        calls.append(save)
+        return image, "✅ ADetailer pass complete."
+
+    callback = _wired_apply(monkeypatch, SimpleNamespace(run_detailer_on_image=detail))
+    image = Image.new("RGB", (8, 8), "white")
+    gallery, status = callback(image, "", False, True, "face.pt", "", "", False, 0.3, "face.pt")
+
+    assert calls == [True]
+    assert gallery is not None
+    assert len(gallery) == 1
+    assert status == "✅ ADetailer pass complete."
+
+
+@pytest.mark.parametrize(
+    "cmd_opts",
+    [SimpleNamespace(hide_ui_dir_config=False), SimpleNamespace(), None, "absent"],
+    ids=["flag off", "host without the flag", "no cmd_opts value", "no cmd_opts"],
+)
+def test_wired_folder_runs_without_hide_ui_dir_config(
+    host, monkeypatch, tmp_path, cmd_opts
+):
+    Image.new("RGB", (8, 8), "white").save(tmp_path / "a.png")
+    if cmd_opts != "absent":
+        sys.modules["modules.shared"].cmd_opts = cmd_opts
+    calls = []
+
+    def detail(image, _args, save, tab=0):
+        calls.append(save)
+        return image, "✅ ADetailer pass complete."
+
+    callback = _wired_apply(monkeypatch, SimpleNamespace(run_detailer_on_image=detail))
+    tab = ("face.pt", "", "", False, 0.3, "face.pt")
+    gallery, status = callback(None, str(tmp_path), False, True, *tab)
+
+    assert calls == [True]
+    assert len(gallery) == 1
+    assert status.startswith("✅ Batch done — 1 image(s): 1 detailed")
+    missing = tmp_path / "missing"
+    assert callback(None, str(missing), False, True, *tab) == (
+        None, f"⚠️ Folder not found: {missing}",
+    )
+
+
 def _wired_preview(monkeypatch, predict, script=None, **extra):
     """The real two-tab Detection preview wiring, with a stub detector."""
     detector = ModuleType("adetailer.ultralytics")
@@ -670,6 +855,7 @@ def test_single_tab_preview_sends_the_picture_without_labels(
 
     assert asked == [True]
     data = json.loads(boxes)
+    assert (data["w"], data["h"]) == (64, 32)
     assert data["boxes"] == [[1, 2, 30, 20]]
     if not has_plain:
         assert "plain" not in data

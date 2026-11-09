@@ -206,6 +206,10 @@ img.ad-plain-picture {
     max-height: none !important;
     object-fit: fill !important;
 }
+/* The preview's own buttons (download) above both picker.js layers. */
+div[id*="_ad_preview_output"] .icon-buttons {
+    z-index: 3;
+}
 /* picker.js: the "Show labels" checkbox right after the preview button. */
 label.ad-show-labels {
     display: inline-flex;

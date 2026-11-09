@@ -28,6 +28,9 @@ def add_forge_script_to_adetailer_run(
     p: StableDiffusionProcessing, script_title: str, script_args: list
 ):
     p.scripts = copy.copy(scripts.scripts_img2img)
+    # The host's cache of ordered scripts compares only their number, and this
+    # runner always has one: shared, the next pass ran the script of the last.
+    p.scripts.callback_map = {}
     p.scripts.alwayson_scripts = []
     p.script_args_value = []
 

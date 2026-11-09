@@ -571,6 +571,37 @@ def test_sort_bboxes_keeps_masks_scores_and_classes_with_their_box(order_by, ord
     assert pred.class_names == [original.class_names[i] for i in order]
 
 
+@pytest.mark.parametrize(
+    ("order_by", "bboxes"),
+    [
+        # The wide box ends further right but starts further left.
+        (SortBy.RIGHT_TO_LEFT, [[100, 0, 150, 50], [0, 0, 200, 100]]),
+        # The tall box starts higher but ends lower.
+        (SortBy.TOP_TO_BOTTOM, [[0, 10, 50, 20], [60, 0, 100, 200]]),
+    ],
+)
+def test_right_to_left_and_top_to_bottom_use_the_right_and_top_edges(order_by, bboxes):
+    from adetailer.common import PredictOutput
+
+    # Right to left goes by the right edge of each box and top to bottom by
+    # its top edge: here the other edge gives the opposite order.
+    pred = sort_bboxes(
+        PredictOutput(
+            bboxes=[list(b) for b in bboxes],
+            masks=[Image.new("L", (200, 200), n) for n in (1, 2)],
+            confidences=[0.9, 0.8],
+            preview=Image.new("RGB", (200, 200)),
+            class_names=["face", "hand"],
+        ),
+        order_by,
+    )
+
+    assert pred.bboxes == [bboxes[1], bboxes[0]]
+    assert [m.getpixel((0, 0)) for m in pred.masks] == [2, 1]
+    assert pred.confidences == [0.8, 0.9]
+    assert pred.class_names == ["hand", "face"]
+
+
 @pytest.mark.parametrize("confidences", [(), (0.9, 0.8)])
 def test_sort_by_confidence_without_one_score_per_box_keeps_the_order(confidences):
     original = _sort_pred()

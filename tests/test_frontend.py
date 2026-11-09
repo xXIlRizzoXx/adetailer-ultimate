@@ -1323,10 +1323,15 @@ def _glob(pattern: str) -> re.Pattern[str]:
 
 @pytest.mark.parametrize("event", ["push", "pull_request"])
 def test_ci_runs_for_every_non_python_file_the_tests_read(event):
-    # The checks of the stylesheet, the scripts, the README and the changelog
-    # never ran on a change to those files alone.
+    # The checks of the stylesheet, the scripts, the README, the changelog and
+    # the bug report form never ran on a change to those files alone.
     patterns = [_glob(p) for p in _workflow_paths(event)]
-    files = ["style.css", "README.md", "CHANGELOG.md"] + [
+    files = [
+        "style.css",
+        "README.md",
+        "CHANGELOG.md",
+        ".github/ISSUE_TEMPLATE/bug_report.yaml",
+    ] + [
         f"javascript/{js.name}" for js in sorted((ROOT / "javascript").glob("*.js"))
     ]
     for name in files:
@@ -1347,10 +1352,12 @@ const P = "script_img2img_adetailer_";
 const img = new El("img", {});
 img.naturalWidth = CASE.natural[0];
 img.naturalHeight = CASE.natural[1];
-img.objectFit = "contain";
-img.rect = { left: 10, top: 20, width: 400, height: 400 };
+img.objectFit = CASE.fit;
+const [left, top, width, height] = CASE.img_rect;
+img.rect = { left, top, width, height };
 const output = new El("div", { id: P + "ad_preview_output" + CASE.sfx }, [img]);
 output.rect = { left: 10, top: 20, width: 400, height: 400 };
+if (CASE.position) output.style.position = CASE.position;
 const boxes = new El("textarea", { value: CASE.boxes });
 const field = new El("textarea", { value: CASE.field });
 const body = new El("body", {}, [
@@ -1374,7 +1381,7 @@ const state = () => {
     ]) : null;
 };
 tick();
-const out = { first: state(), writes: [] };
+const out = { first: state(), position: output.style.position, writes: [] };
 for (const k of CASE.clicks) {
     const box = output.querySelector(".ad-pick-layer").children[k - 1];
     box.handlers.click.forEach((f) => f({ preventDefault() {}, stopPropagation() {} }));
@@ -1392,10 +1399,14 @@ _BOX_1 = ["#1", "0px", "100px", "200px", "100px"]
 _BOX_2 = ["#2", "200px", "200px", "200px", "100px"]
 
 
-def _picker(tmp_path, *, natural=(200, 100), boxes=_TWO_BOXES, field="", clicks=(), sfx=""):
+def _picker(
+    tmp_path, *, natural=(200, 100), boxes=_TWO_BOXES, field="", clicks=(), sfx="",
+    fit="contain", img_rect=(10, 20, 400, 400), position="",
+):
     case = json.dumps({
         "natural": list(natural), "boxes": boxes, "field": field,
-        "clicks": list(clicks), "sfx": sfx,
+        "clicks": list(clicks), "sfx": sfx, "fit": fit,
+        "img_rect": list(img_rect), "position": position,
     })
     return run_js(tmp_path, "picker.js", f"const CASE = {case};\n" + PICKER)
 
@@ -1409,6 +1420,46 @@ def _boxes(state, picked):
 def test_picker_lays_a_box_over_each_detection(tmp_path, sfx):
     out = _picker(tmp_path, sfx=sfx)
     assert _boxes(out["first"], set())
+
+
+@needs_node
+@pytest.mark.parametrize(
+    ("natural", "fit", "img_rect", "box_1", "box_2"),
+    [
+        # A portrait picture in the 400x400 <img> is 200x400, 100 px from the
+        # left: bands at the sides, as object-fit: contain draws it on Forge Neo.
+        ((100, 200), "contain", (10, 20, 400, 400), (100, 0, 100, 200), (200, 200, 100, 200)),
+        # An <img> of 300x200 placed 30 px inside the output: the picture is
+        # 100x200 there, 100 px from the left of the <img>, so 130 px and 30 px.
+        ((100, 200), "contain", (40, 50, 300, 200), (130, 30, 50, 100), (180, 130, 50, 100)),
+        # A landscape picture in the same <img> is 300x150, 25 px down.
+        ((200, 100), "contain", (40, 50, 300, 200), (30, 55, 150, 75), (180, 130, 150, 75)),
+        # scale-down keeps a small picture at its size, centered both ways...
+        ((200, 100), "scale-down", (10, 20, 400, 400), (100, 150, 100, 50), (200, 200, 100, 50)),
+        # ... and shrinks a large one as contain does.
+        ((800, 400), "scale-down", (10, 20, 400, 400), (0, 100, 200, 100), (200, 200, 200, 100)),
+        # fill stretches the picture over the whole <img>, by 2 and by 4.
+        ((200, 100), "fill", (10, 20, 400, 400), (0, 0, 200, 200), (200, 200, 200, 200)),
+    ],
+)
+def test_picker_follows_the_picture_drawn_in_its_img(
+    tmp_path, natural, fit, img_rect, box_1, box_2
+):
+    w, h = natural
+    boxes = json.dumps({"w": w, "h": h, "boxes": [[0, 0, w / 2, h / 2], [w / 2, h / 2, w, h]]})
+    out = _picker(tmp_path, natural=natural, boxes=boxes, fit=fit, img_rect=img_rect)
+    assert out["first"] == [
+        [name, False, *(f"{v}px" for v in box)]
+        for name, box in (("#1", box_1), ("#2", box_2))
+    ]
+
+
+@needs_node
+def test_picker_makes_the_output_the_frame_of_the_boxes(tmp_path):
+    # The box positions are relative to the output: left static, they would
+    # be measured from an outer block of the page.
+    assert _picker(tmp_path)["position"] == "relative"
+    assert _picker(tmp_path, position="absolute")["position"] == "absolute"
 
 
 @needs_node
@@ -1429,6 +1480,15 @@ def test_picker_click_adds_and_removes_a_number(tmp_path):
         ("2 1", {"#1", "#2"}, 2, "1"),
         ("\uff11\u3001\uff12", {"#1", "#2"}, 2, "1"),
         ("1 - 2", {"#1", "#2"}, 2, "1"),
+        ("2-1", {"#1", "#2"}, 2, "1"),
+        ("2,1-2", {"#1", "#2"}, 2, "1"),
+        # The dashes an IME types: the full-width tilde is "~" after NFKC, the
+        # others stay as they are until the line that makes them "-".
+        ("1\uff5e2", {"#1", "#2"}, 2, "1"),
+        ("1\u301c2", {"#1", "#2"}, 2, "1"),
+        ("1\u20132", {"#1", "#2"}, 2, "1"),
+        ("1\u22122", {"#1", "#2"}, 2, "1"),
+        ("1\u30fc2", {"#1", "#2"}, 2, "1"),
         # A number with no box on this preview is kept; text that is not a
         # number is skipped, as the detailer pass skips it.
         ("9, face", set(), 1, "1,9"),
@@ -1463,6 +1523,11 @@ def test_picker_draws_a_box_inside_another_on_top(tmp_path):
 )
 def test_picker_shows_nothing_when_unsure(tmp_path, natural, boxes):
     assert _picker(tmp_path, natural=natural, boxes=boxes)["first"] is None
+
+
+@needs_node
+def test_picker_shows_nothing_on_a_fit_it_cannot_place(tmp_path):
+    assert _picker(tmp_path, fit="cover")["first"] is None
 
 
 def test_the_preview_boxes_field_takes_no_room():
@@ -1628,6 +1693,17 @@ def test_show_labels_styles_exist():
     z = int(re.search(r"z-index:\s*(\d+)", plain).group(1))
     assert z < int(re.search(r"z-index:\s*(\d+)", rules[".ad-pick-layer"]).group(1))
     assert "label.ad-show-labels" in rules
+
+
+def test_the_preview_buttons_stay_above_the_picker_layers():
+    # Gradio puts the Detection preview's download button in a positioned
+    # .icon-buttons with no z-index: the picture without labels (Show labels
+    # off) hid it, and a box in the top right corner took its click.
+    rules = {s: body for selectors, body in css_rules() for s in selectors}
+    buttons = rules['div[id*="_ad_preview_output"] .icon-buttons']
+    z = int(re.search(r"z-index:\s*(\d+)", buttons).group(1))
+    for layer in (".ad-pick-layer", "img.ad-plain-picture"):
+        assert z > int(re.search(r"z-index:\s*(\d+)", rules[layer]).group(1))
 
 
 def test_show_labels_checkbox_shows_its_tick():

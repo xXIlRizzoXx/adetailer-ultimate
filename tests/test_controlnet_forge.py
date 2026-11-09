@@ -6,6 +6,7 @@ and the WebUI's modules, so both are replaced by small stand-ins here.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import sys
 from dataclasses import dataclass
@@ -198,3 +199,116 @@ def test_a_forge_without_the_preprocessor_lists_runs_as_before(monkeypatch):
     del sys.modules["lib_controlnet.global_state"].get_filtered_preprocessors
 
     assert backend.default_module("control_v11p_sd15_openpose") == "None"
+
+
+class _Runner:
+    """ScriptRunner of Forge and Forge Neo: `process` goes through a cache that
+    compares only the number of scripts, `process_before_every_sampling`
+    through alwayson_scripts, without the cache."""
+
+    def __init__(self, *scripts):
+        self.scripts = list(scripts)
+        self.alwayson_scripts = list(scripts)
+        self.callback_map = {}
+
+    def process(self, p):
+        length, callbacks = self.callback_map.get("script_process", (-1, None))
+        if callbacks is None or length != len(self.alwayson_scripts):
+            callbacks = list(self.alwayson_scripts)
+            self.callback_map["script_process"] = len(callbacks), callbacks
+        for script in callbacks:
+            script.process(p)
+
+    def process_before_every_sampling(self, p):
+        for script in self.alwayson_scripts:
+            script.process_before_every_sampling(p)
+
+
+class _ControlNet:
+    """Like Forge's script, it has current_params only after its own process."""
+
+    @staticmethod
+    def title():
+        return "ControlNet"
+
+    def process(self, p):
+        p.ran.append("ControlNet prepared")
+        self.current_params = {}
+
+    def process_before_every_sampling(self, p):
+        self.current_params.clear()
+        p.ran.append("ControlNet applied")
+
+
+class _SoftInpainting:
+    @staticmethod
+    def title():
+        return "Soft Inpainting"
+
+    def process(self, p):
+        p.ran.append("Soft Inpainting")
+
+    def process_before_every_sampling(self, p):
+        pass
+
+
+def _forge_host(monkeypatch):
+    backend = _load_backend(monkeypatch, _Gradio4Unit)
+    runner = _Runner(_SoftInpainting(), _ControlNet())
+    backend.scripts.scripts_img2img = runner
+    ext = backend.ControlNetExt()
+    ext.init_controlnet()
+    return runner, ext
+
+
+def _pass(runner, ext=None):
+    """One detailer pass: with `ext` the tab has a ControlNet model. Without,
+    the pass keeps the runner of "Apply only selected scripts", a copy of the
+    main one with fewer scripts."""
+    p = SimpleNamespace(
+        init_images=[Image.new("RGB", (64, 48))],
+        width=512, height=512, resize_mode=0, ran=[],
+    )
+    p.scripts = copy.copy(runner)
+    p.scripts.alwayson_scripts = runner.alwayson_scripts[:1]
+    if ext:
+        ext.update_scripts_args(p, "control_v11p_sd15_inpaint", "inpaint_only", 1.0, 0.0, 1.0)
+    p.scripts.process(p)
+    p.scripts.process_before_every_sampling(p)
+    return p.ran
+
+
+def test_every_forge_controlnet_pass_runs_its_own_script(monkeypatch):
+    # The next image, tab or X/Y/Z cell got a new copy of the script, but the
+    # WebUI's cache kept the first copy for `process`: the new one had no
+    # current_params, and the region was inpainted without ControlNet.
+    runner, ext = _forge_host(monkeypatch)
+    expected = ["ControlNet prepared", "ControlNet applied"]
+
+    assert [_pass(runner, ext) for _ in range(3)] == [expected] * 3
+
+
+@pytest.mark.parametrize("controlnet_first", [False, True])
+def test_two_forge_tabs_keep_their_own_scripts(monkeypatch, controlnet_first):
+    # Both runners have one script: with the cache shared, the second tab ran
+    # the script of the first one with the wrong arguments.
+    runner, ext = _forge_host(monkeypatch)
+    with_cn = ["ControlNet prepared", "ControlNet applied"]
+    without = ["Soft Inpainting"]
+
+    if controlnet_first:
+        assert [_pass(runner, ext), _pass(runner)] == [with_cn, without]
+    else:
+        assert [_pass(runner), _pass(runner, ext)] == [without, with_cn]
+
+
+def test_a_forge_controlnet_pass_leaves_the_cache_of_the_img2img_runner(monkeypatch):
+    runner, ext = _forge_host(monkeypatch)
+    cache = runner.callback_map
+    runner.process(SimpleNamespace(ran=[]))
+    before = dict(cache)
+
+    _pass(runner, ext)
+
+    assert runner.callback_map is cache
+    assert cache == before

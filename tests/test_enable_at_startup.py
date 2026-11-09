@@ -196,6 +196,72 @@ def test_panel_is_still_built_switched_off_so_the_api_default_stays_off():
     assert len(registered) == 1
 
 
+def test_script_inputs_keep_enable_skip_and_tabs_in_this_order():
+    # is_ad_enabled, set_skip_img2img and _drop_api_default_tab read these
+    # inputs by position, and API requests send them by position: with the
+    # first two swapped, Skip img2img would be read as Enable.
+    adui = _adui_tree()
+    assigned = [
+        node for node in ast.walk(adui)
+        if isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "id", "") == "components"
+    ]
+    assert len(assigned) == 1
+    assert ast.unparse(assigned[0].value) == "[ad_enable, ad_skip_img2img, *states]"
+    # The names in that list are bound once (the Enable accordion and the Skip
+    # checkbox), and the tabs are only appended, in order.
+    for name in ("ad_enable", "ad_skip_img2img", "states"):
+        bound = [
+            node for node in ast.walk(adui)
+            if isinstance(node, ast.Name) and node.id == name
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+        ]
+        assert len(bound) == 1, name
+    on_states = {
+        node.func.attr for node in ast.walk(adui)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and getattr(node.func.value, "id", "") == "states"
+    }
+    assert on_states == {"append"}
+    assert not [
+        node for node in ast.walk(adui)
+        if isinstance(node, ast.Subscript) and getattr(node.value, "id", "") == "states"
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    # Nothing between the list and the return can reorder it (an insert, a
+    # reverse, a slice assignment): the list is built right before returning.
+    assert adui.body[-2] is assigned[0]
+    returned = adui.body[-1]
+    assert isinstance(returned, ast.Return)
+    assert isinstance(returned.value, ast.Tuple)
+    assert [node.id for node in returned.value.elts] == ["components", "infotext_fields"]
+    # The script's ui() hands that list to the WebUI as it is.
+    script = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    cls = next(
+        node for node in script.body
+        if isinstance(node, ast.ClassDef) and node.name == "AfterDetailerScript"
+    )
+    ui = next(
+        node for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "ui"
+    )
+    names = sorted(
+        (
+            node for node in ast.walk(ui)
+            if isinstance(node, ast.Name) and node.id == "components"
+        ),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    assert [type(node.ctx).__name__ for node in names] == ["Store", "Load"]
+    assert ast.unparse(ui.body[-1]) == "return components"
+    unpacked = next(
+        node for node in ui.body
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Tuple)
+    )
+    assert [node.id for node in unpacked.targets[0].elts] == ["components", "infotext_fields"]
+    assert getattr(unpacked.value.func, "id", "") == "adui"
+
+
 class _OptionInfo:
     def __init__(self, default=None, label="", component=None, component_args=None, section=None, **_kw):
         self.default = default
@@ -215,11 +281,12 @@ class _OptionInfo:
         return self
 
 
-def _registered_options(ui):
+def _registered_options(ui, **host):
     options = {}
     shared = SimpleNamespace(
         opts=SimpleNamespace(add_option=lambda key, info: options.__setitem__(key, info)),
         OptionInfo=_OptionInfo,
+        **host,
     )
     gr = SimpleNamespace(
         Slider="Slider", Checkbox="Checkbox", Textbox="Textbox", Radio="Radio",
@@ -257,6 +324,23 @@ def test_option_is_registered_off_by_default(ui):
     # Translatable text: one plain block, no inline markdown.
     for text in (info.label, info.info_text):
         assert not any(mark in text for mark in ("**", "`", "[", "](", "\n"))
+
+
+@pytest.mark.parametrize("visible", [False, True])
+@pytest.mark.parametrize("key", ["ad_extra_models_dir", "ad_save_images_dir"])
+def test_folder_options_follow_the_webui_hide_dirs(ui, key, visible):
+    # With --hide-ui-dir-config the WebUI sets hide_dirs to visible False: its
+    # setter then refuses the option, so a guest cannot point it at any folder
+    # of the server. Only component_args carries that to the WebUI.
+    info = _registered_options(ui, hide_dirs={"visible": visible})[key]
+
+    assert info.component_args == {"visible": visible}
+    assert info.component == "Textbox"
+
+
+@pytest.mark.parametrize("key", ["ad_extra_models_dir", "ad_save_images_dir"])
+def test_folder_options_register_on_a_host_without_hide_dirs(ui, key):
+    assert _registered_options(ui)[key].component_args == {}
 
 
 def _on_ui_tabs(data, apply):

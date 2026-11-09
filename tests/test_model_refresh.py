@@ -95,8 +95,51 @@ def test_a_failed_refresh_keeps_the_detector_menus():
 
     ns["_wire_model_refresh"](tabs, SimpleNamespace(refresh_models=broken, model_mapping={}), 1)
 
-    assert tabs[0].ad_model_refresh.kwargs["fn"]("a.pt") == [{}]
+    assert tabs[0].ad_model_refresh.kwargs["fn"]("a.pt") == {}
     assert dd.choices == ["a.pt", "None"]
+
+
+def _one_tab_refresh(info):
+    ns = _ui_functions()
+    dd = _Dropdown(["a.pt", "None"])
+    ns["_MODEL_DROPDOWNS"][:] = [weakref.ref(dd)]
+    tabs = _tabs(dd)
+    ns["_wire_model_refresh"](tabs, info, 1)
+    kwargs = tabs[0].ad_model_refresh.kwargs
+    assert kwargs["outputs"] == [dd]
+    return kwargs["fn"]
+
+
+def test_with_one_tab_the_refresh_returns_the_update_itself():
+    # "Max tabs" at 1: with a single output Gradio wraps the return value in
+    # a list by itself, so a list here reached the menu as its value. The
+    # detector was then a list: the class handler failed and the tab was
+    # skipped without a word.
+    fn = _one_tab_refresh(
+        SimpleNamespace(refresh_models=lambda: ["a.pt", "new.pt"], model_mapping={})
+    )
+
+    assert fn("new.pt") == {"choices": ["a.pt", "new.pt", "None"], "value": "new.pt"}
+    # A removed detector gives way to the first choice here too.
+    assert fn("gone.pt") == {"choices": ["a.pt", "new.pt", "None"], "value": "a.pt"}
+
+
+def test_with_one_tab_a_refresh_without_the_reader_returns_the_update_itself():
+    fn = _one_tab_refresh(SimpleNamespace(refresh_models=None, model_mapping={"a.pt": "x"}))
+
+    assert fn("a.pt") == {"choices": ["a.pt", "None"], "value": "a.pt"}
+
+
+def test_with_two_tabs_a_failed_refresh_keeps_one_update_per_menu():
+    ns = _ui_functions()
+    tabs = _tabs(_Dropdown(["a.pt", "None"]), _Dropdown(["None", "a.pt"]))
+
+    def broken():
+        raise OSError("disk")
+
+    ns["_wire_model_refresh"](tabs, SimpleNamespace(refresh_models=broken, model_mapping={}), 2)
+
+    assert tabs[0].ad_model_refresh.kwargs["fn"]("a.pt", "None") == [{}, {}]
 
 
 def test_every_tab_gets_a_refresh_button_with_a_tooltip():

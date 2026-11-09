@@ -10,7 +10,7 @@ body:
       value: |
         Thank you for taking the time to report a problem. Any language is welcome.
 
-        Before you post a log, a screenshot or an image, remove anything personal: your user name in folder paths (for example `C:\Users\your-name\...`, `/home/your-name/...` or `/Users/your-name/...`), folder and file names you do not want to show, any password, API key or token in the "Launching Web UI with arguments" line, any public link to your WebUI (a `gradio.live`, ngrok or similar address after "Running on public URL"), and prompts you do not want to share. The Verbose diagnostic log also prints the prompt of every region.
+        Before you post a log, a screenshot or an image, remove anything personal: your user name in folder paths (for example `C:\Users\your-name\...`, `/home/your-name/...` or `/Users/your-name/...`), folder and file names you do not want to show, any password, API key or token in the "Launching Web UI with arguments" line and in the "Commandline" row of the "System info" table that ADetailer prints with an error, any public link to your WebUI (a `gradio.live`, ngrok or similar address after "Running on public URL"), and prompts you do not want to share. The Verbose diagnostic log also prints the prompt of every region.
 
         If the same problem happens with the original ADetailer too, it may belong in [its issue tracker](https://github.com/Bing-su/adetailer/issues).
 
@@ -61,7 +61,7 @@ body:
       label: ADetailer Ultimate version
       description: |
         Open the ADetailer panel (this also switches ADetailer on): the badge at the top right of its header shows the version and the build; on a narrow window, widen it to see the whole badge. The console also prints the version at startup, in the line that starts with "[-] ADetailer initialized. version:".
-      placeholder: "for example: ADetailer Ultimate · v26.2.0+plus.8 · abc1234"
+      placeholder: "for example: ADetailer Ultimate · v26.2.0+plus.9 · abc1234"
     validations:
       required: true
 
@@ -116,7 +116,7 @@ body:
       description: |
         The FULL console log of your terminal, from the start of the WebUI to the error. For a more detailed log, turn on Settings → ADetailer → "Verbose diagnostic log" and repeat the problem.
 
-        ⚠️ Before you paste it, remove anything personal: your user name in folder paths (for example `C:\Users\your-name\...`, `/home/your-name/...` or `/Users/your-name/...`), folder and file names you do not want to show, any password, API key or token in the "Launching Web UI with arguments" line, any public link to your WebUI (a `gradio.live`, ngrok or similar address after "Running on public URL"), and prompts you do not want to share. The Verbose diagnostic log also prints the prompt of every region.
+        ⚠️ Before you paste it, remove anything personal: your user name in folder paths (for example `C:\Users\your-name\...`, `/home/your-name/...` or `/Users/your-name/...`), folder and file names you do not want to show, any password, API key or token in the "Launching Web UI with arguments" line and in the "Commandline" row of the "System info" table that ADetailer prints with an error, any public link to your WebUI (a `gradio.live`, ngrok or similar address after "Running on public URL"), and prompts you do not want to share. The Verbose diagnostic log also prints the prompt of every region.
       placeholder: |
         Python ...
         Version: ...

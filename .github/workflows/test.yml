@@ -11,6 +11,7 @@ on:
       - "style.css"
       - "README.md"
       - "CHANGELOG.md"
+      - ".github/ISSUE_TEMPLATE/bug_report.yaml"
   pull_request:
     paths:
       - "**.py"
@@ -20,6 +21,7 @@ on:
       - "style.css"
       - "README.md"
       - "CHANGELOG.md"
+      - ".github/ISSUE_TEMPLATE/bug_report.yaml"
   workflow_call:
   workflow_dispatch:
   schedule:
