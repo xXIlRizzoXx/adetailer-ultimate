@@ -1488,7 +1488,10 @@ def test_same_name_line_has_no_full_path_and_is_not_repeated(
         " more_detectors/hand.pt is listed as 'hand.pt (more_detectors)'."
     ) in err
     assert str(tmp_path) not in err
-    assert tmp_path.anchor not in err
+    # No path from the root: no word of the line starts with it. (On Linux
+    # and macOS the root is "/", which the paths inside a folder hold too.)
+    words = [word.strip("'\"();,.") for word in err.split()]
+    assert not any(word.startswith(tmp_path.anchor) for word in words)
     assert ":" not in err.replace("[-] ADetailer:", "")
     assert "\\" not in err
 
