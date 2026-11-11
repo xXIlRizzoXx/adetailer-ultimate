@@ -1001,3 +1001,492 @@ def test_iris_is_simply_not_found_without_iris_landmarks(monkeypatch, groups, co
     assert detector.mediapipe_face_features(image, classes="iris").class_names == []
     result = detector.mediapipe_face_features(image, classes="eyes,iris")
     assert result.class_names == ["eyes"]
+
+
+def _fake_requests(monkeypatch, body=None, error=None):
+    """A stand-in for requests.get that serves `body` (or raises `error`);
+    returns the list of URLs asked for. urllib, the fallback, fails too, so
+    no test reaches the network."""
+    asked = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, _size):
+            yield body
+
+    def get(url, **_kwargs):
+        asked.append(url)
+        if error is not None:
+            raise error
+        return Response()
+
+    fake = ModuleType("requests")
+    fake.get = get
+    monkeypatch.setitem(sys.modules, "requests", fake)
+
+    def no_urllib(*_a, **_k):
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr("urllib.request.urlretrieve", no_urllib)
+    return asked
+
+
+_ASSET = ("face_landmarker.task", "https://example.com/models/face_landmarker.task", 1000)
+
+
+def test_mediapipe_model_download_is_announced(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    asked = _fake_requests(monkeypatch, body=b"x" * 1_500_000)
+
+    path = detector._ensure_model(*_ASSET)
+
+    assert path == str(tmp_path / "face_landmarker.task")
+    assert asked == [_ASSET[1]]
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == (
+        "[-] ADetailer: trying to download MediaPipe model 'face_landmarker.task'"
+        " from example.com..."
+    )
+    assert lines[1].startswith(
+        "[-] ADetailer: downloaded MediaPipe model 'face_landmarker.task' (1.5 MB, "
+    )
+    assert len(lines) == 2
+
+
+def test_mediapipe_model_already_there_says_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    (tmp_path / "face_landmarker.task").write_bytes(b"x" * 2000)
+    asked = _fake_requests(monkeypatch, body=b"x" * 2000)
+
+    assert detector._ensure_model(*_ASSET) == str(tmp_path / "face_landmarker.task")
+    assert asked == []
+    assert capsys.readouterr().out == ""
+
+
+def test_mediapipe_incomplete_model_download_says_why(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    (tmp_path / "face_landmarker.task").write_bytes(b"x" * 10)
+    _fake_requests(monkeypatch, body=b"x" * 2000)
+
+    detector._ensure_model(*_ASSET)
+
+    out = capsys.readouterr().out
+    assert (
+        "trying to download MediaPipe model 'face_landmarker.task' from"
+        " example.com (the saved copy was incomplete)..."
+    ) in out
+
+
+def test_mediapipe_incomplete_file_put_by_hand_is_not_removed_in_silence(
+    tmp_path, monkeypatch, capsys
+):
+    # After a failed download the user puts the file in the folder by hand,
+    # but an incomplete one: it is removed, and the lines say so again.
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    monkeypatch.setattr(detector, "_DOWNLOAD_FAILED", set(), raising=False)
+    _fake_requests(monkeypatch, error=OSError("unreachable"))
+    assert detector._ensure_model(*_ASSET) is None
+    capsys.readouterr()
+
+    placed = tmp_path / "face_landmarker.task"
+    placed.write_bytes(b"x" * 10)
+    assert detector._ensure_model(*_ASSET) is None
+
+    captured = capsys.readouterr()
+    assert not placed.exists()
+    assert captured.out.splitlines() == [
+        "[-] ADetailer: trying to download MediaPipe model 'face_landmarker.task'"
+        " from example.com (the saved copy was incomplete)..."
+    ]
+    assert "couldn't obtain MediaPipe model 'face_landmarker.task'" in captured.err
+
+
+def test_mediapipe_incomplete_file_that_cannot_be_removed_is_told(
+    tmp_path, monkeypatch, capsys
+):
+    # An incomplete file put by hand, read-only or held by another program:
+    # the detector found nothing, at every call, without a line.
+    model_dir = tmp_path / "some user" / "extensions" / "adetailer" / "adetailer"
+    model_dir = model_dir / "_mediapipe_models"
+    model_dir.mkdir(parents=True)
+    placed = model_dir / "face_landmarker.task"
+    placed.write_bytes(b"x" * 10)
+    monkeypatch.setattr(detector, "_MODEL_DIR", model_dir)
+    monkeypatch.setattr(detector, "_DOWNLOAD_FAILED", set(), raising=False)
+    monkeypatch.setattr(detector, "_MISSING_SAID", {}, raising=False)
+    monkeypatch.setattr(detector, "_STUCK_SAID", set(), raising=False)
+    asked = _fake_requests(monkeypatch, body=b"x" * 2000)
+    state = _fake_webui_job(monkeypatch, "20260101100000")
+    locked = [True]
+    unlink = detector.Path.unlink
+
+    def no_unlink(self, *args, **kwargs):
+        if locked[0] and self.name == placed.name:
+            raise PermissionError(13, "Permission denied", str(self))
+        return unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(detector.Path, "unlink", no_unlink)
+
+    # A batch of three: the full line once, with the short path of the file.
+    for n in range(3):
+        assert detector._ensure_model(*_ASSET) is None
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == (
+            "[-] ADetailer: MediaPipe model file"
+            " 'adetailer/adetailer/_mediapipe_models/face_landmarker.task' is"
+            " incomplete and could not be removed (read-only or in use by"
+            " another program). Remove or replace it manually to use this"
+            " detector.\n"
+            if n == 0
+            else ""
+        )
+        assert captured.err.isascii()
+        assert str(tmp_path) not in captured.err
+        assert "some user" not in captured.err
+    # The next generations: the short reminder, once each.
+    for timestamp in ("20260101100500", "20260101101000"):
+        state.job_timestamp = timestamp
+        for n in range(2):
+            assert detector._ensure_model(*_ASSET) is None
+            captured = capsys.readouterr()
+            assert captured.err.splitlines() == ([_STILL_MISSING] if n == 0 else [])
+            assert captured.out == ""
+    # The file cannot be replaced either: no download was tried.
+    assert asked == []
+    assert placed.read_bytes() == b"x" * 10
+    assert list(model_dir.iterdir()) == [placed]
+
+    # Once the file can be removed, it is fetched again as before, and a
+    # later file that is stuck is told anew.
+    locked[0] = False
+    state.job_timestamp = "20260101102000"
+    assert detector._ensure_model(*_ASSET) == str(placed)
+    assert asked == [_ASSET[1]]
+    assert "(the saved copy was incomplete)" in capsys.readouterr().out
+    placed.write_bytes(b"x" * 10)
+    locked[0] = True
+    assert detector._ensure_model(*_ASSET) is None
+    assert "is incomplete and could not be removed" in capsys.readouterr().err
+    assert asked == [_ASSET[1]]
+
+
+def test_mediapipe_stuck_file_is_told_anew_after_it_was_removed_by_hand(
+    tmp_path, monkeypatch, capsys
+):
+    # A stuck incomplete file is told; the user removes it by hand, without a
+    # connection (the download fails); then another incomplete copy that is
+    # stuck is placed: it got the short reminder only, never the full line.
+    model_dir = tmp_path / "extensions" / "adetailer" / "adetailer"
+    model_dir = model_dir / "_mediapipe_models"
+    model_dir.mkdir(parents=True)
+    placed = model_dir / "face_landmarker.task"
+    placed.write_bytes(b"x" * 10)
+    monkeypatch.setattr(detector, "_MODEL_DIR", model_dir)
+    monkeypatch.setattr(detector, "_DOWNLOAD_FAILED", set(), raising=False)
+    monkeypatch.setattr(detector, "_MISSING_SAID", {}, raising=False)
+    monkeypatch.setattr(detector, "_STUCK_SAID", set(), raising=False)
+    asked = _fake_requests(monkeypatch, error=OSError("unreachable"))
+    state = _fake_webui_job(monkeypatch, "20260101100000")
+    locked = [True]
+    unlink = detector.Path.unlink
+
+    def no_unlink(self, *args, **kwargs):
+        if locked[0] and self.name == placed.name:
+            raise PermissionError(13, "Permission denied", str(self))
+        return unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(detector.Path, "unlink", no_unlink)
+    stuck = "is incomplete and could not be removed"
+
+    assert detector._ensure_model(*_ASSET) is None
+    assert stuck in capsys.readouterr().err
+    assert asked == []
+
+    # Removed by hand, as the line asks; the download fails and is told.
+    locked[0] = False
+    placed.unlink()
+    locked[0] = True
+    state.job_timestamp = "20260101100500"
+    assert detector._ensure_model(*_ASSET) is None
+    captured = capsys.readouterr()
+    assert "couldn't obtain MediaPipe model 'face_landmarker.task'" in captured.err
+    assert stuck not in captured.err
+    assert asked == [_ASSET[1]]
+
+    # Another incomplete copy that cannot be removed: the full line again,
+    # once, then the short reminder.
+    placed.write_bytes(b"x" * 10)
+    state.job_timestamp = "20260101101000"
+    assert detector._ensure_model(*_ASSET) is None
+    captured = capsys.readouterr()
+    assert stuck in captured.err
+    assert _STILL_MISSING not in captured.err
+    assert detector._ensure_model(*_ASSET) is None
+    assert capsys.readouterr().err == ""
+    state.job_timestamp = "20260101101500"
+    assert detector._ensure_model(*_ASSET) is None
+    assert capsys.readouterr().err.splitlines() == [_STILL_MISSING]
+    assert asked == [_ASSET[1]]
+
+
+def test_mediapipe_failed_download_has_no_downloaded_line(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    _fake_requests(monkeypatch, error=OSError("unreachable"))
+
+    assert detector._ensure_model(*_ASSET) is None
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "[-] ADetailer: trying to download MediaPipe model 'face_landmarker.task'"
+        " from example.com..."
+    ]
+    assert "couldn't obtain MediaPipe model" in captured.err
+
+
+def test_mediapipe_failed_download_is_announced_once_per_model(
+    tmp_path, monkeypatch, capsys
+):
+    # Without a connection the model is asked for again at every image of a
+    # batch: the attempt and the error line are told once, and a later
+    # download that works is still told.
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    monkeypatch.setattr(detector, "_DOWNLOAD_FAILED", set(), raising=False)
+    asked = _fake_requests(monkeypatch, error=OSError("unreachable"))
+
+    assert detector._ensure_model(*_ASSET) is None
+    captured = capsys.readouterr()
+    assert "trying to download" in captured.out
+    assert "couldn't obtain MediaPipe model" in captured.err
+
+    for _ in range(3):
+        assert detector._ensure_model(*_ASSET) is None
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+    assert len(asked) == 4
+
+    # Another model has its own line.
+    other = ("face_detector.tflite", "https://example.com/face_detector.tflite", 1000)
+    assert detector._ensure_model(*other) is None
+    assert "'face_detector.tflite' from example.com..." in capsys.readouterr().out
+
+    # The connection is back: the download is told, and the model is no
+    # longer remembered as failed.
+    _fake_requests(monkeypatch, body=b"x" * 2000)
+    assert detector._ensure_model(*_ASSET) == str(tmp_path / "face_landmarker.task")
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("[-] ADetailer: downloaded MediaPipe model")
+    assert _ASSET[0] not in detector._DOWNLOAD_FAILED
+
+
+def _fake_webui_job(monkeypatch, timestamp):
+    """A stand-in for the WebUI's modules.shared with a running job."""
+    state = SimpleNamespace(job_timestamp=timestamp)
+    shared = ModuleType("modules.shared")
+    shared.state = state
+    monkeypatch.setitem(sys.modules, "modules.shared", shared)
+    return state
+
+
+_STILL_MISSING = (
+    "[-] ADetailer: MediaPipe model 'face_landmarker.task' is still missing"
+    " (see the message above): without it this detector may find nothing."
+)
+
+
+def test_mediapipe_missing_model_is_recalled_once_per_generation(
+    tmp_path, monkeypatch, capsys
+):
+    # After the first error the next generations showed only "nothing
+    # detected", the same as a picture without faces. Each generation now has
+    # one short line per model: not one per image of the batch.
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    monkeypatch.setattr(detector, "_DOWNLOAD_FAILED", set(), raising=False)
+    monkeypatch.setattr(detector, "_MISSING_SAID", {}, raising=False)
+    _fake_requests(monkeypatch, error=OSError("unreachable"))
+    state = _fake_webui_job(monkeypatch, "20260101100000")
+
+    # First generation, a batch of three: the full line, once.
+    for n in range(3):
+        assert detector._ensure_model(*_ASSET) is None
+        err = capsys.readouterr().err
+        assert ("couldn't obtain MediaPipe model" in err) == (n == 0)
+        assert "still missing" not in err
+
+    for timestamp in ("20260101100500", "20260101101000"):
+        state.job_timestamp = timestamp
+        assert detector._ensure_model(*_ASSET) is None
+        captured = capsys.readouterr()
+        assert captured.err.splitlines() == [_STILL_MISSING]
+        assert captured.out == ""
+        for _ in range(2):
+            assert detector._ensure_model(*_ASSET) is None
+            captured = capsys.readouterr()
+            assert (captured.out, captured.err) == ("", "")
+
+    # Another model has its own lines.
+    other = ("face_detector.tflite", "https://example.com/face_detector.tflite", 1000)
+    assert detector._ensure_model(*other) is None
+    assert "couldn't obtain MediaPipe model 'face_detector.tflite'" in (
+        capsys.readouterr().err
+    )
+    state.job_timestamp = "20260101102000"
+    assert detector._ensure_model(*other) is None
+    assert detector._ensure_model(*_ASSET) is None
+    lines = capsys.readouterr().err.splitlines()
+    assert lines == [_STILL_MISSING.replace(_ASSET[0], other[0]), _STILL_MISSING]
+    assert all(line.isascii() for line in lines)
+
+
+def test_mediapipe_missing_model_is_recalled_once_a_minute_without_a_webui(
+    tmp_path, monkeypatch, capsys
+):
+    # No WebUI to ask which generation runs (or one without job_timestamp):
+    # the short line comes at most once a minute.
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    monkeypatch.setattr(detector, "_DOWNLOAD_FAILED", set(), raising=False)
+    monkeypatch.setattr(detector, "_MISSING_SAID", {}, raising=False)
+    _fake_requests(monkeypatch, error=OSError("unreachable"))
+    monkeypatch.setitem(sys.modules, "modules.shared", ModuleType("modules.shared"))
+    now = [1000.0]
+    monkeypatch.setattr(detector.time, "monotonic", lambda: now[0])
+
+    assert detector._ensure_model(*_ASSET) is None
+    assert "couldn't obtain MediaPipe model" in capsys.readouterr().err
+
+    now[0] += 59
+    assert detector._ensure_model(*_ASSET) is None
+    assert capsys.readouterr().err == ""
+
+    now[0] += 2
+    assert detector._ensure_model(*_ASSET) is None
+    assert capsys.readouterr().err.splitlines() == [_STILL_MISSING]
+
+    now[0] += 30
+    assert detector._ensure_model(*_ASSET) is None
+    assert capsys.readouterr().err == ""
+
+
+def test_mediapipe_missing_model_is_recalled_once_a_minute_in_the_preview(
+    tmp_path, monkeypatch, capsys
+):
+    # The detection preview runs outside a job: the WebUI keeps the job time
+    # of the last generation, so every preview after the first message was
+    # silent, as a picture without faces. No job running: one line a minute.
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    monkeypatch.setattr(detector, "_DOWNLOAD_FAILED", set(), raising=False)
+    monkeypatch.setattr(detector, "_MISSING_SAID", {}, raising=False)
+    _fake_requests(monkeypatch, error=OSError("unreachable"))
+    state = _fake_webui_job(monkeypatch, "20260101100000")
+    state.job, state.job_count = "", 0
+    now = [1000.0]
+    monkeypatch.setattr(detector.time, "monotonic", lambda: now[0])
+
+    assert detector._ensure_model(*_ASSET) is None
+    assert "couldn't obtain MediaPipe model" in capsys.readouterr().err
+
+    steps = ((10, []), (51, [_STILL_MISSING]), (30, []), (31, [_STILL_MISSING]))
+    for wait, lines in steps:
+        now[0] += wait
+        assert detector._ensure_model(*_ASSET) is None
+        assert capsys.readouterr().err.splitlines() == lines
+
+
+def test_mediapipe_missing_model_is_recalled_once_in_a_long_generation(
+    tmp_path, monkeypatch, capsys
+):
+    # A batch that lasts many minutes is one generation: one line, not one a
+    # minute. The next generation and a preview after it have their own.
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    monkeypatch.setattr(detector, "_DOWNLOAD_FAILED", set(), raising=False)
+    monkeypatch.setattr(detector, "_MISSING_SAID", {}, raising=False)
+    _fake_requests(monkeypatch, error=OSError("unreachable"))
+    state = _fake_webui_job(monkeypatch, "20260101100000")
+    state.job, state.job_count = "Batch 1 out of 4", 4
+    now = [1000.0]
+    monkeypatch.setattr(detector.time, "monotonic", lambda: now[0])
+
+    assert detector._ensure_model(*_ASSET) is None
+    assert "couldn't obtain MediaPipe model" in capsys.readouterr().err
+    for _ in range(5):
+        now[0] += 120
+        assert detector._ensure_model(*_ASSET) is None
+        assert capsys.readouterr().err == ""
+
+    state.job_timestamp = "20260101103000"
+    for n in range(5):
+        now[0] += 120
+        assert detector._ensure_model(*_ASSET) is None
+        assert capsys.readouterr().err.splitlines() == [_STILL_MISSING][n:]
+
+    # The job is over: a preview says it again (the last line is minutes old)
+    # and the one after it does not.
+    state.job, state.job_count = "", 0
+    now[0] += 5
+    assert detector._ensure_model(*_ASSET) is None
+    assert capsys.readouterr().err.splitlines() == [_STILL_MISSING]
+    now[0] += 5
+    assert detector._ensure_model(*_ASSET) is None
+    assert capsys.readouterr().err == ""
+
+
+def test_mediapipe_failed_download_names_the_folder_without_its_full_path(
+    tmp_path, monkeypatch, capsys
+):
+    # The full path holds the user name, and console lines end up pasted in
+    # public bug reports: the folder is named from the extension folder down.
+    model_dir = tmp_path / "some user" / "extensions" / "adetailer" / "adetailer"
+    model_dir = model_dir / "_mediapipe_models"
+    monkeypatch.setattr(detector, "_MODEL_DIR", model_dir)
+    monkeypatch.setattr(detector, "_DOWNLOAD_FAILED", set(), raising=False)
+    _fake_requests(monkeypatch, error=OSError("unreachable"))
+
+    assert detector._ensure_model(*_ASSET) is None
+
+    err = capsys.readouterr().err
+    assert err == (
+        "[-] ADetailer: couldn't obtain MediaPipe model 'face_landmarker.task'."
+        " Place it in the 'adetailer/adetailer/_mediapipe_models' folder of this"
+        " extension manually (from https://example.com/models/face_landmarker.task)"
+        " to use this detector.\n"
+    )
+    assert str(tmp_path) not in err
+    assert "some user" not in err
+
+
+def test_mediapipe_failed_download_is_told_again_after_the_file_was_there(
+    tmp_path, monkeypatch, capsys
+):
+    # The error line comes once per session and model, but a file that was
+    # there in between (put by hand, then removed) starts the count again.
+    monkeypatch.setattr(detector, "_MODEL_DIR", tmp_path)
+    monkeypatch.setattr(detector, "_DOWNLOAD_FAILED", set(), raising=False)
+    _fake_requests(monkeypatch, error=OSError("unreachable"))
+
+    assert detector._ensure_model(*_ASSET) is None
+    assert "couldn't obtain MediaPipe model" in capsys.readouterr().err
+    assert detector._ensure_model(*_ASSET) is None
+    assert capsys.readouterr().err == ""
+
+    placed = tmp_path / "face_landmarker.task"
+    placed.write_bytes(b"x" * 2000)
+    assert detector._ensure_model(*_ASSET) == str(placed)
+    assert _ASSET[0] not in detector._DOWNLOAD_FAILED
+
+    placed.rename(tmp_path / "moved.task")
+    assert detector._ensure_model(*_ASSET) is None
+    captured = capsys.readouterr()
+    assert "trying to download" in captured.out
+    assert "couldn't obtain MediaPipe model" in captured.err

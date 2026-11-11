@@ -82,12 +82,81 @@ _ALL_ARGS_OF_MAIN = [
     ("ad_controlnet_guidance_start", "ADetailer ControlNet guidance start"),
     ("ad_controlnet_guidance_end", "ADetailer ControlNet guidance end"),
     ("ad_inpaint_indices", "ADetailer inpaint indices"),
+    # plus.10: the one entry added since, at the end, so the UI's positions
+    # above stay where they were.
+    ("ad_inpaint_masked_content", "ADetailer inpaint masked content"),
 ]
 
 
 def test_all_args_keep_their_names_and_order() -> None:
-    assert len(ALL_ARGS) == 62
+    assert len(ALL_ARGS) == 63
     assert [tuple(arg) for arg in ALL_ARGS] == _ALL_ARGS_OF_MAIN
+
+
+@pytest.mark.parametrize(
+    ("choice", "fill"),
+    [("fill", 0), ("original", 1), ("latent noise", 2), ("latent nothing", 3)],
+)
+def test_masked_content_gives_the_webuis_inpainting_fill(choice: str, fill: int) -> None:
+    # The WebUI's img2img numbers its "Masked content" choices 0-3.
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_masked_content=choice)
+    assert args.inpainting_fill() == fill
+
+
+def test_masked_content_defaults_to_original() -> None:
+    # Older presets, remembered settings and API requests do not have the
+    # key: they keep the fixed "original" (1) the detailer pass always used.
+    old = {"ad_model": "face_yolov8n.pt", "ad_prompt": "detailed face"}
+    args = ADetailerArgs(**old)
+    assert args.ad_inpaint_masked_content == "original"
+    assert args.inpainting_fill() == 1
+
+
+@pytest.mark.parametrize(
+    "value", ["noise", "latent  noise", "", "4", "-1", "1.0", 4, -1, 1.5, True, None]
+)
+def test_masked_content_takes_only_the_webuis_choices(value: object) -> None:
+    assert ADetailerArgs(ad_inpaint_masked_content="latent noise")
+    with pytest.raises(ValueError, match="ad_inpaint_masked_content"):
+        ADetailerArgs(ad_inpaint_masked_content=value)
+
+
+@pytest.mark.parametrize(
+    ("value", "choice"),
+    [
+        # Any letter case, spaces around it.
+        ("Original", "original"),
+        ("Latent Noise", "latent noise"),
+        (" FILL ", "fill"),
+        ("latent nothing\n", "latent nothing"),
+        # The WebUI's own inpainting_fill number, as a number or as text.
+        (0, "fill"),
+        (1, "original"),
+        (2, "latent noise"),
+        (3, "latent nothing"),
+        ("1", "original"),
+        (" 2 ", "latent noise"),
+    ],
+)
+def test_masked_content_accepts_the_webuis_number_and_any_letter_case(
+    value: object, choice: str
+) -> None:
+    # An API request with "Original" or 1 was an error and the tab was skipped.
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_inpaint_masked_content=value)
+    assert args.ad_inpaint_masked_content == choice
+    assert args.inpainting_fill() == ["fill", "original", "latent noise",
+                                      "latent nothing"].index(choice)
+
+
+def test_masked_content_is_in_the_parameters_only_when_changed() -> None:
+    plain = ADetailerArgs(ad_model="face_yolov8n.pt").extra_params(suffix=" 2nd")
+    assert not any(k.startswith("ADetailer inpaint masked content") for k in plain)
+
+    changed = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_inpaint_masked_content="latent noise"
+    ).extra_params(suffix=" 2nd")
+    assert changed["ADetailer inpaint masked content 2nd"] == "latent noise"
+    assert "ADetailer inpaint masked content" not in changed
 
 
 @pytest.mark.parametrize(

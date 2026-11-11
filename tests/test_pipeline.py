@@ -33,6 +33,13 @@ _NETWORK_HASHES = {
     "restore_network_hashes": restore_network_hashes,
 }
 
+# The pass gives a tab's __name__ wildcards the main prompt's values.
+_MAIN_WILDCARD_FUNCTIONS = {
+    "_main_wildcard_picks", "_put_wildcard_values", "_main_wildcard_values",
+    "_match_wildcard_template", "_wildcard_template_parts", "_strip_host_comments",
+    "_ad_verbose", "_vprint",
+}
+
 
 def _load_runtime(**host_globals):
     tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
@@ -40,11 +47,14 @@ def _load_runtime(**host_globals):
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in {
             "_forge_wanted_modules", "_parse_class_prompts", "_class_prompt_for",
-            "_empty_prompt_note", "_strip_host_comments",
+            "_empty_prompt_note", "_strip_host_comments", "_without_dynamic_prompts",
+            *(_MAIN_WILDCARD_FUNCTIONS - set(host_globals)),
         }:
             selected.append(node)
         elif isinstance(node, ast.Assign) and any(
-            getattr(target, "id", "") == "_PROMPT_TOKEN_RE" for target in node.targets
+            getattr(target, "id", "")
+            in ("_PROMPT_TOKEN_RE", "_WILDCARD_TOKEN_RE", "_DYNAMIC_PROMPTS_MARKS")
+            for target in node.targets
         ):
             selected.append(node)
         elif isinstance(node, ast.ClassDef) and node.name == "AfterDetailerScript":
@@ -553,10 +563,22 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
     # And those that read Settings > ADetailer "Max inpaint size".
     if {"fix_p2", "extra_params"} & set(methods):
         functions = {*functions, "_max_inpaint_side", "_cap_inpaint_size"}
+    # And the parameters line of the "1 megapixel" bbox size matching.
+    if "extra_params" in methods:
+        from adetailer.args import InpaintBBoxMatchMode
+
+        functions = {*functions, "_megapixel_match_on"}
+        host_globals.setdefault("InpaintBBoxMatchMode", InpaintBBoxMatchMode)
     # And the pass, which says when [PROMPT=words] left a prompt empty.
     if "_postprocess_image_inner" in methods:
         functions = {*functions, "_empty_prompt_note", "_strip_host_comments"}
         assigns = {*assigns, "_PROMPT_TOKEN_RE"}
+        # And gives the tab's wildcards the main prompt's values.
+        functions = {*functions, *(_MAIN_WILDCARD_FUNCTIONS - set(host_globals))}
+        assigns = {*assigns, "_WILDCARD_TOKEN_RE"}
+        # And leaves Dynamic Prompts out of a region with nothing to draw.
+        functions = {*functions, "_without_dynamic_prompts"}
+        assigns = {*assigns, "_DYNAMIC_PROMPTS_MARKS"}
     # And the "applied ad_prompt" line, which ignores the removed comments.
     if "compare_prompt" in methods:
         functions = {*functions, "_strip_host_comments"}
@@ -566,6 +588,10 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
         assigns = {*assigns, "_XYZ_MODEL_LIST"}
     if "make_axis_on_xyz_grid" in functions:
         assigns = {*assigns, "_XYZ_MODEL_LIST"}
+    # And the hook that gives Soft Inpainting back the main image's overlay.
+    if "postprocess_image" in methods:
+        functions = {*functions, "_save_soft_inpaint_state", "_restore_soft_inpaint_state"}
+        assigns = {*assigns, "_SOFT_INPAINT_STATE"}
     tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
     selected = ast.parse("from __future__ import annotations").body
     for node in tree.body:
@@ -1809,6 +1835,8 @@ _CN_INPAINT = "control_v11p_sd15_inpaint [ebff9138]"
         {"ad_use_sampler": True, "ad_sampler": "Euler a"},
         # A ControlNet model leaves out the "None" module and default weights.
         {"ad_controlnet_model": _CN_INPAINT, "ad_controlnet_module": "None"},
+        # A masked content other than "original" is written and pasted back.
+        {"ad_inpaint_masked_content": "latent nothing"},
     ],
 )
 def test_pasted_parameters_reproduce_the_image_tab(image):
@@ -1835,6 +1863,7 @@ def test_pasted_parameters_reproduce_the_image_tab(image):
         ad_controlnet_model="control_v11p_sd15_openpose [cab727d4]",
         ad_controlnet_module="inpaint_only+lama", ad_controlnet_weight=0.5,
         ad_controlnet_guidance_start=0.1, ad_controlnet_guidance_end=0.9,
+        ad_inpaint_masked_content="latent noise",
     ).dict()
     params = _infotext(made)
 
@@ -3244,6 +3273,29 @@ def test_whole_picture_inpaint_keeps_the_skip_img2img_image_size(
 
 
 @pytest.mark.parametrize(
+    ("choice", "fill"),
+    [
+        (None, 1),  # not set: "original", the value the pass always used
+        ("fill", 0),
+        ("original", 1),
+        ("latent noise", 2),
+        ("latent nothing", 3),
+    ],
+)
+def test_detailer_pass_uses_the_tabs_masked_content(choice, fill):
+    # "Masked content" was fixed to "original" (inpainting_fill=1).
+    from adetailer.args import ADetailerArgs
+
+    script = _i2i_script()
+    extra = {} if choice is None else {"ad_inpaint_masked_content": choice}
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", **extra)
+
+    i2i = script.get_i2i_p(_txt2img_p(), args, Image.new("RGB", (512, 768)))
+
+    assert i2i.inpainting_fill == fill
+
+
+@pytest.mark.parametrize(
     ("use_checkpoint", "checkpoint", "expected"),
     [
         (True, "other.safetensors", 3.5),
@@ -3365,6 +3417,129 @@ def test_an_error_in_a_tab_still_restarts_the_scripts_and_keeps_params_txt(
 
     assert params_txt.read_text(encoding="utf-8") == "user generation"
     assert hooks == ["postprocess", "before_process", "process"]
+
+
+def _soft_inpaint_postprocess_script(tmp_path, inner):
+    from aaaaaa.p_method import need_call_postprocess, need_call_process
+
+    script = _load_script(
+        methods={"postprocess_image", "read_params_txt", "write_params_txt"},
+        paths=SimpleNamespace(data_path=str(tmp_path)),
+        PARAMS_TXT="params.txt",
+        opts=SimpleNamespace(data={}),
+        ensure_pil_image=lambda image, _mode: image,
+        copy=copy,
+        _verbose_gen_header=lambda *_args: None,
+        need_call_postprocess=need_call_postprocess,
+        need_call_process=need_call_process,
+        Processed=lambda *_args: "dummy",
+        preserve_prompts=lambda _p: nullcontext(),
+        CNHijackRestore=nullcontext,
+        pause_total_tqdm=nullcontext,
+        cn_allow_script_control=nullcontext,
+        _should_skip_for_hires_only=lambda _p, _args: False,
+        is_skip_img2img=lambda _p: False,
+    ).AfterDetailerScript()
+    tab = SimpleNamespace(need_skip=lambda: False)
+    script.is_ad_enabled = lambda *_args: True
+    script.get_i2i_init_image = lambda _p, pp: pp.image
+    script.get_args = lambda *_args: [tab, tab]
+    script._will_run_sequential = lambda _args: False
+    script.save_image = lambda *_args, **_kwargs: None
+    script._postprocess_image_inner = inner
+    return script
+
+
+@pytest.mark.parametrize("fails", [True, False])
+def test_the_detailer_pass_keeps_the_main_soft_inpainting_overlay(tmp_path, fails):
+    # Soft Inpainting keeps the overlay and mask of the image it inpainted on
+    # its script object, and the host applies them to the main image only
+    # after postprocess_image. The detailer pass runs the same object and left
+    # its own there: with "Only masked" (and with Ultimate SD Upscale) the main
+    # image became a black picture the size of the crop.
+    main_masks = [Image.new("L", (64, 64), 255), Image.new("L", (64, 64), 255)]
+    main_overlays = [Image.new("RGBA", (64, 64)), Image.new("RGBA", (64, 64))]
+    soft = SimpleNamespace(
+        filename="extensions-builtin/soft-inpainting/scripts/soft_inpainting.py",
+        masks_for_overlay=main_masks,
+        overlay_images=main_overlays,
+    )
+    # Another script with the same names is not Soft Inpainting: left alone.
+    other = SimpleNamespace(
+        filename="extensions/other/scripts/other.py",
+        masks_for_overlay=["main"],
+        overlay_images=["main"],
+    )
+
+    def inner(_p, _pp, _args, n=0):
+        # What the pass's own post_sample does to the shared objects.
+        soft.masks_for_overlay = [Image.new("L", (16, 16), 255)]
+        soft.overlay_images = [Image.new("RGBA", (16, 16))]
+        other.masks_for_overlay = other.overlay_images = ["pass"]
+        if fails and n == 1:
+            msg = "Model 'missing.pt' not found"
+            raise ValueError(msg)
+        return True
+
+    script = _soft_inpaint_postprocess_script(tmp_path, inner)
+    runner = SimpleNamespace(
+        alwayson_scripts=[other, soft],
+        postprocess=lambda *_args: None,
+        before_process=lambda *_args: None,
+        process=lambda *_args: None,
+    )
+    p = SimpleNamespace(
+        batch_index=0, batch_size=2, seed=1, scripts=runner, extra_generation_params={}
+    )
+    pp = SimpleNamespace(image=Image.new("RGB", (16, 16)))
+
+    if fails:
+        with pytest.raises(ValueError, match="not found"):
+            script.postprocess_image(p, pp, True)
+    else:
+        script.postprocess_image(p, pp, True)
+
+    # The host's postprocess_maskoverlay then reads the main image's, for
+    # every image of the batch.
+    assert soft.masks_for_overlay is main_masks
+    assert soft.overlay_images is main_overlays
+    assert other.masks_for_overlay == other.overlay_images == ["pass"]
+
+
+@pytest.mark.parametrize(
+    "p",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(scripts=None),
+        SimpleNamespace(scripts=SimpleNamespace()),
+        SimpleNamespace(scripts=SimpleNamespace(alwayson_scripts=None)),
+        SimpleNamespace(
+            scripts=SimpleNamespace(alwayson_scripts=[SimpleNamespace(filename=None)])
+        ),
+    ],
+)
+def test_soft_inpainting_state_without_the_script_is_left_alone(p):
+    # A host or job without Soft Inpainting (txt2img, Run ADetailer on an
+    # image, a WebUI without it): nothing to keep, no error, the pass runs.
+    runtime = _load_script(
+        functions={"_save_soft_inpaint_state", "_restore_soft_inpaint_state"},
+        assigns={"_SOFT_INPAINT_STATE"},
+    )
+    saved = runtime._save_soft_inpaint_state(p)
+    assert saved == []
+    runtime._restore_soft_inpaint_state(saved)
+
+    # A Soft Inpainting script of a host that has not run it yet keeps None.
+    soft = SimpleNamespace(
+        filename="soft_inpainting.py", masks_for_overlay=None, overlay_images=None
+    )
+    saved = runtime._save_soft_inpaint_state(
+        SimpleNamespace(scripts=SimpleNamespace(alwayson_scripts=[soft]))
+    )
+    soft.masks_for_overlay, soft.overlay_images = ["pass"], ["pass"]
+    runtime._restore_soft_inpaint_state(saved)
+    assert soft.masks_for_overlay is None
+    assert soft.overlay_images is None
 
 
 @pytest.mark.parametrize("global_dir", [True, False])
@@ -4010,11 +4185,13 @@ def test_the_docs_say_what_full_region_opacity_does():
 
 
 def test_the_docs_do_not_promise_that_the_mirror_never_gets_the_token():
-    # Only ADetailer's own mirror request has token=False: with HF_ENDPOINT
-    # set to the mirror, the request to Hugging Face goes there with the
-    # user's token, so the docs must not say the mirror never receives it.
+    # In plus.9 only ADetailer's own mirror request had token=False: with
+    # HF_ENDPOINT set to the mirror, the request to Hugging Face went there
+    # with the user's token, so the plus.9 notes must not say the mirror never
+    # received it. From plus.10 that request has token=False too.
     common = (_SCRIPT_PATH.parents[1] / "adetailer" / "common.py").read_text(encoding="utf-8")
-    assert "return hf_hub_download(repo_id, file, etag_timeout=1)\n" in common
+    assert 'no_token = {"token": False} if _is_hf_mirror(hub) else {}\n' in common
+    assert "path = _hub_fetch(repo_id, file, save_in, etag_timeout=1, **no_token)\n" in common
     docs = _public_docs()
     readme = docs["README.md"]
     assert "never receives your Hugging Face token" not in readme
@@ -4023,11 +4200,66 @@ def test_the_docs_do_not_promise_that_the_mirror_never_gets_the_token():
     builtin = next(s for s in lines if s.startswith("- The `.pt` detectors in this table"))
     faq = _readme_section("### Does it upload my images?", "### Is a detector file safe?")
     changelog = docs["CHANGELOG.md"]
-    stable = changelog[: changelog.index("## v26.2.0+plus.9.beta.3")]
+    stable = changelog[
+        changelog.index("## v26.2.0+plus.9 ") : changelog.index("## v26.2.0+plus.9.beta.3")
+    ]
     entry = next(s for s in stable.splitlines() if s.startswith("- **") and "hf-mirror.com" in s)
-    assert not entry.startswith("- **Your Hugging Face token is no longer sent")
+    assert entry.startswith("- **ADetailer's own request to the hf-mirror.com mirror")
+    assert "the Hugging Face library sends the token with it" in entry
     for text in (summary, builtin, faq, entry):
         assert "`HF_ENDPOINT`" in text
+    # The stable plus.9 still sends it with HF_ENDPOINT on the mirror; from
+    # plus.10 beta 1 hf-mirror.com does not get it, another host still does.
+    for text in (builtin, faq):
+        assert "in the stable plus.9 the Hugging Face library sends the token there" in text
+        assert (
+            "🟡 from plus.10 beta 1 the token is not sent to hf-mirror.com or its"
+            " subdomains, and only another host set with `HF_ENDPOINT` still gets it"
+        ) in text
+    beta = changelog[
+        changelog.index("## v26.2.0+plus.10.beta.1") : changelog.index("## v26.2.0+plus.9 ")
+    ]
+    fixed = next(
+        s for s in beta.splitlines()
+        if s.startswith("- **With `HF_ENDPOINT` set to hf-mirror.com,")
+    )
+    assert "your Hugging Face token is no longer sent to the mirror.**" in fixed
+    assert "another mirror host set with `HF_ENDPOINT` still gets the token" in fixed
+    assert "v26.2.0+plus.9 and earlier releases had the same problem." in fixed
+    note = next(s for s in lines if s.startswith("- 🟡 With the `HF_ENDPOINT` variable set to"))
+    assert "no longer sends your Hugging Face token to the mirror" in note
+    assert "another mirror host set with `HF_ENDPOINT` still gets the token" in note
+
+
+def test_the_docs_say_a_first_download_is_saved_in_the_model_folder():
+    # From plus.10 beta 1 a built-in detector downloaded for the first time
+    # is a file in models/adetailer, while the README still said that the
+    # built-in detectors are never kept there. The ones already in the
+    # Hugging Face cache stay there, which the notes must say too.
+    common = (_SCRIPT_PATH.parents[1] / "adetailer" / "common.py").read_text(encoding="utf-8")
+    assert 'return ", saved in models/adetailer"\n' in common
+    assert "if (major, minor) < (0, 23):\n" in common
+    docs = _public_docs()
+    readme = docs["README.md"]
+    assert "They are kept in the Hugging Face download folder" not in readme
+    builtin = next(
+        s for s in readme.splitlines() if s.startswith("- The `.pt` detectors in this table")
+    )
+    beta = docs["CHANGELOG.md"]
+    beta = beta[beta.index("## v26.2.0+plus.10.beta.1") : beta.index("## v26.2.0+plus.9 ")]
+    entry = next(
+        s for s in beta.splitlines()
+        if s.startswith("- **A built-in detector downloaded for the first time")
+    )
+    for text in (builtin, entry):
+        assert "saved as a normal file in `models/adetailer`" in text
+        assert 'ends with "saved in models/adetailer"' in text
+        assert "stay there and are used from there" in text
+        assert "huggingface_hub 0.23 or newer" in text
+        assert "`.cache` subfolder" in text
+    assert "In the stable plus.9 they are kept in the Hugging Face download folder" in builtin
+    assert "Tested live with `hand_yolov8n.pt`" in entry
+    assert "not tested live yet" not in entry
 
 
 def test_the_docs_say_forge_removed_the_adetailer_prompt_comments_already():
@@ -6280,6 +6512,18 @@ def test_an_xyz_prompt_search_replace_cell_pastes_back_the_per_class_lines(
     for cls in ("face", "hand"):
         cell = script.get_prompt(p, class_pass(ADetailerArgs(**tab), cls))
         assert script.get_prompt(photo(), class_pass(pasted, cls)) == cell
+
+
+def test_the_verbose_log_lists_masked_content_with_the_inpainting_settings():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    sections = dict(
+        next(
+            ast.literal_eval(node.value) for node in tree.body
+            if isinstance(node, ast.AnnAssign)
+            and getattr(node.target, "id", "") == "_VERBOSE_SECTIONS"
+        )
+    )
+    assert "ad_inpaint_masked_content" in sections["Inpainting"]
 
 
 def _verbose_helpers():
@@ -8611,6 +8855,14 @@ def test_reload_ui_reads_the_class_names_again(tmp_path):
         get_model_class_names.cache_clear()
 
 
+def test_start_gives_get_models_the_model_folder_first():
+    # A built-in model downloaded for the first time is saved in the first
+    # folder given to get_models: models/adetailer, before the extra folders.
+    source = _SCRIPT_PATH.read_text(encoding="utf-8")
+    assert 'adetailer_dir = Path(paths.models_path, "adetailer")\n' in source
+    assert "model_mapping = get_models(\n    adetailer_dir,\n" in source
+
+
 def test_the_refresh_button_is_given_the_folder_read():
     # Without refresh_models the 🔄 only lists the names already in memory,
     # and a detector copied into the folders stays missing (issue #8).
@@ -9621,7 +9873,9 @@ def test_xyz_axes_reach_every_tab_and_keep_the_old_labels(data, tabs):
         ):
             assert f"[ADetailer] {name} {ordinal(n)}" in labels
     assert not [x for x in labels if x.endswith(f" {ordinal(tabs + 1)}")]
-    expected = len(_OLD_XYZ_LABELS) + 1 + 3 + 10 * (tabs - 1)
+    # + "Enable" and "Masked content 1st", + 3 axes for the 1st tab's other
+    # fields, + 10 per tab from the 2nd on.
+    expected = len(_OLD_XYZ_LABELS) + 2 + 3 + 10 * (tabs - 1)
     assert len(labels) == len(set(labels)) == expected
 
     # Called again (a UI reload), it adds nothing twice.
@@ -9646,6 +9900,33 @@ def test_xyz_axes_reach_every_tab_and_keep_the_old_labels(data, tabs):
     for value, expected_value in (("False", False), ("True", True), ("true", True)):
         enable.apply(pc, value, ["False", "True"])
         assert pc._ad_xyz_enable is expected_value
+
+
+def test_the_xyz_masked_content_axis_sets_the_1st_tab():
+    from adetailer.args import INPAINT_MASKED_CONTENT, ADetailerArgs
+
+    runtime, grid = _xyz_runtime({"ad_max_models": 2})
+    # The script imports it from adetailer.args.
+    runtime.make_axis_on_xyz_grid.__globals__["INPAINT_MASKED_CONTENT"] = (
+        INPAINT_MASKED_CONTENT
+    )
+    runtime.make_axis_on_xyz_grid()
+    labels = [x.label for x in grid.axis_options]
+    # After every axis that was there before it, the ones of each tab too:
+    # an API request picks an axis by its place, so their places stay.
+    assert labels[-1] == "[ADetailer] Masked content 1st"
+    assert labels[labels.index("[ADetailer] Enable") + 1] == (
+        "[ADetailer] Detection confidence threshold 1st"
+    )
+    axis = {x.label: x for x in grid.axis_options}["[ADetailer] Masked content 1st"]
+    assert axis.choices() == ["fill", "original", "latent noise", "latent nothing"]
+
+    pc = SimpleNamespace()
+    axis.apply(pc, "latent noise", axis.choices())
+
+    assert pc._ad_xyz == {"ad_inpaint_masked_content": "latent noise"}
+    args = ADetailerArgs(**{"ad_model": "face_yolov8n.pt", **pc._ad_xyz})
+    assert args.inpainting_fill() == 2
 
 
 def test_xyz_detector_axes_list_the_detectors_found_by_the_refresh(tmp_path):
@@ -10183,8 +10464,11 @@ def test_install_keeps_going_when_mediapipe_has_no_wheel(monkeypatch, capsys):
         ("ultralytics>=8.3.75", "rich>=13.0.0"),
         ("mediapipe>=0.10.13,<=0.10.99",),
     ]
-    err = capsys.readouterr().err
-    assert "could not install mediapipe" in err
+    # On stdout: the WebUI shows install.py's stdout and drops its stderr
+    # when install.py ends without an error, as it does here.
+    captured = capsys.readouterr()
+    assert "could not install mediapipe" in captured.out
+    assert "could not install mediapipe" not in captured.err
 
 
 def test_install_keeps_numpy_1_in_both_pip_commands(monkeypatch):
@@ -10202,6 +10486,67 @@ def test_install_keeps_numpy_1_in_both_pip_commands(monkeypatch):
         ("ultralytics>=8.3.75", "rich>=13.0.0", "numpy<2"),
         ("mediapipe>=0.10.13,<=0.10.99", "numpy<2"),
     ]
+
+
+
+def test_install_announces_each_pip_command(monkeypatch, capsys):
+    # pip can take minutes on the first start: one line before and one
+    # after each install, so the console does not look stuck.
+    install = _load_install(monkeypatch)
+    calls = []
+    monkeypatch.setattr(install, "run_pip", lambda *args: calls.append(args))
+    monkeypatch.setattr(install, "is_installed", lambda *a: False)
+    monkeypatch.setattr(install, "numpy_pin", lambda: [])
+
+    install.install()
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == (
+        "[-] ADetailer: installing ultralytics>=8.3.75, rich>=13.0.0 with pip,"
+        " this can take a few minutes..."
+    )
+    assert lines[1].startswith(
+        "[-] ADetailer: installed ultralytics>=8.3.75, rich>=13.0.0 ("
+    )
+    assert lines[2] == (
+        "[-] ADetailer: installing mediapipe>=0.10.13,<=0.10.99 with pip,"
+        " this can take a few minutes..."
+    )
+    assert lines[3].startswith("[-] ADetailer: installed mediapipe>=0.10.13,<=0.10.99 (")
+    assert len(lines) == 4
+    assert len(calls) == 2
+
+
+def test_install_says_nothing_when_everything_is_installed(monkeypatch, capsys):
+    install = _load_install(monkeypatch)
+    calls = []
+    monkeypatch.setattr(install, "run_pip", lambda *args: calls.append(args))
+    monkeypatch.setattr(install, "is_installed", lambda *a: True)
+
+    install.install()
+
+    assert calls == []
+    assert capsys.readouterr().out == ""
+
+
+def test_install_has_no_installed_line_for_a_failed_mediapipe(monkeypatch, capsys):
+    import subprocess
+
+    install = _load_install(monkeypatch)
+
+    def fake_pip(*args):
+        if any(a.startswith("mediapipe") for a in args):
+            raise subprocess.CalledProcessError(1, "pip")
+
+    monkeypatch.setattr(install, "run_pip", fake_pip)
+    monkeypatch.setattr(install, "is_installed", lambda pkg, *a: pkg != "mediapipe")
+    monkeypatch.setattr(install, "numpy_pin", lambda: [])
+
+    install.install()
+
+    out = capsys.readouterr().out
+    assert "installing mediapipe" in out
+    assert "installed" not in out
 
 
 def test_install_still_fails_loudly_when_ultralytics_cannot_install(monkeypatch):
@@ -11173,6 +11518,239 @@ def test_max_inpaint_size_is_a_settings_slider_off_by_default():
     assert "default=0," in option
     assert '"minimum": 0, "maximum": 4096, "step": 64' in option
     assert "component=gr.Slider" in option
+
+
+# Settings -> ADetailer -> "Try to match inpainting size to bounding box size":
+# the "1 megapixel (SDXL, Flux and newer)" choice.
+
+_MEGAPIXEL = "1 megapixel (SDXL, Flux and newer)"
+
+
+def test_megapixel_size_keeps_the_shape_in_multiples_of_64_near_1024_squared():
+    from adetailer.opts import optimal_crop_size
+
+    for tenths in range(25, 401):  # every shape from 1:4 to 4:1
+        ratio = tenths / 100
+        width, height = optimal_crop_size.megapixel([0, 0, 100 * ratio, 100])
+        assert width % 64 == 0
+        assert height % 64 == 0
+        assert width >= 64
+        assert height >= 64
+        assert abs(width * height - 1024 * 1024) <= 0.1 * 1024 * 1024
+        # The shape is the box's, up to the rounding to 64.
+        assert abs(width / height - ratio) / ratio < 0.15, (ratio, width, height)
+
+
+@pytest.mark.parametrize(
+    ("bbox", "size"),
+    [
+        ([0, 0, 900, 900], (1024, 1024)),
+        ([10, 10, 210, 260], (896, 1152)),  # a face, 200 x 250
+        ([0, 0, 600, 400], (1280, 832)),
+        # Kept between 1:4 and 4:1.
+        ([0, 0, 120, 500], (512, 2048)),
+        ([0, 0, 500, 120], (2048, 512)),
+        ([0, 0, 10, 3000], (512, 2048)),
+        ([0, 0, 3000, 10], (2048, 512)),
+        # A tiny box is brought up to about 1 megapixel too.
+        ([5, 5, 7, 8], (832, 1280)),
+        ([5, 5, 6, 6], (1024, 1024)),
+        # A box with no width or height does not divide by zero.
+        ([5, 5, 5, 100], (512, 2048)),
+        ([5, 5, 100, 5], (2048, 512)),
+        # A fractional box, as a merged mask can give.
+        ([0.5, 0.5, 300.5, 200.5], (1280, 832)),
+    ],
+)
+def test_megapixel_size_of_typical_tiny_and_long_boxes(bbox, size):
+    from adetailer.opts import optimal_crop_size
+
+    assert optimal_crop_size.megapixel(bbox) == size
+
+
+def test_megapixel_size_needs_a_box_of_four_numbers():
+    from adetailer.opts import optimal_crop_size
+
+    with pytest.raises(ValueError, match="bbox length must be 4"):
+        optimal_crop_size.megapixel([0, 0, 10])
+
+
+def _match_fix_p2(match, opts_data=None, *, sdxl=False, bbox=(10, 10, 210, 260), **arg_values):
+    """p2's size after fix_p2, with the bbox size matching on ``match``, for a
+    region inpainted at 512 x 768 on a 1024 x 1024 picture."""
+    from adetailer.args import ADetailerArgs, InpaintBBoxMatchMode
+    from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+
+    runtime = _load_script(
+        methods={
+            "fix_p2", "get_dynamic_denoise_strength", "get_optimal_crop_image_size",
+            "get_seed", "get_each_tab_seed",
+        },
+        opts=SimpleNamespace(
+            data={"ad_match_inpaint_bbox_size": match, **(opts_data or {})}
+        ),
+        shared=SimpleNamespace(
+            opts=SimpleNamespace(data={}), sd_model=SimpleNamespace(is_sdxl=sdxl)
+        ),
+        get_i=lambda _p: 0,
+        InpaintBBoxMatchMode=InpaintBBoxMatchMode,
+        dynamic_denoise_strength=dynamic_denoise_strength,
+        optimal_crop_size=optimal_crop_size,
+    )
+    p2 = SimpleNamespace(width=512, height=768, denoising_strength=0.4, image_mask=None)
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", **arg_values)
+    outer = SimpleNamespace(seed=1, subseed=1, all_seeds=[1], all_subseeds=[1])
+    runtime.AfterDetailerScript().fix_p2(
+        outer, p2, SimpleNamespace(image=Image.new("RGB", (1024, 1024))), args,
+        SimpleNamespace(bboxes=[list(bbox)]), 0,
+    )
+    return p2.width, p2.height
+
+
+@pytest.mark.parametrize(
+    ("opts_data", "bbox", "size"),
+    [
+        # Any model (here not SDXL): no model check, unlike Strict.
+        ({}, (10, 10, 210, 260), (896, 1152)),
+        ({}, (0, 0, 120, 500), (512, 2048)),
+        ({}, (0, 0, 900, 900), (1024, 1024)),
+        # "Max inpaint size" is applied after, keeping the shape.
+        ({"ad_max_inpaint_side": 768}, (10, 10, 210, 260), (592, 768)),
+        ({"ad_max_inpaint_side": 768}, (0, 0, 120, 500), (192, 768)),
+        ({"ad_max_inpaint_side": 768}, (0, 0, 900, 900), (768, 768)),
+        ({"ad_max_inpaint_side": 2048}, (0, 0, 120, 500), (512, 2048)),
+    ],
+)
+def test_megapixel_match_sizes_the_region_then_max_inpaint_size_caps_it(
+    opts_data, bbox, size
+):
+    assert _match_fix_p2(_MEGAPIXEL, opts_data, bbox=bbox) == size
+
+
+@pytest.mark.parametrize(
+    ("arg_values", "size"),
+    [
+        # "Use separate width/height" wins: the tab's size stays (fix_p2 does
+        # not change p2, which get_i2i_p already set to it).
+        ({"ad_use_inpaint_width_height": True}, (512, 768)),
+        # Whole-picture inpaint keeps the size get_i2i_p set.
+        ({"ad_inpaint_only_masked": False}, (512, 768)),
+        # "Scale inpaint to bbox" takes its place: 200 x 250 at 1.5.
+        ({"ad_use_resolution_scale": True, "ad_resolution_scale": 1.5}, (296, 368)),
+        # None of them: about 1 megapixel.
+        ({}, (896, 1152)),
+    ],
+)
+def test_megapixel_match_keeps_the_priorities_of_fix_p2(arg_values, size):
+    assert _match_fix_p2(_MEGAPIXEL, **arg_values) == size
+
+
+@pytest.mark.parametrize(
+    ("match", "sdxl", "bbox", "size"),
+    [
+        # The sizes the three old choices gave before "1 megapixel" came.
+        ("Off", False, (10, 10, 210, 260), (512, 768)),
+        ("Off", True, (0, 0, 120, 500), (512, 768)),
+        ("Free", False, (10, 10, 210, 260), (616, 768)),
+        ("Free", False, (0, 0, 600, 400), (768, 512)),
+        ("Free", False, (0, 0, 120, 500), (184, 768)),
+        ("Strict (SDXL only)", True, (10, 10, 210, 260), (896, 1152)),
+        ("Strict (SDXL only)", True, (0, 0, 120, 500), (640, 1536)),
+        ("Strict (SDXL only)", True, (0, 0, 600, 400), (1216, 832)),
+        ("Strict (SDXL only)", False, (0, 0, 600, 400), (512, 768)),
+        # An unknown saved value still keeps the size.
+        ("Something else", False, (0, 0, 600, 400), (512, 768)),
+    ],
+)
+def test_off_strict_and_free_give_the_same_sizes_as_before(match, sdxl, bbox, size):
+    assert _match_fix_p2(match, sdxl=sdxl, bbox=bbox) == size
+
+
+def test_megapixel_is_the_fourth_choice_and_the_old_values_are_unchanged():
+    from adetailer.args import INPAINT_BBOX_MATCH_MODES, InpaintBBoxMatchMode
+
+    # Saved settings keep the strings of the three old choices.
+    assert INPAINT_BBOX_MATCH_MODES == [
+        "Off", "Strict (SDXL only)", "Free", _MEGAPIXEL,
+    ]
+    assert InpaintBBoxMatchMode.MEGAPIXEL.value == _MEGAPIXEL
+
+    script_text = _SCRIPT_PATH.read_text(encoding="utf-8")
+    option = script_text[
+        script_text.index('        "ad_match_inpaint_bbox_size",\n        shared.OptionInfo('):
+    ]
+    option = option[: option.index("shared.opts.add_option")]
+    assert "default=InpaintBBoxMatchMode.OFF.value" in option
+    assert '"choices": INPAINT_BBOX_MATCH_MODES' in option
+    info = re.search(r'\.info\(\s*"([^"]*)"\s*\)', option).group(1)
+    # One plain block of text (translations replace whole text nodes).
+    for mark in ("**", "`", "[", "\n", "<"):
+        assert mark not in info
+    assert "1 megapixel works with any model" in info
+    assert "SD1.5" in info
+    assert "four times the time and video memory" in info
+
+
+@pytest.mark.parametrize(
+    ("match", "tabs", "written"),
+    [
+        # Not the 1 megapixel choice: nothing written, as for Strict and Free.
+        (None, [{"ad_model": "face_yolov8n.pt"}], None),
+        ("Off", [{"ad_model": "face_yolov8n.pt"}], None),
+        ("Free", [{"ad_model": "face_yolov8n.pt"}], None),
+        ("Strict (SDXL only)", [{"ad_model": "face_yolov8n.pt"}], None),
+        # On, with a running tab it applies to.
+        (_MEGAPIXEL, [{"ad_model": "face_yolov8n.pt"}], "1 MP"),
+        # On, but no tab it applies to.
+        (_MEGAPIXEL, [], None),
+        (_MEGAPIXEL, [{"ad_model": "None"}], None),
+        (_MEGAPIXEL, [{"ad_model": "face_yolov8n.pt", "ad_tab_enable": False}], None),
+        (_MEGAPIXEL, [{"ad_model": "face_yolov8n.pt", "ad_inpaint_only_masked": False}], None),
+        (
+            _MEGAPIXEL,
+            [{"ad_model": "face_yolov8n.pt", "ad_use_inpaint_width_height": True}],
+            None,
+        ),
+        (
+            _MEGAPIXEL,
+            [{"ad_model": "face_yolov8n.pt", "ad_use_resolution_scale": True}],
+            None,
+        ),
+        # One running tab it applies to is enough.
+        (
+            _MEGAPIXEL,
+            [
+                {"ad_model": "face_yolov8n.pt", "ad_use_resolution_scale": True},
+                {"ad_model": "hand_yolov8n.pt"},
+            ],
+            "1 MP",
+        ),
+    ],
+)
+def test_megapixel_match_is_written_to_the_parameters_only_when_it_applies(
+    match, tabs, written
+):
+    from adetailer.args import ADetailerArgs
+
+    data = {} if match is None else {"ad_match_inpaint_bbox_size": match}
+    runtime = _load_script(
+        methods={"extra_params"},
+        opts=SimpleNamespace(data=data),
+        suffix=_ui_suffix(),
+        __version__="test",
+    )
+    arg_list = [ADetailerArgs(**values) for values in tabs]
+    params = runtime.AfterDetailerScript().extra_params(arg_list)
+    assert params.get("ADetailer inpaint size match") == written
+
+
+def test_megapixel_parameters_line_is_read_back_as_written():
+    # The infotext parser of AUTOMATIC1111 and Forge reads "key: value"
+    # pairs split at commas: the line must come back whole on paste.
+    pattern = re.compile(r'\s*(\w[\w \-/]+):\s*("(?:\\.|[^\\"])+"|[^,]*)(?:,|$)')
+    line = "Steps: 20, ADetailer inpaint size match: 1 MP, ADetailer version: test"
+    pairs = {k: v for k, v in pattern.findall(line)}
+    assert pairs["ADetailer inpaint size match"] == "1 MP"
 
 
 # Settings -> ADetailer -> "Hide detection boxes from the live preview".
@@ -12859,3 +13437,1031 @@ def test_verbose_header_shows_the_picture_size_with_skip_img2img(orig, expected)
         p._ad_orig = orig
     runtime._verbose_gen_header(p, [])
     assert expected in printed[0]
+
+
+# A tab's __name__ wildcards take the values the main prompt drew.
+
+
+def _wildcards(verbose=False, styles=None, **host_globals):
+    """The values `_main_wildcard_picks` reads, put in the tab's texts as
+    get_prompt does, with a host whose comments start with "#"; the lines it
+    prints with "Verbose diagnostic log" go to `printed`."""
+    printed = []
+    runtime = _load_script(
+        functions=_MAIN_WILDCARD_FUNCTIONS - {"_strip_host_comments", "_ad_verbose", "_vprint"},
+        assigns={"_WILDCARD_TOKEN_RE"},
+        get_i=lambda p: getattr(p, "i", 0),
+        shared=SimpleNamespace(prompt_styles=styles),
+        _strip_host_comments=lambda text: re.sub(r"[ \t]*#[^\n]*", "", text),
+        _ad_verbose=lambda: verbose,
+        _vprint=printed.append,
+        **host_globals,
+    )
+
+    def reuse(p, args, prompts, negatives, n=0):
+        picks = runtime._main_wildcard_picks(p, args, n)
+        return tuple(
+            [runtime._put_wildcard_values(text, taken) for text in texts]
+            if taken else texts
+            for texts, taken in zip((prompts, negatives), picks)
+        )
+
+    return reuse, printed
+
+
+def _drawn(typed, drawn, negative="", drawn_negative=None, **fields):
+    """An image whose main prompt was typed as `typed` and drawn as `drawn`
+    (one per image of the batch)."""
+    drawn = [drawn] if isinstance(drawn, str) else drawn
+    return SimpleNamespace(
+        prompt=typed, all_prompts=drawn, negative_prompt=negative,
+        all_negative_prompts=drawn_negative or [negative] * len(drawn), **fields,
+    )
+
+
+def _tab(prompt="", negative="", append="", negative_append=""):
+    return SimpleNamespace(
+        ad_prompt=prompt, ad_negative_prompt=negative,
+        ad_prompt_append=append, ad_negative_prompt_append=negative_append,
+    )
+
+
+@pytest.mark.parametrize(
+    ("typed", "drawn", "tab", "expected"),
+    [
+        # One wildcard.
+        (
+            "1girl, __eyecolor__ eyes, red dress", "1girl, green eyes, red dress",
+            "close-up, __eyecolor__ eyes", "close-up, green eyes",
+        ),
+        # Two, with names that hold "_" and "/", one used twice by the tab.
+        (
+            "photo of __hair/color__ hair, __eye_color__ eyes, smiling",
+            "photo of long blond hair, deep blue eyes, smiling",
+            "__eye_color__ eyes, (__hair/color__ hair:1.2), __eye_color__ iris",
+            "deep blue eyes, (long blond hair:1.2), deep blue iris",
+        ),
+        # The same wildcard twice in the main prompt with the same value.
+        (
+            "__color__ shirt, __color__ shoes", "red shirt, red shoes",
+            "__color__ shirt", "red shirt",
+        ),
+        # Dynamic Prompts blocks around them: a plain choice and any other block.
+        (
+            "{red|dark red} __hair__ hair, {2$$a|b|c} photo",
+            "dark red long hair, b, c photo",
+            "__hair__ hair", "long hair",
+        ),
+        # Only the wildcards the main prompt holds: the others are drawn again.
+        (
+            "1girl, __eyecolor__ eyes", "1girl, green eyes",
+            "__eyecolor__ eyes, __hair__ hair", "green eyes, __hair__ hair",
+        ),
+        # No wildcard script: the main prompt kept its token, and so does the tab.
+        (
+            "1girl, __eyecolor__ eyes", "1girl, __eyecolor__ eyes",
+            "__eyecolor__ eyes", "__eyecolor__ eyes",
+        ),
+        # The main prompt's comments: the host removed them before drawing.
+        (
+            "1girl, __eyecolor__ eyes # blue looks best\nsmiling",
+            "1girl, green eyes\nsmiling",
+            "__eyecolor__ eyes", "green eyes",
+        ),
+    ],
+)
+def test_the_tab_takes_the_values_of_the_main_prompt_wildcards(typed, drawn, tab, expected):
+    reuse, printed = _wildcards(verbose=True)
+    p = _drawn(typed, drawn)
+    assert reuse(p, _tab(tab), [tab], [""]) == ([expected], [""])
+    assert printed == []
+
+
+def test_each_image_of_the_batch_takes_its_own_values():
+    reuse, _printed = _wildcards()
+    p = _drawn(
+        "portrait, __character__, __eyecolor__ eyes",
+        ["portrait, knight, green eyes", "portrait, wizard, grey eyes",
+         "portrait, pirate captain, brown eyes"],
+    )
+    tab = "__character__ face, __eyecolor__ eyes"
+    seen = []
+    for i in range(4):  # one more than the drawn prompts: the host's i % len
+        p.i = i
+        seen.append(reuse(p, _tab(tab), [tab], [""])[0][0])
+    assert seen == [
+        "knight face, green eyes", "wizard face, grey eyes",
+        "pirate captain face, brown eyes", "knight face, green eyes",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("typed", "drawn", "expected", "said"),
+    [
+        # The same wildcard drawn twice with different values.
+        (
+            "__color__ shirt, __color__ shoes", "red shirt, blue shoes", None,
+            "__color__ drawn again, __color__ took different values in the main prompt",
+        ),
+        # Two wildcards with no text between them.
+        (
+            "__color____size__ hat", "redbig hat", None,
+            "__color__ drawn again, a wildcard of the main prompt touches another one",
+        ),
+        # Read in two ways: "dark red" + "long" or "dark" + "red long".
+        (
+            "__color__ __hair__ hair", "dark red long hair", None,
+            "__color__, __hair__ drawn again, the main prompt can be read in more "
+            "than one way",
+        ),
+        # Another extension rewrote the main prompt.
+        (
+            "1girl, __color__ eyes", "1girl, green eyes, masterpiece, best quality", None,
+            "__color__ drawn again, the main prompt does not match its wildcards",
+        ),
+        # Also drawn inside a block, where it may have another value.
+        (
+            "__color__ eyes, {__color__ dress|black suit}", "green eyes, red dress", None,
+            "__color__ drawn again, __color__ is also inside a {...} block of the "
+            "main prompt",
+        ),
+        # A brace left open.
+        (
+            "__color__ eyes, {smile", "green eyes, {smile", None,
+            "__color__ drawn again, the main prompt does not match its wildcards",
+        ),
+        # Only inside a block: that value cannot be read, the other one can.
+        (
+            "__hair__ hair, {__color__ dress|black suit}", "long hair, red dress",
+            "close-up, __color__ eyes, long hair",
+            "__color__ drawn again, inside a {...} block of the main prompt",
+        ),
+    ],
+)
+def test_a_value_not_told_for_sure_leaves_the_tab_as_it_is(typed, drawn, expected, said):
+    tab = "close-up, __color__ eyes, __hair__ hair"
+    reuse, printed = _wildcards(verbose=True)
+    assert reuse(_drawn(typed, drawn), _tab(tab), [tab], [""]) == ([expected or tab], [""])
+    assert printed == [f"[-] ADetailer: tab 1 prompt: {said}."]
+    # Said only with the Verbose diagnostic log on.
+    reuse, printed = _wildcards(verbose=False)
+    assert reuse(_drawn(typed, drawn), _tab(tab), [tab], [""])[0] == [expected or tab]
+    assert printed == []
+
+
+def test_a_tab_without_wildcards_is_left_exactly_as_it_is():
+    reuse, printed = _wildcards(verbose=True)
+    p = _drawn("1girl, __eyecolor__ eyes", "1girl, green eyes")
+    texts = ["close-up, eyecolor eyes, snake_case_text, (smile:1.2)  ", ""]
+    negatives = ["blurry, _ugly_"]
+    out = reuse(p, _tab("close-up [SEP]", "blurry"), texts, negatives)
+    assert out[0] is texts and out[1] is negatives
+    # The text the main prompt brings ([PROMPT], a blank tab) is not touched.
+    assert reuse(p, _tab(""), ["1girl, __eyecolor__ x"], [""])[0] == [
+        "1girl, __eyecolor__ x"
+    ]
+    assert printed == []
+
+
+def test_every_part_of_the_tab_and_its_append_text_take_the_values():
+    reuse, _printed = _wildcards()
+    p = _drawn("1girl, __eyecolor__ eyes", "1girl, green eyes")
+    # What get_prompt gives: the [SEP] parts, the append text in each one.
+    out = reuse(
+        p, _tab("__eyecolor__ eyes [SEP] face", append="__eyecolor__ iris"),
+        ["green eyes, __eyecolor__ iris", "face, __eyecolor__ iris"], [""],
+    )
+    assert out[0] == ["green eyes, green iris", "face, green iris"]
+
+
+def test_the_negative_prompt_takes_the_values_of_the_main_negative_prompt():
+    reuse, _printed = _wildcards()
+    p = _drawn(
+        "1girl, __color__ eyes", ["1girl, green eyes", "1girl, red eyes"],
+        negative="blurry, __flaw__",
+        drawn_negative=["blurry, bad hands", "blurry, extra fingers"],
+    )
+    p.i = 1
+    tab = _tab("__color__ eyes", "__flaw__, __color__ eyes")
+    # The negative one is matched with the main negative prompt only: there
+    # __color__ is not drawn, so the tab draws it again.
+    assert reuse(p, tab, ["__color__ eyes"], ["__flaw__, __color__ eyes"]) == (
+        ["red eyes"], ["extra fingers, __color__ eyes"],
+    )
+
+
+class _AppendStyles(_StyleDatabase):
+    styles = {
+        **_StyleDatabase.styles,
+        "film": ("35mm film, grain", "cartoon"),
+        "artist": ("by __artist__", ""),
+    }
+
+
+@pytest.mark.parametrize("dynamic_prompts", [False, True])
+@pytest.mark.parametrize(
+    ("styles", "typed", "drawn"),
+    [
+        (["film"], "1girl, __hair__", "1girl, long hair, 35mm film, grain"),
+        (
+            ["cinematic"], "a woman, __hair__",
+            "cinematic still of a woman, long hair, 35mm film",
+        ),
+        # A style's own wildcard.
+        (["artist"], "a woman, __hair__", "a woman, long hair, by somebody"),
+    ],
+)
+def test_the_styles_of_the_main_prompt_are_matched_too(styles, typed, drawn, dynamic_prompts):
+    # The host applies the styles before the wildcards are drawn. The
+    # "wildcards" extension leaves p.prompt as typed; Dynamic Prompts puts the
+    # styled text there. Without the styles, "__hair__" at the end of the
+    # prompt took the style's text too: "long hair, 35mm film, grain".
+    db = _AppendStyles()
+    reuse, printed = _wildcards(verbose=True, styles=db)
+    if dynamic_prompts:
+        typed = db.apply_styles_to_prompt(typed, styles)
+    p = _drawn(typed, drawn, styles=styles)
+    tab = "__hair__, __artist__ style"
+    expected = "long hair, somebody style" if "artist" in styles else "long hair, __artist__ style"
+    assert reuse(p, _tab(tab), [tab], [""])[0] == [expected]
+    assert printed == []
+
+
+def test_a_wildcard_an_xyz_prompt_sr_put_in_the_tab_takes_the_value():
+    # "[ADetailer] Prompt S/R (AD 1st and main prompt)" turned __color__ into
+    # __size__ in both prompts: the pass's text has __size__.
+    reuse, _printed = _wildcards()
+    p = _drawn(
+        "1girl, __size__ eyes", "1girl, big eyes",
+        _ad_xyz_prompt_sr=[SimpleNamespace(s="__color__", r="__size__", main=True)],
+    )
+    assert reuse(p, _tab("__color__ eyes"), ["__size__ eyes"], [""])[0] == ["big eyes"]
+
+
+def test_the_matcher_gives_up_on_a_prompt_too_long_to_compare():
+    runtime = _load_script(
+        functions={"_match_wildcard_template", "_wildcard_template_parts"},
+        assigns={"_WILDCARD_TOKEN_RE"},
+    )
+    parts = runtime._wildcard_template_parts("__a__ " * 30 + "x")
+    assert runtime._match_wildcard_template(parts, "y " * 400 + "z", budget=500) is None
+    parts = runtime._wildcard_template_parts("__a__, __b__")
+    assert runtime._match_wildcard_template(parts, "red, blue") == {("red", "blue")}
+
+
+def _wildcard_values_runtime():
+    """_main_wildcard_values, and the times its matcher really ran."""
+    runtime = _load_script(
+        functions={
+            "_main_wildcard_values", "_match_wildcard_template",
+            "_wildcard_template_parts",
+        },
+        assigns={"_WILDCARD_TOKEN_RE"},
+    )
+    ran = []
+    matcher = runtime._match_wildcard_template
+
+    def counted(parts, resolved):
+        ran.append(resolved)
+        return matcher(parts, resolved)
+
+    runtime._main_wildcard_values.__globals__["_match_wildcard_template"] = counted
+    return runtime._main_wildcard_values, ran
+
+
+_LONG_WORDS = " ".join(f"w{i}" for i in range(3000))
+# (the main prompt as typed, one or more ways; the prompt drawn from it)
+_WILDCARD_VALUE_CASES = [
+    (["1girl, __size__ eyes, __color__ hair"], "1girl, big eyes, red hair"),
+    (["__size__ eyes # note", "__size__ eyes"], "big eyes"),
+    (["__size__ eyes"], "a hat"),
+    (["__a__ and __b__"], "x and y and z"),
+    (["__a__, __a__"], "red, blue"),
+    (["{__a__|x} cat, __a__ dog"], "x cat, y dog"),
+    (["{red|blue} eyes, __a__ hair"], "red eyes, long hair"),
+    (["no wildcards"], "no wildcards"),
+    # Past the limit of steps: too long to compare.
+    (["__a__ __b__ __c__ __d__ __e__ __f__ __g__ __h__ END"], _LONG_WORDS),
+]
+
+
+def test_the_wildcard_comparison_of_an_image_is_made_once_for_all_its_tabs():
+    # Every tab and field of an image compared the same main prompt again:
+    # seconds each time with a very long prompt. The result is remembered.
+    values, ran = _wildcard_values_runtime()
+    templates = ["__size__ eyes # note", "__size__ eyes"]
+
+    first = values(templates, "big eyes")
+    assert first == ({"size": "big"}, "")
+    assert len(ran) == 2
+    for _tab_or_field in range(5):
+        assert values(templates, "big eyes") == first
+    assert len(ran) == 2
+    # Another image, another prompt: compared.
+    assert values(templates, "small eyes") == ({"size": "small"}, "")
+    assert len(ran) == 4
+    # A prompt too long to compare is not compared again either.
+    templates, drawn = _WILDCARD_VALUE_CASES[-1]
+    for _tab_or_field in range(3):
+        assert values(templates, drawn) == (
+            None, "the main prompt is too long to compare",
+        )
+    assert len(ran) == 5
+
+
+@pytest.mark.parametrize(
+    ("templates", "drawn"),
+    _WILDCARD_VALUE_CASES,
+    ids=[f"case{i}" for i in range(len(_WILDCARD_VALUE_CASES))],
+)
+def test_a_remembered_wildcard_comparison_gives_the_same_result(templates, drawn):
+    values, ran = _wildcard_values_runtime()
+    compared = values(templates, drawn)
+    count = len(ran)
+    remembered = values(templates, drawn)
+    assert len(ran) == count
+    assert remembered == compared
+    # And the same as with nothing remembered.
+    fresh, _ran = _wildcard_values_runtime()
+    assert fresh(templates, drawn) == compared
+
+
+def test_a_remembered_wildcard_comparison_is_not_changed_by_its_caller():
+    values, _ran = _wildcard_values_runtime()
+    taken, _why = values(["__size__ eyes"], "big eyes")
+    taken["size"] = "changed"
+    taken["more"] = "added"
+    assert values(["__size__ eyes"], "big eyes") == ({"size": "big"}, "")
+
+
+def test_few_wildcard_comparisons_are_remembered():
+    values, ran = _wildcard_values_runtime()
+    for i in range(100):
+        assert values(["__size__ eyes"], f"size{i} eyes") == ({"size": f"size{i}"}, "")
+    assert len(ran) == 100
+    assert 0 < len(values.seen) <= 16
+    assert all(isinstance(key, tuple) for key in values.seen)
+    # The last ones are still there.
+    values(["__size__ eyes"], "size99 eyes")
+    assert len(ran) == 100
+
+
+def test_a_wildcard_comparison_that_ran_out_of_stack_is_not_remembered():
+    values, ran = _wildcard_values_runtime()
+    matcher = values.__globals__["_match_wildcard_template"]
+    fail = [True]
+
+    def deep(parts, resolved):
+        if fail[0]:
+            raise RecursionError
+        return matcher(parts, resolved)
+
+    values.__globals__["_match_wildcard_template"] = deep
+    assert values(["__size__ eyes"], "big eyes") == (
+        None, "the main prompt is too long to compare",
+    )
+    fail[0] = False
+    assert values(["__size__ eyes"], "big eyes") == ({"size": "big"}, "")
+
+
+def test_the_matcher_still_reads_a_long_prompt_that_starts_with_six_wildcards():
+    # With the steps counted for real, the first limit gave up on prompts it
+    # read in a tenth of a second: six wildcards with only a space between
+    # them at the start of a prompt of 500 words.
+    reuse, printed = _wildcards(verbose=True)
+    names = "abcdef"
+    tail = ", ".join(f"tag{i} word{i}" for i in range(250))
+    typed = " ".join(f"__{n}__" for n in names) + " hair, " + tail
+    drawn = " ".join(f"v{n}" for n in names) + " hair, " + tail
+    out = reuse(_drawn(typed, drawn), _tab("__c__ eyes"), ["__c__ eyes"], [""])
+    assert out[0] == ["vc eyes"]
+
+
+def test_the_matcher_gives_up_soon_on_a_long_prompt_that_does_not_match():
+    # The steps counted only the places a match was tried from, not the
+    # places tried for the end of each wildcard: with eight wildcards and a
+    # prompt of 3000 words that does not match, one call took ten seconds,
+    # for every image, tab and prompt.
+    import inspect
+
+    reuse, printed = _wildcards(verbose=True)
+    typed = "__a__ __b__ __c__ __d__ __e__ __f__ __g__ __h__ END"
+    drawn = " ".join(f"w{i}" for i in range(3000))
+
+    # The work is measured in searches of the prompt, not in seconds (a slow
+    # machine does the same searches): each one is a step of the limit.
+    runtime = _load_script(
+        functions={"_match_wildcard_template", "_wildcard_template_parts"},
+        assigns={"_WILDCARD_TOKEN_RE"},
+    )
+    matcher = runtime._match_wildcard_template
+    budget = inspect.signature(matcher).parameters["budget"].default
+    searches = [0]
+
+    class Counted(str):
+        __slots__ = ()
+
+        def _one_more(self):
+            searches[0] += 1
+            # Stop at once, not after the tens of millions of an unlimited run.
+            assert searches[0] <= budget + 100, "the step limit did not stop it"
+
+        def find(self, *args):
+            self._one_more()
+            return str.find(self, *args)
+
+        def startswith(self, *args):
+            self._one_more()
+            return str.startswith(self, *args)
+
+    parts = runtime._wildcard_template_parts(typed)
+    assert matcher(parts, Counted(drawn)) is None
+    assert budget // 2 < searches[0] <= budget + 100
+
+    out = reuse(_drawn(typed, drawn), _tab("__a__ eyes"), ["__a__ eyes"], [""])
+    assert out == (["__a__ eyes"], [""])
+    assert printed == [
+        "[-] ADetailer: tab 1 prompt: __a__ drawn again, the main prompt is too "
+        "long to compare."
+    ]
+    # A long prompt that does match is still read.
+    typed = ", ".join(f"__n{i}__ t{i}" for i in range(12)) + ", " + drawn
+    values = ", ".join(f"v{i} x t{i}" for i in range(12)) + ", " + drawn
+    tab = "__n0__ eyes, __n11__ hair"
+    assert reuse(_drawn(typed, values), _tab(tab), [tab], [""])[0] == [
+        "v0 x eyes, v11 x hair"
+    ]
+
+
+def _wildcard_script():
+    """A script with the real get_prompt and what it needs."""
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS,
+        functions={*_INLINE_PROMPT_FUNCTIONS, *_MAIN_WILDCARD_FUNCTIONS},
+        assigns={*_INLINE_PROMPT_ASSIGNS, "_WILDCARD_TOKEN_RE"},
+        get_i=lambda _p: 0,
+        shared=SimpleNamespace(prompt_styles=None),
+    )
+    return runtime.AfterDetailerScript()
+
+
+def _wildcard_pass(p, tab):
+    """One detailer pass, with the real get_prompt: the prompts the regions
+    get."""
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    run, pp, _before = _detailer(
+        state, lambda _p: SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")]),
+        n_masks=1, Image=Image, opts=SimpleNamespace(data={}),
+    )
+    script = _script_of(run)
+    script.get_prompt = _wildcard_script().get_prompt
+    used = []
+    script.i2i_prompts_replace = lambda _p2, ad_prompts, ad_negatives, _j: used.append(
+        (ad_prompts, ad_negatives)
+    )
+    cells = dict(zip(run.__code__.co_freevars, run.__closure__))
+    args = cells["Args"].cell_contents(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_inpaint_only_masked_padding=32, ad_mask_blur=4,
+        ad_prompt=tab, ad_negative_prompt="", ad_prompt_append="",
+        ad_negative_prompt_append="", ad_use_main_loras=False,
+        ad_use_lora_triggers=False, ad_strip_loras=False,
+    )
+    p.extra_generation_params = {}
+    script._postprocess_image_inner(p, pp, args)
+    return used
+
+
+def test_the_detailer_pass_gets_the_main_prompt_values():
+    p = _drawn("1girl, __eyecolor__ eyes, red dress", "1girl, green eyes, red dress")
+    tab = "close-up, __eyecolor__ eyes"
+    assert _wildcard_pass(p, tab) == [(["close-up, green eyes"], [""])]
+    # A tab without wildcards gets its prompts as they were.
+    assert _wildcard_pass(p, "close-up") == [(["close-up"], [""])]
+
+
+def _lora_wildcard_prompt(tab, negative="", reuse_tab=0, **options):
+    from adetailer.args import ADetailerArgs
+
+    # The wildcard's file holds "<lora:alice:0.8> alice, blonde hair".
+    p = _drawn(
+        "1girl, __character__, smiling",
+        "1girl, <lora:alice:0.8> alice, blonde hair, smiling",
+        negative="blurry, __character__",
+        drawn_negative=["blurry, <lora:alice:0.8> alice, blonde hair"],
+    )
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_prompt=tab, ad_negative_prompt=negative,
+        **options,
+    )
+    return _wildcard_script().get_prompt(p, args, False, reuse_tab)
+
+
+def test_a_lora_of_a_reused_wildcard_value_is_not_added_a_second_time():
+    # "Use LoRAs from main prompt" had added the main prompt's LoRA before the
+    # value brought the same one: the pass loaded it twice.
+    tab = "__character__, detailed face"
+    assert _lora_wildcard_prompt(tab, ad_use_main_loras=True)[0] == [
+        "<lora:alice:0.8> alice, blonde hair, detailed face"
+    ]
+    # Without the option the value comes as drawn.
+    assert _lora_wildcard_prompt(tab)[0] == [
+        "<lora:alice:0.8> alice, blonde hair, detailed face"
+    ]
+    # A LoRA the value does not bring is still added.
+    p = _drawn(
+        "1girl, __eyecolor__ eyes <lora:style:1>", "1girl, green eyes <lora:style:1>"
+    )
+    from adetailer.args import ADetailerArgs
+
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_prompt="__eyecolor__ eyes",
+        ad_use_main_loras=True,
+    )
+    assert _wildcard_script().get_prompt(p, args, False, 0)[0] == [
+        "green eyes <lora:style:1>"
+    ]
+
+
+def test_strip_loras_removes_the_lora_of_a_reused_wildcard_value():
+    out = _lora_wildcard_prompt(
+        "__character__, detailed face", "__character__, lowres", ad_strip_loras=True
+    )
+    assert out == (["alice, blonde hair, detailed face"], ["alice, blonde hair, lowres"])
+    # And wins over "Use LoRAs from main prompt", as without wildcards.
+    out = _lora_wildcard_prompt(
+        "__character__, detailed face", ad_strip_loras=True, ad_use_main_loras=True
+    )
+    assert out[0] == ["alice, blonde hair, detailed face"]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{}, {"ad_use_main_loras": True}, {"ad_strip_loras": True},
+     {"ad_use_main_loras": True, "ad_use_lora_triggers": True}],
+)
+def test_a_tab_without_shared_wildcards_gets_the_same_prompts_as_before(options):
+    from adetailer.args import ADetailerArgs
+
+    p = _drawn(
+        "1girl, __character__ <lora:style (soft light):1>",
+        "1girl, <lora:alice:0.8> alice <lora:style (soft light):1>",
+    )
+    script = _wildcard_script()
+    for tab in ("", "detailed face, <lora:own:0.5> [SEP] [PROMPT], __other__ eyes"):
+        args = ADetailerArgs(
+            ad_model="face_yolov8n.pt", ad_prompt=tab, ad_prompt_append="sharp",
+            **options,
+        )
+        assert script.get_prompt(p, args, False, 0) == script.get_prompt(p, args)
+
+
+def test_a_region_without_a_class_block_takes_the_wildcard_values_too():
+    # A region no [CLASS=...] block matches gets the main prompt and the
+    # append text: a wildcard there was left as typed and drawn again.
+    from adetailer.args import ADetailerArgs
+
+    script = _wildcard_script()
+    p = _drawn(
+        "1girl, __eyecolor__ eyes", "1girl, green eyes",
+        negative="blurry, __flaw__", drawn_negative=["blurry, bad hands"],
+    )
+    args = ADetailerArgs(
+        ad_model="face_yolov8n.pt",
+        ad_prompt="[CLASS=hand]five fingers[/CLASS]",
+        ad_prompt_append="__eyecolor__ iris",
+        ad_negative_prompt="[CLASS=hand]extra fingers[/CLASS]",
+        ad_negative_prompt_append="__flaw__",
+    )
+    prompts, negatives = script.get_prompt(p, args, False, 0)
+    pred = SimpleNamespace(class_names=["face", "hand"])
+    seen = []
+    for j in range(2):
+        p2 = SimpleNamespace()
+        script.i2i_prompts_replace(p2, prompts, negatives, j)
+        script._apply_inline_class_prompts(p2, pred, j, 2, False, p, args, True)
+        seen.append((p2.prompt, p2.negative_prompt))
+    assert seen == [
+        ("1girl, green eyes, green iris", "blurry, bad hands, bad hands"),
+        ("five fingers, green iris", "extra fingers, bad hands"),
+    ]
+
+
+def test_the_detailer_pass_asks_the_class_blocks_for_the_wildcard_values():
+    p = _drawn("1girl, __eyecolor__ eyes", "1girl, green eyes")
+    seen = []
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    run, _pp, _before = _detailer(
+        state, lambda _p: SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")]),
+        n_masks=1, Image=Image, opts=SimpleNamespace(data={}),
+    )
+    _script_of(run)._apply_inline_class_prompts = lambda *args: seen.append(args[7:])
+    run()
+    assert seen == [(True,)]
+
+
+# plus.10 beta 1: Dynamic Prompts' Magic Prompt rewrote every detailed region.
+
+
+class _PassScript:
+    """A script of the detailer pass that records the prompts it is run on."""
+
+    def __init__(self, filename):
+        self.filename = filename
+        self.seen = []
+
+    def process(self, p):
+        self.seen.append((p.prompt, p.negative_prompt))
+
+
+class _PassRunner:
+    """The host's ScriptRunner, with its cache of the scripts of each hook:
+    kept by hook name and checked only by the number of scripts."""
+
+    def __init__(self, names, callback_map=None):
+        self.alwayson_scripts = [
+            _PassScript(f"extensions/{name}/scripts/{name}.py") for name in names
+        ]
+        self.callback_map = {} if callback_map is None else callback_map
+
+    def process(self, p):
+        count, cached = self.callback_map.get("script_process", (-1, None))
+        if cached is None or count != len(self.alwayson_scripts):
+            cached = list(self.alwayson_scripts)
+            self.callback_map["script_process"] = len(cached), cached
+        for script in cached:
+            script.process(p)
+        return [Path(script.filename).stem for script in cached]
+
+
+def _dynamic_prompts_pass(  # noqa: PLR0913
+    *, main="1girl, green eyes", typed=None, classes=("face", "face"), db=None,
+    styles=(), data=None, region_prompts=None, nan_first=False, verbose=False,
+    comments=None, **options,
+):
+    """One detailer pass on a host whose pass runs Dynamic Prompts and the
+    "wildcards" extension: the scripts the host ran for each region, the
+    prompts Dynamic Prompts was run on, and the pass's runner. The real
+    get_prompt, [CLASS=...] blocks, per-class prompts and region loop.
+    ``comments``: the strip_comments of the host's Comments script."""
+    from adetailer.args import ADetailerArgs
+
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", (8, 8), "white")
+    mask = Image.new("L", (8, 8), 255)
+    nans = type("NansException", (Exception,), {})
+    runner = _PassRunner(["dynamic_prompting", "wildcards"])
+    host_opts = SimpleNamespace(data={"ad_verbose_log": verbose, **(data or {})})
+    ran = []
+
+    def process_images(p2):
+        ran.append(tuple(p2.scripts.process(p2)))
+        if nan_first and len(ran) == 1:
+            raise nans("NaN in the first region")
+        return SimpleNamespace(images=[image])
+
+    def detect(*_args, **kwargs):
+        # A sequential class pass detects one class.
+        wanted = [c for c in (kwargs.get("classes") or "").split(",") if c]
+        return SimpleNamespace(
+            preview=image, bboxes=[], class_names=wanted or list(classes)
+        )
+
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS | {"_postprocess_image_inner"},
+        functions=_INLINE_PROMPT_FUNCTIONS | {"_parse_class_prompts", "_class_prompt_for"},
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        state=state,
+        shared=SimpleNamespace(state=state, prompt_styles=db, opts=host_opts),
+        opts=host_opts,
+        scripts=SimpleNamespace(scripts_data=[
+            SimpleNamespace(
+                script_class=type("ScriptStripComments", (), {"__module__": "comments.py"}),
+                module=SimpleNamespace(strip_comments=comments),
+            )
+        ] if comments else []),
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: [c.strip() for c in text.split(",") if c.strip()],
+        is_skip_img2img=lambda _p: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        _verbose_pass_result=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=detect,
+        get_model_class_names=lambda _model: [],
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=process_images,
+        NansException=nans,
+        ordinal=str,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[image], prompt="", negative_prompt="", styles=list(styles),
+        scripts=runner, close=lambda: None, denoising_strength=0.4,
+        width=512, height=512,
+    )
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda _p, pred, _args: [mask] * len(pred.class_names)
+    script.save_image = lambda *_args, **_kwargs: None
+    script._apply_auto_class_guard = lambda *_args: None
+
+    def fix_p2(_p, p2, _pp, _args, _pred, j):
+        # A prompt that reaches one region from elsewhere than the tab.
+        if region_prompts:
+            p2.prompt = region_prompts[j]
+
+    script.fix_p2 = fix_p2
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    styled = db.apply_styles_to_prompt(main, styles) if db else main
+    p = SimpleNamespace(
+        prompt=main if typed is None else typed, negative_prompt="",
+        styles=list(styles), all_prompts=[styled], all_negative_prompts=[""],
+        extra_generation_params={},
+    )
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", **options)
+    assert script._postprocess_image_inner(p, SimpleNamespace(image=image), args) is True
+    return ran, runner.alwayson_scripts[0].seen, runner
+
+
+_WITHOUT_IT = ("wildcards",)
+_WITH_IT = ("dynamic_prompting", "wildcards")
+
+
+@pytest.mark.parametrize(
+    "tab",
+    [
+        # A blank tab takes the main prompt, already drawn.
+        {},
+        {"ad_prompt": "detailed face", "ad_negative_prompt": "blurry"},
+        {"ad_prompt": "detailed face [SEP] detailed eyes", "ad_prompt_append": "sharp"},
+        {"ad_prompt": "[PROMPT], [CLASS=face]detailed face[/CLASS]"},
+    ],
+)
+def test_a_tab_without_wildcards_runs_its_regions_without_dynamic_prompts(tab):
+    # The pass runs the scripts of "Script names to apply to ADetailer" on
+    # every region. With Dynamic Prompts' "Magic prompt" on, each region's
+    # prompt was rewritten with generated text, although it had no wildcard
+    # or variant to draw.
+    ran, seen, runner = _dynamic_prompts_pass(**tab)
+    assert ran == [_WITHOUT_IT, _WITHOUT_IT]
+    assert seen == []
+    # Only for the region: the pass's own runner keeps its scripts.
+    assert [Path(s.filename).stem for s in runner.alwayson_scripts] == list(_WITH_IT)
+
+
+@pytest.mark.parametrize(
+    "tab",
+    [
+        {"ad_prompt": "__eyecolor__ eyes"},
+        {"ad_prompt": "{green|blue} eyes"},
+        {"ad_prompt": "detailed face", "ad_negative_prompt": "{blurry|lowres}"},
+        {"ad_prompt": "detailed face", "ad_negative_prompt": "__flaws__"},
+        {"ad_prompt": "detailed face", "ad_prompt_append": "__lighting__"},
+        {"ad_prompt": "detailed face", "ad_negative_prompt_append": "{blurry|lowres}"},
+        {"ad_prompt": "__eyecolor__ eyes [SEP] {green|blue} eyes"},
+        {"ad_prompt": "[CLASS=face]__eyecolor__ eyes[/CLASS][CLASS=hand]{five|slender} fingers[/CLASS]"},
+        # ${variables} and Jinja2 blocks are Dynamic Prompts syntax too, and
+        # so are its comments, which it takes out of the prompt.
+        {"ad_prompt": "${color=red} ${color} eyes"},
+        {"ad_prompt": "{% if true %}detailed face{% endif %}"},
+        {"ad_prompt": "detailed face // sharper"},
+        {"ad_prompt": "detailed face /* sharper */"},
+    ],
+)
+def test_a_tab_with_a_wildcard_or_variant_keeps_dynamic_prompts_on_every_region(tab):
+    # Unchanged: where every region's prompt holds something for Dynamic
+    # Prompts to draw, every region of the tab runs with it, as before.
+    ran, seen, _runner = _dynamic_prompts_pass(classes=("face", "hand"), **tab)
+    assert ran == [_WITH_IT, _WITH_IT]
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize(
+    ("tab", "drawn"),
+    [
+        # Only one [SEP] part holds the wildcard.
+        ({"ad_prompt": "detailed face [SEP] __eyecolor__ eyes"}, ("__eyecolor__ eyes", "")),
+        (
+            {"ad_prompt": "face [SEP] hand", "ad_negative_prompt": "blurry [SEP] __flaws__"},
+            ("hand", "__flaws__"),
+        ),
+        # Only the block of one class does.
+        (
+            {"ad_prompt": "[CLASS=hand]{five|slender} fingers[/CLASS]"},
+            ("{five|slender} fingers", ""),
+        ),
+        (
+            {"ad_prompt": "detailed", "ad_negative_prompt": "[CLASS=hand]__flaws__[/CLASS]"},
+            ("detailed", "__flaws__"),
+        ),
+    ],
+)
+def test_a_wildcard_for_one_region_keeps_dynamic_prompts_only_there(tab, drawn):
+    # Dynamic Prompts was kept on every region of a tab whose texts held a
+    # wildcard or variant anywhere, also on the regions whose own prompt had
+    # none of it: the other [SEP] parts, the regions of the other classes.
+    # Its Magic Prompt went on rewriting those.
+    ran, seen, runner = _dynamic_prompts_pass(classes=("face", "hand"), **tab)
+    assert ran == [_WITHOUT_IT, _WITH_IT]
+    assert seen == [drawn]
+    # Premise: the first region had its own prompt, with nothing to draw.
+    first = runner.alwayson_scripts[1].seen[0]
+    assert first != drawn
+    assert not any(mark in "".join(first) for mark in ("{", "__"))
+
+
+def test_a_tab_wildcard_with_the_main_prompt_value_runs_without_dynamic_prompts():
+    # The tab's __eyecolor__ takes the value the main prompt drew before the
+    # pass (plus.10 beta 1), so the region's prompt has nothing left to draw:
+    # Dynamic Prompts still ran, because the wildcard was in the text typed.
+    ran, seen, runner = _dynamic_prompts_pass(
+        typed="1girl, __eyecolor__ eyes", main="1girl, green eyes",
+        classes=("face",), ad_prompt="__eyecolor__ eyes",
+        ad_prompt_append="__eyecolor__ iris",
+    )
+    assert ran == [_WITHOUT_IT]
+    assert seen == []
+    assert runner.alwayson_scripts[1].seen == [("green eyes, green iris", "")]
+
+
+@pytest.mark.parametrize(
+    ("strip", "note"),
+    [(_a1111_strip_comments, "# my note"), (_neo_strip_comments, "// my note")],
+)
+def test_a_tab_comment_adetailer_removes_runs_without_dynamic_prompts(strip, note):
+    # ADetailer takes the host's comments out of the tab's prompt, as the
+    # host does for the main prompt: the comment typed kept Dynamic Prompts
+    # on although the region's prompt no longer held it.
+    tab = {"ad_prompt": f"detailed face\n{note}", "classes": ("face",)}
+    ran, seen, runner = _dynamic_prompts_pass(comments=strip, **tab)
+    assert ran == [_WITHOUT_IT]
+    assert seen == []
+    assert runner.alwayson_scripts[1].seen[0][0].strip() == "detailed face"
+    # Comments the host leaves in (its option off, or no Comments script)
+    # reach the region, and Dynamic Prompts, which reads them as its own.
+    for left_in in ({"comments": strip, "data": {"enable_prompt_comments": False}}, {}):
+        ran, seen, _runner = _dynamic_prompts_pass(**left_in, **tab)
+        assert ran == [_WITH_IT]
+        assert seen == [(f"detailed face\n{note}", "")]
+
+
+def test_a_per_class_prompt_with_a_variant_keeps_dynamic_prompts():
+    # Sequential classes: the variant is only in one class's own prompt, and
+    # only that class's pass runs with Dynamic Prompts.
+    ran, seen, _runner = _dynamic_prompts_pass(
+        ad_model_classes="face,hand",
+        ad_classes_sequential=True,
+        ad_prompt="detailed",
+        ad_class_prompts="hand: {five|slender} fingers",
+    )
+    assert ran == [_WITHOUT_IT, _WITH_IT]
+    assert seen == [("{five|slender} fingers", "")]
+    # A per-class prompt is used only by sequential classes: left unused, it
+    # does not keep Dynamic Prompts on.
+    ran, seen, _runner = _dynamic_prompts_pass(
+        ad_prompt="detailed", ad_class_prompts="hand: {five|slender} fingers",
+    )
+    assert ran == [_WITHOUT_IT, _WITHOUT_IT]
+    # Without it, both class passes run without the script.
+    ran, seen, _runner = _dynamic_prompts_pass(
+        ad_model_classes="face,hand",
+        ad_classes_sequential=True,
+        ad_prompt="detailed",
+        ad_class_prompts="hand: five fingers",
+    )
+    assert ran == [_WITHOUT_IT, _WITHOUT_IT]
+    assert seen == []
+
+
+def test_a_tab_wildcard_the_main_prompt_drew_still_reaches_dynamic_prompts():
+    # The tab's __eyecolor__ takes the main prompt's value before the pass;
+    # __haircolor__, only in the tab, is still Dynamic Prompts' to draw.
+    ran, seen, _runner = _dynamic_prompts_pass(
+        typed="1girl, __eyecolor__ eyes", main="1girl, green eyes",
+        classes=("face",), ad_prompt="__eyecolor__ eyes, __haircolor__ hair",
+    )
+    assert ran == [_WITH_IT]
+    assert seen == [("green eyes, __haircolor__ hair", "")]
+
+
+def test_a_main_prompt_left_with_a_variant_keeps_dynamic_prompts():
+    # A blank tab takes the main prompt: one that still holds a variant (the
+    # main pass ran without Dynamic Prompts, say) is left to it, as before.
+    ran, _seen, _runner = _dynamic_prompts_pass(main="1girl, {green|blue} eyes")
+    assert ran == [_WITH_IT, _WITH_IT]
+
+
+def test_a_style_with_a_wildcard_keeps_dynamic_prompts():
+    # The host adds the selected styles to the pass's prompts before the
+    # scripts run: a wildcard written in a style is drawn there.
+    db = _StyleDatabase()
+    db.styles = {
+        "plain": ("{prompt}, masterpiece", "lowres"),
+        "lit": ("__lighting__", ""),
+        "flawed": ("", "{blurry|lowres}"),
+    }
+    for style in ("lit", "flawed"):
+        ran, _seen, _runner = _dynamic_prompts_pass(
+            db=db, styles=(style,), ad_prompt="detailed face"
+        )
+        assert ran == [_WITH_IT, _WITH_IT]
+    # A style without one does not, its "{prompt}" placeholder included.
+    ran, _seen, _runner = _dynamic_prompts_pass(
+        db=db, styles=("plain",), ad_prompt="detailed face"
+    )
+    assert ran == [_WITHOUT_IT, _WITHOUT_IT]
+
+
+@pytest.mark.parametrize("nan_first", [False, True])
+def test_dynamic_prompts_is_chosen_again_for_each_region(nan_first):
+    # A prompt that reaches one region from elsewhere than the tab's texts:
+    # that region runs with Dynamic Prompts. Also after a region that failed
+    # with NaN, whose pass object is used again for the next one.
+    ran, seen, _runner = _dynamic_prompts_pass(
+        ad_prompt="detailed face", nan_first=nan_first,
+        classes=("face", "face", "face"),
+        region_prompts=["detailed face", "{green|blue} eyes", "detailed face"],
+    )
+    assert ran == [_WITHOUT_IT, _WITH_IT, _WITHOUT_IT]
+    assert seen == [("{green|blue} eyes", "")]
+
+
+@pytest.mark.parametrize(
+    ("tab", "kept"),
+    [("<green|blue> eyes", True), ("@@eyecolor@@ eyes", True), ("green eyes", False)],
+)
+def test_dynamic_prompts_own_markers_from_its_settings_are_read(tab, kept):
+    # Settings > Dynamic Prompts can change the variant and wildcard markers.
+    data = {"dp_parser_variant_start": "<", "dp_parser_wildcard_wrap": "@@"}
+    ran, _seen, _runner = _dynamic_prompts_pass(data=data, ad_prompt=tab)
+    assert ran == [_WITH_IT if kept else _WITHOUT_IT] * 2
+
+
+def _without_dynamic_prompts_runtime():
+    return _load_script(
+        functions={"_without_dynamic_prompts"}, assigns={"_DYNAMIC_PROMPTS_MARKS"},
+        copy=copy, opts=SimpleNamespace(data={}), shared=SimpleNamespace(),
+    )
+
+
+def test_a_pass_without_dynamic_prompts_keeps_its_runner():
+    # No Dynamic Prompts among the pass's scripts: nothing changes.
+    runtime = _without_dynamic_prompts_runtime()
+    p2 = SimpleNamespace(prompt="detailed face", negative_prompt="", styles=[])
+    runner = _PassRunner(["wildcards", "wildcard_recursive", "negpip"])
+    assert runtime._without_dynamic_prompts(runner, p2) is runner
+    # And whatever cannot be read leaves every script, as before.
+    runner = _PassRunner(["dynamic_prompting", "wildcards"])
+    for odd in (
+        SimpleNamespace(prompt=["detailed face"], negative_prompt="", styles=[]),
+        SimpleNamespace(prompt="detailed face", negative_prompt="", styles=["missing"]),
+        SimpleNamespace(prompt="detailed face"),
+    ):
+        assert runtime._without_dynamic_prompts(runner, odd) is runner
+    no_runner = object()
+    assert runtime._without_dynamic_prompts(no_runner, p2) is no_runner
+
+
+def test_the_runner_without_dynamic_prompts_has_its_own_script_cache():
+    # The host keeps the ordered scripts of each hook in a cache that only
+    # compares their number, and the pass's runners are copies that share
+    # it: a tab with ControlNet and no wildcard (Dynamic Prompts left out)
+    # has as many scripts as a tab without ControlNet that keeps it.
+    runtime = _without_dynamic_prompts_runtime()
+    shared_cache = {}
+    with_controlnet = _PassRunner(
+        ["dynamic_prompting", "wildcards", "controlnet"], shared_cache
+    )
+    plain = _PassRunner(["dynamic_prompting", "wildcards"], shared_cache)
+    p2 = SimpleNamespace(prompt="detailed face", negative_prompt="", styles=[])
+
+    reduced = runtime._without_dynamic_prompts(with_controlnet, p2)
+
+    assert reduced.process(p2) == ["wildcards", "controlnet"]
+    assert plain.process(p2) == ["dynamic_prompting", "wildcards"]
+    assert reduced.process(p2) == ["wildcards", "controlnet"]
+    assert with_controlnet.process(p2) == ["dynamic_prompting", "wildcards", "controlnet"]
+
+
+def test_the_verbose_log_says_when_dynamic_prompts_is_left_out(capsys):
+    _dynamic_prompts_pass(ad_prompt="detailed face", verbose=True)
+    out = capsys.readouterr().out
+    assert out.count("Dynamic Prompts not run") == 2
+    assert "tab 1, region 2: Dynamic Prompts not run" in out
+    assert out.isascii()
+    _dynamic_prompts_pass(ad_prompt="__eyecolor__ eyes", verbose=True)
+    assert "Dynamic Prompts not run" not in capsys.readouterr().out

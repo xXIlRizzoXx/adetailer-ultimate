@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -11,7 +13,13 @@ from PIL import Image, ImageDraw
 
 from adetailer import PredictOutput
 from adetailer.classes import FACE_FEATURE_CLASSES, parse_csv
-from adetailer.common import create_bbox_from_mask, create_mask_from_bbox
+from adetailer.common import (
+    create_bbox_from_mask,
+    create_mask_from_bbox,
+    _short_path,
+    describe_file,
+    say_progress,
+)
 
 # --- Model assets (new MediaPipe "tasks" API) -------------------------------
 # Recent MediaPipe wheels — notably the Python 3.13 builds Forge Neo ships —
@@ -77,6 +85,83 @@ _FACEMESH_NOSE_FALLBACK = frozenset(
 )
 
 
+# The model assets whose download failed in this session.
+_DOWNLOAD_FAILED: set[str] = set()
+# The incomplete model files that could not be removed, already told.
+_STUCK_SAID: set[str] = set()
+# When each of them was last told as missing: (generation, time.monotonic()).
+_MISSING_SAID: dict[str, tuple[str | None, float]] = {}
+# Without a WebUI to ask which generation runs, and outside a job (the
+# detection preview): one short line a minute.
+_MISSING_SAID_EVERY = 60.0
+
+
+def _generation() -> str | None:
+    """The running generation, as the WebUI names it: the time its job began
+    (the same for every image of a batch, a new one at each Generate and each
+    ADetailer job). Read only if the WebUI has loaded modules.shared itself,
+    never imported from here; None outside a WebUI."""
+    try:
+        return str(sys.modules["modules.shared"].state.job_timestamp)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _no_job() -> bool:
+    """True when the WebUI says that no job runs. The detection preview does
+    not begin one, so there the job time is still the one of the last
+    generation. False when it cannot be told."""
+    try:
+        state = sys.modules["modules.shared"].state
+        return state.job == "" and state.job_count == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _say_still_missing(name: str) -> None:
+    """The short reminder of a model that could not be obtained: once per
+    generation and model (once a minute in the detection preview), so a later
+    picture without faces and a detector without its model do not look the
+    same in the console."""
+    generation = _generation()
+    now = time.monotonic()
+    said = _MISSING_SAID.get(name)
+    if said is not None:
+        if generation is not None and generation == said[0] and not _no_job():
+            return
+        if (generation is None or generation == said[0]) and (
+            now - said[1] < _MISSING_SAID_EVERY
+        ):
+            return
+    _MISSING_SAID[name] = (generation, now)
+    print(
+        f"[-] ADetailer: MediaPipe model {name!r} is still missing (see the"
+        " message above): without it this detector may find nothing.",
+        file=sys.stderr,
+    )
+
+
+def _say_stuck(name: str, dst: Path) -> None:
+    """An incomplete model file that cannot be removed: told once per session
+    and model, then with the short reminder."""
+    if name in _STUCK_SAID:
+        _say_still_missing(name)
+        return
+    _STUCK_SAID.add(name)
+    _MISSING_SAID[name] = (_generation(), time.monotonic())
+    # As "adetailer/adetailer/_mediapipe_models/<file>", never the full path.
+    try:
+        short = _short_path(_MODEL_DIR.parent.parent, dst)
+    except Exception:  # noqa: BLE001
+        short = name
+    print(
+        f"[-] ADetailer: MediaPipe model file {short!r} is incomplete and"
+        " could not be removed (read-only or in use by another program)."
+        " Remove or replace it manually to use this detector.",
+        file=sys.stderr,
+    )
+
+
 def _ensure_model(name: str, url: str, min_bytes: int = 1024) -> str | None:
     """Return the local path to a tasks model asset, downloading it on first use.
 
@@ -90,12 +175,31 @@ def _ensure_model(name: str, url: str, min_bytes: int = 1024) -> str | None:
     installed) so a broken download never gets cached forever.
     """
     dst = _MODEL_DIR / name
+    incomplete = False
     try:
         if dst.exists():
             if dst.stat().st_size >= min_bytes:
+                # The file is there (again): a later failure is told anew.
+                _DOWNLOAD_FAILED.discard(name)
+                _STUCK_SAID.discard(name)
                 return str(dst)
             # A previously-cached-but-corrupt file: drop it so we re-fetch.
-            dst.unlink(missing_ok=True)
+            try:
+                dst.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                # Read-only, or held by another program: a download could not
+                # take its place either, so none is tried.
+                _say_stuck(name, dst)
+                return None
+            _STUCK_SAID.discard(name)
+            incomplete = True
+            # A file was there (put by hand, too small): its removal and the
+            # failure of the download that follows are told, as the first time.
+            _DOWNLOAD_FAILED.discard(name)
+        else:
+            # No file (a stuck one was removed by hand): a later file that
+            # is stuck is told anew.
+            _STUCK_SAID.discard(name)
     except Exception:  # noqa: BLE001
         return None
     try:
@@ -109,6 +213,18 @@ def _ensure_model(name: str, url: str, min_bytes: int = 1024) -> str | None:
 
     tmp = dst.with_name(f"{dst.name}.{os.getpid()}.part")
     ok = False
+    # Said only when the file is really fetched: a model already in the
+    # folder returned above, without a line.
+    # After a failed attempt the next ones (one per image of a batch, without
+    # a connection) are tried without this line and without the error line.
+    host = urlparse(url).hostname or url
+    why = " (the saved copy was incomplete)" if incomplete else ""
+    if name not in _DOWNLOAD_FAILED:
+        say_progress(
+            "[-] ADetailer: trying to download MediaPipe model"
+            f" {name!r} from {host}{why}..."
+        )
+    started = time.monotonic()
     # Prefer requests (robust SSL/proxy handling inside the WebUI); fall back to
     # urllib. The WebUI process has working HTTPS (it downloads the YOLO models
     # the same way).
@@ -135,6 +251,11 @@ def _ensure_model(name: str, url: str, min_bytes: int = 1024) -> str | None:
         try:
             if tmp.stat().st_size >= min_bytes:
                 tmp.replace(dst)
+                _DOWNLOAD_FAILED.discard(name)
+                say_progress(
+                    f"[-] ADetailer: downloaded MediaPipe model {name!r}"
+                    f" ({describe_file(str(dst), started)})."
+                )
                 return str(dst)
         except Exception:  # noqa: BLE001
             pass
@@ -142,9 +263,22 @@ def _ensure_model(name: str, url: str, min_bytes: int = 1024) -> str | None:
         tmp.unlink(missing_ok=True)
     except Exception:  # noqa: BLE001
         pass
+    if name in _DOWNLOAD_FAILED:
+        _say_still_missing(name)
+        return None
+    _DOWNLOAD_FAILED.add(name)
+    _MISSING_SAID[name] = (_generation(), time.monotonic())
+    # The folder as "adetailer/adetailer/_mediapipe_models", never the full
+    # path: it holds the user name, and console lines end up pasted in public
+    # bug reports.
+    try:
+        folder = _short_path(_MODEL_DIR.parent.parent, _MODEL_DIR)
+    except Exception:  # noqa: BLE001
+        folder = _MODEL_DIR.name
     print(
         f"[-] ADetailer: couldn't obtain MediaPipe model {name!r}. Place it in "
-        f"{_MODEL_DIR} manually (from {url}) to use this detector.",
+        f"the {folder!r} folder of this extension manually (from {url}) to use"
+        " this detector.",
         file=sys.stderr,
     )
     return None

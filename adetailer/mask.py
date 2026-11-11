@@ -272,9 +272,49 @@ def sort_bboxes(
 
 
 # Filter by ratio
+def bbox_ratio(bbox: list[T], orig_area: int) -> float:
+    """The share of the image a box takes (0.12 = 12%): the value the "Mask
+    min area ratio" and "Mask max area ratio" filter compares."""
+    return bbox_area(bbox) / orig_area
+
+
 def is_in_ratio(bbox: list[T], low: float, high: float, orig_area: int) -> bool:
-    area = bbox_area(bbox)
-    return low <= area / orig_area <= high
+    return low <= bbox_ratio(bbox, orig_area) <= high
+
+
+def bbox_ratio_label(bbox: list[T], image_size: tuple[int, int]) -> str:
+    """bbox_ratio as the short percentage the Detection preview writes next to
+    a box's number, for a picture of ``image_size`` (width, height). Always one
+    decimal, cut down (never rounded up) to a step of the "Mask min/max area
+    ratio" sliders (0.001 = 0.1%): a box at 11.68% reads "11.6%". So the value
+    read, set as the minimum (11.6% = 0.116), keeps its own box, and set as
+    the maximum plus one step (0.117) keeps it too. "100%" for a box as large
+    as the picture, "<0.1%" for a box smaller than one step. An empty string
+    when it cannot be worked out (a broken box, an empty picture)."""
+    try:
+        width, height = image_size
+        ratio = bbox_ratio(bbox, width * height)
+        if not 0 <= ratio < float("inf"):
+            return ""
+        # The steps of the sliders the box holds: the largest count with
+        # steps / 1000 <= ratio, compared as is_in_ratio compares a slider
+        # set to that step. ratio * 1000 alone can land a hair on either
+        # side of a step (0.116 * 1000 is not always 116), so it is checked.
+        steps = int(ratio * 1000)
+        while steps / 1000 > ratio:
+            steps -= 1
+        while (steps + 1) / 1000 <= ratio:
+            steps += 1
+        if steps == 0:
+            text = "<0.1" if ratio > 0 else "0"
+        elif steps == 1000:
+            text = "100"
+        else:
+            text = f"{steps // 10}.{steps % 10}"
+    except Exception:
+        # Cosmetic: the label is then drawn without it.
+        return ""
+    return text + "%"
 
 
 def filter_by_ratio(

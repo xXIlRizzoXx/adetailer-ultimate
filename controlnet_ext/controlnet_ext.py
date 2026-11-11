@@ -8,7 +8,7 @@ from pathlib import Path
 from modules import extensions, sd_models, shared
 from modules.paths import extensions_builtin_dir, extensions_dir, models_path
 
-from .common import cn_model_module, cn_model_regex
+from .common import anytest_name, cn_model_module, cn_model_regex
 
 ext_path = Path(extensions_dir)
 ext_builtin_path = Path(extensions_builtin_dir)
@@ -64,8 +64,11 @@ class ControlNetExt:
         if module == "None":
             module = None
         if module is None:
+            name = anytest_name(model)
             for m, v in cn_model_module.items():
-                if m in model.lower():  # listed in any case (cn_model_regex)
+                if m == "anytest" and "union" in name:
+                    break  # a union model, as in the UI: no module, as before
+                if m in name:  # listed in any case (cn_model_regex)
                     module = v
                     break
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
+import time
 from importlib.metadata import version  # python >= 3.8
 
 from packaging.version import parse
@@ -41,6 +42,26 @@ def is_installed(
 
 def run_pip(*args):
     subprocess.run([sys.executable, "-m", "pip", "install", *args], check=True)
+
+
+def say_installing(pkgs: list[str]) -> float:
+    """Say which packages pip installs now, as that can take minutes on the
+    first start; return the start time for say_installed. Only called when a
+    package is missing or outside its versions, never on a normal start."""
+    print(
+        f"[-] ADetailer: installing {', '.join(pkgs)} with pip,"
+        " this can take a few minutes...",
+        flush=True,
+    )
+    return time.monotonic()
+
+
+def say_installed(pkgs: list[str], started: float) -> None:
+    print(
+        f"[-] ADetailer: installed {', '.join(pkgs)}"
+        f" ({time.monotonic() - started:.1f} s).",
+        flush=True,
+    )
 
 
 def numpy_pin() -> list[str]:
@@ -94,19 +115,25 @@ def install():
                 pkgs.append(cmd)
 
     if pkgs:
+        started = say_installing(pkgs)
         run_pip(*pkgs, *numpy_pin())
+        say_installed(pkgs, started)
 
     # Separate command: some platforms have no mediapipe 0.10.x wheel at all
     # (Linux aarch64 on Python 3.13), and a failure there must not stop
     # ultralytics from installing. Only the mediapipe_* detectors need it.
     if mediapipe_cmd:
         try:
+            started = say_installing([mediapipe_cmd])
             run_pip(mediapipe_cmd, *numpy_pin())
+            say_installed([mediapipe_cmd], started)
         except subprocess.CalledProcessError:
+            # stdout, not stderr: the WebUI shows install.py's stdout and
+            # drops its stderr when install.py ends without an error.
             print(
                 f"[-] ADetailer: could not install {mediapipe_cmd}; the"
                 " mediapipe_* detectors will not work, the YOLO ones will.",
-                file=sys.stderr,
+                flush=True,
             )
 
 

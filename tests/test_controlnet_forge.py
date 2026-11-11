@@ -35,6 +35,7 @@ class _Gradio3Unit:
     processor_res: int = -1
     guidance_start: float = 0.0
     guidance_end: float = 1.0
+    pixel_perfect: bool = False
 
 
 @dataclass
@@ -44,6 +45,21 @@ class _Gradio4Unit(_Gradio3Unit):
 
     image_fg: object = None
     mask_image_fg: object = None
+
+
+@dataclass
+class _NoPixelPerfectUnit:
+    """A ControlNetUnit without the Pixel Perfect option (none known)."""
+
+    enabled: bool = True
+    module: str = "None"
+    model: str = "None"
+    weight: float = 1.0
+    image: object = None
+    mask_image: object = None
+    processor_res: int = -1
+    guidance_start: float = 0.0
+    guidance_end: float = 1.0
 
 
 class _PlainUnit:
@@ -126,37 +142,143 @@ def _unit(monkeypatch, unit_class):
     assert (script.title(), script.args_from, script.args_to) == ("ControlNet", 0, 1)
     (unit,) = p.script_args_value
     assert (unit.model, unit.module, unit.weight) == ("control_v11p_sd15_inpaint", "inpaint_only", 0.8)
-    assert (unit.guidance_start, unit.guidance_end, unit.processor_res) == (0.1, 0.9, 512)
+    assert (unit.guidance_start, unit.guidance_end) == (0.1, 0.9)
     return np.asarray(p.init_images[0]), unit
 
 
-def test_a_gradio_4_forge_controlnet_gets_the_image_and_mask_as_arrays(monkeypatch):
-    # Classic Forge since its Gradio 4 update compares unit.image as an array:
-    # the {"image", "mask"} dict raised a TypeError there, so the ADetailer
-    # ControlNet model did nothing on every region.
-    image, unit = _unit(monkeypatch, _Gradio4Unit)
+def _gradio4_input(p, unit):
+    """The image and mask classic Forge (Gradio 4) and Forge Neo pick for a
+    unit (scripts/controlnet.py, get_input_data)."""
+    unit_image = unit.image
+    unit_image_fg = unit.image_fg[:, :, 3] if unit.image_fg is not None else None
+    if unit.image is None:
+        image, mask = np.asarray(p.init_images[0]), np.asarray(p.image_mask)
+    else:
+        if (unit_image < 5).all() and (unit_image_fg > 5).any():
+            image = unit_image_fg
+        else:
+            image = unit_image
+        mask = unit.mask_image if (unit.mask_image > 5).any() else None
+    return image, mask
 
-    assert isinstance(unit.image, np.ndarray)
-    assert np.array_equal(unit.image, image)
-    assert isinstance(unit.mask_image, np.ndarray)
-    assert unit.mask_image.shape == image.shape
-    assert (unit.mask_image == 255).all()
-    # The check classic Forge runs on it, and its choice of mask.
-    assert not (unit.image < 5).all()
-    assert (unit.mask_image > 5).any()
+
+def _dict_input(p, unit):
+    """The same for older Forge and reForge, which read the image dict."""
+    if unit.image is None:
+        image, mask = np.asarray(p.init_images[0]), np.asarray(p.image_mask)
+    else:
+        if (unit.image["image"] < 5).all() and (unit.image["mask"] > 5).any():
+            image = unit.image["mask"]
+        else:
+            image = unit.image["image"]
+        mask = unit.image["mask"] if (unit.image["mask"] > 5).any() else None
+    return image, mask
 
 
-@pytest.mark.parametrize("unit_class", [_Gradio3Unit, _PlainUnit])
-def test_an_older_forge_controlnet_still_gets_the_image_dict(monkeypatch, unit_class):
-    # Older Forge and reForge's main branch read only unit.image["image"] and
-    # unit.image["mask"]; an unknown unit keeps that format too.
-    image, unit = _unit(monkeypatch, unit_class)
+def _region_mask(box):
+    mask = Image.new("L", (64, 48), 0)
+    mask.paste(255, box)
+    return mask
 
-    assert isinstance(unit.image, dict)
-    assert set(unit.image) == {"image", "mask"}
-    assert np.array_equal(unit.image["image"], image)
-    assert (unit.image["mask"] == 255).all()
+
+@pytest.mark.parametrize(
+    ("unit_class", "host_input"),
+    [
+        (_Gradio4Unit, _gradio4_input),
+        (_Gradio3Unit, _dict_input),
+        (_PlainUnit, _dict_input),
+    ],
+)
+def test_every_forge_controlnet_reads_each_regions_own_picture_and_mask(
+    monkeypatch, unit_class, host_input
+):
+    # As on AUTOMATIC1111. The unit carried the picture of the tab's start
+    # with an all-white mask: ControlNet covered the whole crop, and the 2nd
+    # region did not see the 1st one already inpainted.
+    backend = _load_backend(monkeypatch, unit_class)
+    ext = backend.ControlNetExt()
+    ext.init_controlnet()
+    i2i = SimpleNamespace(
+        init_images=[Image.new("RGB", (64, 48), (200, 120, 40))],
+        width=512, height=512, resize_mode=0,
+    )
+    ext.update_scripts_args(i2i, "control_v11p_sd15_inpaint", "inpaint_only", 1.0, 0.0, 1.0)
+    (unit,) = i2i.script_args_value
+    assert unit.image is None
     assert unit.mask_image is None
+
+    # The detailer loop: p2 = copy(i2i) for each region, with its own mask,
+    # and from the 2nd region on the picture the 1st one returned.
+    first = copy.copy(i2i)
+    first.image_mask = _region_mask((4, 4, 20, 20))
+    second = copy.copy(i2i)
+    second.init_images = [Image.new("RGB", (64, 48), (10, 220, 90))]
+    second.image_mask = _region_mask((40, 20, 60, 44))
+
+    for p in (first, second):
+        image, mask = host_input(p, unit)
+        assert np.array_equal(image, np.asarray(p.init_images[0]))
+        assert np.array_equal(mask, np.asarray(p.image_mask))
+
+
+@pytest.mark.parametrize("unit_class", [_Gradio4Unit, _Gradio3Unit, _PlainUnit])
+def test_a_forge_unit_carries_the_tabs_controlnet_settings(monkeypatch, unit_class):
+    _image, unit = _unit(monkeypatch, unit_class)
+
+    assert unit.enabled is True
+
+
+@pytest.mark.parametrize("unit_class", [_Gradio4Unit, _Gradio3Unit, _PlainUnit])
+def test_a_forge_preprocessor_fits_each_regions_canvas(monkeypatch, unit_class):
+    # As on AUTOMATIC1111 (Pixel Perfect). One resolution was worked out from
+    # the whole picture and the size the pass had before each region's own.
+    backend = _load_backend(monkeypatch, unit_class)
+    ext = backend.ControlNetExt()
+    ext.init_controlnet()
+    i2i = SimpleNamespace(
+        init_images=[Image.new("RGB", (64, 48))],
+        width=1024, height=1024, resize_mode=0,
+    )
+    ext.update_scripts_args(i2i, "control_v11f1p_sd15_depth", "depth_midas", 1.0, 0.0, 1.0)
+    (unit,) = i2i.script_args_value
+    assert unit.pixel_perfect is True
+
+    used = []
+    for width, height in ((512, 640), (768, 768)):
+        p2 = copy.copy(i2i)
+        p2.width, p2.height = width, height  # what fix_p2 sets per region
+        # Every Forge, when the region runs: the preprocessor's resolution
+        # follows the region's canvas (here, its short side).
+        if unit.pixel_perfect:
+            unit.processor_res = min(p2.width, p2.height)
+        used.append(unit.processor_res)
+
+    assert used == [512, 768]
+
+
+def test_a_forge_unit_without_pixel_perfect_keeps_the_default(monkeypatch):
+    _image, unit = _unit(monkeypatch, _NoPixelPerfectUnit)
+
+    assert unit.processor_res == -1
+
+
+def test_a_forge_controlnet_reads_an_almost_black_picture(monkeypatch):
+    # Classic Forge and Forge Neo compare a near-black unit image with its
+    # missing image_fg, which raised a TypeError: no ControlNet there.
+    backend = _load_backend(monkeypatch, _Gradio4Unit)
+    ext = backend.ControlNetExt()
+    ext.init_controlnet()
+    p = SimpleNamespace(
+        init_images=[Image.new("RGB", (64, 48), (2, 2, 2))],
+        image_mask=_region_mask((4, 4, 20, 20)),
+        width=512, height=512, resize_mode=0,
+    )
+    ext.update_scripts_args(p, "control_v11f1p_sd15_depth", "depth_midas", 1.0, 0.0, 1.0)
+    (unit,) = p.script_args_value
+
+    image, _mask = _gradio4_input(p, unit)
+
+    assert (image == 2).all()
 
 
 @pytest.mark.parametrize(
@@ -312,3 +434,130 @@ def test_a_forge_controlnet_pass_leaves_the_cache_of_the_img2img_runner(monkeypa
 
     assert runner.callback_map is cache
     assert cache == before
+
+
+class _BatchControlNet(_ControlNet):
+    """Forge Neo's script reads the batch folder while `process` reads the image."""
+
+    def __init__(self, group):
+        self.group = group
+
+    def process(self, p):
+        p.ran.append(f"folder={self.group.GLOBAL_CONTROLNET_BATCH_DIR!r}")
+        super().process(p)
+        if getattr(p, "fail", False):
+            msg = "preprocessor failed"
+            raise RuntimeError(msg)
+
+
+def _forge_neo_host(monkeypatch, folder="batch_input"):
+    backend = _load_backend(monkeypatch, _Gradio4Unit)
+    group = type("ControlNetUiGroup", (), {"GLOBAL_CONTROLNET_BATCH_DIR": folder})
+    ui = ModuleType("lib_controlnet.controlnet_ui")
+    ui_group = ModuleType("lib_controlnet.controlnet_ui.controlnet_ui_group")
+    ui_group.ControlNetUiGroup = group
+    ui.controlnet_ui_group = ui_group
+    sys.modules["lib_controlnet"].controlnet_ui = ui
+    monkeypatch.setitem(sys.modules, "lib_controlnet.controlnet_ui", ui)
+    monkeypatch.setitem(sys.modules, ui_group.__name__, ui_group)
+    runner = _Runner(_SoftInpainting(), _BatchControlNet(group))
+    backend.scripts.scripts_img2img = runner
+    ext = backend.ControlNetExt()
+    ext.init_controlnet()
+    return runner, ext, group
+
+
+def test_a_forge_neo_controlnet_pass_ignores_the_batch_folder(monkeypatch):
+    # A folder typed in ControlNet's or img2img Batch's input directory made
+    # Forge Neo read every unit's image from it, ADetailer's too: the region
+    # got the control map of another picture.
+    runner, ext, group = _forge_neo_host(monkeypatch)
+
+    ran = _pass(runner, ext)
+
+    assert ran == ["folder=''", "ControlNet prepared", "ControlNet applied"]
+    # The main ControlNet keeps the folder.
+    assert group.GLOBAL_CONTROLNET_BATCH_DIR == "batch_input"
+
+
+def test_the_batch_folder_comes_back_after_a_failed_controlnet_pass(monkeypatch):
+    runner, ext, group = _forge_neo_host(monkeypatch)
+    p = SimpleNamespace(
+        init_images=[Image.new("RGB", (64, 48))],
+        width=512, height=512, resize_mode=0, ran=[], fail=True,
+    )
+    p.scripts = copy.copy(runner)
+    ext.update_scripts_args(p, "control_v11p_sd15_depth", "depth_midas", 1.0, 0.0, 1.0)
+
+    with pytest.raises(RuntimeError, match="preprocessor failed"):
+        p.scripts.process(p)
+
+    assert p.ran == ["folder=''", "ControlNet prepared"]
+    assert group.GLOBAL_CONTROLNET_BATCH_DIR == "batch_input"
+
+
+def test_a_batch_folder_typed_during_the_pass_is_kept(monkeypatch):
+    runner, ext, group = _forge_neo_host(monkeypatch)
+    script = runner.scripts[1]
+    process = type(script).process
+
+    def typed_meanwhile(self, p):
+        process(self, p)
+        group.GLOBAL_CONTROLNET_BATCH_DIR = "new_folder"
+
+    monkeypatch.setattr(_BatchControlNet, "process", typed_meanwhile)
+
+    _pass(runner, ext)
+
+    assert group.GLOBAL_CONTROLNET_BATCH_DIR == "new_folder"
+
+
+def test_a_batch_folder_emptied_during_the_pass_stays_empty(monkeypatch):
+    # Forge Neo updates the folder as soon as the box loses focus, also while
+    # a pass runs: the emptied box was taken for the pass's own clearing and
+    # the old folder came back, active with an empty box on screen.
+    runner, ext, group = _forge_neo_host(monkeypatch)
+    script = runner.scripts[1]
+    process = type(script).process
+
+    def emptied_meanwhile(self, p):
+        process(self, p)
+        group.GLOBAL_CONTROLNET_BATCH_DIR = ""
+
+    monkeypatch.setattr(_BatchControlNet, "process", emptied_meanwhile)
+
+    ran = _pass(runner, ext)
+
+    assert ran[0] == "folder=''"
+    assert group.GLOBAL_CONTROLNET_BATCH_DIR == ""
+
+
+def test_the_cleared_batch_folder_reads_as_no_folder(monkeypatch):
+    # Forge Neo reads the value with .strip() and os.path.isdir().
+    runner, ext, group = _forge_neo_host(monkeypatch)
+    script = runner.scripts[1]
+    process = type(script).process
+    seen = []
+
+    def read_as_forge_neo(self, p):
+        seen.append(group.GLOBAL_CONTROLNET_BATCH_DIR.strip())
+        process(self, p)
+
+    monkeypatch.setattr(_BatchControlNet, "process", read_as_forge_neo)
+
+    _pass(runner, ext)
+
+    assert seen == [""]
+    assert type(seen[0]) is str
+    assert group.GLOBAL_CONTROLNET_BATCH_DIR == "batch_input"
+    assert type(group.GLOBAL_CONTROLNET_BATCH_DIR) is str
+
+
+@pytest.mark.parametrize("folder", ["", "   "])
+def test_a_forge_without_a_batch_folder_runs_controlnet_as_before(monkeypatch, folder):
+    runner, ext, group = _forge_neo_host(monkeypatch, folder)
+
+    ran = _pass(runner, ext)
+
+    assert ran == [f"folder={folder!r}", "ControlNet prepared", "ControlNet applied"]
+    assert group.GLOBAL_CONTROLNET_BATCH_DIR == folder

@@ -58,6 +58,7 @@ from adetailer.args import (
     BBOX_SORTBY_MORE,
     BUILTIN_SCRIPT,
     INPAINT_BBOX_MATCH_MODES,
+    INPAINT_MASKED_CONTENT,
     SCRIPT_DEFAULT,
     ADetailerArgs,
     InpaintBBoxMatchMode,
@@ -689,6 +690,297 @@ def _empty_prompt_note(ad_prompt: str, prompts: list[str], n: int) -> str:
     return ""
 
 
+# A __name__ wildcard of Dynamic Prompts or of the "wildcards" extension: a
+# name without spaces, braces, brackets, commas or colons.
+_WILDCARD_TOKEN_RE = re.compile(
+    r"__([^\s_{}|$()\[\]<>,:](?:[^\s{}|$()\[\]<>,:]*?[^\s_{}|$()\[\]<>,:])?)__"
+)
+
+
+def _wildcard_template_parts(template: str) -> list[tuple[str, Any]] | None:
+    """`template` (a prompt as typed) in parts: ("text", s), ("wildcard",
+    name), ("choice", options) for a plain Dynamic Prompts {a|b} block, and
+    ("any", names) for any other {...} or ${...} block, with the names of
+    the wildcards inside it. None when a brace is left open."""
+    parts: list[tuple[str, Any]] = []
+
+    def add(kind: str, value: Any = None) -> None:
+        if kind == "text" and not value:
+            return
+        # Two texts, or two blocks of any text, are one.
+        if parts and parts[-1][0] == kind and kind in ("text", "any"):
+            joined = parts[-1][1] + value if kind == "text" else parts[-1][1] | value
+            parts[-1] = (kind, joined)
+            return
+        parts.append((kind, value))
+
+    def add_text(text: str) -> None:
+        last = 0
+        for m in _WILDCARD_TOKEN_RE.finditer(text):
+            add("text", text[last : m.start()])
+            add("wildcard", m.group(1))
+            last = m.end()
+        add("text", text[last:])
+
+    start = pos = 0
+    while pos < len(template):
+        if template[pos] != "{":
+            pos += 1
+            continue
+        depth, end = 0, pos
+        while end < len(template):
+            if template[end] == "{":
+                depth += 1
+            elif template[end] == "}":
+                depth -= 1
+                if not depth:
+                    break
+            end += 1
+        if depth:
+            return None
+        dollar = pos > start and template[pos - 1] == "$"
+        add_text(template[start : pos - 1 if dollar else pos])
+        inner = template[pos + 1 : end]
+        if dollar or re.search(r"[{}$]|__|::", inner):
+            inside = frozenset(m.group(1) for m in _WILDCARD_TOKEN_RE.finditer(inner))
+            add("any", inside)
+        else:
+            # Kept as typed too: without Dynamic Prompts it stays in the text.
+            options = {template[pos : end + 1]}
+            for option in inner.split("|"):
+                options.update((option, option.strip()))
+            add("choice", tuple(sorted(options, key=len, reverse=True)))
+        start = pos = end + 1
+    add_text(template[start:])
+    return parts
+
+
+def _match_wildcard_template(
+    parts: list[tuple[str, Any]], resolved: str, budget: int = 1_000_000
+) -> set[tuple[str, ...]] | None:
+    """The values of the wildcards of `parts`, in order, for every way the
+    parts can match the whole of `resolved`; stopped at two different ones.
+    None past `budget` steps (each place tried for the end of a wildcard or
+    block is one)."""
+    memo: dict[tuple[int, int], set[tuple[str, ...]]] = {}
+    steps = [0]
+
+    def ends(k: int, pos: int, shortest: int):
+        # A wildcard or block ends where the text after it starts.
+        after = parts[k + 1] if k + 1 < len(parts) else None
+        if after is None:
+            if len(resolved) - pos >= shortest:
+                yield len(resolved)
+            return
+        if after[0] == "text":
+            j = resolved.find(after[1], pos + shortest)
+            while j != -1:
+                yield j
+                j = resolved.find(after[1], j + 1)
+            return
+        yield from range(pos + shortest, len(resolved) + 1)
+
+    def match(k: int, pos: int) -> set[tuple[str, ...]]:
+        if (k, pos) in memo:
+            return memo[(k, pos)]
+        steps[0] += 1
+        if steps[0] > budget:
+            return set()
+        found: set[tuple[str, ...]] = set()
+        if k == len(parts):
+            if pos == len(resolved):
+                found = {()}
+        else:
+            kind, value = parts[k]
+            if kind == "text":
+                if resolved.startswith(value, pos):
+                    found = match(k + 1, pos + len(value))
+            elif kind == "choice":
+                for option in value:
+                    if resolved.startswith(option, pos):
+                        found = found | match(k + 1, pos + len(option))
+                        if len(found) > 1:
+                            break
+            else:
+                wildcard = kind == "wildcard"
+                for end in ends(k, pos, 1 if wildcard else 0):
+                    steps[0] += 1
+                    if steps[0] > budget:
+                        break
+                    for rest in match(k + 1, end):
+                        found.add((resolved[pos:end], *rest) if wildcard else rest)
+                    if len(found) > 1:
+                        break
+        memo[(k, pos)] = found
+        return found
+
+    found = match(0, 0)
+    return None if steps[0] > budget else found
+
+
+def _main_wildcard_values(
+    templates: list[str], resolved: str
+) -> tuple[dict[str, str] | None, str]:
+    """The value the main prompt drew for each of its __name__ wildcards,
+    read from the first of `templates` (the main prompt as typed, with and
+    without the styles) that matches the whole of `resolved`, the prompt the
+    image was made with. (None, why) when the values cannot be told for sure:
+    then the tab's wildcards are drawn again, as before. The last comparisons
+    are remembered: every tab and field of an image asks for the same ones,
+    and a very long prompt takes seconds to compare."""
+    seen = _main_wildcard_values.__dict__.setdefault("seen", {})
+    for template in templates:
+        parts = _wildcard_template_parts(template)
+        if not parts:
+            continue
+        names = [value for kind, value in parts if kind == "wildcard"]
+        if not names:
+            # Only inside {...} blocks, if anywhere: nothing to read.
+            return {}, ""
+        for a, b in zip(parts, parts[1:]):
+            if "wildcard" in (a[0], b[0]) and a[0] in ("wildcard", "any") and b[0] in (
+                "wildcard",
+                "any",
+            ):
+                return None, "a wildcard of the main prompt touches another one"
+        key = (template, resolved)
+        kept = seen.get(key, seen)
+        if kept is not seen:
+            # A copy: the one below is emptied.
+            found = None if kept is None else set(kept)
+        else:
+            try:
+                found = _match_wildcard_template(parts, resolved)
+            except RecursionError:
+                found = None
+            else:
+                try:
+                    while len(seen) >= 16:
+                        del seen[next(iter(seen))]
+                    seen[key] = None if found is None else frozenset(found)
+                except Exception:  # noqa: BLE001
+                    pass
+        if found is None:
+            return None, "the main prompt is too long to compare"
+        if not found:
+            continue
+        if len(found) > 1:
+            return None, "the main prompt can be read in more than one way"
+        values: dict[str, str] = {}
+        for name, value in zip(names, found.pop()):
+            if values.setdefault(name, value) != value:
+                return None, f"__{name}__ took different values in the main prompt"
+        # Drawn again inside a {...} block: maybe another value there.
+        for kind, inside in parts:
+            twice = sorted(inside & values.keys()) if kind == "any" else []
+            if twice:
+                return None, (
+                    f"__{twice[0]}__ is also inside a {{...}} block of the main prompt"
+                )
+        return values, ""
+    return None, "the main prompt does not match its wildcards"
+
+
+def _put_wildcard_values(text: str, values: dict[str, str]) -> str:
+    """`text` with each __name__ wildcard of `values` replaced by its value."""
+    return _WILDCARD_TOKEN_RE.sub(lambda m: values.get(m.group(1), m.group(0)), text)
+
+
+def _main_wildcard_picks(p, args, n: int = 0) -> tuple[dict[str, str], dict[str, str]]:
+    """For the tab's prompt and negative prompt, the value of each __name__
+    wildcard that the main prompt (or negative prompt) also holds, as drawn
+    there for this image, so the detailer pass does not draw another one.
+    Dynamic Prompts and the "wildcards" extension leave the main prompt as
+    typed in p.prompt and the drawn one in p.all_prompts. A tab without
+    wildcards, or a value that cannot be told for sure, gives no value: the
+    prompts stay as they are. A negative `n` leaves the verbose line out."""
+    out: list[dict[str, str]] = []
+    for field, append, typed_attr, all_attr, negative in (
+        ("ad_prompt", "ad_prompt_append", "prompt", "all_prompts", False),
+        (
+            "ad_negative_prompt",
+            "ad_negative_prompt_append",
+            "negative_prompt",
+            "all_negative_prompts",
+            True,
+        ),
+    ):
+        own = f"{getattr(args, field, '') or ''}\n{getattr(args, append, '') or ''}"
+        if "__" not in own:
+            out.append({})
+            continue
+        try:
+            # With those an X/Y/Z Prompt S/R puts in the tab's text.
+            for pair in getattr(p, "_ad_xyz_prompt_sr", None) or []:
+                own += f"\n{getattr(pair, 'r', '')}"
+            names = {
+                m.group(1)
+                for m in _WILDCARD_TOKEN_RE.finditer(_strip_host_comments(own))
+            }
+            typed = getattr(p, typed_attr, None)
+            drawn = getattr(p, all_attr, None) or []
+            i = get_i(p)
+            if isinstance(typed, list) and typed:
+                typed = typed[i % len(typed)]
+            if not names or not isinstance(typed, str) or not drawn:
+                out.append({})
+                continue
+            bases = [typed, _strip_host_comments(typed)]
+            templates = []
+            try:
+                styles = getattr(p, "styles", None) or []
+                db = getattr(shared, "prompt_styles", None)
+                if styles and db is not None:
+                    apply = (
+                        db.apply_negative_styles_to_prompt
+                        if negative
+                        else db.apply_styles_to_prompt
+                    )
+                    # First: the host applied the styles before the
+                    # "wildcards" extension drew; Dynamic Prompts keeps the
+                    # styled text in p.prompt, matched by the plain one.
+                    for base in bases:
+                        styled = apply(base, styles)
+                        templates += [styled, _strip_host_comments(styled)]
+            except Exception:  # noqa: BLE001
+                pass
+            templates = list(dict.fromkeys([*templates, *bases]))
+            shared_names = sorted(
+                names
+                & {
+                    m.group(1)
+                    for template in templates
+                    for m in _WILDCARD_TOKEN_RE.finditer(template)
+                }
+            )
+            if not shared_names:
+                out.append({})
+                continue
+            resolved = drawn[i] if i < len(drawn) else drawn[i % len(drawn)]
+            values, why = _main_wildcard_values(templates, resolved or "")
+            if values is not None:
+                missing = [name for name in shared_names if name not in values]
+                if missing:
+                    why = "inside a {...} block of the main prompt"
+                    shared_names = missing
+            if why and n >= 0 and _ad_verbose():
+                kind = "negative prompt" if negative else "prompt"
+                listed = ", ".join(f"__{name}__" for name in shared_names)
+                listed = listed.encode("ascii", "backslashreplace").decode()
+                _vprint(
+                    f"[-] ADetailer: tab {n + 1} {kind}: {listed} drawn again, "
+                    f"{why}."
+                )
+            taken = {name: value for name, value in (values or {}).items() if name in names}
+            if taken:
+                out.append(taken)
+                continue
+        except Exception:  # noqa: BLE001 - leave the prompts as they are
+            pass
+        out.append({})
+    return out[0], out[1]
+
+
 # First choice of Settings > ADetailer "Upscaler for ADetailer's inpaint area": the
 # pass keeps the WebUI's own "Upscaler for img2img".
 AD_CROP_UPSCALER_WEBUI = "Use the WebUI's img2img upscaler"
@@ -775,6 +1067,63 @@ def _keep_host_overlay(runner) -> bool:
     return True
 
 
+# What Dynamic Prompts (sd-dynamic-prompts) reads in a prompt: {a|b} variants,
+# also ${variables}, %{wraps} and Jinja2 blocks, __name__ wildcards, and its
+# own comments. Its settings can change the first two: see below.
+_DYNAMIC_PROMPTS_MARKS = ("{", "__", "#", "//", "/*")
+
+
+def _without_dynamic_prompts(runner, p2):
+    """The script runner of a detailer pass for the region `p2` is about to
+    inpaint: `runner` itself, or a copy without the Dynamic Prompts script
+    when nothing is there for it to draw in the region's final prompts, nor
+    in the styles the host adds to them. It ran on every region anyway, and
+    its "Magic prompt", "I'm feeling lucky" and "Attention grabber" rewrote
+    prompts that had no wildcard or variant in them.
+
+    Only the final prompts count, not the tab's texts as typed: when this is
+    called they hold all of the tab that reaches the region (its [SEP] part,
+    the append texts, the [CLASS=...] block or per-class prompt of its
+    class), without what ADetailer took out or replaced (a comment, a
+    wildcard that got the main prompt's value, the other [SEP] parts and
+    classes), and they are the texts Dynamic Prompts reads.
+    `runner` itself whenever unsure, as before."""
+    try:
+        scripts_ = list(runner.alwayson_scripts)
+        kept = [
+            script
+            for script in scripts_
+            if Path(str(getattr(script, "filename", "") or "")).stem
+            != "dynamic_prompting"
+        ]
+        if len(kept) == len(scripts_):
+            return runner
+        texts = [p2.prompt, p2.negative_prompt]
+        styles = getattr(p2, "styles", None) or []
+        if styles:
+            db = shared.prompt_styles
+            texts.append(db.apply_styles_to_prompt("", styles))
+            texts.append(db.apply_negative_styles_to_prompt("", styles))
+        marks = list(_DYNAMIC_PROMPTS_MARKS)
+        # Settings > Dynamic Prompts: its own variant and wildcard markers.
+        for key in ("dp_parser_variant_start", "dp_parser_wildcard_wrap"):
+            mark = opts.data.get(key)
+            if isinstance(mark, str) and mark.strip():
+                marks.append(mark.strip())
+        for text in texts:
+            if not isinstance(text, str) or any(mark in text for mark in marks):
+                return runner
+        reduced = copy(runner)
+        reduced.alwayson_scripts = kept
+        # The host's cache of ordered scripts compares only their number, and
+        # the copy would share it with the runners that keep the script.
+        if isinstance(getattr(reduced, "callback_map", None), dict):
+            reduced.callback_map = {}
+    except Exception:  # noqa: BLE001 -- unsure: every script, as before
+        return runner
+    return reduced
+
+
 def _paste_region_back(p2, image):
     """Paste the region's result back into the picture with the host's own
     overlay, as it does with "Overlay original for inpaint" on, for a pass
@@ -791,6 +1140,47 @@ def _paste_region_back(p2, image):
         return image
     pasted.info.update(image.info)
     return pasted
+
+
+# Soft Inpainting (AUTOMATIC1111 1.8 and later, Forge, Forge Neo, reForge)
+# keeps the overlay and the mask of the last image it inpainted on its script
+# object, not on p, and the host reads them for the main image only after
+# postprocess_image. The detailer pass runs the same script object, so the
+# main image of an inpaint job got the pass's overlay: with "Only masked" (and
+# with Ultimate SD Upscale, which inpaints every tile so) a picture the size of
+# the crop, mostly black.
+_SOFT_INPAINT_STATE = ("masks_for_overlay", "overlay_images")
+
+
+def _save_soft_inpaint_state(p) -> list:
+    """The overlay and mask that p's Soft Inpainting script holds, for
+    _restore_soft_inpaint_state. Empty when p has no such script."""
+    saved = []
+    try:
+        runner = getattr(p, "scripts", None)
+        for script in getattr(runner, "alwayson_scripts", None) or []:
+            if Path(str(getattr(script, "filename", "") or "")).stem != "soft_inpainting":
+                continue
+            values = {
+                name: getattr(script, name)
+                for name in _SOFT_INPAINT_STATE
+                if hasattr(script, name)
+            }
+            saved.append((script, values))
+    except Exception:  # noqa: BLE001 — a host without it: nothing to keep
+        return []
+    return saved
+
+
+def _restore_soft_inpaint_state(saved: list) -> None:
+    """Give the Soft Inpainting script back the main image's overlay and mask
+    after the detailer passes."""
+    for script, values in saved:
+        for name, value in values.items():
+            try:
+                setattr(script, name, value)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _match_region_colors(before, after, mask, padding: int, blur: int):
@@ -845,6 +1235,17 @@ def _max_inpaint_side() -> int:
         return max(int(float(opts.data.get("ad_max_inpaint_side", 0) or 0)), 0)
     except Exception:  # noqa: BLE001
         return 0
+
+
+def _megapixel_match_on() -> bool:
+    """Settings > ADetailer bbox size matching is on "1 megapixel"."""
+    try:
+        return (
+            opts.data.get("ad_match_inpaint_bbox_size")
+            == InpaintBBoxMatchMode.MEGAPIXEL.value
+        )
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _cap_inpaint_size(width: int, height: int, max_side: int) -> tuple[int, int]:
@@ -970,6 +1371,7 @@ _VERBOSE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
               "ad_mask_min_ratio", "ad_mask_max_ratio", "ad_x_offset", "ad_y_offset",
               "ad_dilate_erode", "ad_mask_merge_invert", "ad_mask_blur")),
     ("Inpainting", ("ad_denoising_strength", "ad_dynamic_denoise_power",
+                    "ad_inpaint_masked_content",
                     "ad_inpaint_only_masked", "ad_inpaint_only_masked_padding",
                     "ad_use_inpaint_width_height", "ad_inpaint_width",
                     "ad_inpaint_height", "ad_use_resolution_scale",
@@ -1397,6 +1799,17 @@ class AfterDetailerScript(scripts.Script):
             for args in arg_list
         ):
             params["ADetailer max inpaint size"] = max_side
+        # "1 megapixel" bbox size matching, written only when a tab it applies
+        # to runs: "Inpaint only masked" without its own width/height and
+        # without "Scale inpaint to bbox", which both take its place.
+        if _megapixel_match_on() and any(
+            not args.need_skip()
+            and args.ad_inpaint_only_masked
+            and not args.ad_use_inpaint_width_height
+            and not args.ad_use_resolution_scale
+            for args in arg_list
+        ):
+            params["ADetailer inpaint size match"] = "1 MP"
         return params
 
     @staticmethod
@@ -1448,6 +1861,7 @@ class AfterDetailerScript(scripts.Script):
         include_triggers: bool = False,
         strip_loras: bool = False,
         merge_loras: list[str] | None = None,
+        wildcards: dict[str, str] | None = None,
     ) -> list[str]:
         prompts = re.split(r"\s*\[SEP\]\s*", ad_prompt)
         blank_replacement = self.prompt_blank_replacement(all_prompts, i, default)
@@ -1527,6 +1941,13 @@ class AfterDetailerScript(scripts.Script):
                 base = prompts[n].rstrip().rstrip(",").rstrip()
                 prompts[n] = f"{base}, {append_clean}" if base else append_clean
 
+            # The main prompt's values for the __name__ wildcards the tab
+            # shares with it (see _main_wildcard_picks). Before the LoRA
+            # steps: a LoRA the value brings is not merged a second time, and
+            # "Strip LoRAs" removes it too.
+            if wildcards:
+                prompts[n] = _put_wildcard_values(prompts[n], wildcards)
+
             # LoRA auto-inclusion: append LoRAs from the main prompt that
             # aren't already named in this segment (its own weight wins). The
             # order is preserved and duplicates skipped.
@@ -1547,9 +1968,18 @@ class AfterDetailerScript(scripts.Script):
         return prompts
 
     def get_prompt(
-        self, p, args: ADetailerArgs, keep_comments: bool = False
+        self,
+        p,
+        args: ADetailerArgs,
+        keep_comments: bool = False,
+        reuse_tab: int | None = None,
     ) -> tuple[list[str], list[str]]:
         i = get_i(p)
+        # Given the tab's number (the detailer pass gives it), a __name__
+        # wildcard the main prompt also holds takes the value drawn there.
+        picks: tuple[dict[str, str], dict[str, str]] = ({}, {})
+        if reuse_tab is not None:
+            picks = _main_wildcard_picks(p, args, reuse_tab)
 
         # The WebUI's Comments script removes the comments of the main
         # prompts, but by default the detailer pass runs without it: remove
@@ -1617,6 +2047,7 @@ class AfterDetailerScript(scripts.Script):
             ),
             strip_loras=args.ad_strip_loras,
             merge_loras=_without_style_loras(_extract_lora_tags(loras_source), p),
+            wildcards=picks[0],
         )
         # Triggers only make sense on the positive prompt — leaving the
         # negative pipeline unchanged keeps the negative prompt the exact
@@ -1629,6 +2060,7 @@ class AfterDetailerScript(scripts.Script):
             replacements=prompt_sr,
             append=own(args.ad_negative_prompt_append),
             strip_loras=args.ad_strip_loras,
+            wildcards=picks[1],
         )
 
         return prompt, negative_prompt
@@ -1979,7 +2411,7 @@ class AfterDetailerScript(scripts.Script):
             denoising_strength=args.ad_denoising_strength,
             mask=None,
             mask_blur=args.ad_mask_blur,
-            inpainting_fill=1,
+            inpainting_fill=args.inpainting_fill(),
             inpaint_full_res=args.ad_inpaint_only_masked,
             inpaint_full_res_padding=args.ad_inpaint_only_masked_padding,
             inpainting_mask_invert=0,
@@ -2702,6 +3134,10 @@ class AfterDetailerScript(scripts.Script):
                 inpaint_width, inpaint_height, bbox
             )
 
+        # 1 megapixel: about 1024 x 1024 with the box's shape, for any model.
+        elif calculate_optimal_crop == InpaintBBoxMatchMode.MEGAPIXEL.value:
+            optimal_resolution = optimal_crop_size.megapixel(bbox)
+
         if optimal_resolution is None:
             msg = "[-] ADetailer: unsupported inpaint bounding box match mode. Original inpainting dimensions will be used."
             print(msg)
@@ -2727,6 +3163,7 @@ class AfterDetailerScript(scripts.Script):
         inverted: bool = False,
         p=None,
         args: ADetailerArgs | None = None,
+        reuse_wildcards: bool = False,
     ) -> str | None:
         """Resolve inline ``[CLASS=name]...[/CLASS]`` blocks in mask ``j``'s
         prompt against the class the detector found on that mask.
@@ -2745,6 +3182,8 @@ class AfterDetailerScript(scripts.Script):
         does, instead of an empty one. A region its own block leaves with an
         empty prompt gives back that block as typed (for the console note of
         a [PROMPT=words] token that matched nothing); None otherwise.
+        With ``reuse_wildcards`` (the detailer pass) that main prompt text
+        takes the main prompt's wildcard values too, as the tab's prompt did.
         """
         try:
             cn = getattr(pred, "class_names", None)
@@ -2846,8 +3285,12 @@ class AfterDetailerScript(scripts.Script):
                         typed_own = own
                     continue
                 if blank is None:
+                    # -1: the tab's verbose line was already printed.
                     blank = self.get_prompt(
-                        p, args.copy(update={"ad_prompt": "", "ad_negative_prompt": ""})
+                        p,
+                        args.copy(update={"ad_prompt": "", "ad_negative_prompt": ""}),
+                        False,
+                        -1 if reuse_wildcards else None,
                     )
                 setattr(p2, attr, blank[k][0])
             if typed_own and not (p2.prompt or "").strip():
@@ -3427,7 +3870,13 @@ class AfterDetailerScript(scripts.Script):
         i = get_i(p)
 
         i2i = self.get_i2i_p(p, args, pp.image)
-        ad_prompts, ad_negatives = self.get_prompt(p, args)
+        # A __name__ wildcard the main prompt also holds takes the value drawn
+        # there for this image. Asked for here, on the text the pass will use
+        # (comments gone, X/Y/Z S/R applied, every [SEP] part, the append
+        # text, the per-class prompts of a sequential pass, before the LoRA
+        # options); get_prompt also records the X/Y/Z parameters, which keep
+        # the tab's text as typed.
+        ad_prompts, ad_negatives = self.get_prompt(p, args, False, n)
         # A [PROMPT=words] token that left the whole prompt empty: said
         # once per tab and generation, also without the verbose log.
         # The same for a region its own [CLASS=...] block leaves empty, below.
@@ -3621,6 +4070,7 @@ class AfterDetailerScript(scripts.Script):
                 getattr(args, "ad_mask_merge_invert", "None") == "Merge and Invert",
                 p,
                 args,
+                True,
             )
             if isinstance(own_block, str):
                 say_empty(_empty_prompt_note(own_block, [""], n))
@@ -3705,6 +4155,19 @@ class AfterDetailerScript(scripts.Script):
                 region_before = None
             # The picture before this region, for "Detailed region opacity".
             region_start = p2.init_images[0] if region_opacity < 100 else None
+
+            # With no wildcard or variant in this region's final prompts
+            # (nothing changes them from here to process_images), the region
+            # runs without the Dynamic Prompts script, whose Magic Prompt
+            # rewrote it. From i2i: p2 is reused after a NaN.
+            pass_scripts = getattr(i2i, "scripts", None)
+            if pass_scripts is not None:
+                p2.scripts = _without_dynamic_prompts(pass_scripts, p2)
+                if _v and p2.scripts is not pass_scripts:
+                    _vprint(
+                        f"[-] ADetailer: tab {n + 1}, region {j + 1}: Dynamic "
+                        "Prompts not run, no wildcard or variant in the prompts."
+                    )
 
             try:
                 processed = process_images(p2)
@@ -3941,6 +4404,9 @@ class AfterDetailerScript(scripts.Script):
                 kept[1].extend(getattr(dummy, "infotexts", None) or [])
                 p._ad_script_extras = kept
 
+        # The detailer passes overwrite the main image's Soft Inpainting
+        # overlay, which the host applies after this hook: put it back.
+        soft_inpaint_state = _save_soft_inpaint_state(p)
         # A tab that raises (a missing model, out of memory) must still
         # restart the scripts shut down above and restore params.txt.
         try:
@@ -3981,6 +4447,7 @@ class AfterDetailerScript(scripts.Script):
                     p, init_image, condition="ad_save_images_before", suffix="-ad-before"
                 )
         finally:
+            _restore_soft_inpaint_state(soft_inpaint_state)
             if need_call_process(p):
                 with preserve_prompts(p):
                     copy_p = copy(p)
@@ -4524,7 +4991,7 @@ def on_ui_settings():
             label="Try to match inpainting size to bounding box size, if 'Use separate width/height' is not set",
             section=section,
         ).info(
-            "Strict is for SDXL only, and matches exactly to trained SDXL resolutions. Free works with any model, but will use potentially unsupported dimensions."
+            "Strict is for SDXL only, and matches exactly to trained SDXL resolutions. Free works with any model, but will use potentially unsupported dimensions. 1 megapixel works with any model: about 1024x1024 pixels with the shape of the box (from 1:4 to 4:1), sides in multiples of 64, made for SDXL, Flux and newer models; with SD1.5 models it takes about four times the time and video memory."
         ),
     )
 
@@ -4823,6 +5290,17 @@ def make_axis_on_xyz_grid():
                 )
             )
 
+    # Newer axes go here, after every axis above: an API request picks an
+    # axis by its place in the list, and those places must stay.
+    axis.append(
+        xyz_grid.AxisOption(
+            "[ADetailer] Masked content 1st",
+            str,
+            partial(set_value, field="ad_inpaint_masked_content"),
+            choices=lambda: list(INPAINT_MASKED_CONTENT),
+        )
+    )
+
     # By label: a UI reload after a larger "Max tabs" adds only the new tabs.
     labels = {x.label for x in xyz_grid.axis_options}
     xyz_grid.axis_options.extend(x for x in axis if x.label not in labels)
@@ -4924,6 +5402,7 @@ _INFOTEXT_PASTE_DEFAULTS = {
     "ADetailer apply on hires only": "False",
     "ADetailer use bbox mask": "False",
     "ADetailer use resolution scale": "False",
+    "ADetailer inpaint masked content": "original",
 }
 # Keys that the infotext leaves out at their defaults only while the key on
 # the left is written: the scheduler of a separate sampler, and the settings

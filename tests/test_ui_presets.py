@@ -10,7 +10,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from adetailer.args import ALL_ARGS
+from adetailer.args import ALL_ARGS, INPAINT_MASKED_CONTENT
 from adetailer.classes import MEDIAPIPE_FACE_FEATURES_MODEL
 
 
@@ -990,9 +990,10 @@ def test_restart_splits_a_ticked_old_sampler_name(saved, schedulers, expected, c
     namespace = {
         "gr": SimpleNamespace(
             update=lambda **kwargs: kwargs, Row=Block, Column=Block, Group=Block,
-            Dropdown=Block, Slider=Block, Checkbox=Block,
+            Dropdown=Block, Slider=Block, Checkbox=Block, Radio=Block,
         ),
         "partial": partial,
+        "INPAINT_MASKED_CONTENT": INPAINT_MASKED_CONTENT,
     }
     module = ast.Module(body=[source.body[0], *nodes], type_ignores=[])
     exec(compile(module, str(path), "exec"), namespace)
@@ -1035,6 +1036,82 @@ def test_restart_splits_a_ticked_old_sampler_name(saved, schedulers, expected, c
         )
     else:
         assert "saved sampler" not in out
+
+
+def _built_inpainting(saved):
+    """inpainting() of aaaaaa/ui.py with Gradio blocks that record their settings."""
+    from functools import partial
+
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    source = ast.parse(path.read_text(encoding="utf-8"))
+    names = {
+        "inpainting", "elem_id", "_sv", "suffix", "ordinal", "gr_interactive",
+        "split_sampler_name",
+    }
+    nodes = [
+        node for node in source.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    namespace = {
+        "gr": SimpleNamespace(
+            update=lambda **kwargs: kwargs, Row=Block, Column=Block, Group=Block,
+            Dropdown=Block, Slider=Block, Checkbox=Block, Radio=Block,
+        ),
+        "partial": partial,
+        "INPAINT_MASKED_CONTENT": INPAINT_MASKED_CONTENT,
+    }
+    module = ast.Module(body=[source.body[0], *nodes], type_ignores=[])
+    exec(compile(module, str(path), "exec"), namespace)
+    webui_info = SimpleNamespace(
+        sampler_names=["Euler a"], scheduler_names=[], scheduler_endings=[],
+        checkpoints_list=[], vae_list=[], text_encoders_list=[],
+    )
+    w = SimpleNamespace()
+    namespace["inpainting"](w, 1, False, webui_info, saved)
+    return w
+
+
+@pytest.mark.parametrize(
+    ("saved", "expected"),
+    [({}, "original"), ({"ad_inpaint_masked_content": "latent noise"}, "latent noise")],
+)
+def test_masked_content_choices_and_restart(saved, expected):
+    # The WebUI's own "Masked content", in its order (the position is the
+    # number the img2img pass takes); a restart keeps the remembered choice.
+    w = _built_inpainting(saved)
+
+    radio = w.ad_inpaint_masked_content.kwargs
+    assert radio["choices"] == ["fill", "original", "latent noise", "latent nothing"]
+    assert radio["value"] == expected
+    assert radio["label"] == "Masked content 2nd"
+    assert radio["elem_id"] == "script_txt2img_adetailer_ad_inpaint_masked_content_2nd"
+    # One plain block of text, for the translation extensions.
+    assert not any(c in radio["info"] for c in "*`[]_")
+
+
+def test_masked_content_sits_between_dynamic_denoise_and_inpaint_only_masked():
+    path = Path(__file__).resolve().parents[1] / "aaaaaa" / "ui.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    func = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "inpainting"
+    )
+    order = [
+        node.targets[0].attr
+        for node in ast.walk(func)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Attribute)
+        and getattr(node.targets[0].value, "id", "") == "w"
+    ]
+    order.sort(key=lambda attr: next(
+        node.lineno for node in ast.walk(func)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Attribute)
+        and node.targets[0].attr == attr
+    ))
+    at = order.index("ad_inpaint_masked_content")
+    assert order[at - 1] == "ad_dynamic_denoise_power"
+    assert order[at + 1] == "ad_inpaint_only_masked"
 
 
 def _paste(fields, params):
@@ -1407,6 +1484,7 @@ def test_load_resets_settings_an_older_preset_does_not_have(callbacks):
     result = preset_widgets[0][1].callback("saved")[1:]
     restored = dict(zip(ALL_ARGS.attrs, result[:-1]))
     assert restored["ad_inpaint_indices"]["value"] == ""
+    assert restored["ad_inpaint_masked_content"]["value"] == "original"
     assert restored["ad_detection_resolution"]["value"] == 0
     assert restored["ad_class_guard"]["value"] is False
     assert restored["ad_confidence"]["value"] == 0.3
@@ -2671,6 +2749,31 @@ def test_detection_resolution_help_names_the_detectors_own_size():
         assert old not in readme
 
 
+def test_guide_has_the_reference_face_and_own_prompt_recipes():
+    # Two recipes with options that already exist: the same face from a
+    # reference picture (Passthrough), and many pictures each with its own
+    # prompt (img2img Batch + PNG info + Skip img2img), since "Run ADetailer
+    # on an image" starts with an empty prompt. Plain text, as the newer lines.
+    _tree, sections = _guide_sections()
+    problems = next(body for title, body in sections.items() if "Fixing" in title)
+    tools = next(body for title, body in sections.items() if "run-on-image" in title)
+    face = next(
+        line for line in problems.splitlines()
+        if line.startswith("- Same face from a reference picture")
+    )
+    for words in ("IP-Adapter", "Passthrough", "Skip img2img", "sd-webui-controlnet"):
+        assert words in face
+    own = next(
+        line for line in tools.splitlines()
+        if line.startswith("- Many pictures, each with its own prompt")
+    )
+    for words in ("empty prompt", "Append png info to prompts", "Append PNG Info", "Skip img2img"):
+        assert words in own
+    for line in (face, own):
+        assert "**" not in line
+        assert "`" not in line
+
+
 def test_guide_says_combine_all_tabs_detects_at_each_detectors_own_size():
     # The combined preview passes no detection resolution, so every detector
     # runs at the size stored in its own file, not at a fixed default.
@@ -2723,6 +2826,49 @@ def test_guide_names_show_labels_and_the_gallery_previews():
     cap = re.search(r"^_GALLERY_PREVIEWS_MAX = (\d+)$", script, re.M)
     assert cap
     assert f"up to {cap.group(1)} per generation" in gallery[0]
+
+
+def test_guide_says_the_preview_labels_end_with_the_share_of_the_image():
+    # From plus.10 beta 1 each label of the Detection preview ends with the
+    # share of the picture its box takes, the value to set on "Mask min area
+    # ratio" and "Mask max area ratio". One plain line next to "Show labels",
+    # with examples that are what the label helper writes.
+    from adetailer.mask import bbox_ratio_label
+
+    _tree, sections = _guide_sections()
+    tools = next(body for title, body in sections.items() if "run-on-image" in title)
+    lines = [
+        line for line in tools.splitlines()
+        if line.startswith("- Share of the image on the labels")
+    ]
+    assert len(lines) == 1
+    line = lines[0]
+    for words in (
+        "#1 face 12.3%", "#1 1:face 0.90 12.3%", "Mask min area ratio",
+        "Mask max area ratio", "12.3% is 0.123", "0.4% is 0.004",
+        "a box at 11.68% reads 11.6%", "never rounded up",
+        "as the maximum, set one step more (11.6% is 0.117)", "Show labels",
+    ):
+        assert words in line
+    assert "**" not in line
+    assert "`" not in line
+    assert tools.index("- Show labels") < tools.index(line)
+    assert bbox_ratio_label([0, 0, 410, 300], (1000, 1000)) == "12.3%"
+    assert bbox_ratio_label([0, 0, 80, 50], (1000, 1000)) == "0.4%"
+    assert bbox_ratio_label([0, 0, 400, 292], (1000, 1000)) == "11.6%"
+
+
+def test_guide_names_masked_content_in_the_inpainting_section():
+    _tree, sections = _guide_sections()
+    inpainting = next(body for title, body in sections.items() if "Inpainting" in title)
+    lines = [
+        line for line in inpainting.splitlines() if line.startswith("- Masked content")
+    ]
+    assert len(lines) == 1
+    for choice in ("Original", "fill", "latent noise", "latent nothing", "0.8"):
+        assert choice in lines[0]
+    assert "**" not in lines[0]
+    assert "`" not in lines[0]
 
 
 def test_guide_per_face_prompts_mention_more_sort_orders():

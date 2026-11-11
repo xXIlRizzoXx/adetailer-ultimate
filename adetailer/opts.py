@@ -99,5 +99,28 @@ class _OptimalCropSize:
 
         return int(optimal_width), int(optimal_height)
 
+    def megapixel(self, bbox: Sequence[T]) -> tuple[int, int]:
+        """About one megapixel (1024 x 1024) with the shape of the box, kept
+        between 1:4 and 4:1; both sides rounded to the nearest multiple of 64,
+        at least 64. The inpaint size the region had is not used."""
+        if len(bbox) != 4:
+            msg = f"bbox length must be 4, got {len(bbox)}"
+            raise ValueError(msg)
+
+        # A box with no width or height (a merged or clipped box) is treated
+        # as a very thin one: the shape limits below then apply.
+        bbox_width = max(float(bbox[2] - bbox[0]), 1e-6)
+        bbox_height = max(float(bbox[3] - bbox[1]), 1e-6)
+        aspect_ratio = min(max(bbox_width / bbox_height, 0.25), 4.0)
+
+        area = 1024 * 1024
+        width = (area * aspect_ratio) ** 0.5
+        height = (area / aspect_ratio) ** 0.5
+
+        return (
+            max(64, int(round(width / 64)) * 64),
+            max(64, int(round(height / 64)) * 64),
+        )
+
 
 optimal_crop_size = _OptimalCropSize()

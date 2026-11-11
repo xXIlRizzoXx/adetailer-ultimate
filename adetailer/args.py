@@ -118,12 +118,26 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
     ad_controlnet_guidance_start: confloat(ge=0.0, le=1.0) = 0.0
     ad_controlnet_guidance_end: confloat(ge=0.0, le=1.0) = 1.0
     ad_inpaint_indices: str = ""
+    ad_inpaint_masked_content: Literal[
+        "fill", "original", "latent noise", "latent nothing"
+    ] = "original"
     is_api: bool = True
 
     @validator("is_api", pre=True)
     def is_api_validator(cls, v: Any):  # noqa: N805
         "tuple is json serializable but cannot be made with json deserialize."
         return type(v) is not tuple
+
+    @validator("ad_inpaint_masked_content", pre=True)
+    def masked_content_validator(cls, v: Any):  # noqa: N805
+        "Any letter case, or the WebUI's inpainting_fill number (0-3)."
+        if isinstance(v, str):
+            v = v.strip().lower()
+            if v in ("0", "1", "2", "3"):
+                v = int(v)
+        if type(v) is int and 0 <= v < len(INPAINT_MASKED_CONTENT):
+            return INPAINT_MASKED_CONTENT[v]
+        return v
 
     @staticmethod
     def ppop(
@@ -173,6 +187,7 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
         ppop("ADetailer mask min ratio", cond=0.0)
         ppop("ADetailer mask max ratio", cond=1.0)
         ppop("ADetailer inpaint indices")
+        ppop("ADetailer inpaint masked content", cond="original")
         ppop("ADetailer x offset", cond=0)
         ppop("ADetailer y offset", cond=0)
         ppop("ADetailer mask merge invert", cond="None")
@@ -250,6 +265,10 @@ class ADetailerArgs(BaseModel, extra=Extra.forbid):
             p = {k + suffix: v for k, v in p.items()}
 
         return p
+
+    def inpainting_fill(self) -> int:
+        # The WebUI's "Masked content" number for the detailer pass (0-3).
+        return INPAINT_MASKED_CONTENT.index(self.ad_inpaint_masked_content)
 
     def is_mediapipe(self) -> bool:
         return self.ad_model.lower().startswith("mediapipe")
@@ -332,6 +351,9 @@ _all_args = [
     ("ad_controlnet_guidance_start", "ADetailer ControlNet guidance start"),
     ("ad_controlnet_guidance_end", "ADetailer ControlNet guidance end"),
     ("ad_inpaint_indices", "ADetailer inpaint indices"),
+    # Added last: the UI passes the settings by position, so the ones above
+    # keep their places.
+    ("ad_inpaint_masked_content", "ADetailer inpaint masked content"),
 ]
 
 _args = [Arg(*args) for args in _all_args]
@@ -357,6 +379,10 @@ BBOX_SORTBY_MORE = [
 ]
 
 MASK_MERGE_INVERT = ["None", "Merge", "Merge and Invert"]
+
+# "Masked content", in the WebUI's order: the position is the number its
+# img2img pass takes as inpainting_fill.
+INPAINT_MASKED_CONTENT = ["fill", "original", "latent noise", "latent nothing"]
 
 _script_default = (
     "dynamic_prompting",
@@ -387,10 +413,12 @@ class InpaintBBoxMatchMode(Enum):
     OFF = "Off"
     STRICT = "Strict (SDXL only)"
     FREE = "Free"
+    MEGAPIXEL = "1 megapixel (SDXL, Flux and newer)"
 
 
 INPAINT_BBOX_MATCH_MODES = [
     InpaintBBoxMatchMode.OFF.value,
     InpaintBBoxMatchMode.STRICT.value,
     InpaintBBoxMatchMode.FREE.value,
+    InpaintBBoxMatchMode.MEGAPIXEL.value,
 ]

@@ -13,7 +13,7 @@ import gradio as gr
 from aaaaaa.conditional import InputAccordion, schedulers
 from aaaaaa.jobs import wrap_adetailer_detection, wrap_adetailer_job
 from adetailer import ADETAILER, __version__
-from adetailer.args import ALL_ARGS, MASK_MERGE_INVERT
+from adetailer.args import ALL_ARGS, INPAINT_MASKED_CONTENT, MASK_MERGE_INVERT
 from adetailer.classes import MEDIAPIPE_FACE_FEATURES_MODEL, get_model_class_names
 from adetailer.persistence import load_state, save_tab_state
 from adetailer.presets import (
@@ -28,7 +28,7 @@ from adetailer.presets import (
     take_recovery_note,
 )
 from controlnet_ext import controlnet_exists, controlnet_type, get_cn_models
-from controlnet_ext.common import default_cn_module
+from controlnet_ext.common import anytest_choices, default_cn_module
 
 if controlnet_type == "forge":
     from lib_controlnet import global_state
@@ -62,6 +62,11 @@ else:
 
 union = list(chain.from_iterable(cn_module_choices.values()))
 cn_module_choices["union"] = union
+# Anytest models start with no preprocessor (the crop as it is): "None" on
+# Forge, "none" on AUTOMATIC1111. Last: anytest_depth is a depth model.
+cn_module_choices["anytest"] = anytest_choices(
+    union, "None" if controlnet_type == "forge" else "none"
+)
 
 
 def _apply_exif_orientation(im):
@@ -256,6 +261,7 @@ _GUIDE_SECTIONS: list[tuple[str, str]] = [
         """
 - **Inpaint denoising strength** — how much the region changes. Lower keeps the original shape; higher redraws more. ~0.3–0.5 is typical; low values help a detected class keep looking like itself.
 - **Dynamic denoise by area (new)** — automatically gives smaller detected regions more denoise. `0` = use the global Settings value; `2`–`4` is a good range.
+- Masked content — what fills the region before it is redrawn, as in the WebUI's own inpaint. Original (the default) keeps it as it is; fill paints it with the colours around it; latent noise and latent nothing redraw it from scratch and need a denoising strength of about 0.8 or more.
 - **Inpaint mask blur** — soften the mask edge for smoother blending.
 - **Inpaint only masked** (+ padding) — regenerate just the region at full detail (recommended), keeping some surrounding context.
 - **Separate inpaint width/height** or **scale** — set the working resolution of the region.
@@ -278,8 +284,10 @@ Use different settings **only** for the detail pass; each is off (inherits the m
 Two sibling tools sit right after each tab's **Detection** section (roughly the middle of the tab, above Mask preprocessing and Inpainting):
 - **Detection preview** — drop an image to see what the detector would find (boxes), without generating. The single-tab preview honours this tab's **Detection resolution**. **Combine all tabs** overlays every tab's detector at once (that combined view uses each detector's own size).
 - Show labels — the checkbox next to 🔍 Run detection preview. Untick it to see only the boxes and masks, without the class names, scores and numbers; the boxes can still be clicked. It is on by default and the browser remembers it. The download button of the preview always saves the picture with the labels.
+- Share of the image on the labels — each label of the Detection preview ends with the share of the picture its box takes, for example #1 face 12.3%, and with Combine all tabs #1 1:face 0.90 12.3%. It is the value Mask min area ratio and Mask max area ratio compare: 12.3% is 0.123 and 0.4% is 0.004. It always has one decimal and is cut down, never rounded up (a box at 11.68% reads 11.6%), so the value read on a box keeps that box when set as the minimum; as the maximum, set one step more (11.6% is 0.117). Unticking Show labels hides it too.
 - **Run ADetailer on an image** — drop a finished image and run the full detect + inpaint pass on it, without regenerating. Optional **Save result to outputs** writes to a dedicated `ADetailer-Inpaint` folder; click the result to enlarge it.
 - **Batch a whole folder (new)** — paste a **folder path** in that same tool to detail every image inside it in one go; each result is always saved: to the `ADetailer-Inpaint` folder or, with **📁 Save results in the source folder instead** ticked, beside each source image as `name-ad` (a new file — originals are never overwritten; `name-ad-1`, `name-ad-2`… if the name is taken). A folder path takes priority over a single dropped image.
+- Many pictures, each with its own prompt — Run ADetailer on an image and its folder batch start every picture with an empty prompt and negative prompt and use only the tab's. To keep each picture's own prompt, use img2img → Batch with its PNG info option on (Append png info to prompts; on Forge Neo, Append PNG Info) and Prompt and Negative prompt ticked under Parameters to take from png info, leave the main prompt and the tab's prompt empty, and tick Skip img2img in ADetailer.
 """,
     ),
     (
@@ -301,6 +309,7 @@ Two sibling tools sit right after each tab's **Detection** section (roughly the 
 - **The wrong thing gets regenerated** (e.g. one part redrawn as another) — keep denoise low and turn on **Auto class-guard**, or write **per-class prompts** / **inline `[CLASS=]`** so each class stays itself.
 - **Small or distant faces are missed** — raise **Detection resolution** above the detector's own size (e.g. 1024 for the bundled 640 models), and/or lower the confidence threshold.
 - **The face no longer looks like the character** — lower **Inpaint denoising strength**.
+- Same face from a reference picture — in img2img (not Inpaint), enable one unit of the WebUI's own ControlNet section, tick Upload independent control image, drop the reference face there and pick an IP-Adapter preprocessor and model (for example an ip-adapter-plus-face model for SDXL); switch the other units off. In the ADetailer tab set ControlNet model to Passthrough, so the pass uses the WebUI's units, and tick Skip img2img, so only the detected faces change (in txt2img the unit changes the main image too). With several tabs on, set Passthrough in each. A ControlNet model picked in the tab replaces the WebUI's units, so the two do not go together. AUTOMATIC1111 needs the sd-webui-controlnet extension; Forge and Forge Neo have ControlNet built in. On anime checkpoints the SDXL IP-Adapter models can spoil the picture even without ADetailer: try the unit alone first and lower its weight to about 0.5-0.7.
 - **A style LoRA bleeds onto the detailed region** — turn on **Strip LoRAs from the detailer prompt**.
 - **The mask is too tight / edges show** — use **bbox as mask** or **dilation**, and increase **mask blur**.
 - **The same face is detailed twice** (two boxes on one face) — set **Drop overlapping detections** (`Settings → ADetailer`) to about 0.6.
@@ -318,6 +327,7 @@ These go inside the tab's **Prompt** field:
 - **`[SKIP]`** — skip a region entirely. On its own it skips all; inside a class block (`[CLASS=hand] [SKIP] [/CLASS]`) it skips only that class.
 - **`[PROMPT]`** — insert the main generation prompt at that spot.
 - [PROMPT=eyes,hair] — insert only the parts of the main prompt (the parts between its commas, new lines, BREAK and AND) that name one of these words, with their weights, e.g. close-up, [PROMPT=eyes] brings green eyes when a wildcard picked them for this image. A minus sign drops parts instead: [PROMPT=-dress] brings all the rest. Words match whole, in any case, and an underscore counts as a space; the numbers of the weights are not searched. With plain words it never brings the main prompt's LoRAs (Use LoRAs from main prompt adds them); with only minus words it keeps them (Strip LoRAs from the detailer prompt removes them). When no part matches, it adds nothing. [PROMPT=] brings the whole main prompt, like [PROMPT].
+- Wildcards — a wildcard of Dynamic Prompts or of the wildcards extension in the tab's prompt, negative prompt or Prompt append that the main prompt also holds takes the value drawn there for each image, e.g. the same eye colour, instead of a new draw. A wildcard that is not in the main prompt is drawn as before, so use one of those to get a different value on purpose. When the value cannot be read for sure, the prompt is left as it is and Verbose diagnostic log says why.
 - **A different prompt or LoRA for each face** — set `Settings → ADetailer → Sort bounding boxes by` to *Position (left to right)* and leave *More sort orders* on Off (or pick another order there, such as right to left), then write one part per face, e.g. `smiling woman <lora:style_a:0.8> [SEP] old man, grey beard [SEP] [SKIP]`. Each face is a pass of its own, so a LoRA in one part is used only for that face; faces beyond the last part get the last part (`[SKIP]` here leaves them as they are).
 """,
     ),
@@ -853,6 +863,8 @@ def on_cn_model_update(
 ):
     # The model list matches its type in any case (OpenPoseXL2): so does this.
     cn_model_name = cn_model_name.lower().replace("inpaint_depth", "depth")
+    cn_model_name = cn_model_name.replace("any-test", "anytest")
+    cn_model_name = cn_model_name.replace("any_test", "anytest")
     for t in cn_module_choices:
         if t in cn_model_name:
             choices = cn_module_choices[t]
@@ -1109,7 +1121,10 @@ def _chip_spot(first, box, size, image_size, taken):
     the first free spot next to the box: above it, inside one of its corners,
     below it, beside it, or above or below it just past a chip in the way; when
     no spot is free, the one that covers the least of the other chips. Every
-    spot is moved inside the image. Only the chips near the box are compared,
+    spot is moved inside the image (left or up, as far as it takes); a chip
+    larger than the image starts at its left or top edge, so that the start of
+    the label, the number, is the part that shows. Only the chips near the box
+    are compared,
     and with more than 40 of them (hundreds of boxes, as at a confidence near
     0) the chip keeps its usual spot, so such a preview stays quick. Plain
     arithmetic, no fonts."""
@@ -1118,11 +1133,8 @@ def _chip_spot(first, box, size, image_size, taken):
     x1, y1, x2, y2 = box
 
     def inside(sx, sy):
-        # Inside the image; a chip larger than the image still starts in it.
-        return (
-            max(0, min(sx, img_w - w if w <= img_w else img_w - 1)),
-            max(0, min(sy, img_h - h if h <= img_h else img_h - 1)),
-        )
+        # Inside the image; a chip larger than the image starts at its edge.
+        return max(0, min(sx, img_w - w)), max(0, min(sy, img_h - h))
 
     fixed = (
         first,
@@ -1177,10 +1189,18 @@ def _draw_detection_numbers(img, bboxes, class_names=None):
     keep only that region. With ``class_names`` (parallel to ``bboxes``) the
     chip also names the class ("#1 eyes"): it sits where a MediaPipe plot writes
     its label, and hides it. A chip that would cover an earlier one moves next
-    to its box (see _chip_spot). Cosmetic and fully guarded: any failure (bad font,
+    to its box (see _chip_spot). The chip ends with the box's share of the
+    picture ("#1 12.3%", "#1 eyes 0.4%"), worked out as the "Mask min/max area
+    ratio" filter does, so the value read here can be set on those sliders
+    (12.3% = 0.123). Cosmetic and fully guarded: any failure (bad font,
     bad box) returns the image unchanged rather than breaking the preview."""
     try:
         from PIL import ImageDraw, ImageFont
+
+        try:
+            from adetailer.mask import bbox_ratio_label
+        except Exception:  # noqa: BLE001 - the chips are drawn without the area
+            bbox_ratio_label = None
 
         out = img.convert("RGB")
         draw = ImageDraw.Draw(out)
@@ -1204,15 +1224,40 @@ def _draw_detection_numbers(img, bboxes, class_names=None):
             except Exception:  # noqa: BLE001
                 continue
             label = f"#{j + 1}"
+            name = ""
             if class_names and j < len(class_names) and class_names[j]:
-                label += f" {class_names[j]}"
+                name = f"{class_names[j]}"
+                label += f" {name}"
+            # " 12.3%": the box's share of the picture ("" when not worked out).
+            area = bbox_ratio_label(box, out.size) if bbox_ratio_label else ""
+            area = f" {area}" if area else ""
+            label += area
             try:
                 tb = draw.textbbox((0, 0), label, font=font)
             except Exception:  # noqa: BLE001
                 # The bitmap fallback font (Pillow < 10.1, no TrueType font
                 # found) is Latin-1 only: keep the number, drop the name.
-                label = f"#{j + 1}"
+                label = f"#{j + 1}" + area
+                name = ""
                 tb = draw.textbbox((0, 0), label, font=font)
+            # A chip wider than the picture (a long class name on a narrow,
+            # tall one) ran past the right edge, where the share is: the name
+            # is cut ("#1 left_ey... 3.0%") to the most letters that fit, and
+            # left out when not even one does. Found by halving, to measure
+            # a long name only a few times.
+            if name and tb[2] - tb[0] + 8 > out.width:
+                low, high = 0, len(name) - 1
+                while True:
+                    cut = (low + high + 1) // 2
+                    short = f" {name[:cut].rstrip()}..." if cut else ""
+                    label = f"#{j + 1}" + short + area
+                    tb = draw.textbbox((0, 0), label, font=font)
+                    if low == high:
+                        break
+                    if tb[2] - tb[0] + 8 <= out.width:
+                        low = cut
+                    else:
+                        high = cut - 1
             tw, th = tb[2] - tb[0], tb[3] - tb[1]
             # Just inside the box's top-left corner, unless a chip is there.
             lx, ly = _chip_spot(
@@ -1453,6 +1498,11 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             from PIL import Image as _PILImage
             from PIL import ImageDraw, ImageFont
 
+            try:
+                from adetailer.mask import bbox_ratio_label
+            except Exception:  # noqa: BLE001 - the labels go without the area
+                bbox_ratio_label = None
+
             targets = [
                 i for i in range(num_models) if per_tab[i][0] and per_tab[i][0] != "None"
             ]
@@ -1546,10 +1596,16 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     c = confs[j] if j < len(confs) else None
                     # "#<det> <tab>:<class> <conf>" — the leading #N is this tab's
                     # 1-based detection number (what the ad_inpaint_indices field
-                    # for this tab expects); tabs are also colour-coded.
+                    # for this tab expects); tabs are also colour-coded. Last,
+                    # the box's share of the picture, as on the single-tab
+                    # numbers: the "Mask min/max area ratio" value (12.3% = 0.123).
+                    area = (
+                        bbox_ratio_label(box, canvas.size) if bbox_ratio_label else ""
+                    )
+                    area = f" {area}" if area else ""
                     label = f"#{j + 1} {i + 1}:{cls}" + (
                         f" {c:.2f}" if c is not None else ""
-                    )
+                    ) + area
                     try:
                         tb = draw.textbbox((0, 0), label, font=font)
                     except Exception:  # noqa: BLE001
@@ -1558,8 +1614,37 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                         # the name.
                         label = f"#{j + 1} {i + 1}" + (
                             f" {c:.2f}" if c is not None else ""
-                        )
+                        ) + area
                         tb = draw.textbbox((0, 0), label, font=font)
+                    # A label wider than the picture, as for the single-tab
+                    # numbers: the class name is cut ("#1 2:left_ey... 0.90
+                    # 3.0%") to the most letters that fit, then left out, then
+                    # the confidence too.
+                    if tb[2] - tb[0] + 8 > canvas.width:
+                        head = f"#{j + 1} {i + 1}"
+                        conf = f" {c:.2f}" if c is not None else ""
+                        low = 0
+                        # Never below 0: a class without a name ("") would
+                        # leave the search with no end.
+                        high = (
+                            max(len(str(cls)) - 1, 0)
+                            if label.startswith(head + ":")
+                            else 0
+                        )
+                        while True:
+                            cut = (low + high + 1) // 2
+                            short = f":{str(cls)[:cut].rstrip()}..." if cut else ""
+                            label = head + short + conf + area
+                            tb = draw.textbbox((0, 0), label, font=font)
+                            fits = tb[2] - tb[0] + 8 <= canvas.width
+                            if low == high:
+                                if fits or not conf:
+                                    break
+                                conf = ""
+                            elif fits:
+                                low = cut
+                            else:
+                                high = cut - 1
                     tw, th = tb[2] - tb[0], tb[3] - tb[1]
                     ly = y1 - th - 7 if (y1 - th - 7) >= 0 else y1 + 2
                     lx, ly = _chip_spot(
@@ -4139,6 +4224,21 @@ def inpainting(  # noqa: PLR0915
                 value=sv("ad_dynamic_denoise_power", 0.0),
                 visible=True,
                 elem_id=eid("ad_dynamic_denoise_power"),
+            )
+
+        with gr.Row():
+            w.ad_inpaint_masked_content = gr.Radio(
+                label="Masked content" + suffix(n),
+                info=(
+                    "What fills the region before it is redrawn. Original keeps "
+                    "it as it is (the usual choice). Latent noise and latent "
+                    "nothing redraw it from scratch and need a denoising "
+                    "strength of about 0.8 or more."
+                ),
+                choices=INPAINT_MASKED_CONTENT,
+                value=sv("ad_inpaint_masked_content", "original"),
+                visible=True,
+                elem_id=eid("ad_inpaint_masked_content"),
             )
 
         with gr.Row(elem_classes=["ad-2col-row"]):

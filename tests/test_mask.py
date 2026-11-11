@@ -1,15 +1,22 @@
+import math
+
 import cv2
 import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
+from adetailer.common import PredictOutput
 from adetailer.mask import (
     bbox_area,
     bbox_iou,
+    bbox_ratio,
+    bbox_ratio_label,
     dilate_erode,
+    filter_by_ratio,
     filter_overlapping,
     has_intersection,
     is_all_black,
+    is_in_ratio,
     mask_invert,
     mask_merge,
     mask_preprocess,
@@ -174,6 +181,11 @@ def test_merge_invert_keeps_the_background_around_detections():
         ("1, #3", [0, 2]),
         ("#1-#2", [0, 1]),
         (" #2 ", [1]),
+        # A label typed whole, with its class name and its share of the
+        # picture, still picks only its number.
+        ("#1 12%", [0]),
+        ("#2 eyes 0.4%, #3 <0.1%", [1, 2]),
+        ("#3 100%", [2]),
         # A spaced range stays a range (not the two numbers 1 and 3).
         ("1 - 3", [0, 1, 2]),
         ("1 -3", [0, 1, 2]),
@@ -343,6 +355,184 @@ class TestHasIntersection:
 def test_bbox_area():
     bbox = [0.0, 0.0, 10.0, 10.0]
     assert bbox_area(bbox) == 100
+
+
+@pytest.mark.parametrize(
+    ("bbox", "size", "label"),
+    [
+        # As large as the picture, square or not.
+        ([0, 0, 512, 512], (512, 512), "100%"),
+        ([0, 0, 640, 480], (640, 480), "100%"),
+        ([0, 0, 480, 640], (480, 640), "100%"),
+        # Half as wide and half as tall is a quarter, on any shape.
+        ([0, 0, 50, 50], (100, 100), "25.0%"),
+        ([256, 96, 768, 480], (1024, 768), "25.0%"),
+        ([0.5, 0.5, 100.5, 50.5], (200, 100), "25.0%"),
+        # Always one decimal.
+        ([0, 0, 400, 300], (1000, 1000), "12.0%"),
+        ([0, 0, 200, 170], (1000, 1000), "3.4%"),
+        ([100, 50, 300, 250], (2000, 500), "4.0%"),
+        ([0, 0, 80, 50], (1000, 1000), "0.4%"),
+        # Cut down to a step of the sliders, never rounded up: 11.68% set as
+        # "12%" (0.12) on "Mask min area ratio" dropped its own box.
+        ([0, 0, 400, 292], (1000, 1000), "11.6%"),
+        ([0, 0, 1234, 100], (1000, 1000), "12.3%"),
+        ([0, 0, 47, 100], (1000, 1000), "0.4%"),
+        ([0, 0, 996, 100], (1000, 1000), "9.9%"),
+        ([0, 0, 999, 1000], (1000, 1000), "99.9%"),
+        ([0, 0, 9996, 100], (1000, 1000), "99.9%"),
+        # Exactly on a step: 0.116 is "11.6%", not "11.5%".
+        ([0, 0, 116, 1000], (1000, 1000), "11.6%"),
+        ([0, 0, 290, 100], (100, 1000), "29.0%"),
+        ([0, 0, 1, 100], (100, 1000), "0.1%"),
+        # Smaller than one step of the sliders (0.001 = 0.1%).
+        ([0, 0, 2, 2], (1024, 1024), "<0.1%"),
+        ([10, 10, 10, 40], (64, 64), "0%"),
+        # Past the picture's edge: still the value the filter works out.
+        ([0, 0, 110, 100], (100, 100), "110.0%"),
+        # Nothing to write.
+        ([1, 2], (100, 100), ""),
+        (None, (100, 100), ""),
+        ([0, 0, 10, 10], (0, 100), ""),
+        ([0, 0, 10, 10], None, ""),
+        ([30, 0, 10, 10], (100, 100), ""),
+        ([0, 0, float("nan"), 10], (100, 100), ""),
+        ([0, 0, float("inf"), 10], (100, 100), ""),
+    ],
+)
+def test_bbox_ratio_label(bbox, size, label):
+    # The Detection preview writes a box's share of the picture next to its
+    # number, to be set on "Mask min area ratio" / "Mask max area ratio".
+    assert bbox_ratio_label(bbox, size) == label
+
+
+def _slider(label, steps=0):
+    """The value read on a label, typed on a "Mask min/max area ratio" slider
+    (11.6% is 0.116), ``steps`` steps of the slider (0.001) further up."""
+    whole, _, tenth = label[:-1].partition(".")
+    count = int(whole) * 10 + int(tenth or 0) + steps
+    return float(f"{count // 1000}.{count % 1000:03d}")
+
+
+def _ratio_label_boxes():
+    """(box, picture size) pairs: whole-pixel and fractional boxes on pictures
+    of several shapes, and boxes exactly on a step of the sliders."""
+    for width, height in ((640, 480), (768, 1344), (1024, 1024), (1920, 816)):
+        for box_w in range(4, width + 1, 37):
+            for box_h in range(4, height + 1, 53):
+                yield [0.0, 0.0, float(box_w), float(box_h)], (width, height)
+    # The scan of the review that found the rounded label.
+    for box_w in range(8, 1024, 7):
+        for box_h in range(8, 1024, 11):
+            yield [0, 0, box_w, box_h], (1024, 1024)
+    for box in ([0, 0, 400, 304], [0, 0, 400, 322], [0, 0, 190, 190], [0, 0, 60, 60]):
+        yield box, (1024, 1024)
+    # Exactly on a step: 0.001, 0.002, ... 1.0 of the picture.
+    for steps in range(1, 1001):
+        yield [0, 0, steps, 1000], (1000, 1000)
+        yield [0.0, 0.0, steps / 8, 80.0], (100, 100)
+    # Fractional corners, as a detector gives them.
+    rng = np.random.default_rng(620)
+    for x1, y1, x2, y2 in rng.uniform(0, 1, (4000, 4)).tolist():
+        yield (
+            [x1 * 300, y1 * 400, 300 + x2 * 468, 400 + y2 * 624], (768, 1024)
+        )
+
+
+def test_bbox_ratio_label_set_on_the_sliders_keeps_its_own_box():
+    # The label was rounded: a box at 11.68% read "12%", and "Mask min area
+    # ratio" at 0.12 dropped that very box (half of the boxes of a scan). It is
+    # now cut down to a step of the sliders, so the value read keeps its box as
+    # the minimum, and as the maximum one step further up.
+    kinds = set()
+    checked = 0
+    for box, (width, height) in _ratio_label_boxes():
+        area = width * height
+        label = bbox_ratio_label(box, (width, height))
+        ratio = bbox_ratio(box, area)
+        if label == "<0.1%":
+            # Below every setting of the sliders but 0.
+            assert 0 < ratio < 0.001, (box, label)
+            assert not is_in_ratio(box, 0.001, 1.0, area)
+            assert is_in_ratio(box, 0.0, 0.001, area)
+            kinds.add("tiny")
+            continue
+        if label == "100%":
+            assert is_in_ratio(box, 1.0, 1.0, area), (box, label)
+            kinds.add("full")
+            continue
+        # Always one decimal.
+        whole, dot, tenth = label[:-1].partition(".")
+        assert label.endswith("%") and dot, (box, label)
+        assert whole.isdigit() and tenth.isdigit() and len(tenth) == 1, (box, label)
+        low, high = _slider(label), _slider(label, 1)
+        assert round(high - low, 6) == 0.001
+        # As the minimum it keeps its own box; one step more would not.
+        assert is_in_ratio(box, low, 1.0, area), (box, label)
+        assert not is_in_ratio(box, high, 1.0, area), (box, label)
+        # As the maximum plus one step it keeps its own box.
+        assert is_in_ratio(box, 0.0, high, area), (box, label)
+        assert is_in_ratio(box, low, high, area), (box, label)
+        # Through the filter itself.
+        for lowest, highest in ((low, 1.0), (0.0, high)):
+            pred = PredictOutput(
+                bboxes=[box], masks=["m"], confidences=[0.9],
+                preview=Image.new("1", (width, height)),
+            )
+            assert filter_by_ratio(pred, lowest, highest).masks == ["m"], (box, label)
+        kinds.add("decimal")
+        checked += 1
+    # Premise: the scan has every kind of label, and many boxes.
+    assert kinds == {"tiny", "decimal", "full"}
+    assert checked > 10000
+
+
+def test_bbox_ratio_label_of_a_box_on_a_step_is_that_step():
+    # 0.57 of the picture is "57.0%": cut from the percentage it would read
+    # one step less on 81 of the steps (100 * 0.57 is 56.99999999999999).
+    for steps in range(1, 1000):
+        label = bbox_ratio_label([0, 0, steps, 1000], (1000, 1000))
+        assert label == f"{steps // 10}.{steps % 10}%", steps
+    assert bbox_ratio_label([0, 0, 1000, 1000], (1000, 1000)) == "100%"
+
+
+def test_bbox_ratio_label_of_a_box_a_hair_below_a_step_is_the_step_before():
+    # A fractional box can be the smallest possible amount below a step:
+    # the filter set to that step drops it, so the label must not name it
+    # (the ratio times 1000 alone gives the step itself for 0.117, 0.203...).
+    for steps in range(2, 1001):
+        ratio = math.nextafter(steps / 1000, 0.0)
+        box = [0.0, 0.0, ratio, 1.0]
+        assert bbox_ratio(box, 1) == ratio
+        assert not is_in_ratio(box, steps / 1000, 1.0, 1)
+        label = bbox_ratio_label(box, (1, 1))
+        assert label == f"{(steps - 1) // 10}.{(steps - 1) % 10}%", steps
+        assert is_in_ratio(box, _slider(label), _slider(label, 1), 1)
+
+
+@pytest.mark.parametrize("size", [(400, 200), (200, 400)])
+def test_the_ratio_read_on_the_preview_works_on_the_sliders(size):
+    # 30.0% read on the label is 0.3 on the sliders: as the minimum it keeps
+    # that box and the larger one, as the maximum that box and the smaller.
+    def boxes():
+        found = [[0, 0, 400, 200], [0, 0, 200, 120], [100, 100, 120, 116]]
+        if size[0] < size[1]:
+            found = [[y1, x1, y2, x2] for x1, y1, x2, y2 in found]
+        return found
+
+    assert [bbox_ratio_label(b, size) for b in boxes()] == ["100%", "30.0%", "0.4%"]
+
+    def kept(low, high):
+        pred = PredictOutput(
+            bboxes=boxes(), masks=["a", "b", "c"], confidences=[0.9, 0.8, 0.7],
+            preview=Image.new("RGB", size),
+        )
+        return filter_by_ratio(pred, low, high).masks
+
+    assert kept(0.3, 1.0) == ["a", "b"]
+    assert kept(0.0, 0.3) == ["b", "c"]
+    assert kept(0.004, 0.3) == ["b", "c"]
+    assert kept(0.005, 0.3) == ["b"]
 
 
 class TestMaskMerge:

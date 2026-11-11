@@ -1001,17 +1001,18 @@ def _load_draw_detection_numbers():
 @pytest.mark.parametrize(
     ("names", "labels"),
     [
-        (["eyes", "nose"], ["#1 eyes", "#2 nose"]),
-        (["eyes"], ["#1 eyes", "#2"]),
-        (["", "nose"], ["#1", "#2 nose"]),
-        ([], ["#1", "#2"]),
-        (None, ["#1", "#2"]),
+        (["eyes", "nose"], ["#1 eyes 6.8%", "#2 nose 9.1%"]),
+        (["eyes"], ["#1 eyes 6.8%", "#2 9.1%"]),
+        (["", "nose"], ["#1 6.8%", "#2 nose 9.1%"]),
+        ([], ["#1 6.8%", "#2 9.1%"]),
+        (None, ["#1 6.8%", "#2 9.1%"]),
     ],
 )
 def test_detection_number_chips_name_the_class(monkeypatch, names, labels):
     # mediapipe_face_features writes each part's name at the top-left corner of
     # its box, where the number chip covered it: the five overlapping boxes of
-    # a face showed only #1 to #5, so the number to type was a guess.
+    # a face showed only #1 to #5, so the number to type was a guess. Every
+    # chip ends with the box's share of the picture.
     from PIL import ImageDraw
 
     draw_numbers = _load_draw_detection_numbers()
@@ -1030,14 +1031,14 @@ def test_detection_number_chips_name_the_class(monkeypatch, names, labels):
 
     assert drawn == labels
     # Without a name the chips are drawn as before.
-    assert (out.tobytes() == plain.tobytes()) is (labels == ["#1", "#2"])
+    assert (out.tobytes() == plain.tobytes()) is (labels == ["#1 6.8%", "#2 9.1%"])
 
 
 @pytest.mark.parametrize(
     ("names", "labels"),
     [
-        (["顔", "hand"], ["#1", "#2 hand"]),
-        (["hand", "łapa"], ["#1 hand", "#2"]),
+        (["顔", "hand"], ["#1 6.8%", "#2 hand 9.1%"]),
+        (["hand", "łapa"], ["#1 hand 6.8%", "#2 9.1%"]),
     ],
 )
 def test_detection_number_chips_keep_the_number_with_a_bitmap_font(
@@ -1072,14 +1073,162 @@ def test_detection_number_chips_keep_the_number_with_a_bitmap_font(
     assert out.tobytes() != image.tobytes()
 
 
+def _drawn_labels(monkeypatch):
+    """Every text drawn on a picture from now on, in drawing order."""
+    from PIL import ImageDraw
+
+    drawn = []
+    text = ImageDraw.ImageDraw.text
+
+    def record(self, xy, label, *args, **kwargs):
+        drawn.append(label)
+        return text(self, xy, label, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", record)
+    return drawn
+
+
+def _upright(boxes, size):
+    """``boxes`` given for a wide picture, turned for a tall one."""
+    if size[0] >= size[1]:
+        return [list(b) for b in boxes]
+    return [[y1, x1, y2, x2] for x1, y1, x2, y2 in boxes]
+
+
+_AREA_BOXES = [[0, 0, 400, 200], [0, 0, 200, 120], [100, 100, 120, 116], [10, 10, 14, 13]]
+
+
+@pytest.mark.parametrize("size", [(400, 200), (200, 400)])
+def test_detection_number_chips_end_with_the_share_of_the_picture(monkeypatch, size):
+    # "Mask min area ratio" and "Mask max area ratio" compare a box's share of
+    # the whole image, but the preview gave no value to set them to. Each chip
+    # ends with that share: a box as large as the picture, a large one, one
+    # under 1% (a decimal) and one too small for a step of the sliders, on a
+    # wide and on a tall picture.
+    from adetailer.mask import filter_by_ratio
+
+    draw_numbers = _load_draw_detection_numbers()
+    image = Image.new("RGB", size, "gray")
+    boxes = _upright(_AREA_BOXES, size)
+    drawn = _drawn_labels(monkeypatch)
+    out = draw_numbers(image, boxes, ["face", "", "eyes"])
+
+    assert drawn == ["#1 face 100%", "#2 30.0%", "#3 eyes 0.4%", "#4 <0.1%"]
+    assert out.tobytes() != image.tobytes()
+    # The same value as the filter: 30.0% read here is 0.3 on the sliders.
+    pred = SimpleNamespace(
+        bboxes=_upright(_AREA_BOXES, size), masks=list("abcd"),
+        confidences=[0.9] * 4, class_names=[], preview=image,
+    )
+    assert filter_by_ratio(pred, 0.3, 1.0).masks == ["a", "b"]
+
+
+def test_detection_number_chips_are_drawn_without_the_area_helper(monkeypatch):
+    # The area is an extra: when it cannot be worked out the chips are drawn
+    # with the number and the name, as before.
+    monkeypatch.setitem(sys.modules, "adetailer.mask", ModuleType("adetailer.mask"))
+    draw_numbers = _load_draw_detection_numbers()
+    image = Image.new("RGB", (256, 256), "gray")
+    drawn = _drawn_labels(monkeypatch)
+    out = draw_numbers(image, [[10, 10, 100, 60], [20, 70, 120, 130]], ["eyes"])
+
+    assert drawn == ["#1 eyes", "#2"]
+    assert out.tobytes() != image.tobytes()
+
+
+def test_detection_number_chips_skip_the_area_of_a_broken_box(monkeypatch):
+    draw_numbers = _load_draw_detection_numbers()
+    image = Image.new("RGB", (100, 100), "gray")
+    drawn = _drawn_labels(monkeypatch)
+    draw_numbers(image, [[10, 10, 60, 60], [70, 5, 40, 30], "bad"], None)
+
+    # A box turned inside out has no share; one that cannot be read, no chip.
+    assert drawn == ["#1 25.0%", "#2"]
+
+
+def test_single_tab_preview_writes_the_share_of_the_preview_picture(host, monkeypatch):
+    # Through the real wiring: the share is worked out on the detector's
+    # preview picture, the one filter_by_ratio measures, and neither the
+    # status nor the boxes sent to picker.js change.
+    def predict(_path, **_kwargs):
+        return SimpleNamespace(
+            bboxes=[[10, 20, 300, 200], [0, 0, 640, 320]], confidences=[0.9, 0.8],
+            masks=[], preview=Image.new("RGB", (640, 320)), class_names=["face", "face"],
+        )
+
+    callback = _wired_preview(
+        monkeypatch, predict, _draw_detection_numbers=_load_draw_detection_numbers()
+    )
+    drawn = _drawn_labels(monkeypatch)
+    _image, status, boxes = callback(
+        Image.new("RGB", (640, 320), "white"), False,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    # (A picture wide enough for its labels: on a narrower one they are cut.)
+    assert drawn == ["#1 face 25.4%", "#2 face 100%"]
+    assert status == "\u2705 2 detection(s). Click the boxes to choose which to inpaint."
+    assert json.loads(boxes) == {
+        "w": 640, "h": 320, "boxes": [[10, 20, 300, 200], [0, 0, 640, 320]],
+    }
+
+
+@pytest.mark.parametrize("size", [(400, 200), (200, 400)])
+def test_combined_preview_labels_end_with_the_share_of_the_picture(
+    host, monkeypatch, size
+):
+    def predict(path, **_kwargs):
+        face = "face" in path
+        found = _AREA_BOXES[1:2] if face else _AREA_BOXES[2:] + _AREA_BOXES[:1]
+        found = _upright(found, size)
+        return SimpleNamespace(
+            bboxes=found, confidences=[0.9] * len(found), masks=[], preview=None,
+            class_names=["face" if face else "hand"] * len(found),
+        )
+
+    callback = _wired_preview(monkeypatch, predict)
+    drawn = _drawn_labels(monkeypatch)
+    image, status, _boxes = callback(
+        Image.new("RGB", size, "white"), True,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert image is not None
+    assert status.startswith("\u2705 4 detection(s) across 2 tab(s)")
+    assert drawn == [
+        "#1 1:face 0.90 30.0%", "#1 2:hand 0.90 0.4%", "#2 2:hand 0.90 <0.1%",
+        "#3 2:hand 0.90 100%",
+    ]
+
+
+def test_combined_preview_labels_are_drawn_without_the_area_helper(host, monkeypatch):
+    monkeypatch.setitem(sys.modules, "adetailer.mask", ModuleType("adetailer.mask"))
+
+    def predict(_path, **_kwargs):
+        return SimpleNamespace(
+            bboxes=[[10, 20, 60, 70]], confidences=[0.9], masks=[], preview=None,
+            class_names=["face"],
+        )
+
+    callback = _wired_preview(monkeypatch, predict)
+    drawn = _drawn_labels(monkeypatch)
+    image, _status, _boxes = callback(
+        Image.new("RGB", (128, 128), "white"), True,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert image is not None
+    assert drawn == ["#1 1:face 0.90", "#1 2:face 0.90"]
+
+
 @pytest.mark.parametrize(
     ("names", "confidences", "labels"),
     [
-        (["hand"], [0.9], ["#1 1:hand 0.90", "#1 2:hand 0.90"]),
-        (["visage"], [0.9], ["#1 1:visage 0.90", "#1 2:visage 0.90"]),
-        (["顔"], [0.9], ["#1 1 0.90", "#1 2 0.90"]),
-        (["łapa"], [], ["#1 1", "#1 2"]),
-        ([], [0.9], ["#1 1:T1 0.90", "#1 2:T2 0.90"]),
+        (["hand"], [0.9], ["#1 1:hand 0.90 15.2%", "#1 2:hand 0.90 15.2%"]),
+        (["visage"], [0.9], ["#1 1:visage 0.90 15.2%", "#1 2:visage 0.90 15.2%"]),
+        (["顔"], [0.9], ["#1 1 0.90 15.2%", "#1 2 0.90 15.2%"]),
+        (["łapa"], [], ["#1 1 15.2%", "#1 2 15.2%"]),
+        ([], [0.9], ["#1 1:T1 0.90 15.2%", "#1 2:T2 0.90 15.2%"]),
     ],
 )
 def test_combined_preview_keeps_its_labels_with_a_bitmap_font(
@@ -1109,13 +1258,14 @@ def test_combined_preview_keeps_its_labels_with_a_bitmap_font(
 
     def predict(_path, **_kwargs):
         return SimpleNamespace(
-            bboxes=[[10, 20, 60, 70]], confidences=confidences, masks=[],
+            bboxes=[[10, 20, 110, 120]], confidences=confidences, masks=[],
             preview=None, class_names=names,
         )
 
+    # A picture wide enough for its labels: on a narrower one they are cut.
     callback = _wired_preview(monkeypatch, predict)
     image, status, _boxes = callback(
-        Image.new("RGB", (128, 128), "white"), True,
+        Image.new("RGB", (256, 256), "white"), True,
         "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
     )
 
@@ -1745,6 +1895,22 @@ def test_a_chip_stays_inside_the_image():
         assert 0 <= y < 20
 
 
+def test_a_chip_larger_than_the_image_starts_at_its_edge():
+    # A chip wider than the image started wherever its box was, up to the last
+    # pixel of the row, so on a narrow picture its number could be the only
+    # part left, or nothing: it starts at the left edge, where the number is.
+    chip_spot = _load_chip_spot()
+    box = (309, 1024, 460, 1228)
+    for taken in ([], [[0, 0, 40, 40]], [[0, 1000, 512, 1100]]):
+        assert chip_spot((311, 1026), box, (517, 54), (512, 2048), taken)[0] == 0
+    # Taller than the image: at its top edge.
+    assert chip_spot((7, 7), (5, 5, 15, 15), (10, 60), (40, 20), []) == (7, 0)
+    # A chip that fits is moved left only as far as it takes.
+    assert chip_spot((311, 1026), box, (512, 54), (512, 2048), []) == (0, 1026)
+    assert chip_spot((311, 1026), box, (300, 54), (512, 2048), []) == (212, 1026)
+    assert chip_spot((111, 1026), box, (300, 54), (512, 2048), []) == (111, 1026)
+
+
 def test_a_chip_with_no_free_spot_covers_the_least():
     chip_spot = _load_chip_spot()
     taken = [[0, 0, 512, 512]]
@@ -1773,8 +1939,8 @@ def _chip_spot_every_chip(first, box, size, image_size, taken):
                 spots += [(x, y) for x in (r[2] + 1, r[0] - w - 1) if x1 - w < x < x2]
     best = None
     for sx, sy in spots:
-        x = max(0, min(sx, img_w - w if w <= img_w else img_w - 1))
-        y = max(0, min(sy, img_h - h if h <= img_h else img_h - 1))
+        x = max(0, min(sx, img_w - w))
+        y = max(0, min(sy, img_h - h))
         cover = sum(
             max(0, min(x + w, r[2]) - max(x, r[0])) * max(0, min(y + h, r[3]) - max(y, r[1]))
             for r in taken
@@ -1946,6 +2112,204 @@ def test_combined_preview_labels_do_not_cover_each_other(host, monkeypatch):
     # The first label stays where it was: on the box's left edge, just above it.
     assert (rects[0][0], rects[0][3]) == (40, 60)
     assert not _overlap(rects[0], rects[1])
+
+
+def _bitmap_font_only(monkeypatch):
+    """No TrueType font found, as on macOS with Pillow < 10.1: the small
+    Latin-1 bitmap font."""
+    from PIL import ImageFont
+
+    bitmap = getattr(ImageFont, "load_default_imagefont", ImageFont.load_default)()
+
+    def no_truetype(*_args, **_kwargs):
+        raise OSError("cannot open resource")
+
+    # No `size` argument, as on Pillow < 10.1.
+    monkeypatch.setattr(ImageFont, "truetype", no_truetype)
+    monkeypatch.setattr(ImageFont, "load_default", lambda: bitmap)
+
+
+def _chips_with_labels(monkeypatch, draw, *args):
+    """The chips ``draw(*args)`` paints, each with its text and font."""
+    from PIL import ImageDraw
+
+    texts = []
+    text = ImageDraw.ImageDraw.text
+
+    def record(self, xy, label, *a, **kw):
+        texts.append((label, kw.get("font")))
+        return text(self, xy, label, *a, **kw)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ImageDraw.ImageDraw, "text", record)
+        rects = _chip_rects(patch, draw, *args)
+    assert len(rects) == len(texts)
+    return [(rect, label, font) for rect, (label, font) in zip(rects, texts)]
+
+
+def _chip_width(label, font):
+    from PIL import ImageDraw
+
+    box = ImageDraw.Draw(Image.new("RGB", (8, 8))).textbbox((0, 0), label, font=font)
+    return box[2] - box[0] + 8
+
+
+def _first_that_fits(labels, font, width):
+    """(label, its place in ``labels``): the first one whose chip is no wider
+    than ``width``, the last one when none is."""
+    for place, label in enumerate(labels):
+        if _chip_width(label, font) <= width:
+            return label, place
+    return labels[-1], len(labels) - 1
+
+
+_NARROW_SIZES = [
+    (1024, 1024),  # wide enough for the whole label
+    (512, 2048), (384, 2304), (256, 2048), (160, 512), (128, 128), (96, 96), (80, 80),
+]
+
+
+@pytest.mark.parametrize("small_font", [False, True])
+@pytest.mark.parametrize("name", ["left_eyebrow", "a person holding an umbrella"])
+def test_a_detection_number_chip_wider_than_the_picture_is_shortened(
+    monkeypatch, name, small_font
+):
+    # The font follows the picture's height, so on a narrow, tall picture
+    # (512x2048) a chip with a long class name was wider than the picture: it
+    # started at its box and ran past the right edge, and the share of the
+    # picture at its end could not be read. The name is cut, then left out,
+    # until the chip fits; the number and the share stay.
+    from adetailer.mask import bbox_ratio_label
+
+    if small_font:
+        _bitmap_font_only(monkeypatch)
+    draw_numbers = _load_draw_detection_numbers()
+    kinds = set()
+    for width, height in _NARROW_SIZES:
+        box = [width * 0.6, height * 0.5, width * 0.9, height * 0.6]
+        share = bbox_ratio_label(box, (width, height))
+        image = Image.new("RGB", (width, height), "gray")
+        ((chip, label, font),) = _chips_with_labels(
+            monkeypatch, draw_numbers, image, [box], [name]
+        )
+        choices = [f"#1 {name} {share}"]
+        choices += [
+            f"#1 {name[:cut].rstrip()}... {share}" for cut in range(len(name) - 1, 0, -1)
+        ]
+        choices += [f"#1 {share}"]
+        expected, place = _first_that_fits(choices, font, width)
+
+        assert share.endswith("%")
+        assert label == expected, (width, height)
+        assert chip[2] - chip[0] == _chip_width(label, font)
+        if _chip_width(label, font) <= width:
+            # Whole inside the picture.
+            assert 0 <= chip[0] and chip[2] <= width, (width, height)
+        else:
+            # Too narrow even for the number and the share: from the left edge.
+            assert chip[0] == 0
+        assert 0 <= chip[1] and chip[3] <= height
+        kinds.add("whole" if place == 0 else "no name" if expected == choices[-1] else "cut")
+    # Premise: some pictures take the whole label, some a cut name.
+    assert {"whole", "cut"} <= kinds
+
+
+@pytest.mark.parametrize("small_font", [False, True])
+def test_a_combined_preview_label_wider_than_the_picture_is_shortened(
+    host, monkeypatch, small_font
+):
+    # The same with "Combine all tabs": the class name is cut, then left out,
+    # then the confidence; the detection number, the tab and the share stay.
+    from adetailer.mask import bbox_ratio_label
+
+    if small_font:
+        _bitmap_font_only(monkeypatch)
+    name = "left_eyebrow"
+    kinds = set()
+    for width, height in _NARROW_SIZES:
+        box = [width * 0.6, height * 0.5, width * 0.9, height * 0.6]
+        share = bbox_ratio_label(box, (width, height))
+
+        def predict(_path, box=box, **_kwargs):
+            return SimpleNamespace(
+                bboxes=[box], confidences=[0.9], masks=[], preview=None,
+                class_names=[name],
+            )
+
+        callback = _wired_preview(monkeypatch, predict)
+        chips = _chips_with_labels(
+            monkeypatch, callback, Image.new("RGB", (width, height), "white"), True,
+            "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+        )
+
+        assert len(chips) == 2
+        for tab, (chip, label, font) in enumerate(chips, 1):
+            choices = [f"#1 {tab}:{name} 0.90 {share}"]
+            choices += [
+                f"#1 {tab}:{name[:cut]}... 0.90 {share}"
+                for cut in range(len(name) - 1, 0, -1)
+            ]
+            choices += [f"#1 {tab} 0.90 {share}", f"#1 {tab} {share}"]
+            expected, place = _first_that_fits(choices, font, width)
+
+            assert label == expected, (width, height)
+            if _chip_width(label, font) <= width:
+                assert 0 <= chip[0] and chip[2] <= width, (width, height)
+            else:
+                assert chip[0] == 0
+            kinds.add(
+                "whole" if place == 0
+                else "no confidence" if expected == choices[-1]
+                else "no name" if expected == choices[-2]
+                else "cut"
+            )
+    # Premise: the whole label, a cut name and a label without confidence.
+    assert {"whole", "cut", "no confidence"} <= kinds
+
+
+def test_a_combined_preview_label_of_a_class_without_a_name_is_shortened(
+    host, monkeypatch
+):
+    # A class whose name is "" on a picture narrower than its label: the
+    # search for the letters of the name that fit had no end, and the preview
+    # never came back. The label goes without the name, then without the
+    # confidence, as for any other class.
+    import threading
+
+    from adetailer.mask import bbox_ratio_label
+
+    width, height = 80, 600
+    box = [10, 100, 60, 300]
+    share = bbox_ratio_label(box, (width, height))
+
+    def predict(_path, **_kwargs):
+        return SimpleNamespace(
+            bboxes=[box], confidences=[0.9], masks=[], preview=None, class_names=[""]
+        )
+
+    callback = _wired_preview(monkeypatch, predict)
+    found = []
+
+    def run():
+        found.extend(
+            _chips_with_labels(
+                monkeypatch, callback, Image.new("RGB", (width, height), "white"),
+                True, "face.pt", "", "", False, 0.3, "None", "", "", False, 0.3,
+                "face.pt",
+            )
+        )
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(30)
+
+    assert not worker.is_alive(), "the preview never came back"
+    ((chip, label, font),) = found
+    choices = [f"#1 1: 0.90 {share}", f"#1 1 0.90 {share}", f"#1 1 {share}"]
+    expected, place = _first_that_fits(choices, font, width)
+    # Premise: the whole label is wider than the picture.
+    assert place > 0
+    assert label == expected
 
 
 def _chips_and_texts(monkeypatch, draw, *args):

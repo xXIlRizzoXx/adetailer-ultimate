@@ -3,14 +3,13 @@ from __future__ import annotations
 import copy
 from itertools import chain
 
-import numpy as np
 from lib_controlnet import external_code, global_state
 from lib_controlnet.external_code import ControlNetUnit
 
 from modules import scripts
 from modules.processing import StableDiffusionProcessing
 
-from .common import cn_model_regex, default_cn_module
+from .common import anytest_choices, anytest_name, cn_model_regex, default_cn_module
 
 controlnet_exists = True
 controlnet_type = "forge"
@@ -24,6 +23,48 @@ def find_script(p: StableDiffusionProcessing, script_title: str) -> scripts.Scri
     return script
 
 
+class _ClearedBatchDir(str):
+    """The empty batch folder a pass sets while it reads its image."""
+
+    __slots__ = ()
+
+
+def _without_batch_dir(process):
+    """Run the pass's ControlNet `process` without Forge Neo's batch folder.
+
+    On Forge Neo, a folder typed in ControlNet's batch input directory or in
+    the img2img Batch tab's input directory replaces the image of every unit,
+    the ADetailer one included, with a file of that folder: the region got
+    the control map of another picture. The folder is cleared only while this
+    pass reads its image (as in the IOSakaki/adetailer fork, commit 649ef43).
+    Other Forge versions have no such folder and run as before.
+    """
+
+    def run(*args, **kwargs):
+        try:
+            from lib_controlnet.controlnet_ui import controlnet_ui_group
+
+            group = controlnet_ui_group.ControlNetUiGroup
+        except Exception:  # noqa: BLE001 - no batch folder in this Forge
+            group = None
+        folder = getattr(group, "GLOBAL_CONTROLNET_BATCH_DIR", None)
+        if not isinstance(folder, str) or not folder.strip():
+            return process(*args, **kwargs)
+        # An empty text of its own, which Forge Neo reads as no folder
+        # (.strip(), then os.path.isdir) and which is told apart from the ""
+        # of a box the user emptied in the meantime.
+        cleared = _ClearedBatchDir()
+        group.GLOBAL_CONTROLNET_BATCH_DIR = cleared
+        try:
+            return process(*args, **kwargs)
+        finally:
+            # Not over a folder the user typed, or emptied, in the meantime.
+            if group.GLOBAL_CONTROLNET_BATCH_DIR is cleared:
+                group.GLOBAL_CONTROLNET_BATCH_DIR = folder
+
+    return run
+
+
 def add_forge_script_to_adetailer_run(
     p: StableDiffusionProcessing, script_title: str, script_args: list
 ):
@@ -35,6 +76,8 @@ def add_forge_script_to_adetailer_run(
     p.script_args_value = []
 
     script = copy.copy(find_script(p, script_title))
+    if callable(getattr(script, "process", None)):
+        script.process = _without_batch_dir(script.process)
     script.args_from = len(p.script_args_value)
     script.args_to = len(p.script_args_value) + len(script_args)
     p.scripts.alwayson_scripts.append(script)
@@ -64,7 +107,8 @@ def default_module(model: str) -> str:
             for t, tag in _CN_TYPE_TAGS.items()
         }
         by_type["union"] = list(chain.from_iterable(by_type.values()))
-        name = model.lower().replace("inpaint_depth", "depth")
+        by_type["anytest"] = anytest_choices(by_type["union"], "None")
+        name = anytest_name(model).replace("inpaint_depth", "depth")
         for t, choices in by_type.items():
             if t in name:
                 return default_cn_module(t, choices)
@@ -96,24 +140,19 @@ class ControlNetExt:
         if module is None:
             module = default_module(model)
 
-        image = np.asarray(p.init_images[0])
-        mask = np.full_like(image, fill_value=255)
-
-        # The Gradio 4 ControlNet (classic Forge since mid-2024, reForge's
-        # Gradio 4 branches, Forge Neo; its unit has image_fg) reads image and
-        # mask_image as separate arrays; the older one (older Forge, reForge's
-        # main branch) reads only the {"image", "mask"} dict.
-        if "image_fg" in getattr(ControlNetUnit, "__dataclass_fields__", {}):
-            image_kwargs = {"image": image, "mask_image": mask}
-        else:
-            image_kwargs = {"image": {"image": image, "mask": mask}}
-
-        pres = external_code.pixel_perfect_resolution(
-            image,
-            target_H=p.height,
-            target_W=p.width,
-            resize_mode=external_code.resize_mode_from_value(p.resize_mode),
-        )
+        # No image in the unit, as on AUTOMATIC1111: every Forge (classic,
+        # Forge Neo, reForge, old and Gradio 4) then reads the pass's own
+        # picture and mask (p.init_images[0], p.image_mask) when each region
+        # runs. A fixed picture with an all-white mask applied ControlNet to
+        # the whole crop, and later regions did not see the earlier ones.
+        # Pixel Perfect, also as on AUTOMATIC1111: ControlNet sizes the
+        # preprocessor to each region's crop and canvas. A resolution worked
+        # out here came from the whole picture, before the region's size was
+        # set. A unit without the option keeps ControlNet's default.
+        fields = getattr(ControlNetUnit, "__dataclass_fields__", None)
+        resolution = {"pixel_perfect": True}
+        if fields is not None and "pixel_perfect" not in fields:
+            resolution = {}
 
         add_forge_script_to_adetailer_run(
             p,
@@ -121,13 +160,12 @@ class ControlNetExt:
             [
                 ControlNetUnit(
                     enabled=True,
-                    **image_kwargs,
                     model=model,
                     module=module,
                     weight=weight,
                     guidance_start=guidance_start,
                     guidance_end=guidance_end,
-                    processor_res=pres,
+                    **resolution,
                 )
             ],
         )
