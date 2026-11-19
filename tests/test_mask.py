@@ -564,8 +564,12 @@ class TestMaskMerge:
         draw2 = ImageDraw.Draw(img2)
         draw2.rectangle((6, 6, 8, 8), fill="white")
 
+        # OpenCV 4 says "-209:Sizes of input arguments do not match"; OpenCV
+        # 5.1 says "-215:Assertion failed" with "inputs not broadcast-compatible".
         with pytest.raises(
-            cv2.error, match="-209:Sizes of input arguments do not match"
+            cv2.error,
+            match="-209:Sizes of input arguments do not match"
+            "|inputs not broadcast-compatible",
         ):
             mask_merge([img1, img2])
 
