@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import chain
@@ -14,7 +15,11 @@ from aaaaaa.conditional import InputAccordion, schedulers
 from aaaaaa.jobs import wrap_adetailer_detection, wrap_adetailer_job
 from adetailer import ADETAILER, __version__
 from adetailer.args import ALL_ARGS, INPAINT_MASKED_CONTENT, MASK_MERGE_INVERT
-from adetailer.classes import MEDIAPIPE_FACE_FEATURES_MODEL, get_model_class_names
+from adetailer.classes import (
+    MEDIAPIPE_FACE_FEATURES_MODEL,
+    get_model_class_names,
+    is_yoloe_model,
+)
 from adetailer.persistence import load_state, save_tab_state
 from adetailer.presets import (
     delete_preset,
@@ -26,6 +31,17 @@ from adetailer.presets import (
     rename_preset,
     save_preset,
     take_recovery_note,
+)
+from adetailer.subject_guide import (
+    DEFAULT_WEIGHT,
+    GUIDE_ATTRS,
+    GUIDE_MODES,
+    GUIDE_SUBJECTS,
+    NO_LORA,
+    PEOPLE_CHOICES,
+    build_subject_guide,
+    host_comment_marks,
+    lora_choices,
 )
 from controlnet_ext import controlnet_exists, controlnet_type, get_cn_models
 from controlnet_ext.common import anytest_choices, default_cn_module
@@ -117,6 +133,21 @@ class WebuiInfo:
     # The endings the WebUI takes off a sampler name, per scheduler (label,
     # name, aliases), for a restart's split_sampler_name. Empty: labels only.
     scheduler_endings: list[list[str | None]] = field(default_factory=list)
+    # For the guide "several subjects, one LoRA each" (subject_guide_ui).
+    # lora_names(): the LoRA names the WebUI knows, [] when it has no LoRA
+    # list. sort_order(): the values of "Sort bounding boxes by" and "More
+    # sort orders". main_prompt: this side's main prompt box, only read.
+    # strip_comments(text): the text without the WebUI's prompt comments.
+    # lora_aliases(): the other names a LoRA tag can take on this WebUI (a
+    # dict: each with the name of its LoRA file, or a list). reads_lyco():
+    # True when the WebUI surely reads a <lyco:...> tag as a LoRA tag.
+    # None: the guide works without it.
+    lora_names: Any = None
+    lora_aliases: Any = None
+    sort_order: Any = None
+    main_prompt: Any = None
+    strip_comments: Any = None
+    reads_lyco: Any = None
 
 
 def gr_interactive(value: bool = True):
@@ -208,6 +239,7 @@ _GUIDE_SECTIONS: list[tuple[str, str]] = [
 - **Tabs (1st, 2nd, …)** — each numbered tab is an independent detector + its own settings, and they run **in order** (e.g. tab 1 = faces, tab 2 = hands). Change how many tabs you have in `Settings → ADetailer`.
 - **Enable this tab** — the checkbox at the top of each tab. On a fresh setup only the 1st tab is switched on: tick it in the 2nd and later tabs, or they are skipped even with a detector picked. The green "Nx Tabs" pill next to the ADetailer title counts the tabs switched on.
 - **First run:** enable ADetailer, pick `face_yolov8n.pt` in the detector dropdown, and generate — every face is detected and re-detailed automatically.
+- Sections of a tab — a blue bar marks the settings of the pass (Inpaint prompts, Detection, Mask Preprocessing, Inpainting), an amber bar the tools that work on a picture (Detection preview, Run ADetailer on an image) and a grey bar the preset library file. The detector and ControlNet controls sit under their own small labels, Detector and ControlNet.
 """,
     ),
     (
@@ -219,6 +251,8 @@ _GUIDE_SECTIONS: list[tuple[str, str]] = [
 - **MediaPipe** — `mediapipe_face_mesh` and `..._eyes_only` detect faces/eyes by landmarks. They need no `.pt` model, but MediaPipe's own small model files (`face_landmarker.task` for these two) are downloaded into `adetailer/_mediapipe_models/` on first use; on an offline machine, place them there by hand (the console names each missing file and its URL).
 - **MediaPipe face features (new)** — `mediapipe_face_features` treats the face as classes **eyes, mouth, nose, eyebrows, face, iris**; pick all, some, or just one in the CLASSES dropdown. The iris gives one mask per eye and is found only when you pick it, never with no class picked.
 - **YOLO-World (`…-world`)** — open vocabulary: type comma-separated words in the classes field to detect almost anything you can name.
+- YOLOE (yoloe in the file name, such as yoloe-11s-seg.pt) — works like YOLO-World: type comma-separated words in the same classes field. Left empty, it finds the classes saved in its file. The prompt-free ones (-pf in the name) are ordinary detectors with their own CLASSES list. The first detection with typed words makes the Ultralytics library download its text model (about 600 MB, or about 254 MB for YOLOE-26), and these detections are slow. If the words cannot be given to the detector, the console says why and that tab inpaints nothing; when the clip package is missing, for YOLO-World too, that line gives the pip command that installs it.
+- Models that are not detectors — an OBB model (rotated boxes), a classification model or a semantic segmentation model picked as the detector inpaints nothing: the console says why in one line, and the Detection preview and Run ADetailer on an image say it in their status. Use a detection or segmentation model; pose models work too.
 - **Custom models** — drop a `.pt` into your ADetailer models folder. If its classes don't appear, add a sidecar file `<model>.names.json` shaped like `{"names": {"0": "face", "1": "hand"}}`.
 - **More detectors** — larger face and hand models, `person_yolov8m-seg` and a clothing model (`deepfashion2_yolov8s-seg`, 13 clothing classes) are on the Bingsu/adetailer page on Hugging Face; community detectors for eyes, hair, feet and more are on Civitai and Hugging Face (search for "ADetailer"). A `.pt` can contain code: use only files from sources you trust.
 - **Model file safety** — a `.pt` detector is a pickle file, and loading one can run code stored in it. ADetailer reads only `.pt` detectors (no `.safetensors`) and, like the original ADetailer, loads them with AUTOMATIC1111's safe-unpickle check switched off, because that check does not accept the Python classes a YOLO model contains (Forge Neo has no such check). So a scanner or site warning about a YOLO `.pt` is common and proves neither that the file is harmful nor that it is safe: download detectors only from sources you trust (the bundled ones come from the Bingsu/adetailer page on Hugging Face). On AUTOMATIC1111 with the check on, a `<model>.names.json` beside a custom model lets the panel list its classes without opening the file.
@@ -254,6 +288,7 @@ _GUIDE_SECTIONS: list[tuple[str, str]] = [
 - **Auto class-guard (new)** — for each detected region, adds its own class name to the positive and every **other** class of the model to the negative, so a detected part isn't re-drawn as a different one. Your per-class prompts always override it. **Class-guard emphasis** weights the added class name (1.0 = plain).
 - **Use LoRAs from main prompt** (+ **Append LoRA triggers from name**) — copy the LoRA tags (and their trigger words) from the main prompt into the detail pass.
 - **Strip LoRAs from the detailer prompt (new)** — remove all `<lora:…>` / `<lyco:…>` tags from the detail prompt so the main prompt's LoRAs don't bleed onto the region. Wins over *Use LoRAs from main prompt* when both are on.
+- The same LoRA twice — the WebUI loads a LoRA once for each tag in a prompt (classic Forge loads two identical tags once). The same LoRA in the main prompt and in a tab that has its own prompt is not doubled, because the tab's prompt takes the place of the main one. It is doubled when the tab's final prompt names it twice, for example with [PROMPT] plus a tag of a LoRA that the main prompt already has, or with one more in Prompt append or in a selected Style: the console then says so once per generation, tab and LoRA. Keep one tag.
 """,
     ),
     (
@@ -276,6 +311,9 @@ Use different settings **only** for the detail pass; each is off (inherits the m
 - **Sampler / scheduler / steps / CFG scale / CLIP skip** — per-pass sampling settings.
 - **Why the detail pass runs fewer steps** — it is an img2img pass, and img2img runs only about steps × denoising strength (30 steps at 0.4 denoise ≈ 12), also with *Use separate steps*. To run the full number, turn on the WebUI option `Settings → img2img → With img2img, do exactly the amount of steps the slider specifies` (Forge Neo: *During img2img, do exactly the number of Steps the slider specifies*). It applies to every img2img generation, not only to ADetailer.
 - **Apply only on hires. fix** — run this tab only when hires.fix is on.
+- With hires fix, detail with the hires checkpoint (Settings → ADetailer, off by default) — after a txt2img hires fix with its own Hires checkpoint, the tabs without their own checkpoint detail the upscaled picture with that checkpoint instead of the main one; on Forge and Forge Neo with the hires VAE / text encoder choices and the Hires Distilled CFG Scale. Tabs with their own checkpoint keep it. No effect without hires fix, in img2img and in Run ADetailer on an image.
+- A checkpoint of another model family — on Forge and Forge Neo, when a tab's own checkpoint is of another family than the main model (one of them SD 1.5, SD 2 or SDXL) and its pass kept the main model's VAE or text encoder files, the console warns once per generation and tab (in a folder batch of Run ADetailer on an image, once for the whole folder), and a single Run ADetailer on an image also says it in its status line: give the tab Use separate text encoder with None (use detailer checkpoint's own) and Use separate VAE with Automatic, or, when the line says that Automatic would keep the main model's VAE file, a VAE file of the checkpoint's family in Use separate VAE. When the line says that Use separate VAE already has a VAE file of the checkpoint's family, set only the text encoder; the line is not printed when no other file of the main model is kept. When the line says that no choice of the tab takes out a file of the main model, move that file into the folder the line names and pick it again in the WebUI's VAE / Text Encoder list. When the tab's checkpoint cannot be loaded at all with those files, the console says that instead, and on Forge Neo the whole generation can then fail; the next point says when ADetailer prevents it.
+- A tab skipped for its checkpoint — on Forge and Forge Neo, before a tab's pass ADetailer reads the header of the safetensors files and skips the tab when its checkpoint cannot be loaded with the VAE file of the pass: a VAE file kept from the main model (an SD 1.5 or SDXL checkpoint in the tab with the VAE file of a Flux main model, or a Flux checkpoint in the tab with the VAE file of an SDXL main model), or the VAE file chosen in the tab's own Use separate VAE. The other tabs run and the picture is saved, instead of the whole generation failing. The console and the text under the results say what to set in the tab, or first to move a file of the main model into the VAE or text encoder folder they name, and Run ADetailer on an image says that ADetailer did not run. In any doubt (a ckpt or GGUF file, a checkpoint whose family is not recognised, the hires fix checkpoint) nothing is skipped. Only the VAE file is checked: a Flux checkpoint without text encoders inside still fails in a tab, so use one that holds them.
 """,
     ),
     (
@@ -287,7 +325,8 @@ Two sibling tools sit right after each tab's **Detection** section (roughly the 
 - Share of the image on the labels — each label of the Detection preview ends with the share of the picture its box takes, for example #1 face 12.3%, and with Combine all tabs #1 1:face 0.90 12.3%. It is the value Mask min area ratio and Mask max area ratio compare: 12.3% is 0.123 and 0.4% is 0.004. It always has one decimal and is cut down, never rounded up (a box at 11.68% reads 11.6%), so the value read on a box keeps that box when set as the minimum; as the maximum, set one step more (11.6% is 0.117). Unticking Show labels hides it too.
 - **Run ADetailer on an image** — drop a finished image and run the full detect + inpaint pass on it, without regenerating. Optional **Save result to outputs** writes to a dedicated `ADetailer-Inpaint` folder; click the result to enlarge it.
 - **Batch a whole folder (new)** — paste a **folder path** in that same tool to detail every image inside it in one go; each result is always saved: to the `ADetailer-Inpaint` folder or, with **📁 Save results in the source folder instead** ticked, beside each source image as `name-ad` (a new file — originals are never overwritten; `name-ad-1`, `name-ad-2`… if the name is taken). A folder path takes priority over a single dropped image.
-- Many pictures, each with its own prompt — Run ADetailer on an image and its folder batch start every picture with an empty prompt and negative prompt and use only the tab's. To keep each picture's own prompt, use img2img → Batch with its PNG info option on (Append png info to prompts; on Forge Neo, Append PNG Info) and Prompt and Negative prompt ticked under Parameters to take from png info, leave the main prompt and the tab's prompt empty, and tick Skip img2img in ADetailer.
+- Keep the transparency — turn on Settings → ADetailer → Run ADetailer on an image and Skip img2img keep the transparency of the picture: a cut-out picture is still detailed with its transparent parts filled with the img2img background color, then the result gets its transparency back, also in a folder batch, and in img2img with Skip img2img ticked (also in its Batch tab; on Forge Neo, a Batch tab file whose sides are not multiples of the WebUI's Resolution Step setting, 64 by default, is resized by the WebUI first and comes out without its transparency). The saved file keeps it only in a file format that has it, such as PNG (and WebP on Forge Neo); with JPEG, or WebP on AUTOMATIC1111, the saved file has none, and the status (with Skip img2img, the text under the results) and the console say so.
+- Many pictures, each with its own prompt — turn on Settings → ADetailer → Run ADetailer on an image uses the prompt saved in the image, leave the tab's prompt empty (or use [PROMPT]) and use Run ADetailer on an image with a folder path: each picture gets the prompt and negative prompt the WebUI saved in it (the PNG text, or the EXIF comment of a JPEG or WebP). Only the two prompts are taken, not the seed, sampler or size, and a picture without saved parameters, such as one pasted from the clipboard, keeps an empty main prompt. With the option off, Run ADetailer on an image and its folder batch start every picture with an empty prompt and negative prompt and use only the tab's. Another way, which can also take each picture's seed, sampler and steps: use img2img → Batch with its PNG info option on (Append png info to prompts; on Forge Neo, Append PNG Info) and Prompt and Negative prompt ticked under Parameters to take from png info, leave the main prompt and the tab's prompt empty, and tick Skip img2img in ADetailer.
 """,
     ),
     (
@@ -329,6 +368,7 @@ These go inside the tab's **Prompt** field:
 - [PROMPT=eyes,hair] — insert only the parts of the main prompt (the parts between its commas, new lines, BREAK and AND) that name one of these words, with their weights, e.g. close-up, [PROMPT=eyes] brings green eyes when a wildcard picked them for this image. A minus sign drops parts instead: [PROMPT=-dress] brings all the rest. Words match whole, in any case, and an underscore counts as a space; the numbers of the weights are not searched. With plain words it never brings the main prompt's LoRAs (Use LoRAs from main prompt adds them); with only minus words it keeps them (Strip LoRAs from the detailer prompt removes them). When no part matches, it adds nothing. [PROMPT=] brings the whole main prompt, like [PROMPT].
 - Wildcards — a wildcard of Dynamic Prompts or of the wildcards extension in the tab's prompt, negative prompt or Prompt append that the main prompt also holds takes the value drawn there for each image, e.g. the same eye colour, instead of a new draw. A wildcard that is not in the main prompt is drawn as before, so use one of those to get a different value on purpose. When the value cannot be read for sure, the prompt is left as it is and Verbose diagnostic log says why.
 - **A different prompt or LoRA for each face** — set `Settings → ADetailer → Sort bounding boxes by` to *Position (left to right)* and leave *More sort orders* on Off (or pick another order there, such as right to left), then write one part per face, e.g. `smiling woman <lora:style_a:0.8> [SEP] old man, grey beard [SEP] [SKIP]`. Each face is a pass of its own, so a LoRA in one part is used only for that face; faces beyond the last part get the last part (`[SKIP]` here leaves them as they are).
+- Guide: several subjects, one LoRA each — the closed box above the tabs of the ADetailer panel writes that prompt for people, so there is no token to remember. Pick What to redraw (Whole person (outline), Face only, or Whole person, then face (2 tabs)), give each row a LoRA, a weight and a few words, and press ✨ Fill the tabs: it switches ADetailer on and fills the 1st tab (with the last choice, the 2nd too) with the detector, one part per subject separated by [SEP] with a last [SKIP], and the settings that keep the parts in order, with Inpaint denoising strength at 0.6. The prompt those tabs had is replaced. The subjects are the biggest people in the picture, as many as the last filled row or People in the picture says, counted from left to right, and a row left empty leaves that person as they are. The status under the button says what was done and what to check: the order needs Settings → ADetailer → Sort bounding boxes by on Position (left to right), which the guide does not change, and a LoRA that is also in the main prompt acts on the whole picture. The subjects are easier to recognise when the main prompt already describes them (colours, clothes, who is on the left and who on the right) without their LoRAs. Up to 4 subjects; the guide's own choices are not saved, and everything it fills can be edited afterwards.
 """,
     ),
     (
@@ -564,7 +604,8 @@ def on_ad_model_update(
     predictable across model changes. They're populated with the model's
     class names when applicable, empty otherwise.
 
-    - YOLO-World: ALSO shows the free-text textbox (open-vocabulary),
+    - YOLO-World (and YOLOE with text prompts): ALSO shows the free-text
+      textbox (open-vocabulary),
       preserving values restored by presets or PNG infotext. The exclude
       checkbox is hidden and off and its excluded list is emptied: World
       always detects the typed classes.
@@ -590,12 +631,12 @@ def on_ad_model_update(
             gr.update(value=""),
         )
 
-    if "-world" in model:
+    if "-world" in model or is_yoloe_model(model):
         return (
             gr.update(
                 visible=True,
                 value=current_include or "",
-                placeholder="Comma separated class names to detect, ex: 'person,cat'. default: COCO 80 classes",
+                placeholder="Comma separated class names to detect, ex: 'person,cat'. Empty: YOLO-World looks for its 80 COCO classes, YOLOE for the classes saved in the model.",
             ),
             gr.update(visible=True, choices=[], value=[]),
             gr.update(visible=False, value=False),
@@ -674,7 +715,7 @@ def _restored_tab_updates(
     dropdown_update = gr.update()
     if "ad_model" in state:
         model = state.get("ad_model") or "None"
-        world = "-world" in model
+        world = "-world" in model or is_yoloe_model(model)
         exclude = bool(state.get("ad_model_classes_exclude", False))
         csv = state.get(
             "ad_model_classes_excluded" if exclude else "ad_model_classes", ""
@@ -776,11 +817,11 @@ def _class_filter_infotext_fields(
             value = params.get(key, default)
             if attr == "ad_model_classes_exclude":
                 # YOLO-World has no NOT mode: its checkbox stays off.
-                value = str(value).strip().lower() == "true" and (
-                    "-world" not in state["ad_model"]
+                value = str(value).strip().lower() == "true" and not (
+                    "-world" in state["ad_model"] or is_yoloe_model(state["ad_model"])
                 )
             elif attr == "ad_model_classes_excluded" and (
-                "-world" in state["ad_model"]
+                "-world" in state["ad_model"] or is_yoloe_model(state["ad_model"])
             ):
                 value = ""  # nor an excluded list
             state[attr] = value
@@ -852,7 +893,7 @@ def _tab_infotext_fields(w: Widgets, n: int) -> list[tuple[Any, Any]]:
 def _sync_class_dropdown(selected: list[str] | None, exclude: bool, model: str):
     # World classes live in a separate free-text field. Loading/resetting its
     # empty fixed-class dropdown must never erase that open vocabulary.
-    if model and "-world" in model:
+    if model and ("-world" in model or is_yoloe_model(model)):
         return gr.update(), gr.update()
     csv = ",".join(selected or [])
     return ("" if exclude else csv), (csv if exclude else "")
@@ -939,6 +980,14 @@ def adui(
             (ad_skip_img2img, _BoolInfotextKey("ADetailer skip img2img"))
         )
 
+        # The guide "several subjects, one LoRA each", above the tabs it
+        # fills. Components only: its button is wired at the very end.
+        try:
+            subject_guide = subject_guide_ui(is_img2img, _guide_lora_names(webui_info))
+        except Exception as e:  # noqa: BLE001 — never break the UI build
+            subject_guide = None
+            print(f"[-] ADetailer: the subject guide was not built: {type(e).__name__}")
+
         # Shared clipboard for per-tab copy/paste. Tuple of (source_tab_idx,
         # list_of_values_in_copyable_attrs_order). source_tab_idx == -1 means
         # "clipboard empty" — paste buttons stay disabled until the first copy.
@@ -1020,6 +1069,20 @@ def adui(
         # lets each tab's "Combine all tabs" checkbox run every tab's detector.
         _wire_detection_previews(all_widgets, webui_info, num_models, script)
         _wire_model_refresh(all_widgets, webui_info, num_models)
+        # The panel's last listener, so that the ones above keep their order:
+        # the one .click of the subject guide's button.
+        if subject_guide is not None:
+            try:
+                _wire_subject_guide(
+                    subject_guide, ad_enable, all_widgets, num_models, webui_info
+                )
+            except Exception as e:  # noqa: BLE001 — never break the UI build
+                # Hidden rather than shown with a button that does nothing.
+                subject_guide.components[0].visible = False
+                print(
+                    "[-] ADetailer: the subject guide's button was not wired: "
+                    f"{type(e).__name__}"
+                )
 
         # The full user guide lives in its own top-level "ADetailer Guide" tab
         # (opt-in, off by default — see the on_ui_tabs gate + the
@@ -1403,6 +1466,19 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                     imgsz=int(imgsz or 0),
                     **({"plain_preview": True} if plain else {}),
                 )
+            note = getattr(pred, "note", "")
+            if note:
+                # The detector could not be used at all (for example a model
+                # that is not a detection model): its reason is the answer,
+                # not "No detections", with one line in the console.
+                import sys as _sys
+
+                line = f"[-] ADetailer: {note}"
+                print(
+                    line.encode("ascii", "backslashreplace").decode("ascii"),
+                    file=_sys.stderr,
+                )
+                return None, note
             return pred, None
         except Exception as e:  # noqa: BLE001 — surface to the UI
             return None, str(e)
@@ -1678,6 +1754,31 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
         _batch_gallery_cap = 30
 
         def _run_folder(folder, same_folder, *flat):
+            # Settings > ADetailer "...uses the prompt saved in the image":
+            # while the folder runs, the pass leaves out its console line for
+            # each picture without a saved prompt; the folder prints one line
+            # with their count at its end. Guarded: a script without the
+            # attribute just prints its lines as before.
+            try:
+                script._ad_folder_run = True
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                return _run_folder_files(folder, same_folder, *flat)
+            finally:
+                try:
+                    script._ad_folder_run = False
+                    # The tabs warned about a checkpoint of another model
+                    # family: the next folder warns again.
+                    script._ad_folder_family_warned = None
+                    # And those told that their detector could not be used.
+                    script._ad_folder_detector_noted = None
+                    # And those told that their pass names a LoRA twice.
+                    script._ad_folder_lora_noted = None
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def _run_folder_files(folder, same_folder, *flat):
             """Batch: run the full detect+inpaint pass on EVERY image in
             `folder`. Each result is saved to the ADetailer-Inpaint outputs folder,
             or — when ``same_folder`` is on — beside its source file as
@@ -1758,6 +1859,26 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 except OSError:
                     return False
 
+            def _keeps_alpha(ext):
+                # Whether Pillow writes the alpha channel in a file with this
+                # extension: a tiny transparent picture is written to memory
+                # and read back (JPEG refuses it, BMP drops it).
+                try:
+                    import io as _io
+
+                    _buf = _io.BytesIO()
+                    _PILImage.new("RGBA", (2, 2)).save(
+                        _buf, format=_PILImage.registered_extensions()[ext]
+                    )
+                    _buf.seek(0)
+                    with _PILImage.open(_buf) as _back:
+                        return (
+                            _back.mode in ("RGBA", "LA", "PA")
+                            or "transparency" in _back.info
+                        )
+                except Exception:  # noqa: BLE001
+                    return False
+
             gallery = []
             saved = 0
             unchanged = 0
@@ -1765,6 +1886,26 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
             not_saved = 0
             failed = 0
             run_failed = 0
+            # Settings > ADetailer "...uses the prompt saved in the image":
+            # pictures it found no prompt in (the pass says so in its answer,
+            # also when it then fails or is cancelled).
+            no_prompt = 0
+            # Settings > ADetailer "...keep the transparency of the picture":
+            # results saved in a file format without transparency.
+            no_alpha = 0
+
+            def _without_prompt_note(st):
+                # A failed pass's answer as the reason of the folder's
+                # summary, without that note (the summary counts it). What
+                # the answer says after the note stays: a tab skipped for
+                # its checkpoint, the warning about the tab's checkpoint.
+                for note in (
+                    " The image has no saved prompt,",
+                    " The prompt saved in the image couldn't be read,",
+                ):
+                    st = st.replace(note + " so the main prompt was empty.", "")
+                return st
+
             first_error = ""
             interrupted = False
             # _run's answers that depend only on the tab's settings, so they
@@ -1823,9 +1964,11 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                             if st.startswith(settings_errors):
                                 return (gallery or None), st
                             run_failed += 1
-                            first_error = first_error or st
+                            no_prompt += "so the main prompt was empty" in st
+                            first_error = first_error or _without_prompt_note(st)
                             continue
                         st = st if isinstance(st, str) else ""
+                        no_prompt += "so the main prompt was empty" in st
                         if st.startswith("ℹ️ Cancelled"):  # cancelled -> not written
                             cancelled += 1
                         elif st.startswith("ℹ️"):  # nothing detected -> not written
@@ -1868,10 +2011,19 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                                 except Exception:  # noqa: BLE001 — no setting: the result decides
                                     pass
                                 _ext = f.suffix.lower()
+                                # A result with the picture's transparency
+                                # (Settings > ADetailer) in a file format
+                                # without it is saved filled, as with the
+                                # option off, and counted.
+                                _out, _lost = img, False
+                                if getattr(img, "mode", None) in (
+                                    "RGBA", "LA", "PA"
+                                ) and not _keeps_alpha(_ext):
+                                    _out, _lost = img.convert("RGB"), True
                                 try:
                                     _kw = {"icc_profile": _icc} if _icc else {}
                                     if f.suffix.lower() in {".jpg", ".jpeg"}:
-                                        img.save(dst, quality=95, subsampling=0, **_kw)
+                                        _out.save(dst, quality=95, subsampling=0, **_kw)
                                     elif f.suffix.lower() == ".webp":
                                         # Pillow's default is lossy at quality 80:
                                         # a lossless source stays lossless, a
@@ -1881,15 +2033,16 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                                             if _webp_lossless(f)
                                             else {"quality": 95}
                                         )
-                                        img.save(dst, **_q, **_kw)
+                                        _out.save(dst, **_q, **_kw)
                                     else:
                                         if _info and _ext == ".png":
                                             from PIL import PngImagePlugin
 
                                             _kw["pnginfo"] = PngImagePlugin.PngInfo()
                                             _kw["pnginfo"].add_text("parameters", _info)
-                                        img.save(dst, **_kw)
+                                        _out.save(dst, **_kw)
                                     saved += 1
+                                    no_alpha += _lost
                                     if _info and _ext in {".jpg", ".jpeg", ".webp"}:
                                         # The WebUI's own way (piexif, which it
                                         # ships): the copy is written first and
@@ -1948,9 +2101,11 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                         if st.startswith(settings_errors):
                             return (gallery or None), st
                         run_failed += 1
-                        first_error = first_error or st
+                        no_prompt += "so the main prompt was empty" in st
+                        first_error = first_error or _without_prompt_note(st)
                         continue
                     st = st if isinstance(st, str) else ""
+                    no_prompt += "so the main prompt was empty" in st
                     # run_detailer_on_image reports "ℹ️ …unchanged" when nothing
                     # was detected (not written); "✅ … (couldn't save …)" when it
                     # detailed the image but the disk write failed; a plain "✅ …"
@@ -1964,6 +2119,7 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                         not_saved += 1
                     else:
                         saved += 1
+                        no_alpha += "The saved file has no transparency" in st
                     if len(gallery) < _batch_gallery_cap:
                         gallery.append(img)
                 except Exception:  # noqa: BLE001 — skip a bad file, keep going
@@ -2002,11 +2158,39 @@ def _wire_detection_previews(all_widgets, webui_info, num_models, script=None):
                 status += f", {cancelled} cancelled (left unchanged)"
             if not_saved:
                 status += f", {not_saved} detailed but not saved (see console)"
+            if no_alpha:
+                status += (
+                    f", {no_alpha} saved without their transparency (their file "
+                    "format has none)"
+                )
+                import sys as _sys
+
+                # One line for the whole folder, without file names.
+                print(
+                    f"[-] ADetailer: {no_alpha} image(s) of the folder were saved "
+                    "without their transparency: their file format has none.",
+                    file=_sys.stderr,
+                )
             if run_failed:
-                reason = first_error.removeprefix("⚠️").strip().rstrip(".")
+                # The answer's own "(see console)" would be said twice.
+                reason = first_error.removeprefix("⚠️").strip()
+                reason = reason.replace(" (see console)", "").rstrip(".")
                 status += f", {run_failed} failed ({reason} — see console)"
             if failed:
                 status += f", {failed} skipped (unreadable)"
+            if no_prompt:
+                status += (
+                    f", {no_prompt} without a saved prompt that could be read"
+                    " (main prompt left empty)"
+                )
+                import sys as _sys
+
+                # One line for the whole folder, without file names.
+                print(
+                    f"[-] ADetailer: {no_prompt} image(s) of the folder had no "
+                    "saved prompt that could be read; their main prompt was empty.",
+                    file=_sys.stderr,
+                )
             if earlier:
                 status += (
                     f", {earlier} skipped as earlier results"
@@ -2201,6 +2385,387 @@ def _wire_model_refresh(all_widgets, webui_info, num_models):
         w.ad_model_refresh.click(
             fn=refresh, inputs=dropdowns, outputs=dropdowns, queue=False
         )
+
+
+# One plain block, without inline markdown, so that it stays translatable.
+_SUBJECT_GUIDE_INTRO = (
+    "Pick a LoRA and a few words for each subject, then press the button. The "
+    "guide fills the 1st tab (and the 2nd with the last choice of What to redraw): detector, "
+    "one prompt part per subject, and the settings that keep the parts in order. "
+    "The prompt those tabs had is replaced, and their Inpaint denoising strength "
+    "is set to 0.6. The subjects are the biggest people "
+    "in the picture, as many as People in the picture below says, counted from "
+    "left to right: Subject 1 is the leftmost of them. This needs Settings → "
+    "ADetailer → Sort bounding boxes by set to Position (left to right): the "
+    "status under the button says when it is not. Leave a row empty to leave "
+    "that subject as it is. The subjects are easier to recognise when the main "
+    "prompt already describes them: colours, clothes, who is on the left and who "
+    "on the right. Keep these LoRAs out of the main prompt. Everything "
+    "can be edited afterwards."
+)
+_SUBJECT_GUIDE_PEOPLE_INFO = (
+    "How many people the guide counts: the biggest ones, from left to right. "
+    "Auto counts up to the last row filled. Set it when the picture has more "
+    "people than rows filled: the rows then go to the leftmost of the people "
+    "counted, not to the biggest ones."
+)
+_SUBJECT_GUIDE_MODE_INFO = (
+    "Whole person redraws each person inside their outline, so body and "
+    "clothes follow the LoRA too. Face only redraws the faces. The last choice "
+    "redraws each person on the 1st tab and then their face on the 2nd."
+)
+
+
+def _no_latex(markdown: Any) -> dict:
+    """``latex_delimiters=[]`` for a gr.Markdown that quotes a typed text: no
+    formula is looked for in it. Gradio 3.41 reads "$...$" as a formula in
+    the page it has drawn, where a "$" written as a character reference is a
+    "$" again, so a name such as a$b$c would not be shown as typed. Empty on
+    a Gradio whose Markdown has no such parameter."""
+    import inspect
+
+    try:
+        params = inspect.signature(markdown).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {"latex_delimiters": []} if "latex_delimiters" in params else {}
+
+
+# Every LoRA menu of the subject guide built in this process (txt2img and
+# img2img), as weak references (see _PRESET_DROPDOWNS), so the guide's button
+# can update the page config too.
+_GUIDE_LORA_DROPDOWNS: list = []
+
+
+def _sync_lora_choices(dropdowns: list, choices: list[str]) -> bool:
+    # A browser reload is served the page config built at startup: update each
+    # LoRA menu's own choices list in place, as _sync_model_choices does for
+    # the detectors, so a reload lists the LoRAs the last click listed. Gradio
+    # 3 keeps plain strings, Gradio 4 (label, value) pairs. Best effort: True
+    # when every menu given was updated.
+    done = True
+    for dd in dropdowns:
+        try:
+            cur = dd.choices
+            if not isinstance(cur, list) or not cur:
+                done = False
+                continue
+            cur[:] = (
+                [(x, x) for x in choices]
+                if isinstance(cur[0], (tuple, list))
+                else list(choices)
+            )
+        except Exception:  # noqa: BLE001 — never cost the action its result
+            done = False
+    return done
+
+
+@contextmanager
+def _hidden_if_unfinished(box):
+    """Hide `box` when what is built inside it raises: the panel goes on
+    without the guide, and half a box (rows without their button) would
+    stay on screen."""
+    try:
+        yield
+    except Exception:
+        try:
+            box.visible = False
+        except Exception:  # noqa: BLE001 — the first error is the one to tell
+            pass
+        raise
+
+
+def _subject_row_id(eid, row: int, field: str) -> str:
+    """The elem_id of a field of the guide's subject row `row` (1-4)."""
+    return eid(f"ad_subject_guide_{field}_{row}")
+
+
+def _guide_lora_names(webui_info, which: str = "lora_names") -> list[str] | dict[str, str]:
+    """The LoRA names the WebUI knows now; [] when it cannot tell. With
+    "lora_aliases", the other names a tag can take there: a dict of each
+    one with its LoRA file when the WebUI tells them (build_subject_guide)."""
+    try:
+        reader = getattr(webui_info, which, None)
+        names = reader() if callable(reader) else []
+        if isinstance(names, dict):
+            return {
+                name: file
+                for name, file in list(names.items())
+                if isinstance(name, str) and isinstance(file, str)
+            }
+        return [name for name in names if isinstance(name, str)]
+    except Exception:  # noqa: BLE001 — the menus then offer "None" and typing
+        return []
+
+
+def subject_guide_ui(is_img2img: bool, lora_names: list[str]) -> SimpleNamespace:
+    """The closed box "Guide: several subjects, one LoRA each": what to
+    redraw, how many people to count, four subject rows (LoRA, weight,
+    words), the button and a status.
+
+    Service components only: none is in ALL_ARGS or in what adui returns, so
+    they stay out of the script's arguments, the infotext, the presets,
+    user_state.json and the API, and each one opts out of ui-config.json.
+    No listener here: the button's one .click is _wire_subject_guide.
+    """
+    eid = partial(elem_id, n=0, is_img2img=is_img2img)
+    choices = lora_choices(lora_names)
+    # lora_choices: the list the menus show (see _wire_subject_guide).
+    guide = SimpleNamespace(loras=[], weights=[], words=[], lora_choices=list(choices))
+    with gr.Accordion(
+        "Guide: several subjects, one LoRA each",
+        open=False,
+        elem_id=eid("ad_subject_guide"),
+        elem_classes=["ad-subject-guide"],
+    ) as accordion, _hidden_if_unfinished(accordion):
+        intro = gr.Markdown(_SUBJECT_GUIDE_INTRO, elem_classes=["ad-subject-guide-intro"])
+        guide.mode = gr.Radio(
+            label="What to redraw",
+            choices=list(GUIDE_MODES),
+            value=GUIDE_MODES[0],
+            info=_SUBJECT_GUIDE_MODE_INFO,
+            elem_id=eid("ad_subject_guide_mode"),
+        )
+        # Without it the tab keeps as many of the biggest people as the last
+        # filled row says: with two people and one row, the bigger one.
+        guide.people = gr.Radio(
+            label="People in the picture",
+            choices=list(PEOPLE_CHOICES),
+            value=PEOPLE_CHOICES[0],
+            info=_SUBJECT_GUIDE_PEOPLE_INFO,
+            elem_id=eid("ad_subject_guide_people"),
+        )
+        for i in range(1, GUIDE_SUBJECTS + 1):
+            # The rows explain themselves (label, example, the text above):
+            # no info line and no tooltip of their own.
+            row_id = partial(_subject_row_id, eid, i)
+            with gr.Row():
+                guide.loras.append(
+                    gr.Dropdown(
+                        label=f"Subject {i} LoRA",
+                        # A list of its own for each menu.
+                        choices=list(choices),
+                        value=NO_LORA,
+                        # A LoRA added since the start can be typed, and a
+                        # WebUI without a LoRA list still takes a name.
+                        allow_custom_value=True,
+                        scale=2,
+                        elem_id=row_id("lora"),
+                    )
+                )
+                guide.weights.append(
+                    gr.Slider(
+                        label=f"Subject {i} weight",
+                        minimum=0.0,
+                        maximum=2.0,
+                        step=0.05,
+                        value=DEFAULT_WEIGHT,
+                        scale=1,
+                        elem_id=row_id("weight"),
+                    )
+                )
+                guide.words.append(
+                    gr.Textbox(
+                        label=f"Subject {i} words",
+                        value="",
+                        lines=1,
+                        placeholder="woman, red hair, green dress",
+                        scale=3,
+                        elem_id=row_id("words"),
+                    )
+                )
+        guide.button = gr.Button(
+            value="✨ Fill the tabs", elem_id=eid("ad_subject_guide_fill")
+        )
+        # A class of its own: "ad-preset-status" lines fade after a few
+        # seconds (preset-status-fade.js), and this one has to stay readable.
+        guide.status = gr.Markdown(
+            value="",
+            elem_id=eid("ad_subject_guide_status"),
+            elem_classes=["ad-subject-guide-status"],
+            **_no_latex(gr.Markdown),
+        )
+    guide.components = [
+        accordion, intro, guide.mode, guide.people, *guide.loras, *guide.weights,
+        *guide.words, guide.button, guide.status,
+    ]
+    # Choices of the moment, not settings: the WebUI's ui-config.json tracks
+    # labelled components by label and would bring them back at every start.
+    for component in guide.components:
+        try:
+            component.do_not_save_to_config = True
+        except Exception:  # noqa: BLE001 — never break UI build over a flag
+            pass
+    try:
+        _GUIDE_LORA_DROPDOWNS.extend(weakref.ref(d) for d in guide.loras)
+    except Exception:  # noqa: BLE001 — then only a reload shows an old list
+        pass
+    return guide
+
+
+def _wire_subject_guide(guide, ad_enable, all_widgets, num_models, webui_info):
+    """The guide's "Fill the tabs" button: its one .click.
+
+    Called last in adui(), after every other listener of the panel, so those
+    keep their order. It reads the guide's choices, "Enable this tab" of every
+    tab, the prompt of the tabs it can write (the 1st, and the 2nd when there
+    is one: also to tell when the 2nd is left on with the parts of an earlier
+    fill) and, when the WebUI gave it, the main prompt (never written). It
+    writes the status, "Enable ADetailer", the GUIDE_ATTRS of those tabs with
+    their classes menu, and the choices of the four LoRA menus (only when the
+    WebUI's list changed since they were last written). What to write
+    is decided by build_subject_guide; a setting it leaves out, and every
+    setting when it only has something to say, gets an update that changes
+    nothing.
+    """
+    tabs = list(all_widgets[:num_models])
+    targets = tabs[:2]
+    attrs = list(GUIDE_ATTRS)
+    model_mapping = webui_info.model_mapping
+    main_prompt = getattr(webui_info, "main_prompt", None)
+    inputs = [
+        guide.mode,
+        guide.people,
+        *(c for row in zip(guide.loras, guide.weights, guide.words) for c in row),
+        *(w.ad_tab_enable for w in tabs),
+        *(w.ad_prompt for w in targets),
+        *([main_prompt] if main_prompt is not None else []),
+    ]
+    outputs = [
+        guide.status,
+        ad_enable,
+        *(getattr(w, attr) for w in targets for attr in attrs),
+        *(w.ad_model_classes_dropdown for w in targets),
+        *guide.loras,
+    ]
+    # ad_enable, the tabs' settings and their classes menus.
+    n_settings = 1 + len(targets) * (len(attrs) + 1)
+
+    # The list this side's menus show: the one they were built with, then the
+    # last one a click wrote.
+    shown = [list(getattr(guide, "lora_choices", None) or [])]
+
+    def menus(names):
+        # The LoRAs the WebUI lists now (no disk scan). Choices only: the
+        # value stays what the user picked or typed.
+        if not names:
+            return [gr.update() for _ in guide.loras]
+        choices = lora_choices(names)
+        if choices == shown[0]:
+            # The list the menus already show: with thousands of LoRAs,
+            # sending it again four times is megabytes at every click.
+            return [gr.update() for _ in guide.loras]
+        # A page reload is served the lists the components hold: without
+        # this it would bring the menus back to the list of the start-up.
+        live = [ref() for ref in list(_GUIDE_LORA_DROPDOWNS)]
+        mine = {id(dd) for dd in guide.loras}
+        _sync_lora_choices(
+            [dd for dd in live if dd is not None and id(dd) not in mine], choices
+        )
+        if _sync_lora_choices(list(guide.loras), choices):
+            # Only then is the new list what a reloaded page shows too.
+            shown[0] = choices
+        return [gr.update(choices=list(choices)) for _ in guide.loras]
+
+    def fill(mode=None, people=None, *values):
+        # A new update for every output: Gradio 4 empties an update dict in
+        # place while it sends it, so a shared one would reach only the first.
+        try:
+            names = _guide_lora_names(webui_info)
+            n = GUIDE_SUBJECTS * 3
+            subjects = [values[i : i + 3] for i in range(0, n, 3)]
+            rest = values[n:]
+            enabled = rest[: len(tabs)]
+            old_prompts = rest[len(tabs) : len(tabs) + len(targets)]
+            main = None
+            if main_prompt is not None and len(rest) > len(tabs) + len(targets):
+                main = rest[len(tabs) + len(targets)]
+            try:
+                sort, more = webui_info.sort_order()
+            except Exception:  # noqa: BLE001 — the status then says "not readable"
+                sort = more = None
+            try:
+                reads_lyco = webui_info.reads_lyco() is True
+            except Exception:  # noqa: BLE001 — unknown: a lyco tag is told
+                reads_lyco = False
+            result = build_subject_guide(
+                mode,
+                subjects,
+                installed_models=list(model_mapping or ()),
+                num_tabs=len(tabs),
+                sort_order=sort,
+                more_sort_order=more,
+                enabled_tabs=enabled,
+                old_prompts=old_prompts,
+                main_prompt=main,
+                people=people,
+                # Only the comment marks of this WebUI are told ("#" alone
+                # on AUTOMATIC1111), and none with prompt comments off.
+                comment_marks=host_comment_marks(
+                    getattr(webui_info, "strip_comments", None)
+                ),
+                # A name the WebUI does not know is told (a translated
+                # "None", a typing mistake); one typed in another letter
+                # case or with its file ending is written as listed.
+                lora_names=names,
+                lora_aliases=_guide_lora_names(webui_info, "lora_aliases"),
+                # Forge and Forge Neo skip a <lyco:...> tag: told unless this
+                # WebUI surely reads it.
+                reads_lyco=reads_lyco,
+            )
+            if not result.tabs:
+                return [
+                    _md_safe(result.status),
+                    *(gr.update() for _ in range(n_settings)),
+                    *menus(names),
+                ]
+            widget_updates = []
+            classes_updates = []
+            for i in range(len(targets)):
+                state = result.tabs.get(i)
+                if state is None:
+                    widget_updates.extend(gr.update() for _ in attrs)
+                    classes_updates.append(gr.update())
+                    continue
+                # The way of Load preset: the values with their classes menu.
+                restored = _restored_tab_updates(dict(state), attrs, model_mapping)
+                if "ad_model" in state:
+                    at = attrs.index("ad_model")
+                    restored[at] = _added_model_update(
+                        restored[at], state["ad_model"], i, model_mapping
+                    )
+                widget_updates.extend(restored[:-1])
+                classes_updates.append(restored[-1])
+            return [
+                _md_safe(result.status),
+                gr.update(value=True),
+                *widget_updates,
+                *classes_updates,
+                *menus(names),
+            ]
+        except Exception as e:  # noqa: BLE001 — a guide never costs the panel
+            # The kind of error and where, not its text: that can hold a
+            # full path of this PC, and console lines end up in bug reports.
+            tb = e.__traceback__
+            while tb is not None and tb.tb_next is not None:
+                tb = tb.tb_next
+            where = (
+                f"{tb.tb_frame.f_code.co_name}, line {tb.tb_lineno}"
+                if tb is not None
+                else "an unknown place"
+            )
+            print(
+                "[-] ADetailer: the subject guide could not fill the tabs: "
+                f"{type(e).__name__} in {where}"
+            )
+            return [
+                "⚠️ The guide could not fill the tabs "
+                f"({type(e).__name__}): nothing was changed. The console says "
+                "where it stopped.",
+                *(gr.update() for _ in range(len(outputs) - 1)),
+            ]
+
+    guide.button.click(fn=fill, inputs=inputs, outputs=outputs, queue=False)
 
 
 def _copyable_attrs() -> list[str]:
@@ -3046,6 +3611,7 @@ def one_ui_group(
         "Preset library export / import",
         open=False,
         elem_id=eid("ad_preset_io_accordion"),
+        elem_classes=["ad-sec", "ad-sec-library"],
     ):
         with gr.Row(variant="compact"):
             # gr.DownloadButton needs Gradio 4 (Forge / Forge Neo). AUTOMATIC1111
@@ -3379,6 +3945,9 @@ def one_ui_group(
     if _saved_model not in model_choices:
         _saved_model = model_choices[0]
 
+    # Group label, like "Preset library" above: a plain gr.Markdown with no
+    # event, so the listeners and Forge's fn_index stay as they are.
+    gr.Markdown("Detector", elem_classes=["ad-section-label"])
     with gr.Group():
         with gr.Row():
             w.ad_model = gr.Dropdown(
@@ -3411,10 +3980,13 @@ def one_ui_group(
         # the empty dropdown over it, wiping the saved world classes. A visible
         # box makes the JS visibility guard correctly leave it untouched — a
         # robust signal that does not depend on reading transient dropdown state.
-        _is_world_saved = bool(_saved_model) and "-world" in _saved_model
+        # A YOLOE detector with text prompts is handled the same way.
+        _is_world_saved = bool(_saved_model) and (
+            "-world" in _saved_model or is_yoloe_model(_saved_model)
+        )
         with gr.Row():
             w.ad_model_classes = gr.Textbox(
-                label="ADetailer detector CLASSES (YOLO-World)" + suffix(n),
+                label="ADetailer detector CLASSES (YOLO-World / YOLOE)" + suffix(n),
                 value=sv("ad_model_classes", ""),
                 visible=_is_world_saved,
                 elem_id=eid("ad_model_classes"),
@@ -3463,6 +4035,7 @@ def one_ui_group(
                     or _saved_model == MEDIAPIPE_FACE_FEATURES_MODEL
                 )
                 and "-world" not in _saved_model
+                and not is_yoloe_model(_saved_model)
             ):
                 try:
                     if _saved_model == MEDIAPIPE_FACE_FEATURES_MODEL:
@@ -3614,6 +4187,7 @@ def one_ui_group(
         "Inpaint prompts",
         open=False,
         elem_id=eid("ad_prompts_accordion"),
+        elem_classes=["ad-sec", "ad-sec-setting"],
     ):
         with gr.Row(elem_id=eid("ad_toprow_prompt"), elem_classes=["ad-prompt-row"]):
             w.ad_prompt = gr.Textbox(
@@ -3765,7 +4339,10 @@ def one_ui_group(
 
     with gr.Group():
         with gr.Accordion(
-            "Detection", open=False, elem_id=eid("ad_detection_accordion")
+            "Detection",
+            open=False,
+            elem_id=eid("ad_detection_accordion"),
+            elem_classes=["ad-sec", "ad-sec-setting"],
         ):
             detection(w, n, is_img2img, saved)
 
@@ -3778,6 +4355,7 @@ def one_ui_group(
                 "Detection preview",
                 open=False,
                 elem_id=eid("ad_preview_accordion"),
+                elem_classes=["ad-sec", "ad-sec-tool"],
             ):
                 gr.Markdown(
                     "Drop or paste an image and press the button to run the "
@@ -3842,6 +4420,7 @@ def one_ui_group(
                 "Run ADetailer on an image",
                 open=False,
                 elem_id=eid("ad_apply_accordion"),
+                elem_classes=["ad-sec", "ad-sec-tool"],
             ):
                 gr.Markdown(
                     "Drop or paste an image and press the button to run the full "
@@ -3940,14 +4519,19 @@ def one_ui_group(
             "Mask Preprocessing",
             open=False,
             elem_id=eid("ad_mask_preprocessing_accordion"),
+            elem_classes=["ad-sec", "ad-sec-setting"],
         ):
             mask_preprocessing(w, n, is_img2img, saved)
 
         with gr.Accordion(
-            "Inpainting", open=False, elem_id=eid("ad_inpainting_accordion")
+            "Inpainting",
+            open=False,
+            elem_id=eid("ad_inpainting_accordion"),
+            elem_classes=["ad-sec", "ad-sec-setting"],
         ):
             inpainting(w, n, is_img2img, webui_info, saved)
 
+    gr.Markdown("ControlNet", elem_classes=["ad-section-label"])
     with gr.Group():
         controlnet(w, n, is_img2img, saved)
 

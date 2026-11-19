@@ -202,16 +202,20 @@ def _listener_calls(source):
 
 
 @pytest.mark.parametrize(
-    ("relpath", "expected"), [("aaaaaa/ui.py", 28), ("scripts/!adetailer.py", 1)]
+    ("relpath", "expected"), [("aaaaaa/ui.py", 29), ("scripts/!adetailer.py", 1)]
 )
 def test_no_new_gradio_event_listener(relpath, expected):
     # Forge numbers the event handlers (fn_index) in registration order, so a
     # new listener shifts the WebUI's own handlers: the project adds none
     # without a live check of the gallery on AUTOMATIC1111 and Forge Neo
     # (Send to, Save, a full page reload). The 28th is the detector menu's
-    # 🔄 .click (_wire_model_refresh, plus.9 beta 3, issue #8).
+    # 🔄 .click (_wire_model_refresh, plus.9 beta 3, issue #8). The 29th is
+    # the .click of the subject guide's "Fill the tabs" button
+    # (_wire_subject_guide, plus.10 beta 2): one per side, registered last
+    # in adui(), after every other listener of the panel, so those keep
+    # their order.
     # This counts the registration calls in the source (the project's grep
-    # also counts a comment in ui.py, hence its 29); a call inside a loop,
+    # also counts a comment in ui.py, hence its 30); a call inside a loop,
     # such as the per-setting .change of ALL_ARGS, counts once here, which is
     # why tests/test_args.py pins ALL_ARGS too.
     calls = _listener_calls((_UI_PATH.parents[1] / relpath).read_text(encoding="utf-8"))
@@ -272,16 +276,18 @@ def test_the_listener_count_leaves_out_the_plain_methods_of_the_same_name(source
     assert _listener_calls(source) == []
 
 
-def _wired_apply(monkeypatch, script):
-    """Execute the actual callback wiring, omitting only WebUI import side effects."""
+def _wired_apply(monkeypatch, script, upright=False):
+    """Execute the actual callback wiring, omitting only WebUI import side effects.
+    `upright`: with the real _apply_exif_orientation, not one that does nothing."""
     args_module = ModuleType("adetailer.args")
     args_module.ADetailerArgs = SimpleNamespace
     monkeypatch.setitem(sys.modules, "adetailer.args", args_module)
     tree = ast.parse(_UI_PATH.read_text(encoding="utf-8"))
     body = ast.parse("from __future__ import annotations").body
+    names = {"_wire_detection_previews"} | ({"_apply_exif_orientation"} if upright else set())
     body.extend(
         node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_wire_detection_previews"
+        if isinstance(node, ast.FunctionDef) and node.name in names
     )
     namespace = {
         "ALL_ARGS": SimpleNamespace(attrs=("ad_model",)),
@@ -781,6 +787,44 @@ def test_combined_preview_reports_a_failed_detector(host, monkeypatch, second_ta
         assert status.startswith("⚠️ Preview failed")
         assert "Tab2: ERR (simulated detector failure)" in status
         assert "No detections" not in status
+
+
+@pytest.mark.parametrize("combine", [False, True])
+def test_preview_says_why_a_detector_could_not_be_used(
+    host, monkeypatch, capsys, combine
+):
+    # A model that is not a detector (an OBB or classification model) gives
+    # an empty result with a note: the preview answered with the detector's
+    # own error, or would say "No detections". The note is the answer, with
+    # one ASCII line in the console.
+    note = (
+        "the detector 'planes-ü.pt' is an OBB model (rotated boxes); ADetailer "
+        "needs a detection or segmentation model."
+    )
+
+    def predict(path, **_kwargs):
+        return SimpleNamespace(
+            bboxes=[], confidences=[], masks=[], preview=None,
+            note=note if path == "models/face.pt" else "",
+        )
+
+    callback = _wired_preview(monkeypatch, predict)
+    image, status, _boxes = callback(
+        Image.new("RGB", (8, 8), "white"), combine,
+        "face.pt", "", "", False, 0.3, "hand.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    if combine:
+        # The other tab ran and found nothing.
+        assert status == f"ℹ️ No detections across tabs — Tab1: ERR ({note}) | Tab2: 0"
+    else:
+        assert image is None
+        assert status == f"⚠️ Preview failed: {note}"
+    err = capsys.readouterr().err
+    assert err.splitlines() == [
+        "[-] ADetailer: the detector 'planes-\\xfc.pt' is an OBB model (rotated "
+        "boxes); ADetailer needs a detection or segmentation model."
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1432,6 +1476,626 @@ def test_wired_folder_counts_files_with_nothing_to_inpaint(
 
 
 @pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_gives_each_picture_its_own_saved_prompt(
+    host, monkeypatch, tmp_path, capsys, same_folder
+):
+    # Settings > ADetailer "Run ADetailer on an image uses the prompt saved
+    # in the image": in a folder of mixed pictures each one is detailed with
+    # the prompts it was made with, read from the file; one without saved
+    # parameters keeps an empty main prompt, and the status counts it.
+    from tests.test_pipeline import _prompt_runtime, _saved_picture_bytes
+
+    pictures = {"a.png": "png", "b.jpg": "JPEG", "c.png": "plain", "d.webp": "WEBP"}
+    for name, kind in pictures.items():
+        text = (
+            f"{name} prompt\nNegative prompt: {name} negative\n"
+            "Steps: 20, Seed: 1, Size: 64x64"
+        )
+        (tmp_path / name).write_bytes(_saved_picture_bytes(kind, text))
+    out = tmp_path / "out"
+    script, shells, _reads = _prompt_runtime(out, on=True)
+    out.mkdir()
+    callback = _wired_apply(monkeypatch, script)
+
+    _gallery, status = callback(
+        None, str(tmp_path), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert [(p.prompt, p.negative_prompt) for p in shells] == [
+        ("a.png prompt", "a.png negative"),
+        ("b.jpg prompt", "b.jpg negative"),
+        ("", ""),
+        ("d.webp prompt", "d.webp negative"),
+    ]
+    assert ", 1 without a saved prompt that could be read (main prompt left empty)" in status
+    assert capsys.readouterr().err.count("no saved prompt") == 1
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_says_once_how_many_pictures_have_no_saved_prompt(
+    host, monkeypatch, tmp_path, capsys, same_folder
+):
+    # A folder of photos without parameters printed the same "no saved
+    # prompt" line once for every photo: one line now, at the end, with the
+    # count and no file name. A single image still gets its own line.
+    from tests.test_pipeline import _prompt_runtime, _saved_picture_bytes
+
+    src = tmp_path / "photos"
+    src.mkdir()
+    for k in range(3):
+        (src / f"photo{k}.png").write_bytes(_saved_picture_bytes("plain"))
+    out = tmp_path / "out"
+    script, _shells, _reads = _prompt_runtime(out, on=True)
+    out.mkdir()
+    callback = _wired_apply(monkeypatch, script)
+
+    _gallery, status = callback(
+        None, str(src), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert ", 3 without a saved prompt that could be read" in status
+    lines = [
+        line for line in capsys.readouterr().err.splitlines()
+        if "no saved prompt" in line
+    ]
+    assert lines == [
+        "[-] ADetailer: 3 image(s) of the folder had no saved prompt that could "
+        "be read; their main prompt was empty."
+    ]
+
+    script.run_detailer_on_image(
+        Image.open(src / "photo0.png"), SimpleNamespace(), save=False
+    )
+    assert capsys.readouterr().err.count("the image has no saved prompt") == 1
+
+
+@pytest.mark.parametrize("ends", ["done", "error"])
+def test_wired_folder_warns_once_about_a_tab_checkpoint_of_another_family(
+    host, monkeypatch, tmp_path, capsys, ends
+):
+    # Forge / Forge Neo: a tab's own checkpoint of another model family that
+    # keeps the main model's files. Each picture of a folder gets a new p, so
+    # the console said it once for every picture: once for the folder now,
+    # and the next folder (also after one that ended with an error) and a
+    # single image say it again.
+    from tests.test_pipeline import (
+        _OWN, _SDXL, _engine, _family_runtime, _own_tab, _prompt_runtime,
+    )
+
+    family, data = _family_runtime()
+    family._main_model_family()  # the main model was loaded
+    data.load(_engine(**_SDXL), as_settings_ask=False)  # the tab's checkpoint
+    src = tmp_path / "photos"
+    src.mkdir()
+    for k in range(3):
+        Image.new("RGB", (8, 8), "white").save(src / f"photo{k}.png")
+    out = tmp_path / "out"
+    out.mkdir()
+    script, shells, _reads = _prompt_runtime(out, on=None)
+
+    class Stop(BaseException):
+        pass
+
+    def inner(p, _pp, _args, n=0):
+        shells.append(p)
+        note = family._warn_other_family_modules(p, _own_tab(), n, _OWN)
+        if note:
+            script._ad_family_note = note
+        if ends == "error" and script._ad_folder_run and len(shells) == 2:
+            raise Stop
+        return True
+
+    script._postprocess_image_inner = inner
+    callback = _wired_apply(monkeypatch, script)
+    tab = ("face.pt", "", "", False, 0.3, "face.pt")
+
+    def run_folder():
+        if ends == "error":
+            with pytest.raises(Stop):
+                callback(None, str(src), False, True, *tab)
+        else:
+            callback(None, str(src), False, True, *tab)
+        return capsys.readouterr().err.count("[-] ADetailer: tab 1 uses checkpoint")
+
+    assert run_folder() == 1
+    assert len({id(p) for p in shells}) == len(shells) > 1  # a new p per picture
+    shells.clear()
+    assert run_folder() == 1
+    assert not getattr(script, "_ad_folder_run", False)
+    script.run_detailer_on_image(Image.new("RGB", (8, 8)), SimpleNamespace(), save=False)
+    script.run_detailer_on_image(Image.new("RGB", (8, 8)), SimpleNamespace(), save=False)
+    assert capsys.readouterr().err.count("[-] ADetailer: tab 1 uses checkpoint") == 2
+
+
+def test_wired_folder_says_once_why_its_detector_could_not_be_used(
+    host, monkeypatch, tmp_path, capsys
+):
+    # A folder run with a model that is not a detector: every picture has a
+    # new p, so the console would say it once for every picture, and the
+    # summary would count them all as "left unchanged (nothing to inpaint)".
+    # One line for the folder, the files counted as failed with the reason;
+    # the next folder and a single image say it again.
+    from tests.test_pipeline import _UNUSABLE_DETECTOR, _detector_note_runtime
+
+    src = tmp_path / "photos"
+    src.mkdir()
+    for k in range(3):
+        Image.new("RGB", (8, 8), "white").save(src / f"photo{k}.png")
+    out = tmp_path / "out"
+    out.mkdir()
+    pred = SimpleNamespace(preview=None, note=_UNUSABLE_DETECTOR)
+    script, args = _detector_note_runtime(out, pred)
+    real_pass = script._postprocess_image_inner
+    # The wiring builds the tab's settings from its own fields: the pass
+    # gets complete ones.
+    script._postprocess_image_inner = lambda p, pp, _args, n=0: real_pass(
+        p, pp, args, n=n
+    )
+    callback = _wired_apply(monkeypatch, script)
+    tab = ("face.pt", "", "", False, 0.3, "face.pt")
+    said = "[-] ADetailer: tab 1 inpaints nothing: the detector"
+
+    for _folder in range(2):
+        _gallery, status = callback(None, str(src), False, True, *tab)
+        assert status.startswith("⚠️ Batch failed — 3 image(s): 0 detailed")
+        assert "3 failed (ADetailer run failed: the detector 'planes-ü.pt' is" in status
+        assert "left unchanged" not in status
+        assert capsys.readouterr().err.count(said) == 1
+
+    image = Image.new("RGB", (8, 8))
+    script.run_detailer_on_image(image, args, save=False)
+    script.run_detailer_on_image(image, args, save=False)
+    assert capsys.readouterr().err.count(said) == 2
+
+
+@pytest.mark.parametrize("ends", ["done", "error"])
+def test_wired_folder_says_once_a_lora_its_pass_names_twice(
+    host, monkeypatch, tmp_path, capsys, ends
+):
+    # Each picture of a folder gets a new p, where the "already said" memory
+    # of the line lived: the console said it once for every picture. Once for
+    # the folder, tab and LoRA now; the next folder (also after one that
+    # ended with an error) and a single image say it again.
+    from tests.test_pipeline import _lora_note_runtime, _prompt_runtime, _region
+
+    note = _lora_note_runtime(monkeypatch)
+    src = tmp_path / "photos"
+    src.mkdir()
+    for k in range(4):
+        Image.new("RGB", (8, 8), "white").save(src / f"photo{k}.png")
+    out = tmp_path / "out"
+    out.mkdir()
+    script, shells, _reads = _prompt_runtime(out, on=None)
+    twice = "<lora:detail:1> face <lora:detail:0.5>"
+
+    class Stop(BaseException):
+        pass
+
+    def inner(p, _pp, _args, n=0):
+        shells.append(p)
+        # Two regions, then another tab; from the third picture on the first
+        # tab's prompt names a second LoRA twice as well.
+        note._repeated_lora_note(p, _region(twice), n)
+        note._repeated_lora_note(p, _region(twice), n)
+        note._repeated_lora_note(p, _region(twice), n + 1)
+        if len(shells) > 2:
+            note._repeated_lora_note(p, _region("<lora:skin:1> <lora:skin:1>"), n)
+        if ends == "error" and script._ad_folder_run and len(shells) == 3:
+            raise Stop
+        return True
+
+    script._postprocess_image_inner = inner
+    callback = _wired_apply(monkeypatch, script)
+    tab = ("face.pt", "", "", False, 0.3, "face.pt")
+
+    def run_folder():
+        if ends == "error":
+            with pytest.raises(Stop):
+                callback(None, str(src), False, True, *tab)
+        else:
+            callback(None, str(src), False, True, *tab)
+        said = capsys.readouterr().out
+        return [
+            said.count("tab 1 names the same LoRA more than once"),
+            said.count("tab 2 names the same LoRA more than once"),
+            said.count("'detail' (2 times)"),
+            said.count("'skin' (2 times)"),
+        ]
+
+    assert run_folder() == [2, 1, 2, 1]
+    assert len({id(p) for p in shells}) == len(shells) > 2  # a new p per picture
+    shells.clear()
+    assert run_folder() == [2, 1, 2, 1]
+    assert not getattr(script, "_ad_folder_run", False)
+    shells.clear()
+    script.run_detailer_on_image(Image.new("RGB", (8, 8)), SimpleNamespace(), save=False)
+    script.run_detailer_on_image(Image.new("RGB", (8, 8)), SimpleNamespace(), save=False)
+    assert capsys.readouterr().out.count("names the same LoRA more than once") == 4
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_counts_a_camera_comment_with_pairs_as_no_saved_prompt(
+    host, monkeypatch, tmp_path, capsys, same_folder
+):
+    # A camera's EXIF comment with three "Name: value" pairs passed as the
+    # WebUI's parameters with an empty prompt: the folder didn't count it.
+    from tests.test_pipeline import (
+        _CAMERA_PAIRS_COMMENT,
+        _prompt_runtime,
+        _saved_picture_bytes,
+    )
+
+    src = tmp_path / "photos"
+    src.mkdir()
+    (src / "a.jpg").write_bytes(_saved_picture_bytes("JPEG", _CAMERA_PAIRS_COMMENT))
+    (src / "b.jpg").write_bytes(
+        _saved_picture_bytes("JPEG", "a cat\nSteps: 20, Seed: 1, Size: 64x64")
+    )
+    out = tmp_path / "out"
+    script, shells, _reads = _prompt_runtime(out, on=True)
+    out.mkdir()
+    callback = _wired_apply(monkeypatch, script)
+
+    _gallery, status = callback(
+        None, str(src), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert [p.prompt for p in shells] == ["", "a cat"]
+    assert ", 1 without a saved prompt that could be read" in status
+    assert capsys.readouterr().err.count("no saved prompt") == 1
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_says_once_how_many_saved_prompts_couldnt_be_read(
+    host, monkeypatch, tmp_path, capsys, same_folder
+):
+    # A folder whose pictures' saved prompt couldn't be read printed one
+    # "couldn't read" line for every picture, plus the count at its end: only
+    # the count now. A single image still gets its own line. (The reader
+    # fails, and the pictures' EXIF can't be read without it either.)
+    from tests.test_pipeline import _prompt_runtime
+
+    def unreadable(_image):
+        msg = "bad EXIF data"
+        raise ValueError(msg)
+
+    src = tmp_path / "photos"
+    src.mkdir()
+    for k in range(3):
+        Image.new("RGB", (8, 8), "white").save(
+            src / f"photo{k}.png", exif=b"Exif\x00\x00garbage"
+        )
+    out = tmp_path / "out"
+    script, _shells, _reads = _prompt_runtime(out, on=True, reader=unreadable)
+    out.mkdir()
+    callback = _wired_apply(monkeypatch, script)
+
+    _gallery, status = callback(
+        None, str(src), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert ", 3 without a saved prompt that could be read" in status
+    lines = [
+        line for line in capsys.readouterr().err.splitlines() if "prompt" in line
+    ]
+    assert lines == [
+        "[-] ADetailer: 3 image(s) of the folder had no saved prompt that could "
+        "be read; their main prompt was empty."
+    ]
+
+    script.run_detailer_on_image(
+        Image.open(src / "photo0.png"), SimpleNamespace(), save=False
+    )
+    assert capsys.readouterr().err.count(
+        "couldn't read the prompt saved in the image (bad EXIF data)"
+    ) == 1
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_reads_the_prompt_of_jpegs_turned_upright(
+    host, monkeypatch, tmp_path, capsys, same_folder
+):
+    # The folder batch turns a rotated JPEG upright before the pass reads it:
+    # the WebUI's reader stopped on the EXIF comment Pillow wrote back, so a
+    # camera photo with a blank comment counted as "couldn't be read" and a
+    # WebUI picture rotated in a viewer lost its prompt.
+    from tests.test_pipeline import (
+        _BLANK_CAMERA_COMMENT,
+        _CAMERA_COMMENT,
+        _SAVED_PROMPTS,
+        _WEBUI_UNICODE_COMMENT,
+        _prompt_runtime,
+        _rotated_jpeg_bytes,
+        _webui_reader_with_piexif,
+    )
+
+    src = tmp_path / "photos"
+    src.mkdir()
+    (src / "a.jpg").write_bytes(_rotated_jpeg_bytes(_WEBUI_UNICODE_COMMENT, 6))
+    (src / "b.jpg").write_bytes(_rotated_jpeg_bytes(_BLANK_CAMERA_COMMENT, 8))
+    (src / "c.jpg").write_bytes(_rotated_jpeg_bytes(_CAMERA_COMMENT, 6))
+    out = tmp_path / "out"
+    script, shells, reads = _prompt_runtime(
+        out, on=True, reader=_webui_reader_with_piexif
+    )
+    out.mkdir()
+    callback = _wired_apply(monkeypatch, script, upright=True)
+
+    _gallery, status = callback(
+        None, str(src), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert [image.size for image in reads] == [(32, 64)] * 3  # turned upright
+    assert [(p.prompt, p.negative_prompt) for p in shells] == [
+        _SAVED_PROMPTS, ("", ""), ("", "")
+    ]
+    assert ", 2 without a saved prompt that could be read" in status
+    err = capsys.readouterr().err
+    assert "couldn't read" not in err
+    assert "tuple" not in err
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_counts_pictures_without_a_saved_prompt_that_fail_or_are_cancelled(
+    host, monkeypatch, tmp_path, capsys, same_folder
+):
+    # A folder leaves out each picture's own "no saved prompt" line and counts
+    # them at its end from the pass's answers: a picture whose pass then
+    # failed (NaN, an error) or was cancelled was neither written nor counted.
+    from tests.test_pipeline import _prompt_runtime, _saved_picture_bytes
+
+    src = tmp_path / "photos"
+    src.mkdir()
+    for k in range(4):
+        (src / f"photo{k}.png").write_bytes(_saved_picture_bytes("plain"))
+    out = tmp_path / "out"
+    script, shells, _reads = _prompt_runtime(out, on=True)
+    out.mkdir()
+    state = script.run_detailer_on_image.__globals__["state"]
+
+    def inner(p, _pp, _args, n=0):
+        shells.append(p)
+        k = len(shells) - 1
+        if k == 0:
+            script._ad_nan_regions = 1
+        elif k == 1:
+            script._ad_error_regions = 1
+            script._ad_first_region_error = "CUDA error"
+        elif k == 2:
+            msg = "out of memory"
+            raise RuntimeError(msg)
+        else:
+            state.interrupted = True
+        return False
+
+    script._postprocess_image_inner = inner
+    callback = _wired_apply(monkeypatch, script)
+
+    _gallery, status = callback(
+        None, str(src), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert len(shells) == 4
+    assert ", 3 failed (ADetailer run failed: NaN error while inpainting — see console)" in status
+    assert ", 1 cancelled" in status
+    assert ", 4 without a saved prompt that could be read (main prompt left empty)" in status
+    lines = [
+        line for line in capsys.readouterr().err.splitlines()
+        if "no saved prompt" in line
+    ]
+    assert lines == [
+        "[-] ADetailer: 4 image(s) of the folder had no saved prompt that could "
+        "be read; their main prompt was empty."
+    ]
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+@pytest.mark.parametrize("saved_prompt", ["none", "unreadable", "option off"])
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        # The tab skipped because its checkpoint cannot be loaded.
+        (
+            "skipped",
+            "ADetailer did not run. ⚠️ The tab was skipped: its checkpoint cannot "
+            "be loaded with the main model's VAE file",
+        ),
+        # A failed region, with the warning about the tab's checkpoint.
+        (
+            "nan",
+            "ADetailer run failed: NaN error while inpainting. ⚠️ The tab's "
+            "checkpoint could not be loaded while the pass kept the main model's",
+        ),
+        # A detector that cannot be used: said before the note, always kept.
+        ("detector", "ADetailer run failed: 'cls.pt' is not a detection model — see console)"),
+    ],
+    ids=["skipped", "nan", "detector"],
+)
+def test_wired_folder_gives_the_reason_written_after_the_saved_prompt_note(  # noqa: PLR0913
+    host, monkeypatch, tmp_path, same_folder, saved_prompt, failure, reason
+):
+    # The pass's answer puts the "no saved prompt" note before the reason a
+    # tab was skipped: the folder's summary cut the answer at the note, and
+    # said only "ADetailer did not run".
+    from tests.test_pipeline import _prompt_runtime, _saved_picture_bytes
+
+    def unreadable(_image):
+        msg = "bad EXIF data"
+        raise ValueError(msg)
+
+    src = tmp_path / "photos"
+    src.mkdir()
+    for k in range(2):
+        if saved_prompt == "unreadable":
+            Image.new("RGB", (8, 8), "white").save(
+                src / f"photo{k}.png", exif=b"Exif\x00\x00garbage"
+            )
+        else:
+            (src / f"photo{k}.png").write_bytes(_saved_picture_bytes("plain"))
+    out = tmp_path / "out"
+    reader = {"reader": unreadable} if saved_prompt == "unreadable" else {}
+    script, shells, _reads = _prompt_runtime(out, on=saved_prompt != "option off", **reader)
+    out.mkdir()
+
+    def inner(p, _pp, _args, n=0):
+        shells.append(p)
+        if failure == "skipped":
+            script._ad_family_note = (
+                "[-] ADetailer: tab 1 skipped: its checkpoint 'xl.safetensors' "
+                "(SDXL) cannot be loaded with the main model's VAE file."
+            )
+        elif failure == "nan":
+            script._ad_nan_regions = 1
+            script._ad_family_note = (
+                "[-] ADetailer: tab 1's checkpoint could not be loaded."
+            )
+        else:
+            script._ad_detector_note = "'cls.pt' is not a detection model"
+        return False
+
+    script._postprocess_image_inner = inner
+    callback = _wired_apply(monkeypatch, script)
+
+    _gallery, status = callback(
+        None, str(src), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert len(shells) == 2
+    assert f", 2 failed ({reason}" in status
+    # The note itself is counted, not repeated in the reason.
+    assert "so the main prompt was empty" not in status
+    counted = ", 2 without a saved prompt that could be read" in status
+    assert counted == (saved_prompt != "option off")
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+@pytest.mark.parametrize(
+    ("note", "error_regions", "reason"),
+    [
+        (
+            "[-] ADetailer: tab 1 skipped: its checkpoint 'xl.safetensors' (SDXL) "
+            "cannot be loaded with the main model's (Flux) VAE file (ae.safetensors), "
+            "which the pass would keep. Give the tab its own: 'Use separate VAE' "
+            "with Automatic.",
+            0,
+            "ADetailer did not run. ⚠️ The tab was skipped: its checkpoint cannot be "
+            "loaded with the main model's VAE file, which the pass would keep. Give "
+            "the tab its own: Use separate VAE with Automatic — see console)",
+        ),
+        (
+            "[-] ADetailer: tab 1 skipped: its checkpoint 'xl.safetensors' (SDXL) "
+            "cannot be loaded with the VAE file chosen in the tab (ae.safetensors).",
+            0,
+            "ADetailer did not run. ⚠️ The tab was skipped: its checkpoint cannot be "
+            "loaded with the VAE file chosen in the tab. Choose another one in Use "
+            "separate VAE — see console)",
+        ),
+        (
+            "[-] ADetailer: tab 1 skipped: its checkpoint 'flux.safetensors' (Flux) "
+            "cannot be loaded with the main model's (SDXL) VAE file (xl.safetensors).",
+            0,
+            "ADetailer did not run. ⚠️ The tab was skipped: its checkpoint cannot be "
+            "loaded with the main model's VAE file, which the pass would keep. Pick "
+            "a VAE file of the checkpoint's family in the tab's Use separate VAE — "
+            "see console)",
+        ),
+        # A failed region without its error's text, then the checkpoint warning.
+        (
+            "[-] ADetailer: tab 1's checkpoint 'xl.safetensors' could not be loaded.",
+            1,
+            "ADetailer run failed: error while inpainting. ⚠️ The tab's checkpoint "
+            "could not be loaded while the pass kept the main model's VAE / text "
+            "encoder files: if it is of another model family, give the tab its own "
+            "— see console)",
+        ),
+        ("", 1, "ADetailer run failed: error while inpainting — see console)"),
+    ],
+    ids=["skipped", "skipped-tab-vae", "skipped-flux", "error-and-warning", "error"],
+)
+def test_wired_folder_says_see_console_once_in_the_reason_of_the_failed_files(  # noqa: PLR0913
+    host, monkeypatch, tmp_path, same_folder, note, error_regions, reason
+):
+    # The pass's answer already ends with "(see console).": the folder's
+    # summary said "...with Automatic (see console) — see console)".
+    from tests.test_pipeline import _prompt_runtime, _saved_picture_bytes
+
+    src = tmp_path / "photos"
+    src.mkdir()
+    for k in range(2):
+        (src / f"photo{k}.png").write_bytes(_saved_picture_bytes("plain"))
+    out = tmp_path / "out"
+    script, shells, _reads = _prompt_runtime(out, on=False)
+    out.mkdir()
+
+    def inner(p, _pp, _args, n=0):
+        shells.append(p)
+        script._ad_family_note = note
+        script._ad_error_regions = error_regions
+        return False
+
+    script._postprocess_image_inner = inner
+    callback = _wired_apply(monkeypatch, script)
+
+    _gallery, status = callback(
+        None, str(src), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert len(shells) == 2
+    assert f", 2 failed ({reason}." in status
+    assert status.count("see console") == 1
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
+def test_wired_folder_results_record_each_pictures_own_prompts(
+    host, monkeypatch, tmp_path, same_folder
+):
+    # With "...uses the prompt saved in the image" on, each result recorded
+    # the face tab's prompt as its main prompt (the WebUI writes the region
+    # pass's): a folder of results run again with the hand tab redrew the
+    # hands with it. Saved beside the source or to ADetailer-Inpaint.
+    from tests.test_pipeline import (
+        _REGION_PARAMETERS_LINE,
+        _region_pass_runtime,
+        _saved_picture_bytes,
+    )
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for name in ("a.png", "b.png"):
+        text = (
+            f"{name} prompt\nNegative prompt: {name} negative\n"
+            "Steps: 20, Seed: 1, Size: 64x64"
+        )
+        (src / name).write_bytes(_saved_picture_bytes("png", text))
+    saved = []
+    script, _shells = _region_pass_runtime(tmp_path, on=True, saved=saved)
+    callback = _wired_apply(monkeypatch, script)
+
+    _gallery, status = callback(
+        None, str(src), same_folder, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert status.startswith("✅ Batch done — 2 image(s): 2 detailed")
+    if same_folder:
+        recorded = [_read_parameters(src / n) for n in ("a-ad.png", "b-ad.png")]
+    else:
+        recorded = [kwargs["info"] for kwargs in saved]
+    assert recorded == [
+        f"{name} prompt\nNegative prompt: {name} negative\n{_REGION_PARAMETERS_LINE}"
+        for name in ("a.png", "b.png")
+    ]
+
+
+@pytest.mark.parametrize("same_folder", [False, True])
 def test_wired_folder_that_wrote_nothing_is_headed_failed(
     host, monkeypatch, tmp_path, same_folder
 ):
@@ -1671,6 +2335,89 @@ def test_wired_folder_keeps_the_transparency_of_a_cut_out(host, monkeypatch, tmp
         ("RGB", (10, 20, 30)),
     ]
     assert seen[4][0] == "RGB"
+
+
+def _transparent_result(image):
+    """What the pass gives with Settings > ADetailer "...keep the
+    transparency of the picture" on: an RGBA result for a cut-out."""
+    result = Image.new("RGBA", image.size, (0, 0, 255, 0))
+    result.paste((0, 0, 255, 255), (2, 2, 6, 6))
+    return result
+
+
+def test_wired_same_folder_copy_keeps_the_transparency_its_format_can_hold(
+    host, monkeypatch, tmp_path, capsys
+):
+    # The copy saved beside each source keeps the source's file format: a
+    # PNG, WebP or TIFF holds the transparency of the result; a picture with
+    # transparency named .jpg (a PNG inside) is written filled as
+    # with the option off, instead of failing, and the folder says once how
+    # many were saved without it.
+    cutout = _transparent_result(Image.new("RGB", (8, 8)))
+    for name in ("a.png", "b.webp", "c.tif"):
+        cutout.save(tmp_path / name)
+    cutout.save(tmp_path / "d.jpg", format="PNG")
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(tmp_path / "f.jpg")
+
+    def detail(image, _args, save, tab=0):
+        if image.mode == "RGBA":
+            return _transparent_result(image), "✅ ADetailer pass complete."
+        return image.copy(), "✅ ADetailer pass complete."
+
+    callback = _wired_apply(monkeypatch, SimpleNamespace(run_detailer_on_image=detail))
+    _gallery, status = callback(
+        None, str(tmp_path), True, False,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert status.startswith("✅ Batch done — 5 image(s): 5 detailed")
+    assert ", 1 saved without their transparency (their file format has none)" in status
+    for name, mode in (
+        ("a-ad.png", "RGBA"), ("b-ad.webp", "RGBA"), ("c-ad.tif", "RGBA"),
+        ("d-ad.jpg", "RGB"), ("f-ad.jpg", "RGB"),
+    ):
+        with Image.open(tmp_path / name) as result:
+            assert result.mode == mode, name
+            if mode == "RGBA":
+                assert result.getpixel((0, 0))[3] == 0
+                assert result.getpixel((3, 3)) == (0, 0, 255, 255)
+    err = capsys.readouterr().err
+    assert err.count("without their transparency") == 1
+    assert "1 image(s) of the folder" in err
+
+
+def test_wired_folder_counts_results_saved_without_transparency_once(
+    host, monkeypatch, tmp_path, capsys
+):
+    # Saved to the ADetailer-Inpaint folder in the WebUI's format: the pass
+    # says it of each picture, the folder once, with the count.
+    for name in ("a.png", "b.png", "c.png"):
+        Image.new("RGB", (8, 8), (10, 20, 30)).save(tmp_path / name)
+    answers = iter([
+        "✅ ADetailer pass complete. Saved to the 'ADetailer-Inpaint' folder. "
+        "The saved file has no transparency: the WebUI writes 'jpg' files without it.",
+        "✅ ADetailer pass complete. Saved to the 'ADetailer-Inpaint' folder.",
+        "✅ ADetailer pass complete. Saved to the 'ADetailer-Inpaint' folder. "
+        "The saved file has no transparency: the WebUI writes 'jpg' files without it.",
+    ])
+
+    def detail(image, _args, save, tab=0):
+        return image, next(answers)
+
+    callback = _wired_apply(monkeypatch, SimpleNamespace(run_detailer_on_image=detail))
+    _gallery, status = callback(
+        None, str(tmp_path), False, True,
+        "face.pt", "", "", False, 0.3, "face.pt",
+    )
+
+    assert status == (
+        "✅ Batch done — 3 image(s): 3 detailed and saved to the "
+        "'ADetailer-Inpaint' folder, 2 saved without their transparency "
+        "(their file format has none)."
+    )
+    err = capsys.readouterr().err
+    assert err.count("without their transparency") == 1
+    assert "2 image(s) of the folder" in err
 
 
 def test_run_on_an_image_input_keeps_transparency():

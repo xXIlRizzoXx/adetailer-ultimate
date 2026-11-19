@@ -37,7 +37,7 @@
 
         // Detector and classes
         ad_model_classes:
-            "YOLO-World only: the names to look for, separated by commas, for example person, hand. Left empty, it looks for its 80 default classes.",
+            "YOLO-World and YOLOE only: the names to look for, separated by commas, for example person, hand. Left empty, YOLO-World looks for its 80 default classes and YOLOE for the classes saved in the model.",
         ad_model_classes_exclude:
             "Turns the class filter around: every class except the ones you pick is detailed. With no class picked, nothing is left out.",
         ad_classes_sequential:

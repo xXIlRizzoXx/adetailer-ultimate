@@ -124,7 +124,22 @@
         );
         if (!modelBox) return false;
         const inp = modelBox.querySelector("input");
-        return !!inp && (inp.value || "").indexOf("-world") >= 0;
+        if (!inp) return false;
+        const name = inp.value || "";
+        return name.indexOf("-world") >= 0 || isYoloeText(name);
+    }
+
+    // A YOLOE detector with text prompts takes typed classes like YOLO-World.
+    // Same rule as is_yoloe_model in adetailer/classes.py: "yoloe" in the file
+    // name (any case, not followed by a letter), not a prompt-free "-pf" one;
+    // the folder a menu name adds ("name.pt (folder)") does not count.
+    function isYoloeText(name) {
+        const file = name.replace(/^(.+?\.pt) \([\s\S]*\)$/i, "$1");
+        const stem = file
+            .replace(/^.*[\\/]/, "")
+            .replace(/\.[^.]*$/, "")
+            .toLowerCase();
+        return /yoloe(?![a-z])/.test(stem) && !/[-_]pf(?![a-z0-9])/.test(stem);
     }
 
     function syncOne(dropdown) {

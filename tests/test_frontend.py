@@ -335,6 +335,31 @@ def test_class_sync_never_writes_a_translated_class_name(
     assert run_js(tmp_path, "class-sync.js", scenario) == expected
 
 
+@needs_node
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        # Restored at start-up, before the free-text field is shown: the
+        # typed words of an open-vocabulary detector are never wiped.
+        ("yoloe-11s-seg.pt", "person,cat"),
+        ("YOLOE-v8l-seg.pt (pack/v2)", "person,cat"),
+        ("custom-world.pt", "person,cat"),
+        # A prompt-free YOLOE, or a folder named after YOLOE, is an ordinary
+        # detector: its hidden field mirrors the (empty) dropdown.
+        ("yoloe-11s-seg-pf.pt", ""),
+        ("faces.pt (yoloe)", ""),
+    ],
+)
+def test_class_sync_leaves_the_typed_classes_of_a_yoloe_detector(
+    tmp_path, model, expected
+):
+    case = json.dumps({"tokens": [], "localization": {}, "backstop": "person,cat"})
+    scenario = f"const CASE = {case};\n" + CLASS_SYNC.replace(
+        '{ value: "faces.pt" }', "{ value: " + json.dumps(model) + " }"
+    )
+    assert run_js(tmp_path, "class-sync.js", scenario) == expected
+
+
 TOOLTIPS = r"""
 const P = "script_txt2img_adetailer_";
 const els = {
@@ -937,6 +962,63 @@ def test_dropdown_value_stays_translated_after_a_change(tmp_path, translated):
     assert out["blurred"] == [tck, tvae, tvae, ck]
 
 
+TYPED_VALUE = r"""
+const box = (value) => { const i = new El("input", { value }); i.role = "listbox"; return i; };
+const lora = [box("None"), box("None")];
+const detector = box("None");
+const late = box("None");
+const guide = new El("div", { id: "script_txt2img_adetailer_ad_subject_guide" }, [
+    new El("div", { id: "script_txt2img_adetailer_ad_subject_guide_lora_1" }, [
+        new El("div", { class: "wrap" }, [lora[0]])]),
+]);
+const panel = new El("div", { id: "script_txt2img_adetailer_ad_main_accordion" }, [
+    guide,
+    new El("div", { id: "script_txt2img_adetailer_ad_model_2nd" }, [detector]),
+]);
+const body = new El("body", {}, [panel]);
+run(SCRIPT, body, { localization: CASE });
+const all = () => [lora[0].value, lora[1].value, detector.value, late.value];
+const out = { swept: all() };
+// A menu mounted later (the lazy accordion), seen by the observer.
+const added = new El("div", { id: "script_img2img_adetailer_ad_subject_guide_lora_4" }, [lora[1]]);
+const other = new El("div", { id: "script_img2img_adetailer_ad_model" }, [late]);
+guide.append(added);
+panel.append(other);
+const obs = observers[observers.length - 1];
+if (obs) obs.cb([{ type: "childList", addedNodes: [added, other] }]);
+out.added = all();
+// A value change writes the English choice back; then Gradio's event.
+lora[0].value = lora[1].value = detector.value = late.value = "None";
+(listeners.gradio || []).forEach(
+    (f) => f({ type: "gradio", detail: { event: "change", id: 7, data: null } }));
+out.changed = all();
+console.log(JSON.stringify(out));
+"""
+
+
+@needs_node
+@pytest.mark.parametrize("translated", [True, False])
+def test_a_menu_that_takes_typed_text_keeps_its_value_untranslated(tmp_path, translated):
+    # The subject guide's LoRA menus take typed text (allow_custom_value): a
+    # translated "None" written into the input came back to the server as a
+    # LoRA name, and the guide wrote <lora:(translated None):0.8>.
+    localization = {"None": "NONE (translated)"} if translated else {}
+    scenario = f"const CASE = {json.dumps(localization)};\n" + TYPED_VALUE
+    out = run_js(tmp_path, "localize_emoji_buttons.js", scenario)
+    shown = "NONE (translated)" if translated else "None"
+    # The LoRA menus stay as they are; any other dropdown is still translated,
+    # at the first sweep, when it is mounted later and after a value change.
+    assert out["swept"] == ["None", "None", shown, "None"]
+    assert out["added"] == ["None", "None", shown, shown]
+    assert out["changed"] == ["None", "None", shown, shown]
+    # The ids the script looks for are the ones the panel gives those menus.
+    ui = (ROOT / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    assert 'return eid(f"ad_subject_guide_{field}_{row}")' in ui
+    assert 'elem_id=row_id("lora"),' in ui
+    script = (ROOT / "javascript" / "localize_emoji_buttons.js").read_text(encoding="utf-8")
+    assert """const FREE_TEXT_SEL = '[id*="ad_subject_guide_lora"]';""" in script
+
+
 def _export_js() -> str:
     tree = ast.parse((ROOT / "aaaaaa" / "ui.py").read_text(encoding="utf-8"))
     return next(
@@ -1307,6 +1389,129 @@ def test_open_sections_cover_every_tab_section_but_the_main_panel():
             for stem in stems:
                 matched = id_re.match(namespace["elem_id"](f"ad_{stem}_accordion", n, img2img))
                 assert bool(matched) == (stem != "main"), (stem, n, img2img)
+
+
+# Every section of a tab: its title (word for word), its kind and the emoji
+# that style.css draws before the title.
+TAB_SECTIONS = {
+    "preset_io": ("Preset library export / import", "ad-sec-library", "\U0001F4E6"),
+    "prompts": ("Inpaint prompts", "ad-sec-setting", "✍️"),
+    "detection": ("Detection", "ad-sec-setting", "\U0001F3AF"),
+    "preview": ("Detection preview", "ad-sec-tool", "\U0001F50D"),
+    "apply": ("Run ADetailer on an image", "ad-sec-tool", "✨"),
+    "mask_preprocessing": ("Mask Preprocessing", "ad-sec-setting", "\U0001F3AD"),
+    "inpainting": ("Inpainting", "ad-sec-setting", "\U0001F3A8"),
+}
+SECTION_KINDS = {"ad-sec-setting", "ad-sec-tool", "ad-sec-library"}
+
+
+def _ui_tree() -> ast.Module:
+    return ast.parse((ROOT / "aaaaaa" / "ui.py").read_text(encoding="utf-8"))
+
+
+def _section_calls() -> dict[str, ast.Call]:
+    # Accordion-like calls with elem_id=eid("ad_<stem>_accordion").
+    out = {}
+    for node in ast.walk(_ui_tree()):
+        if not isinstance(node, ast.Call):
+            continue
+        for k in node.keywords:
+            v = k.value
+            if (
+                k.arg == "elem_id"
+                and isinstance(v, ast.Call)
+                and getattr(v.func, "id", "") == "eid"
+                and v.args
+                and isinstance(v.args[0], ast.Constant)
+            ):
+                m = re.fullmatch(r"ad_(\w+)_accordion", str(v.args[0].value))
+                if m:
+                    out[m.group(1)] = node
+    return out
+
+
+def _keyword(call: ast.Call, name: str):
+    for k in call.keywords:
+        if k.arg == name:
+            return ast.literal_eval(k.value)
+    return None
+
+
+def _css_text(value: str) -> str:
+    # A CSS string with its \HEX escapes turned into characters.
+    body = value.strip()[1:-1]
+    return re.sub(
+        r"\\([0-9a-fA-F]{1,6}) ?", lambda m: chr(int(m.group(1), 16)), body
+    )
+
+
+def test_every_tab_section_has_a_kind_class_and_keeps_its_title():
+    calls = _section_calls()
+    # A new section must be given its kind too.
+    assert set(calls) == set(TAB_SECTIONS) | {"main"}
+    for stem, (title, kind, _) in TAB_SECTIONS.items():
+        call = calls[stem]
+        assert getattr(call.func, "attr", "") == "Accordion", stem
+        # Titles stay word for word: translations and tests match them.
+        assert call.args and ast.literal_eval(call.args[0]) == title, stem
+        assert title.isascii(), stem  # the emoji is only in style.css
+        classes = _keyword(call, "elem_classes")
+        assert classes is not None and "ad-sec" in classes, stem
+        assert set(classes) & SECTION_KINDS == {kind}, stem
+    # The main panel, with its "Nx Tabs" pill, is left alone.
+    main = _keyword(calls["main"], "elem_classes") or []
+    assert not any(str(c).startswith("ad-sec") for c in main)
+
+
+def test_every_tab_section_has_its_emoji_and_bar_in_the_stylesheet():
+    rules = {s: body for selectors, body in css_rules() for s in selectors}
+    for stem, (_, _, emoji) in TAB_SECTIONS.items():
+        sel = f'.ad-sec[id*="_ad_{stem}_accordion"] > .label-wrap > span:first-child::before'
+        assert sel in rules, stem
+        content = re.search(r"content:\s*(\"[^\"]*\")", rules[sel])
+        assert content and _css_text(content.group(1)) == emoji, stem
+    assert not [s for s in rules if "ad_main_accordion" in s and "ad-sec" in s]
+    header = rules[".ad-sec > .label-wrap"]
+    assert re.search(r"border-left:\s*3px solid var\(--ad-sec-bar", header)
+    assert "padding-left" in header
+    # One bar colour per kind; blue and amber also on the dark theme.
+    bars = {}
+    for kind in SECTION_KINDS:
+        bar = re.search(r"--ad-sec-bar:\s*([^;]+);", rules[f".{kind}"])
+        assert bar, kind
+        bars[kind] = bar.group(1).strip()
+    for kind in ("ad-sec-setting", "ad-sec-tool"):
+        assert "--ad-sec-bar" in rules[f".dark .{kind}"], kind
+    assert len(set(bars.values())) == 3
+    # The theme accent is orange in both WebUIs' Default theme: not "blue".
+    assert "--color-accent" not in bars["ad-sec-setting"]
+
+
+def test_detector_and_controlnet_have_a_plain_group_label():
+    tree = _ui_tree()
+    group = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "one_ui_group"
+    )
+    found = {}
+    for i, stmt in enumerate(group.body):
+        call = stmt.value if isinstance(stmt, ast.Expr) else None
+        if not (
+            isinstance(call, ast.Call)
+            and getattr(call.func, "attr", "") == "Markdown"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+        ):
+            continue
+        text = call.args[0].value
+        # A bare expression: nothing can chain an event on it.
+        assert _keyword(call, "elem_classes") == ["ad-section-label"], text
+        assert text.isascii() and not re.search(r"[*`#\[\]<\n]", text), text
+        nxt = group.body[i + 1]
+        assert isinstance(nxt, ast.With), text
+        found[text] = ast.unparse(nxt)
+    assert set(found) >= {"Preset library", "Detector", "ControlNet"}
+    assert "w.ad_model = gr.Dropdown(" in found["Detector"]
+    assert "controlnet(w, n, is_img2img, saved)" in found["ControlNet"]
 
 
 def _workflow_paths(event: str) -> list[str]:

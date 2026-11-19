@@ -14,7 +14,21 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import gradio as gr
 from PIL import Image, ImageChops
-from rich import print  # noqa: A004  Shadowing built-in 'print'
+
+try:
+    from rich import print  # noqa: A004  Shadowing built-in 'print'
+except ImportError as _rich_error:
+    # A WebUI started with --skip-install, or a failed install: one plain line
+    # that names the package and how to install it (not through rich, which is
+    # what is missing), then the error as before.
+    _rich_line = (
+        "[-] ADetailer: the Python package 'rich' cannot be imported "
+        f"({_rich_error}), so ADetailer cannot load. Start the WebUI once "
+        "without --skip-install, or install it with the WebUI's Python: "
+        'python -m pip install "rich>=13.0.0"\n'
+    )
+    sys.stderr.write(_rich_line.encode("ascii", "backslashreplace").decode("ascii"))
+    raise
 
 import modules
 from aaaaaa.conditional import create_binary_mask, schedulers
@@ -26,14 +40,20 @@ from aaaaaa.helper import (
     preserve_prompts,
 )
 from aaaaaa.p_method import (
+    add_model_hashes,
+    drop_resolved_prompts,
+    end_resolved_prompts,
     get_i,
     is_img2img_inpaint,
     is_inpaint_only_masked,
     is_skip_img2img,
+    keep_resolved_prompts,
     merge_network_hashes,
     need_call_postprocess,
     need_call_process,
+    note_used_prompts,
     restore_network_hashes,
+    start_resolved_prompts,
 )
 from aaaaaa.traceback import rich_traceback
 from aaaaaa.ui import (
@@ -84,6 +104,7 @@ from adetailer.mask import (
     sort_bboxes,
 )
 from adetailer.opts import dynamic_denoise_strength, optimal_crop_size
+from adetailer.ultralytics import warn_missing_ultralytics
 from controlnet_ext import (
     CNHijackRestore,
     ControlNetExt,
@@ -176,10 +197,15 @@ except Exception:  # noqa: BLE001
 txt2img_submit_button = img2img_submit_button = None
 txt2img_submit_button = cast(gr.Button, txt2img_submit_button)
 img2img_submit_button = cast(gr.Button, img2img_submit_button)
+# The main prompt boxes (on_after_component), None until the WebUI builds them.
+txt2img_prompt_box = img2img_prompt_box = None
 
 print(
     f"[-] ADetailer initialized. version: {__version__}, num models: {len(model_mapping)}"
 )
+# Ultralytics is imported at the first detection only: when it is not
+# installed (a WebUI started with --skip-install), the console says so now.
+warn_missing_ultralytics()
 
 # The detector choices of the X/Y/Z plot axes, refreshed with model_mapping.
 _XYZ_MODEL_LIST: list[str] = []
@@ -688,6 +714,330 @@ def _empty_prompt_note(ad_prompt: str, prompts: list[str], n: int) -> str:
                 "matched no part of the main prompt."
             )
     return ""
+
+
+# A LoRA tag as the host reads it: its kind, then the name up to the next ":".
+_LORA_NAME_RE = re.compile(r"<(lora|lyco):([^>]+)>")
+
+
+def _repeated_lora_note(p, p2, n: int, runner=None) -> str:
+    """The console line for tab `n` when the prompt of a region of its
+    detailer pass names the same LoRA more than once; "" otherwise.
+
+    Read on the region's final prompt, `p2.prompt` with the styles the host
+    still adds to it. The host loads a LoRA once for each tag it finds
+    there, whatever the weights, so a LoRA named twice gets a stronger effect
+    than one tag asks for (the classic Forge alone keeps one of two tags that
+    are exactly the same). A tag in the negative prompt is never loaded, so
+    it is not counted. A "lyco" tag counts only where the host reads it as
+    a LoRA tag (AUTOMATIC1111, reForge; Forge and Forge Neo ignore it). With
+    Dynamic Prompts among the scripts of the pass (`runner`), the branches
+    of a {a|b} block are not added up, and a tag whose name it still has to
+    draw is not counted; with the "wildcards" extension among them, a tag
+    with a __name__ wildcard in its name is not counted either. A tag without
+    a name never is. Once per generation, tab and LoRA. A warning only: the
+    prompt stays as it is.
+    """
+    try:
+        text = p2.prompt
+        styles = getattr(p2, "styles", None) or []
+        if styles:
+            try:
+                text = shared.prompt_styles.apply_styles_to_prompt(text, styles)
+            except Exception:  # noqa: BLE001 — the prompt alone
+                text = p2.prompt
+        if not isinstance(text, str) or "<" not in text:
+            return ""
+        kinds = {"lora"}
+        try:
+            host = sys.modules["modules.extra_networks"]
+            # The host looks a tag's kind up in its registry, then its aliases.
+            known = {**host.extra_network_aliases, **host.extra_network_registry}
+            kinds = {
+                kind
+                for kind in ("lora", "lyco")
+                if known.get("lora") is not None and known.get(kind) is known["lora"]
+            }
+        except Exception:  # noqa: BLE001 — a host that cannot be asked: "lora" only
+            kinds = {"lora"}
+
+        def count(part: str) -> dict[str, int]:
+            found: dict[str, int] = {}
+            for kind, body in _LORA_NAME_RE.findall(part):
+                name = body.split(":")[0]
+                # A tag without a name names no LoRA.
+                if kind in kinds and name.strip():
+                    found[name] = found.get(name, 0) + 1
+            return found
+
+        # Dynamic Prompts, when it runs in the pass (as _without_dynamic_prompts
+        # tells; a prompt with a "{" keeps it), leaves one branch of a {a|b}
+        # block: outside the blocks every tag counts, a block adds only the
+        # tags every one of its branches has. A block inside another, one
+        # that can keep more branches ("2$$"), a ${variable}, a %{wrap}, a
+        # block left open: not sure, nothing counted there.
+        blocks: list[str] = []
+        try:
+            dynamic = any(
+                Path(str(getattr(script, "filename", "") or "")).stem
+                == "dynamic_prompting"
+                for script in runner.alwayson_scripts
+            )
+            # The "wildcards" extension draws each __name__ by itself too.
+            wildcards = any(
+                Path(str(getattr(script, "filename", "") or "")).stem
+                in ("wildcards", "wildcard_recursive")
+                for script in runner.alwayson_scripts
+            )
+            if dynamic or wildcards:
+                # A tag whose name Dynamic Prompts still has to draw (a block
+                # or a wildcard in it) names no LoRA yet: two of them can be
+                # two LoRAs, so they are not counted.
+                unsure = ["{", "}", "__"] if dynamic else ["__"]
+                wrap = opts.data.get("dp_parser_wildcard_wrap") if dynamic else None
+                if isinstance(wrap, str) and wrap.strip():
+                    unsure.append(wrap.strip())
+                text = _LORA_NAME_RE.sub(
+                    lambda tag: ""
+                    if any(mark in tag.group(2).split(":")[0] for mark in unsure)
+                    else tag.group(0),
+                    text,
+                )
+            # Its own variant marker (Settings > Dynamic Prompts) in the
+            # prompt: its blocks cannot be told here, so nothing is said.
+            mark = opts.data.get("dp_parser_variant_start") if dynamic else None
+            if isinstance(mark, str) and mark.strip() not in ("", "{"):
+                if mark.strip() in text:
+                    return ""
+                dynamic = False
+        except Exception:  # noqa: BLE001 — no script runner: every tag counts
+            dynamic = False
+        if dynamic:
+            outside, depth, start, plain = "", 0, 0, True
+            for k, char in enumerate(text):
+                if char == "{":
+                    if depth == 0:
+                        start = k
+                        plain = text[max(k - 1, 0) : k] not in ("$", "%")
+                    else:
+                        plain = False
+                    depth += 1
+                elif char == "}" and depth:
+                    depth -= 1
+                    if depth == 0 and plain and "$$" not in text[start:k]:
+                        blocks.append(text[start + 1 : k])
+                elif depth == 0:
+                    outside += char
+            text = outside
+        counts = count(text)
+        for block in blocks:
+            branches = [count(branch) for branch in block.split("|")]
+            for name in branches[0]:
+                sure = min(branch.get(name, 0) for branch in branches)
+                if sure:
+                    counts[name] = counts.get(name, 0) + sure
+        noted = getattr(p, "_ad_repeated_lora_noted", None)
+        if not isinstance(noted, set):
+            noted = set()
+        new = [
+            name
+            for name, count in counts.items()
+            if count > 1 and (n, name) not in noted
+        ]
+        if not new:
+            return ""
+        noted.update((n, name) for name in new)
+        p._ad_repeated_lora_noted = noted
+        listed = ", ".join(f"{name!a} ({counts[name]} times)" for name in new)
+        line = (
+            f"[-] ADetailer: tab {n + 1} names the same LoRA more than once in "
+            f"the prompt of its detailer pass: {listed}. The WebUI can apply a "
+            "LoRA once per tag (a stronger effect). Keep one tag: [PROMPT] and "
+            "a blank prompt already bring the main prompt's LoRAs; the append "
+            "text and the styles add their own."
+        )
+        # sys.stdout, not the rich print: it would read "[PROMPT]" as markup.
+        sys.stdout.write(line + "\n")
+        return line
+    except Exception:  # noqa: BLE001 — a warning never breaks the pass
+        return ""
+
+
+def _exif_comment_saved_in_image(image) -> str | None:
+    """The EXIF comment (UserComment) of `image`, read with Pillow and
+    decoded as the WebUI's reader decodes it, for when that reader fails.
+    None when there is none. Raises when the EXIF can't be read."""
+    comment = image.getexif().get_ifd(0x8769).get(0x9286)
+    if comment is None:
+        return None
+    # Pillow gives bytes; a tuple, a list or one number of bytes, or a text,
+    # are the same bytes in another form.
+    if isinstance(comment, int):
+        comment = (comment,)
+    if isinstance(comment, str):
+        comment = comment.encode("latin-1", errors="replace")
+    elif isinstance(comment, (tuple, list)):
+        comment = bytes(comment)
+    if not isinstance(comment, bytes):
+        msg = f"unreadable EXIF comment ({type(comment).__name__})"
+        raise TypeError(msg)
+    try:
+        import piexif.helper
+
+        load = piexif.helper.UserComment.load
+    except Exception:  # noqa: BLE001 — read below as piexif reads it
+        load = None
+    if load is not None:
+        try:
+            return load(comment)
+        except ValueError:
+            # The WebUI's reader: any other form as UTF-8 text.
+            return comment.decode("utf8", errors="ignore")
+        except Exception:  # noqa: BLE001 — read below
+            pass
+    # piexif's own reading: an 8-byte prefix names the text's encoding.
+    encoding = {
+        b"ASCII\x00\x00\x00": "ascii",
+        b"JIS\x00\x00\x00\x00\x00": "shift_jis",
+        b"UNICODE\x00": "utf_16_be",
+    }.get(comment[:8])
+    if encoding is None:
+        return comment.decode("utf8", errors="ignore")
+    return comment[8:].decode(encoding, errors="replace")
+
+
+def _prompts_saved_in_image(image) -> tuple[str, str] | None:
+    """Settings > ADetailer "Run ADetailer on an image uses the prompt saved
+    in the image": the main prompt and negative prompt the WebUI saved in a
+    picture (a PNG's "parameters" text, the EXIF comment of a JPEG or WebP),
+    read with the WebUI's own reader. None when the picture has none. Raises
+    on a WebUI without the reader, or when the reader fails and the EXIF
+    comment can't be read without it either (_exif_comment_saved_in_image).
+
+    The reader also gives back any other comment (a JPEG's "Created with
+    GIMP", a camera's "OLYMPUS DIGITAL CAMERA"): a text counts as the WebUI's
+    parameters only when its last line is a WebUI parameters line, by the
+    WebUI's own rule; any other text is None, as a picture without one.
+
+    Only the two prompts are taken, split as the WebUI splits them: the last
+    line holds the other parameters (the tabs' "ADetailer prompt" too) and is
+    left out. The WebUI's parse_generation_parameters is not used: it also
+    takes the text of a saved style out of the prompt (this pass applies no
+    style) and drops the fields of "Fields to skip when pasting"."""
+    reader = getattr(images, "read_info_from_image", None)
+    if not callable(reader):
+        msg = "this WebUI has no reader for the saved parameters"
+        raise AttributeError(msg)
+    try:
+        found = reader(image)[0]
+    except Exception as error:  # noqa: BLE001
+        # The reader stops on the EXIF of a JPEG turned upright (a camera's
+        # portrait photo, or a picture rotated in a viewer): Pillow writes
+        # its comment back as another type, which piexif gives as numbers.
+        # Read it then with Pillow; when that fails too, the reader's error.
+        try:
+            found = _exif_comment_saved_in_image(image)
+        except Exception:  # noqa: BLE001
+            raise error from None
+    # The reader prefers a non-empty EXIF comment to a PNG's own "parameters":
+    # a blank one, or another program's, would hide them. Those are tried
+    # next, by the same rule.
+    info = getattr(image, "info", None)
+    parameters = info.get("parameters") if isinstance(info, dict) else None
+    for text in (found, parameters):
+        if isinstance(text, str):
+            # Many cameras write an EXIF comment of zero bytes, which the
+            # reader gives back as NUL characters: no prompt.
+            text = text.replace("\x00", "")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        # The WebUI's own pattern for one "Name: value" of the parameters
+        # line, and its rule for that line: at least three of them. A camera's
+        # comment can have three too ("Make: ..., Model: ..., ISO: ..."), so
+        # the line must also start with "Steps:", as the WebUI always writes
+        # it (create_infotext).
+        param = re.compile(r'\s*(\w[\w \-/]+):\s*("(?:\\.|[^\\"])+"|[^,]*)(?:,|$)')
+        *lines, last = text.strip().split("\n")
+        if len(param.findall(last)) < 3 or not re.match(r"\s*Steps:", last):
+            # Not the WebUI's parameters: another program's comment.
+            continue
+        prompt = negative = ""
+        in_negative = False
+        for raw in lines:
+            line = raw.strip()
+            if line.startswith("Negative prompt:"):
+                in_negative = True
+                line = line[16:].strip()
+            if in_negative:
+                negative += ("" if negative == "" else "\n") + line
+            else:
+                prompt += ("" if prompt == "" else "\n") + line
+        return prompt, negative
+    return None
+
+
+def _with_prompts_saved_in_image(text: str, prompt: str, negative: str) -> str:
+    """The parameters the WebUI put on the result of "Run ADetailer on an
+    image", with the main prompt and negative prompt read from the picture
+    (_prompts_saved_in_image) in place of the ones the WebUI wrote there:
+    those of the last region's img2img pass, i.e. the tab's prompt. The last
+    line, the other parameters with the tab's "ADetailer prompt", is kept.
+    Built as the WebUI's create_infotext builds it."""
+    # The WebUI's own pattern for one "Name: value" of the parameters line.
+    param = re.compile(r'\s*(\w[\w \-/]+):\s*("(?:\\.|[^\\"])+"|[^,]*)(?:,|$)')
+    last = text.strip().split("\n")[-1]
+    params = last if len(param.findall(last)) >= 3 else ""
+    negative_text = f"\nNegative prompt: {negative}" if negative else ""
+    return f"{prompt}{negative_text}\n{params}".strip()
+
+
+def _transparency_of(image):
+    """Settings > ADetailer "Run ADetailer on an image and Skip img2img keep
+    the transparency of the picture": the alpha channel of a picture with
+    transparent or see-through parts (RGBA, LA, PA, or P / L / RGB with a transparent
+    colour), as an "L" image. None for a picture without any: an opaque RGBA
+    one, as the input box gives every picture, has none either."""
+    mode = getattr(image, "mode", None)
+    info = getattr(image, "info", None) or {}
+    if mode not in ("RGBA", "LA", "PA") and "transparency" not in info:
+        return None
+    alpha = image.convert("RGBA").getchannel("A")
+    return alpha if alpha.getextrema()[0] < 255 else None
+
+
+def _with_transparency(image, alpha):
+    """`image`, the result of the pass, with the picture's alpha channel
+    (_transparency_of) put back; its parameters stay. A result of another
+    size (the whole picture inpainted at a capped size) gets the alpha
+    stretched to its size, as the pass stretched the picture."""
+    if alpha.size != image.size:
+        alpha = alpha.resize(image.size, Image.LANCZOS)
+    result = image.convert("RGBA")
+    result.putalpha(alpha)
+    return result
+
+
+def _host_format_keeps_transparency(extension, size) -> bool:
+    """Whether the WebUI keeps the alpha channel in a file it saves in this
+    format ("png", "jpg", "webp", ...): a tiny transparent picture is written
+    to memory with the WebUI's own writer and read back. AUTOMATIC1111 writes
+    WebP without it, Forge Neo with it; JPEG never has it. A WebUI without
+    that writer: only PNG and TIFF count."""
+    ext = str(extension)
+    try:
+        # The WebUI writes a WebP too large for that format as PNG.
+        if ext.lower() == "webp" and max(size) > 16383:
+            ext = "png"
+        import io
+
+        buffer = io.BytesIO()
+        probe = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+        images.save_image_with_geninfo(probe, None, buffer, f".{ext}")
+        buffer.seek(0)
+        with Image.open(buffer) as back:
+            return back.mode in ("RGBA", "LA", "PA") or "transparency" in back.info
+    except Exception:  # noqa: BLE001 — a WebUI without that writer
+        return ext.lower() in ("png", "tif", "tiff")
 
 
 # A __name__ wildcard of Dynamic Prompts or of the "wildcards" extension: a
@@ -1551,6 +1901,12 @@ class AfterDetailerScript(scripts.Script):
             model_mapping=model_mapping,
             refresh_models=refresh_model_mapping,
             scheduler_endings=_scheduler_endings(),
+            lora_names=_lora_names,
+            lora_aliases=_lora_aliases,
+            reads_lyco=_reads_lyco_tags,
+            sort_order=_sort_order_settings,
+            main_prompt=img2img_prompt_box if is_img2img else txt2img_prompt_box,
+            strip_comments=_strip_host_comments,
         )
 
         components, infotext_fields = adui(num_models, is_img2img, webui_info, script=self)
@@ -1780,6 +2136,16 @@ class AfterDetailerScript(scripts.Script):
                 key = name + suffix(n)
                 if key in params and not str(params[key]).strip():
                     del params[key]
+            # "ADetailer model hash": the short hash of the detector's file
+            # (a MediaPipe detector has none). "ADetailer checkpoint hash":
+            # the one the WebUI already knows for the tab's own checkpoint,
+            # never worked out here. Without a hash the key is not written,
+            # and no hash is ever the reason a generation fails.
+            try:
+                detector = None if args.is_mediapipe() else model_mapping.get(args.ad_model)
+                add_model_hashes(params, n, detector)
+            except Exception:  # noqa: BLE001
+                pass
         params["ADetailer version"] = __version__
         # "Detailed region opacity", written only when it changes the result.
         try:
@@ -2030,6 +2396,30 @@ class AfterDetailerScript(scripts.Script):
                     stripped = _strip_host_comments(typed)
                     if stripped != typed and apply(stripped, styles) == styled:
                         return [stripped]
+                    # Another extension changed the main prompt (a wildcard
+                    # drawn in all_prompts; Dynamic Prompts also leaves the
+                    # styled text in p.prompt): take the text the styles
+                    # wrap, found by styling a mark, and only when the styles
+                    # give back exactly the host's text from it. Anything
+                    # else is left as it is, never cut.
+                    mark = "\x00"
+                    for clean in (str, _strip_host_comments):
+                        if mark in styled:
+                            break
+                        if clean(apply("", styles)) == styled:
+                            return [""]
+                        wrapped = clean(apply(mark, styles))
+                        if wrapped.count(mark) != 1:
+                            continue
+                        head, tail = wrapped.split(mark)
+                        inner = styled[len(head) : len(styled) - len(tail)]
+                        if (
+                            len(styled) >= len(head) + len(tail)
+                            and styled.startswith(head)
+                            and styled.endswith(tail)
+                            and clean(apply(inner, styles)) == styled
+                        ):
+                            return [inner]
             except Exception:  # noqa: BLE001
                 pass
             return all_prompts
@@ -2157,12 +2547,26 @@ class AfterDetailerScript(scripts.Script):
         if args.ad_use_clip_skip:
             d["CLIP_stop_at_last_layers"] = args.ad_clip_skip
 
-        if (
-            args.ad_use_checkpoint
-            and args.ad_checkpoint
-            and args.ad_checkpoint not in ("None", "Use same checkpoint")
-        ):
+        # Settings > ADetailer "With hires fix, detail with the hires
+        # checkpoint": a tab without its own checkpoint details the picture
+        # with the model that drew it, and on Forge / Forge Neo with the hires
+        # VAE / text encoder choices, as the WebUI gives them to its hires pass.
+        hires_modules = None
+        if _own_checkpoint(args) is not None:
             d["sd_model_checkpoint"] = args.ad_checkpoint
+        else:
+            hires = _hires_checkpoint(_p)
+            if hires is not None and _setting_frozen("sd_model_checkpoint"):
+                # The host would refuse to set it: the main one, as before.
+                if "ad_hires_checkpoint" not in _FROZEN_REPORTED:
+                    _FROZEN_REPORTED.add("ad_hires_checkpoint")
+                    sys.stderr.write(
+                        "[-] ADetailer: the WebUI's settings are frozen, so the "
+                        "hires fix checkpoint is not used; the main one is.\n"
+                    )
+            elif hires is not None:
+                d["sd_model_checkpoint"] = hires
+                hires_modules = _hires_modules(_p)
 
         if (
             args.ad_use_vae
@@ -2183,9 +2587,15 @@ class AfterDetailerScript(scripts.Script):
         # If the running Forge build doesn't reload modules from override_settings
         # it simply no-ops — never a crash. None off Forge / when nothing changes.
         try:
-            _fmods = _forge_wanted_modules(args)
+            if hires_modules is None:
+                _fmods = _forge_wanted_modules(args)
+            else:
+                # The tab's own VAE / text encoder swap starts from the hires ones.
+                _fmods = _forge_wanted_modules(args, hires_modules)
         except Exception:  # noqa: BLE001 — never break the pass over this
             _fmods = None
+        if _fmods is None:
+            _fmods = hires_modules
         if _fmods is not None:
             d["forge_additional_modules"] = _fmods
         # With frozen settings the host refuses to set these for the pass and
@@ -2454,6 +2864,14 @@ class AfterDetailerScript(scripts.Script):
             and "sd_model_checkpoint" not in override_settings
         ):
             i2i.distilled_cfg_scale = p.distilled_cfg_scale
+        elif (
+            hasattr(p, "hr_distilled_cfg")
+            and _own_checkpoint(args) is None
+            and "sd_model_checkpoint" in override_settings
+        ):
+            # The hires fix checkpoint (Settings > ADetailer): the value the
+            # user gave its hires pass, made for that model.
+            i2i.distilled_cfg_scale = p.hr_distilled_cfg
 
         i2i.cached_c = [None, None]
         i2i.cached_uc = [None, None]
@@ -2772,6 +3190,20 @@ class AfterDetailerScript(scripts.Script):
                 image = p.init_images[i]
             else:
                 image = p.init_images[0]
+            # Settings > ADetailer "... keep the transparency of the picture":
+            # the init image's alpha channel is kept on p, and
+            # postprocess_image_after_composite puts it back on the result.
+            # Off: nothing is kept; a picture without transparency: None.
+            if (getattr(opts, "data", None) or {}).get(
+                "ad_apply_keep_transparency", False
+            ):
+                try:
+                    p._ad_skip_alpha = _transparency_of(image)
+                    if p._ad_skip_alpha is not None and image.mode != "RGBA":
+                        # LA and palette pictures are filled like RGBA ones.
+                        image = image.convert("RGBA")
+                except Exception:  # noqa: BLE001 — as with the option off
+                    p._ad_skip_alpha = None
             # The host fills the transparent parts of the init image with its
             # img2img background colour only in a copy of its own; dropping
             # the alpha channel instead turned them black.
@@ -2792,6 +3224,9 @@ class AfterDetailerScript(scripts.Script):
         settings from (the actual inpaint still runs on a REAL
         StableDiffusionProcessingImg2Img built by get_i2i_p), runs the detailer,
         and returns (result_image, status_str). Fully guarded — never raises."""
+        # Also on the answer of a pass that fails: a folder counts from it
+        # the pictures without a saved prompt.
+        prompt_note = ""
         try:
             import random
             from types import SimpleNamespace
@@ -2800,6 +3235,81 @@ class AfterDetailerScript(scripts.Script):
             # the job once, including for a whole folder. Never clear its
             # cancellation flags here: a request arriving between files must
             # remain visible to this pass and the folder loop.
+
+            # Settings > ADetailer: the main prompt and negative prompt saved
+            # in the picture, read before the transparency is filled (that
+            # makes a new picture without them). Off: both stay empty.
+            main_prompt, main_negative, prompt_note = "", "", ""
+            from_image = False
+            if (getattr(opts, "data", None) or {}).get(
+                "ad_apply_prompt_from_image", False
+            ):
+                # On: the result records the main prompts used, also when
+                # they are empty (no saved prompt, or it couldn't be read).
+                from_image = True
+                try:
+                    saved = _prompts_saved_in_image(image)
+                except Exception as e:  # noqa: BLE001 — as with the option off
+                    saved = None
+                    prompt_note = (
+                        " The prompt saved in the image couldn't be read, so "
+                        "the main prompt was empty."
+                    )
+                    line = (
+                        f"[-] ADetailer: couldn't read the prompt saved in the "
+                        f"image ({e}); the main prompt is empty.\n"
+                    )
+                else:
+                    if saved is None:
+                        prompt_note = (
+                            " The image has no saved prompt, so the main "
+                            "prompt was empty."
+                        )
+                        line = (
+                            "[-] ADetailer: the image has no saved prompt; "
+                            "the main prompt is empty.\n"
+                        )
+                if saved is not None:
+                    main_prompt, main_negative = saved
+                elif not getattr(self, "_ad_folder_run", False):
+                    # A folder run says it once, at its end, with the count:
+                    # not once for every photo, also when it couldn't be read.
+                    sys.stderr.write(
+                        line.encode("ascii", "backslashreplace").decode("ascii")
+                    )
+
+            # Settings > ADetailer: the result gets back the picture's alpha
+            # channel; the pass still works on the filled picture. Off, or a
+            # picture without transparency: as before.
+            alpha = None
+            if (getattr(opts, "data", None) or {}).get(
+                "ad_apply_keep_transparency", False
+            ):
+                try:
+                    alpha = _transparency_of(image)
+                    if alpha is not None and image.mode != "RGBA":
+                        # LA and palette pictures are filled like RGBA ones.
+                        image = image.convert("RGBA")
+                except Exception:  # noqa: BLE001 — as with the option off
+                    alpha = None
+
+            def transparency_back(result):
+                # The result with the picture's transparency, and a note for
+                # the answer when it couldn't be put back.
+                try:
+                    return _with_transparency(result, alpha), ""
+                except Exception as e:  # noqa: BLE001 — keep the filled result
+                    msg = (
+                        f"[-] ADetailer: couldn't put the transparency back "
+                        f"on the result ({e}).\n"
+                    )
+                    sys.stderr.write(
+                        msg.encode("ascii", "backslashreplace").decode("ascii")
+                    )
+                    return result, (
+                        " The transparency couldn't be put back on the result "
+                        "(see console)."
+                    )
 
             # Fill transparency with the img2img background colour, as the
             # host does before img2img (dropping the alpha turned it black).
@@ -2868,10 +3378,10 @@ class AfterDetailerScript(scripts.Script):
                 ad_params = {}
             p = SimpleNamespace(
                 sd_model=shared.sd_model,
-                prompt="",
-                negative_prompt="",
-                all_prompts=[""],
-                all_negative_prompts=[""],
+                prompt=main_prompt,
+                negative_prompt=main_negative,
+                all_prompts=[main_prompt],
+                all_negative_prompts=[main_negative],
                 seed=seed,
                 subseed=subseed,
                 all_seeds=[seed],
@@ -2900,6 +3410,27 @@ class AfterDetailerScript(scripts.Script):
                 override_settings={},
                 _ad_standalone=True,
             )
+            # A folder run warns about a tab's checkpoint of another model
+            # family once for the whole folder, not once for every picture:
+            # the tabs already warned stay on the script until the folder ends.
+            if getattr(self, "_ad_folder_run", False):
+                warned = getattr(self, "_ad_folder_family_warned", None)
+                if not isinstance(warned, set):
+                    warned = set()
+                    self._ad_folder_family_warned = warned
+                p._ad_family_warned = warned
+                # The same for a tab whose detector could not be used.
+                noted = getattr(self, "_ad_folder_detector_noted", None)
+                if not isinstance(noted, set):
+                    noted = set()
+                    self._ad_folder_detector_noted = noted
+                p._ad_detector_noted = noted
+                # And for a LoRA a tab's detailer pass names more than once.
+                loras = getattr(self, "_ad_folder_lora_noted", None)
+                if not isinstance(loras, set):
+                    loras = set()
+                    self._ad_folder_lora_noted = loras
+                p._ad_repeated_lora_noted = loras
 
             # NB: PPImage is a typing Protocol (helper.py) and cannot be
             # instantiated — _postprocess_image_inner only ever reads/reassigns
@@ -2919,6 +3450,8 @@ class AfterDetailerScript(scripts.Script):
             self._ad_nan_regions = 0
             self._ad_error_regions = 0
             self._ad_first_region_error = ""
+            self._ad_family_note = ""
+            self._ad_detector_note = ""
             self._ad_detected = False
             try:
                 # As in postprocess_image: puts back the tab's override
@@ -2938,29 +3471,79 @@ class AfterDetailerScript(scripts.Script):
                 except Exception:  # noqa: BLE001
                     pass
             if not processed:
+                # The picture handed back unchanged, with its transparency.
+                back_note = ""
+                if alpha is not None:
+                    image, back_note = transparency_back(image)
                 if (
                     getattr(state, "interrupted", False)
                     or getattr(state, "skipped", False)
                     or getattr(state, "stopping_generation", False)
                 ):
-                    return image, "ℹ️ Cancelled — image unchanged."
+                    return image, (
+                        "ℹ️ Cancelled — image unchanged." + prompt_note + back_note
+                    )
+                if " skipped: its checkpoint " in getattr(self, "_ad_family_note", ""):
+                    # The tab was skipped (_unloadable_tab_checkpoint): not
+                    # "nothing detected". No image, as for a failed run.
+                    return None, (
+                        "⚠️ ADetailer did not run." + prompt_note + _family_status_note(self)
+                    )
                 if getattr(self, "_ad_nan_regions", 0):
                     # Detected, but the inpaint failed: not "nothing detected".
                     # No image, so a folder run counts the file as failed.
-                    return None, "⚠️ ADetailer run failed: NaN error while inpainting."
+                    return None, (
+                        "⚠️ ADetailer run failed: NaN error while inpainting."
+                        + prompt_note
+                        + _family_status_note(self)
+                    )
                 if getattr(self, "_ad_error_regions", 0):
                     # The same for any other error while inpainting.
                     reason = getattr(self, "_ad_first_region_error", "") or "see console"
-                    return None, f"⚠️ ADetailer run failed: error while inpainting ({reason})."
+                    return None, (
+                        f"⚠️ ADetailer run failed: error while inpainting ({reason})."
+                        + prompt_note
+                        + _family_status_note(self)
+                    )
+                if getattr(self, "_ad_detector_note", ""):
+                    # The detector could not be used at all: not "nothing
+                    # detected". No image, so a folder run counts the file
+                    # as failed and gives this reason.
+                    return None, (
+                        f"⚠️ ADetailer run failed: {self._ad_detector_note}"
+                        + prompt_note
+                    )
                 if getattr(self, "_ad_detected", False):
                     # Found, but the detection numbers, the mask filters or
                     # [SKIP] left no region: not "nothing detected".
                     return image, (
                         "ℹ️ Detections found, but the detection numbers, mask "
                         "filters or [SKIP] left none to inpaint — image unchanged."
-                    )
-                return image, "ℹ️ Nothing detected — image unchanged."
-            status = "✅ ADetailer pass complete."
+                    ) + prompt_note + back_note
+                return image, (
+                    "ℹ️ Nothing detected — image unchanged." + prompt_note + back_note
+                )
+            if from_image:
+                # The WebUI wrote the region's img2img prompt (the tab's) as
+                # the result's main prompt: a next run on the result would
+                # take it as the picture's own. Put back the picture's
+                # prompts, read above, empty when there were none; the
+                # parameters line is kept.
+                try:
+                    text = pp.image.info.get("parameters")
+                    if isinstance(text, str) and text:
+                        pp.image.info["parameters"] = _with_prompts_saved_in_image(
+                            text, main_prompt, main_negative
+                        )
+                except Exception:  # noqa: BLE001 — keep the pass's parameters
+                    pass
+            status = "✅ ADetailer pass complete." + prompt_note + _family_status_note(self)
+            restored = False
+            if alpha is not None:
+                # After the parameters above, which the copy keeps.
+                pp.image, back_note = transparency_back(pp.image)
+                status += back_note
+                restored = not back_note
             nan = getattr(self, "_ad_nan_regions", 0)
             if nan:
                 # Other regions were detailed: say which part was not.
@@ -3013,6 +3596,26 @@ class AfterDetailerScript(scripts.Script):
                         p=self._standalone_infotext_p(p), info=info,
                     )
                     status += f" Saved to the '{AD_APPLY_SUBDIR}' folder."
+                    # The WebUI's file format (Settings > Saving images) is
+                    # kept: in one without transparency (JPEG) it says so.
+                    if restored and not _host_format_keeps_transparency(
+                        opts.samples_format, pp.image.size
+                    ):
+                        fmt = str(opts.samples_format)
+                        status += (
+                            " The saved file has no transparency: the WebUI "
+                            f"writes '{fmt}' files without it."
+                        )
+                        if not getattr(self, "_ad_folder_run", False):
+                            # A folder run says it once, with the count.
+                            msg = (
+                                "[-] ADetailer: the result was saved without its "
+                                f"transparency: the WebUI writes '{fmt}' files "
+                                "without it.\n"
+                            )
+                            sys.stderr.write(
+                                msg.encode("ascii", "backslashreplace").decode("ascii")
+                            )
                 except Exception as e:  # noqa: BLE001
                     print(
                         f"[-] ADetailer: couldn't save the preview result ({e}).",
@@ -3027,7 +3630,7 @@ class AfterDetailerScript(scripts.Script):
                 "[-] ADetailer: preview ADetailer run failed:\n" + _tb.format_exc(),
                 file=sys.stderr,
             )
-            return None, f"⚠️ ADetailer run failed: {e}"
+            return None, f"⚠️ ADetailer run failed: {e}" + prompt_note
 
     @staticmethod
     def get_each_tab_seed(seed: int, i: int):
@@ -3529,6 +4132,11 @@ class AfterDetailerScript(scripts.Script):
             # case when img2img inpainting with skip img2img
             return
 
+        # Forge / Forge Neo: the main model's family, learnt here too, where
+        # the WebUI has just loaded the main model. With a Hires checkpoint
+        # the detailer passes find the hires model loaded instead.
+        _main_model_family()
+
         arg_list = self.get_args(p, *args_)
 
         if hasattr(p, "_ad_xyz_prompt_sr"):
@@ -3858,6 +4466,8 @@ class AfterDetailerScript(scripts.Script):
                     )
                 ):
                     pp.image = initial_image
+                    # Nor are the prompts of the classes done so far.
+                    drop_resolved_prompts(p, n)
                     print(
                         f"[-] ADetailer: sequential class pass on tab "
                         f"{n + 1} was skipped - rolled back to the "
@@ -3870,6 +4480,16 @@ class AfterDetailerScript(scripts.Script):
         i = get_i(p)
 
         i2i = self.get_i2i_p(p, args, pp.image)
+        # Forge / Forge Neo: a tab whose own checkpoint cannot be loaded with
+        # the main model's VAE file its pass would keep is skipped, before
+        # anything is detected or loaded. The failed load left the WebUI
+        # without a model and the whole generation was lost with it.
+        skip_note = _unloadable_tab_checkpoint(
+            p, args, n, getattr(i2i, "override_settings", None)
+        )
+        if skip_note:
+            self._ad_family_note = skip_note
+            return False
         # A __name__ wildcard the main prompt also holds takes the value drawn
         # there for this image. Asked for here, on the text the pass will use
         # (comments gone, X/Y/Z S/R applied, every [SEP] part, the append
@@ -3877,6 +4497,38 @@ class AfterDetailerScript(scripts.Script):
         # options); get_prompt also records the X/Y/Z parameters, which keep
         # the tab's text as typed.
         ad_prompts, ad_negatives = self.get_prompt(p, args, False, n)
+        # For the "ADetailer resolved prompt" parameters: the same texts
+        # without those values, asked for only when the tab took some. A part
+        # that differs had a wildcard ADetailer itself resolved.
+        plain_prompts, plain_negatives = ad_prompts, ad_negatives
+        try:
+            if any(_main_wildcard_picks(p, args, -1)):
+                plain_prompts, plain_negatives = self.get_prompt(p, args)
+        except Exception:  # noqa: BLE001 -- unsure: no part counts as resolved
+            pass
+        # One entry per region, in order: its prompts and whether a wildcard
+        # or variant in them was resolved (see keep_resolved_prompts).
+        resolved_regions: list[list] = []
+        # What a script of the pass can draw in them: Dynamic Prompts' variant
+        # and wildcard marks, and its own ones of Settings > Dynamic Prompts.
+        draw_marks = list(_DYNAMIC_PROMPTS_MARKS[:2])
+        try:
+            for key in ("dp_parser_variant_start", "dp_parser_wildcard_wrap"):
+                mark = opts.data.get(key)
+                if isinstance(mark, str) and mark.strip():
+                    draw_marks.append(mark.strip())
+        except Exception:  # noqa: BLE001 -- the usual marks
+            pass
+
+        def took_main_value(plain: list[str], own: list[str], j: int) -> bool:
+            # Region j's [SEP] part, as i2i_prompts_replace picks it.
+            try:
+                return (
+                    plain is not own
+                    and plain[min(j, len(plain) - 1)] != own[min(j, len(own) - 1)]
+                )
+            except Exception:  # noqa: BLE001
+                return False
         # A [PROMPT=words] token that left the whole prompt empty: said
         # once per tab and generation, also without the verbose log.
         # The same for a region its own [CLASS=...] block leaves empty, below.
@@ -3930,12 +4582,32 @@ class AfterDetailerScript(scripts.Script):
                     ),
                     use_bbox_mask=args.ad_use_bbox_mask,
                     imgsz=args.ad_detection_resolution,
+                    # The detector stays loaded until the WebUI job ends.
+                    keep_loaded=True,
                 )
 
         _det_ms = (time.perf_counter() - _t_det) * 1000
 
         if pred.preview is None:
             _verbose_detection(pred, [], _det_ms)
+            note = getattr(pred, "note", "")
+            if note:
+                # The detector could not be used at all (for example a model
+                # that is not a detection model): not "nothing detected".
+                # Said once per tab and generation; the answer of "Run
+                # ADetailer on an image" repeats it.
+                self._ad_detector_note = note
+                noted = getattr(p, "_ad_detector_noted", None)
+                if not isinstance(noted, set):
+                    noted = set()
+                    p._ad_detector_noted = noted
+                if n not in noted:
+                    noted.add(n)
+                    line = f"[-] ADetailer: tab {n + 1} inpaints nothing: {note}\n"
+                    sys.stderr.write(
+                        line.encode("ascii", "backslashreplace").decode("ascii")
+                    )
+                return False
             print(
                 f"[-] ADetailer: nothing detected on image {i + 1} with {ordinal(n + 1)} settings."
             )
@@ -4078,6 +4750,10 @@ class AfterDetailerScript(scripts.Script):
             if re.match(r"^\s*\[SKIP\]\s*$", p2.prompt):
                 if _v:
                     _regions.append({"j": j, "skipped": True})
+                # Keeps its place among the regions' resolved prompts.
+                resolved_regions.append(
+                    ["[SKIP]", getattr(p2, "negative_prompt", ""), False, False]
+                )
                 continue
 
             self._apply_auto_class_guard(
@@ -4120,6 +4796,12 @@ class AfterDetailerScript(scripts.Script):
                         p2.styles = []
                 except Exception:  # noqa: BLE001 — the host applies them, as before
                     pass
+
+            # The same LoRA more than once in this region's final prompt (the
+            # tab's own tag next to the one [PROMPT], a blank prompt, the
+            # append text or a style brings): the host would load it once per
+            # tag. Said once per generation, tab and LoRA; nothing is changed.
+            _repeated_lora_note(p, p2, n, getattr(i2i, "scripts", None))
 
             # "Save inpaint masks": the mask this region is inpainted with, after
             # every mask setting, kept here and saved once the region is
@@ -4169,6 +4851,21 @@ class AfterDetailerScript(scripts.Script):
                         "Prompts not run, no wildcard or variant in the prompts."
                     )
 
+            # The region's prompts as the host is handed them, with the
+            # styles it will add: what the host used is compared with them
+            # below. A region that fails keeps these, and its place.
+            region_prompts = [
+                p2.prompt,
+                getattr(p2, "negative_prompt", ""),
+                took_main_value(plain_prompts, ad_prompts, j),
+                took_main_value(plain_negatives, ad_negatives, j),
+            ]
+            region_styles = list(getattr(p2, "styles", None) or [])
+            resolved_regions.append(region_prompts)
+
+            # Forge / Forge Neo: the main model's family, learnt while it is
+            # still the model loaded (see _warn_other_family_modules).
+            _main_model_family()
             try:
                 processed = process_images(p2)
             except NansException as e:
@@ -4235,6 +4932,13 @@ class AfterDetailerScript(scripts.Script):
                 processed = None
                 break
             finally:
+                # A tab's own checkpoint of another family that kept the main
+                # model's VAE / text encoder files: once per generation and tab.
+                family_note = _warn_other_family_modules(
+                    p, args, n, getattr(p2, "override_settings", None)
+                )
+                if family_note:
+                    self._ad_family_note = family_note
                 p2.close()
                 if isinstance(_hijack_params, dict):
                     try:
@@ -4285,6 +4989,19 @@ class AfterDetailerScript(scripts.Script):
             # keep printing none.
             if not getattr(p, "_ad_standalone", False):
                 self.compare_prompt(p.extra_generation_params, processed, n=n)
+            # The prompts the host really used for this region: counted as
+            # resolved when the one handed over held a wildcard or variant
+            # and a script of the pass (Dynamic Prompts, the "wildcards"
+            # extension) drew it. Not for a LoRA tag the host added to it
+            # (Settings > Extra Networks "Add network to prompt").
+            note_used_prompts(
+                region_prompts,
+                processed,
+                region_styles,
+                getattr(shared, "prompt_styles", None),
+                _strip_host_comments,
+                draw_marks,
+            )
             # Named like the preview of this pass plus the region number. A
             # failed save never stops the pass.
             if region_mask is not None:
@@ -4333,9 +5050,24 @@ class AfterDetailerScript(scripts.Script):
 
         if processed is not None:
             pp.image = processed.images[0]
+            # "ADetailer resolved prompt": written only for a tab where a
+            # wildcard or variant was resolved. Not for "Run ADetailer on an
+            # image" and folder runs: their pass runs no script that draws
+            # one, and their result keeps the parameters the host gave it.
+            if not getattr(p, "_ad_standalone", False):
+                keep_resolved_prompts(p, n, resolved_regions)
             return True
 
         return False
+
+    def before_process_batch(self, p, *args_, **kwargs):  # noqa: ARG002
+        # A new batch of the job (Batch count): the "ADetailer resolved
+        # prompt" keys still in the parameters are those of the last image of
+        # the batch before. Taken out before the WebUI saves this batch's
+        # "before highres fix" copies, which it writes while it samples. A
+        # WebUI that never calls this hook loses nothing: postprocess_image()
+        # takes them out for the image itself.
+        start_resolved_prompts(p)
 
     @rich_traceback
     def postprocess_image(self, p, pp: PPImage, *args_):
@@ -4345,6 +5077,8 @@ class AfterDetailerScript(scripts.Script):
             getattr(p, "extra_generation_params", None),
             getattr(self, "_ad_network_hashes", None),
         )
+        # The same for the prompts its passes resolved.
+        start_resolved_prompts(p)
         # As in process(): an X/Y/Z axis may give the 1st tab its detector.
         tabs = [arg for arg in self._drop_api_default_tab(args_) if isinstance(arg, dict)]
         xyz_tab = [{**tabs[0], **p._ad_xyz}] if tabs and hasattr(p, "_ad_xyz") else []
@@ -4422,6 +5156,11 @@ class AfterDetailerScript(scripts.Script):
                         continue
                     tab_processed = self._postprocess_image_inner(p, pp, args, n=n)
                     is_processed |= tab_processed
+                    # The pass has just loaded the tab's own checkpoint, and
+                    # with it the WebUI worked out its hash: written now when
+                    # it was not known as the generation started.
+                    if tab_processed:
+                        add_model_hashes(getattr(p, "extra_generation_params", None), n)
                     # Save the image right after THIS tab finished its inpaint
                     # pass(es), so the user gets one file per ADetailer stage and
                     # can roll back to a previous one if the next pass spoils it.
@@ -4465,7 +5204,59 @@ class AfterDetailerScript(scripts.Script):
 
             self.write_params_txt(params_txt_content)
 
+    def postprocess_image_after_composite(self, p, pp: PPImage, *args_):  # noqa: ARG002
+        # Settings > ADetailer "... keep the transparency of the picture" with
+        # Skip img2img: the init image's alpha channel, kept by
+        # get_i2i_init_image, goes back on the result here, after the WebUI's
+        # own last steps (colour correction) and right before it saves the
+        # image. Nothing kept (the option off, no Skip img2img, a picture
+        # without transparency, the detailer's own passes): nothing is touched.
+        alpha = getattr(p, "_ad_skip_alpha", None)
+        if alpha is None:
+            return
+        try:
+            # Once: the img2img Batch tab reuses p for the next file.
+            p._ad_skip_alpha = None
+            pp.image = _with_transparency(pp.image, alpha)
+        except Exception as e:  # noqa: BLE001 — keep the filled result
+            msg = (
+                f"[-] ADetailer: couldn't put the transparency back on the "
+                f"result ({e}).\n"
+            )
+            sys.stderr.write(msg.encode("ascii", "backslashreplace").decode("ascii"))
+            return
+        # The WebUI's file format (Settings > Saving images) is kept: in one
+        # without transparency (JPEG) the job says so once, in the console and
+        # in the WebUI's own notes under the results.
+        try:
+            if getattr(p, "_ad_skip_alpha_noted", False):
+                return
+            try:
+                saved = p.save_samples()
+            except Exception:  # noqa: BLE001 — a WebUI without that method
+                saved = not getattr(p, "do_not_save_samples", False)
+            fmt = str(getattr(opts, "samples_format", "png"))
+            if not saved or _host_format_keeps_transparency(fmt, pp.image.size):
+                return
+            p._ad_skip_alpha_noted = True
+            note = (
+                "ADetailer: the Skip img2img result is saved without its "
+                f"transparency: the WebUI writes '{fmt}' files without it."
+            )
+            sys.stderr.write(
+                f"[-] {note}\n".encode("ascii", "backslashreplace").decode("ascii")
+            )
+            p.comment(note)
+        except Exception:  # noqa: BLE001 — the note must never cost the result
+            pass
+
     def postprocess(self, p, processed, *args_):  # noqa: ARG002
+        # The real result (it has images), not the stand-in one of
+        # postprocess_image(): the "ADetailer resolved prompt" keys of the
+        # job's last image do not stay in the parameters for what reads them
+        # after the job with the first image's prompt and seed.
+        if getattr(processed, "images", None):
+            end_resolved_prompts(p)
         # The pictures that another script gave to the stand-in result of
         # postprocess_image() belong to the real one: that has images. Their
         # parameters come after those of the images, as without ADetailer.
@@ -4530,6 +5321,821 @@ class AfterDetailerScript(scripts.Script):
             infotexts.insert(start + k, text)
 
 
+def _own_checkpoint(args: ADetailerArgs) -> "str | None":
+    """The tab's own "Use separate checkpoint" choice, or None when it has none."""
+    if (
+        args.ad_use_checkpoint
+        and args.ad_checkpoint
+        and args.ad_checkpoint not in ("None", "Use same checkpoint")
+    ):
+        return args.ad_checkpoint
+    return None
+
+
+def _hires_checkpoint(p) -> "str | None":
+    """Settings > ADetailer "With hires fix, detail with the hires checkpoint":
+    the checkpoint the hires fix pass of ``p`` ran with, or None when the
+    option is off, without hires fix (img2img, "Run ADetailer on an image")
+    or when hires fix used the main checkpoint ("Use same checkpoint", where
+    the WebUI sets no ``hr_checkpoint_info``)."""
+    if not (getattr(opts, "data", None) or {}).get("ad_hires_checkpoint", False):
+        return None
+    if not getattr(p, "enable_hr", False):
+        return None
+    title = getattr(getattr(p, "hr_checkpoint_info", None), "title", None)
+    return title if isinstance(title, str) and title else None
+
+
+def _hires_modules(p) -> "list | None":
+    """Forge / Forge Neo: the VAE / text encoder files the WebUI gives the hires
+    fix pass of ``p`` ("Hires VAE / Text Encoder"), resolved and sorted as its
+    ``modules_change`` does, or None when it keeps the main ones ("Use same
+    choices", or a WebUI without the field). An empty list is "Built-in"."""
+    choices = getattr(p, "hr_additional_modules", None)
+    if not isinstance(choices, list) or "Use same choices" in choices:
+        return None
+    try:
+        import modules_forge.main_entry as _fme  # Forge only
+
+        module_list = getattr(_fme, "module_list", None)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(module_list, dict):
+        return None
+    names = [Path(str(choice)).name for choice in choices]
+    return sorted((module_list[name] for name in names if name in module_list), key=str)
+
+
+# Forge / Forge Neo model families, named after the engine the WebUI loads a
+# checkpoint with. The VAE and text encoders of SD 1.5, SD 2 and SDXL fit no
+# other family: with another family's files a pass is broken or fails.
+_CLIP_FAMILIES = frozenset({"sd1", "sd2", "sdxl"})
+_FAMILY_NAMES = {
+    "sd1": "SD 1.5", "sd2": "SD 2", "sdxl": "SDXL", "flux": "Flux",
+    "chroma": "Chroma", "zimage": "Z-Image", "anima": "Anima",
+    "lumina": "Lumina", "qwen": "Qwen-Image", "wan": "Wan",
+}
+# Family of each main checkpoint (by file), learnt while it was the model loaded.
+_MAIN_FAMILY_SEEN = {}
+
+
+def _model_family(model) -> "str | None":
+    """Family of a model Forge / Forge Neo loaded, from its engine (SDXL, SD 1.5
+    and SD 2 by the engine's own flags, the others by the engine's module:
+    flux, chroma, zimage, anima, ...). None on the other WebUIs, for the
+    placeholder of a model that failed to load, or when unknown."""
+    try:
+        module = str(getattr(type(model), "__module__", "") or "")
+        prefix = "backend.diffusion_engine."
+        if not module.startswith(prefix):
+            return None
+        for flag, family in (("is_sdxl", "sdxl"), ("is_sd2", "sd2"), ("is_sd1", "sd1")):
+            if getattr(model, flag, False) is True:
+                return family
+        name = module[len(prefix):]
+        return {"sd15": "sd1", "sd20": "sd2"}.get(name, name) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _main_model_family() -> "str | None":
+    """Forge / Forge Neo: family of the main checkpoint (the one the WebUI's
+    settings load). Learnt while the model loaded is exactly the one the
+    settings ask for (the WebUI's own check before it reloads); after a pass
+    that loaded another model, the family learnt before. None when unknown."""
+    try:
+        data = modules.sd_models.model_data
+        params = data.forge_loading_parameters
+        key = getattr(params.get("checkpoint_info"), "filename", None)
+        if not key:
+            return None
+        if data.forge_hash and data.forge_hash == str(params):
+            family = _model_family(data.sd_model)
+            if family:
+                if len(_MAIN_FAMILY_SEEN) >= 32:
+                    _MAIN_FAMILY_SEEN.clear()
+                _MAIN_FAMILY_SEEN[key] = family
+            return family
+        return _MAIN_FAMILY_SEEN.get(key)
+    except Exception:  # noqa: BLE001 — not Forge, or the API differs
+        return None
+
+
+# What to do with a VAE file of the main model kept outside a folder named VAE.
+_MOVE_MAIN_VAE = (
+    "move the main model's VAE file into a folder named VAE (such as "
+    "models/VAE) and pick it again in the WebUI's 'VAE / Text Encoder' list"
+)
+_NO_CHOICE_TAKES_OUT_VAE = (
+    "no choice of the tab takes out a file that is not in a folder named VAE, "
+    "and the WebUI can read it after the tab's."
+)
+
+
+def _main_file_folder(module) -> str:
+    """How _forge_wanted_modules tells a file of the main model, by its
+    folder alone: "te" (taken out by "None" or a file in the tab's 'Use
+    separate text encoder'), "vae" (by Automatic or a file in 'Use separate
+    VAE'), "" (by no choice of the tab)."""
+    where = str(module).replace("\\", "/").lower()
+    if "text_encoder" in where or "text encoder" in where:
+        return "te"
+    if "/vae/" in where or Path(where).parent.name.lower() == "vae":
+        return "vae"
+    return ""
+
+
+def _stuck_main_files(named) -> "tuple[list, list, str]":
+    """Among `named`, files of the main model a pass keeps, those no choice
+    of the tab takes out (_main_file_folder): (the names of the VAE files,
+    the names of the others, the advice to move the others, "" without
+    them). Only reads the headers of the files."""
+    stuck_vae, stuck_other, unread = [], [], False
+    for module in named:
+        if _main_file_folder(module):
+            continue
+        kept_facts = _model_file_facts(module)
+        if kept_facts and kept_facts[1] is not None:
+            stuck_vae.append(Path(str(module)).name)
+        else:
+            stuck_other.append(Path(str(module)).name)
+            unread = unread or kept_facts is None
+    take_out = ""
+    if stuck_other:
+        it = "it" if len(stuck_other) == 1 else "them"
+        take_out = (
+            f"No choice of the tab takes out "
+            f"{', '.join(stuck_other)}, not in a folder named "
+            f"text_encoder{' or VAE' if unread else ''}: move {it} into "
+            "a folder named text_encoder (such as models/text_encoder"
+            f"{'; a VAE file into models/VAE' if unread else ''}) and "
+            f"pick {it} again in the WebUI's 'VAE / Text Encoder' list. "
+            "From there the tab's 'Use separate text encoder' with "
+            f"\"None (use detailer checkpoint's own)\" takes {it} out"
+            f"{' (a VAE file: Use separate VAE with Automatic or a file)' if unread else ''}."
+        )
+    return stuck_vae, stuck_other, take_out
+
+
+def _warn_other_family_modules(p, args: ADetailerArgs, n: int, override) -> str:
+    """Forge / Forge Neo, after a pass of tab ``n`` with its own checkpoint:
+    when that checkpoint and the main one are of different families, one of
+    them SD 1.5 / SD 2 / SDXL, and the pass kept VAE / text encoder files of
+    the main model, say so once per generation and tab. The same when the
+    tab's checkpoint did not even load with those files (its family is then
+    unknown). A warning only: the pass already ran. Returns the console line,
+    or "" (also when unsure)."""
+    try:
+        own = _own_checkpoint(args)
+        override = override if isinstance(override, dict) else {}
+        # The host drops a checkpoint it cannot find: then the main one ran.
+        if own is None or override.get("sd_model_checkpoint") != own:
+            return ""
+        warned = getattr(p, "_ad_family_warned", None)
+        if not isinstance(warned, set):
+            warned = set()
+            p._ad_family_warned = warned
+        if n in warned:
+            return ""
+        main = _main_model_family()
+        data = modules.sd_models.model_data
+        loaded = data.sd_model
+        tab = _model_family(loaded)
+        # No model, or the host's placeholder (Forge leaves None, Forge Neo
+        # its FakeInitialModel): the tab's checkpoint did not load, so its
+        # family is unknown. With the main model's files kept that is the
+        # usual outcome (an SDXL checkpoint does not load with Flux's VAE).
+        # The main model's family is not needed to say so.
+        failed = (
+            not tab
+            and (loaded is None or type(loaded).__name__ == "FakeInitialModel")
+            and bool(getattr(data, "forge_loading_parameters", None))
+        )
+        if not failed and (
+            not main or not tab or main == tab or not ({main, tab} & _CLIP_FAMILIES)
+        ):
+            return ""
+        main_modules = list(getattr(shared.opts, "forge_additional_modules", []) or [])
+        used = override.get("forge_additional_modules", main_modules)
+        kept = [Path(str(m)).name for m in used or [] if m in main_modules]
+        # A VAE file picked in the tab is read after the main model's and
+        # takes its place (as _unloadable_tab_checkpoint counts it). When the
+        # last VAE of the list is such a file, with the latent channels of
+        # the family that loaded, the main model's VAE files before it are
+        # not what the pass used: they are not named, and the advice that
+        # put the tab's file there is not given again.
+        own_vae = None
+        # Whether the tab's 'Use separate VAE' holds a file, and whether one
+        # with the channels of the family that loaded is in the list.
+        vae_chosen = bool(getattr(args, "ad_use_vae", False)) and getattr(
+            args, "ad_vae", None
+        ) not in (None, "", "None", "Use same VAE", "Automatic")
+        has_own = False
+        if not failed and _VAE_CHANNELS.get(tab):
+            rival = False
+            for module in used or []:
+                vae_facts = _model_file_facts(module)
+                if vae_facts is None:
+                    own_vae = None  # not readable: it could be a VAE too
+                elif vae_facts[1] is not None:
+                    fits = module not in main_modules and vae_facts[1] == _VAE_CHANNELS[tab]
+                    own_vae = module if fits else None
+                    has_own = has_own or fits
+                    # The place in this list is not the order of reading:
+                    # Forge Neo sorts the files by path before it reads them
+                    # (modules_forge.main_entry.modules_change), and the last
+                    # VAE read is the one the checkpoint is left with. A VAE
+                    # of the main model that the checkpoint loads with too
+                    # (the same channels, or a layout not read here) can be
+                    # that one, wherever it is in the list. Not one saved
+                    # with a checkpoint's prefix for a family of other
+                    # channels: Forge Neo lays it only over an SD 1.5 / SDXL
+                    # checkpoint (backend/loader.py, replace_state_dict,
+                    # "VAE format 0").
+                    if module in main_modules and (
+                        vae_facts[1] == _VAE_CHANNELS[tab]
+                        or (
+                            vae_facts[1] <= 0
+                            and (_VAE_CHANNELS[tab] == 4 or str(module) not in _PREFIXED_VAES)
+                        )
+                    ):
+                        rival = True
+            if rival:
+                own_vae = None
+        named = [m for m in used or [] if m in main_modules]
+        folder = _main_file_folder
+
+        if own_vae is not None:
+            named = [m for m in named if (_model_file_facts(m) or (None, None))[1] is None]
+            kept = [Path(str(m)).name for m in named]
+        if not kept:
+            return ""
+        warned.add(n)
+        # The files named that no choice of the tab takes out: advice on
+        # "None" or Automatic, once followed, would leave them there and come
+        # again. What is left to do is to move them where the tab reaches.
+        reach = {folder(m) for m in named}
+        stuck_vae, stuck_other, take_out = _stuck_main_files(named)
+        # Only such files are kept: "None" and Automatic would take out nothing.
+        only_stuck = bool(stuck_other) and not (stuck_vae or reach - {""})
+        if failed:
+            family = f" ({_FAMILY_NAMES.get(main, main)})" if main else ""
+            # What to give the tab depends on its checkpoint's family, which
+            # only the header of its file can say here. Automatic and "None"
+            # suit a checkpoint with its VAE and text encoders inside (SD 1.5
+            # / SDXL); a Flux file is often the transformer alone and gets
+            # the advice of _unloadable_tab_checkpoint; unknown: both.
+            try:
+                info = modules.sd_models.checkpoint_aliases.get(own)
+                facts = _model_file_facts(getattr(info, "filename", None))
+            except Exception:  # noqa: BLE001 — no such list: unknown
+                facts = None
+            own_family = facts[0] if facts else None
+            automatic = (
+                "'Use separate text encoder' with \"None (use detailer "
+                "checkpoint's own)\" and 'Use separate VAE' with Automatic."
+            )
+            # As in _unloadable_tab_checkpoint: Automatic takes out the main
+            # model's VAE files only from a folder named VAE. One kept
+            # anywhere else (--vae-dirs) would stay, and the load would fail
+            # again: a VAE file picked in the tab is read after it.
+            picked = ""
+            for module in used or []:
+                kept_facts = _model_file_facts(module) if module in main_modules else None
+                where = str(module).replace("\\", "/").lower()
+                if (
+                    kept_facts and kept_facts[1] is not None
+                    and "/vae/" not in where
+                    and Path(where).parent.name.lower() != "vae"
+                ):
+                    picked = (
+                        "VAE file (4 latent channels) in the tab's 'Use separate "
+                        "VAE' (Automatic would keep the main model's file, which "
+                        "is not in a folder named VAE), and set 'Use separate text "
+                        "encoder' to \"None (use detailer checkpoint's own)\"."
+                    )
+            # That advice already followed: the tab has such a VAE file and
+            # the main model's is still in the list, where no choice of the
+            # tab takes it out. Forge Neo sorts the files by path before it
+            # reads them (modules_forge.main_entry.modules_change), so the
+            # main model's can still be the last one read. What is left to
+            # do is to move that file into a folder named VAE.
+            moved = ""
+            channels = _VAE_CHANNELS.get(own_family) or 4
+            if picked and vae_chosen and any(
+                m not in main_modules
+                and (_model_file_facts(m) or (None, None))[1] == channels
+                for m in used or []
+            ):
+                moved = (
+                    f"{_MOVE_MAIN_VAE}: the tab's 'Use separate VAE' already "
+                    f"has a VAE file with {channels} latent channels, but "
+                    f"{_NO_CHOICE_TAKES_OUT_VAE}"
+                )
+                if channels == 4 and any(folder(m) == "te" for m in named):
+                    moved += (
+                        " Also set 'Use separate text encoder' to \"None (use "
+                        "detailer checkpoint's own)\"."
+                    )
+            # As in _unloadable_tab_checkpoint: a file of the main model that
+            # no choice of the tab takes out is told to be moved only for a
+            # checkpoint of another family (or of one the header does not
+            # tell): one of the main model's family loads with those files.
+            # And it is told first: a VAE file picked in the tab before that
+            # leaves the main model's one in the list, Forge Neo can read it
+            # after the tab's, and the load fails again with the generation.
+            first = ""
+            if own_family and main and own_family == main:
+                take_out = ""
+            elif picked and not moved:
+                first = f"first {_MOVE_MAIN_VAE}: {_NO_CHOICE_TAKES_OUT_VAE}"
+                picked = ""
+            if _VAE_CHANNELS.get(own_family) == 4:
+                advice = f"give the tab its own: {automatic}"
+                if picked:
+                    advice = f"pick an {_FAMILY_NAMES.get(own_family, own_family)} {picked}"
+                if moved:
+                    advice = moved
+            elif _VAE_CHANNELS.get(own_family) == 16 and moved:
+                advice = (
+                    f"{moved} A checkpoint file without text encoders inside "
+                    "also needs its family's, and a tab can pick only one file: "
+                    "use a checkpoint that holds them."
+                )
+            elif _VAE_CHANNELS.get(own_family) == 16:
+                advice = (
+                    "give the tab that family's files. Pick a "
+                    f"{_FAMILY_NAMES.get(own_family, own_family)} VAE file (16 "
+                    "latent channels, such as ae.safetensors) in the tab's 'Use "
+                    "separate VAE'. A checkpoint file without text encoders "
+                    "inside also needs its family's, and a tab can pick only "
+                    "one file: use a checkpoint that holds them."
+                )
+            else:
+                advice = (
+                    "give the tab that family's files. For an SD 1.5 / SDXL "
+                    f"checkpoint: {automatic} For a Flux one, or any whose file "
+                    "holds no VAE: a VAE file of its family in the tab's 'Use "
+                    "separate VAE', not Automatic."
+                )
+                if picked:
+                    advice = (
+                        "give the tab that family's files. For an SD 1.5 / SDXL "
+                        f"checkpoint: pick its family's {picked} For a Flux "
+                        "one, or any whose file holds no VAE: a VAE file of its "
+                        "family in the tab's 'Use separate VAE', not Automatic."
+                    )
+                if moved:
+                    advice = (
+                        "give the tab that family's files. For an SD 1.5 / SDXL "
+                        f"checkpoint: {moved} For a Flux one, or any whose file "
+                        "holds no VAE: a VAE file of its family in the tab's "
+                        "'Use separate VAE', not Automatic."
+                    )
+            # As in the line of a checkpoint that loaded: a file no choice of
+            # the tab takes out is told to be moved, and "None" and Automatic
+            # are not told again when they would take out nothing.
+            if first:
+                advice = " ".join(text for text in (first, take_out, f"Then {advice}") if text)
+            elif take_out and only_stuck and _VAE_CHANNELS.get(own_family) == 4:
+                advice = take_out[0].lower() + take_out[1:]
+            elif take_out and only_stuck and not _VAE_CHANNELS.get(own_family):
+                advice = (
+                    "give the tab that family's files. For an SD 1.5 / SDXL "
+                    f"checkpoint: {take_out} For a Flux one, or any whose file "
+                    "holds no VAE: a VAE file of its family in the tab's 'Use "
+                    "separate VAE', not Automatic."
+                )
+            elif take_out:
+                advice = f"{advice} {take_out}"
+            line = (
+                f"[-] ADetailer: tab {n + 1}'s checkpoint {own!a} could not be "
+                f"loaded while the pass kept the main model's{family} VAE / "
+                f"text encoder files "
+                f"({', '.join(kept)}). If the checkpoint is of another model "
+                f"family, {advice}"
+            )
+        else:
+            advice = (
+                "Give the tab its own: 'Use separate text encoder' with \"None "
+                "(use detailer checkpoint's own)\" and 'Use separate VAE' with "
+                "Automatic."
+            )
+            # As above and in _unloadable_tab_checkpoint: Automatic takes out
+            # the main model's VAE files only from a folder named VAE. One
+            # kept anywhere else (--vae-dirs) would stay with Automatic too:
+            # a VAE file picked in the tab is read after it.
+            if own_vae is not None:
+                # Already picked, and it fits: what is left is the main
+                # model's other files. Automatic here would bring back the
+                # main model's VAE, so the VAE choice is not named.
+                advice = (
+                    "Set the tab's 'Use separate text encoder' to \"None (use "
+                    "detailer checkpoint's own)\"; its 'Use separate VAE' "
+                    "already has a VAE file of the checkpoint's family."
+                )
+            for module in ([] if own_vae is not None else used or []):
+                kept_facts = _model_file_facts(module) if module in main_modules else None
+                where = str(module).replace("\\", "/").lower()
+                if (
+                    kept_facts and kept_facts[1] is not None
+                    and "/vae/" not in where
+                    and Path(where).parent.name.lower() != "vae"
+                ):
+                    which = (
+                        f"an {_FAMILY_NAMES.get(tab, tab)} VAE file (4 latent channels)"
+                        if _VAE_CHANNELS.get(tab) == 4
+                        else "a VAE file of the checkpoint's family"
+                    )
+                    advice = (
+                        f"Pick {which} in the tab's 'Use separate VAE' "
+                        "(Automatic would keep the main model's file, which is "
+                        "not in a folder named VAE), and set 'Use separate text "
+                        "encoder' to \"None (use detailer checkpoint's own)\"."
+                    )
+            if stuck_vae and has_own and vae_chosen:
+                advice = (
+                    "The tab's 'Use separate VAE' already has a VAE file of the "
+                    "checkpoint's family, but no choice of the tab takes out "
+                    f"the main model's VAE file ({', '.join(stuck_vae)}), not in a "
+                    "folder named VAE, and the WebUI can read it after the "
+                    "tab's. Move it into a folder named VAE (such as "
+                    "models/VAE) and pick it again in the WebUI's 'VAE / Text "
+                    "Encoder' list: the tab's file then takes its place."
+                )
+                if "te" in reach:
+                    advice += (
+                        " Also set the tab's 'Use separate text encoder' to "
+                        "\"None (use detailer checkpoint's own)\"."
+                    )
+            if take_out:
+                advice = take_out if only_stuck else f"{advice} {take_out}"
+            line = (
+                f"[-] ADetailer: tab {n + 1} uses checkpoint {own!a} "
+                f"({_FAMILY_NAMES.get(tab, tab)}) but the main model is "
+                f"{_FAMILY_NAMES.get(main, main)}, and the pass kept the main "
+                f"model's VAE / text encoder files ({', '.join(kept)}): the result "
+                f"can be broken or fail. {advice}"
+            )
+        line = line.encode("ascii", "replace").decode("ascii")
+        sys.stderr.write(line + "\n")
+        return line
+    except Exception:  # noqa: BLE001 — a warning never breaks the pass
+        return ""
+
+
+def _family_status_note(script) -> str:
+    """The answer of "Run ADetailer on an image" repeats the warning of
+    _warn_other_family_modules, or the skipped tab of
+    _unloadable_tab_checkpoint, if the run gave it."""
+    if not getattr(script, "_ad_family_note", ""):
+        return ""
+    if " skipped: its checkpoint " in script._ad_family_note:
+        if "choice of the tab takes out" in script._ad_family_note:
+            # A file of the main model that no choice of the tab takes out:
+            # a choice of the tab alone would not be enough.
+            return (
+                " ⚠️ The tab was skipped: its checkpoint cannot be loaded with "
+                "the VAE file of the pass, and no choice of the tab takes out "
+                "some files of the main model. First move them into the folder "
+                "the console names and pick them again (see console)."
+            )
+        if " with the VAE file chosen in the tab " in script._ad_family_note:
+            return (
+                " ⚠️ The tab was skipped: its checkpoint cannot be loaded with "
+                "the VAE file chosen in the tab. Choose another one in Use "
+                "separate VAE (see console)."
+            )
+        if "'Use separate VAE' with Automatic" not in script._ad_family_note:
+            # A checkpoint with a 16-channel VAE: Automatic is not its remedy.
+            return (
+                " ⚠️ The tab was skipped: its checkpoint cannot be loaded with "
+                "the main model's VAE file, which the pass would keep. Pick a "
+                "VAE file of the checkpoint's family in the tab's Use separate "
+                "VAE (see console)."
+            )
+        return (
+            " ⚠️ The tab was skipped: its checkpoint cannot be loaded with the "
+            "main model's VAE file, which the pass would keep. Give the tab "
+            "its own: Use separate VAE with Automatic (see console)."
+        )
+    if "could not be loaded" in script._ad_family_note:
+        if "choice of the tab takes out" in script._ad_family_note:
+            # As the console line says since it tells such files apart.
+            return (
+                " ⚠️ The tab's checkpoint could not be loaded while the pass "
+                "kept the main model's VAE / text encoder files, and no choice "
+                "of the tab takes out some of them: if it is of another model "
+                "family, move them into the folder the console names and pick "
+                "them again (see console)."
+            )
+        return (
+            " ⚠️ The tab's checkpoint could not be loaded while the pass kept "
+            "the main model's VAE / text encoder files: if it is of another "
+            "model family, give the tab its own (see console)."
+        )
+    return (
+        " ⚠️ The tab's checkpoint is of another model family than the main "
+        "model and the pass kept the main model's VAE / text encoder files: "
+        "the result can be broken (see console)."
+    )
+
+
+# Forge / Forge Neo: latent channels of the VAE each family's engine builds
+# (AutoencoderKL, from the WebUI's own config of the family). A VAE file with
+# another number cannot be loaded into it. Only the families checked there.
+_VAE_CHANNELS = {
+    "sd1": 4, "sd2": 4, "sdxl": 4,
+    "flux": 16, "chroma": 16, "zimage": 16, "lumina": 16,
+}
+# What the header of each model file says (by path, modification time, size).
+_FILE_FACTS_SEEN = {}
+# The files (by path) whose last header read was a VAE saved with the
+# "first_stage_model." prefix of a checkpoint (_model_file_facts gives 0).
+_PREFIXED_VAES = set()
+
+
+def _model_file_facts(path) -> "tuple | None":
+    """What the header of a .safetensors / .sft file says, read without
+    loading a tensor (8 bytes little-endian with the header's length, then
+    JSON with the tensor names and shapes): the family of the checkpoint in it
+    ("sd1", "sdxl", "flux", or None when it is not surely one of them, by the
+    keys the WebUI itself tells them apart with), and the latent channels of
+    the VAE the file gives as a Forge additional module (None without a VAE,
+    0 for a VAE of another layout or one saved with the "first_stage_model."
+    prefix of a checkpoint). None when the header cannot be read:
+    another format (.ckpt, .gguf), no file, a broken one."""
+    try:
+        import json
+
+        path = str(path)
+        if not path.lower().endswith((".safetensors", ".sft")):
+            return None
+        stat = Path(path).stat()
+        seen = (path, stat.st_mtime_ns, stat.st_size)
+        if seen in _FILE_FACTS_SEEN:
+            return _FILE_FACTS_SEEN[seen]
+        if len(_FILE_FACTS_SEEN) >= 64:
+            _FILE_FACTS_SEEN.clear()
+        _FILE_FACTS_SEEN[seen] = None  # also for a header that cannot be read
+        with Path(path).open("rb") as file:
+            size = int.from_bytes(file.read(8), "little")
+            if not 2 <= size <= min(stat.st_size - 8, 100_000_000):
+                return None
+            header = json.loads(file.read(size))
+        if not isinstance(header, dict):
+            return None
+
+        def shape(name: str) -> list:
+            entry = header.get(name)
+            dims = entry.get("shape") if isinstance(entry, dict) else None
+            if isinstance(dims, list) and all(type(d) is int for d in dims):
+                return dims
+            return []
+
+        # A file with the UNet / transformer alone has bare names: the WebUI
+        # adds the prefix (backend.loader.preprocess_state_dict).
+        prefix = "model.diffusion_model."
+        if not any(str(k).startswith((prefix, "net.")) for k in header):
+            prefix = ""
+        family = None
+        cross = shape(prefix + "input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight")
+        first = shape(prefix + "input_blocks.0.0.weight")
+        out = shape(prefix + "out.2.weight")
+        label = shape(prefix + "label_emb.0.0.weight")
+        proj = shape(prefix + "input_blocks.4.1.proj_in.weight")
+        flux_marks = (
+            prefix + "double_blocks.0.img_attn.norm.key_norm.scale",
+            prefix + "double_blocks.0.img_attn.norm.key_norm.weight",
+        )
+        # Flux.2, Chroma, Lumina 2 / Z-Image, Wan, SVDQ: other engines.
+        not_flux = (
+            "double_stream_modulation_img.lin.weight",
+            "distilled_guidance_layer.0.norms.0.scale",
+            "distilled_guidance_layer.norms.0.scale",
+            "cap_embedder.1.weight", "head.modulation",
+            "single_transformer_blocks.0.mlp_fc1.qweight",
+        )
+        if (
+            len(cross) == 2 and len(first) == 4 and first[0] == 320
+            and len(out) == 4 and out[0] == 4
+        ):
+            if cross[1] == 2048 and len(label) == 2 and label[1] == 2816 and len(proj) == 2:
+                family = "sdxl"
+            elif cross[1] == 768 and (prefix + "label_emb.0.0.weight") not in header and len(proj) == 4:
+                family = "sd1"
+        elif (
+            any(mark in header for mark in flux_marks)
+            and (prefix + "img_in.weight") in header
+            and not any((prefix + name) in header for name in not_flux)
+        ):
+            family = "flux"
+
+        vae = None
+        conv_in = shape("decoder.conv_in.weight")
+        _PREFIXED_VAES.discard(path)
+        if "first_stage_model.decoder.conv_in.weight" in header:
+            _PREFIXED_VAES.add(path)
+            # A VAE saved with a checkpoint's prefix: the WebUI lays it over
+            # the VAE of an SD 1.5 / SDXL checkpoint, whatever VAE file came
+            # before it (backend.loader.replace_state_dict, "VAE format 0").
+            vae = 0
+        elif "decoder.conv_in.weight" in header:
+            vae = conv_in[1] if len(conv_in) == 4 else 0
+        elif "decoder.middle.0.residual.0.gamma" in header:
+            vae = 0
+        _FILE_FACTS_SEEN[seen] = (family, vae)
+        return _FILE_FACTS_SEEN[seen]
+    except Exception:  # noqa: BLE001 — unknown, never an error
+        return None
+
+
+def _unloadable_tab_checkpoint(p, args: ADetailerArgs, n: int, override) -> str:
+    """Forge / Forge Neo, before a pass of tab ``n``: the console line that
+    says the tab is skipped, when the checkpoint of its pass cannot be loaded
+    with the VAE file the pass would give it; "" otherwise, also when unsure.
+    That file is one of the main model's that a tab with its own checkpoint
+    would keep, or the one chosen in the tab's 'Use separate VAE', for the
+    tab's own checkpoint or, without one, for the main checkpoint (which the
+    WebUI loads again with the tab's files). The WebUI replaces the
+    checkpoint's VAE with that file and builds the VAE of the checkpoint's
+    family: with another number of latent channels (4 for SD 1.5 / SDXL, 16
+    for Flux) the load fails, the WebUI is left without a model and the whole
+    generation fails with it. Decided on the files' headers and, for a file
+    kept from the main model, on the family of that model, learnt while it
+    was loaded (before its first load: read from the header of its file, and
+    then every file must be readable): nothing is loaded or unloaded here.
+    The line is written once per generation and tab, in the console and in
+    the WebUI's notes under the results."""
+    try:
+        own = _own_checkpoint(args)
+        override = override if isinstance(override, dict) else {}
+        # Forge / Forge Neo only: the other WebUIs have no such parameters.
+        params = modules.sd_models.model_data.forge_loading_parameters
+        main = _main_model_family()
+        # Whether the main model was loaded with its files in this session.
+        learnt = bool(main)
+        if own is not None:
+            # The host drops a checkpoint it cannot find: then the main one runs.
+            if override.get("sd_model_checkpoint") != own:
+                return ""
+            info = modules.sd_models.checkpoint_aliases.get(own)
+            facts = _model_file_facts(getattr(info, "filename", None))
+        elif "sd_model_checkpoint" in override or "forge_additional_modules" not in override:
+            # The hires fix checkpoint: not checked. The main checkpoint with
+            # the main model's own files: nothing is loaded again.
+            return ""
+        else:
+            # The main checkpoint, loaded again with the files of the tab.
+            facts = _model_file_facts(
+                getattr(params.get("checkpoint_info"), "filename", None)
+            )
+            if facts and main and facts[0] != main:
+                return ""
+        tab = facts[0] if facts else None
+        tab_channels = _VAE_CHANNELS.get(tab)
+        if not tab_channels:
+            return ""
+        if not main:
+            # Not yet ("Run ADetailer on an image" right after the WebUI
+            # started): the header of the main checkpoint's file says its
+            # family as surely as the tab's own does.
+            facts = _model_file_facts(
+                getattr(params.get("checkpoint_info"), "filename", None)
+            )
+            main = facts[0] if facts else None
+        main_channels = _VAE_CHANNELS.get(main)
+        main_modules = list(getattr(shared.opts, "forge_additional_modules", []) or [])
+        used = override.get("forge_additional_modules", main_modules)
+        kept_vae = own_vae = own_channels = None
+        for module in used or []:
+            kept = module in main_modules
+            facts = _model_file_facts(module)
+            if facts is None:
+                # Not readable. One of the main model's files changes nothing
+                # when that model is of a family with other channels: it
+                # loaded with the file, so a VAE in it has its channels. Any
+                # other file could hold a VAE the checkpoint loads with.
+                if (
+                    not kept or not learnt
+                    or not main_channels or main_channels == tab_channels
+                ):
+                    return ""
+            elif facts[1] is not None:
+                # In any order of the files: every VAE among them has other
+                # channels than the checkpoint's family; one kept from the
+                # main model, the channels that model was loaded with.
+                if facts[1] <= 0 or facts[1] == tab_channels:
+                    return ""
+                if not kept:
+                    own_vae, own_channels = module, facts[1]
+                elif facts[1] != main_channels:
+                    return ""
+                else:
+                    kept_vae = module
+        if kept_vae is None and own_vae is None:
+            return ""
+        # The main model's files kept that no choice of the tab takes out,
+        # by their folder (as _forge_wanted_modules tells them). A choice of
+        # the tab alone could take the skip away while such a file stays:
+        # Forge Neo reads the files sorted by path, so it can read it after
+        # the tab's, the load fails and the whole generation with it. The
+        # line then says first to move it, as _warn_other_family_modules does.
+        # Only for a checkpoint of another family than the main model: one of
+        # the same family loads with those files (a text encoder of the main
+        # model is its own, and "None" would take it out and fail the pass),
+        # so the remedy is the tab's choice alone.
+        stuck_vae, take_out = [], ""
+        if main and tab != main:
+            stuck_vae, _stuck_other, take_out = _stuck_main_files(
+                [m for m in used or [] if m in main_modules]
+            )
+        if own_vae is not None:
+            # Chosen in the tab: the remedy is another choice there. Automatic
+            # only for a family whose checkpoints hold a VAE of their own.
+            name = _FAMILY_NAMES.get(tab, tab)
+            advice = (
+                f"Choose a VAE file for {name} ({tab_channels} latent channels) "
+                "in the tab's 'Use separate VAE'"
+                + (", or Automatic for the checkpoint's own." if tab_channels == 4 else ".")
+            )
+        elif tab_channels == 16:
+            # Not Automatic: a checkpoint of these families is often the
+            # transformer alone, and without a VAE file, or with "None" for
+            # the text encoders, its load fails just the same.
+            advice = (
+                f"Pick a {_FAMILY_NAMES.get(tab, tab)} VAE file (16 latent "
+                "channels, such as ae.safetensors) in the tab's 'Use separate "
+                "VAE'. A checkpoint file without text encoders inside also "
+                "needs its family's, and a tab can pick only one file: use "
+                "a checkpoint that holds them."
+            )
+        else:
+            advice = (
+                "Give the tab its own: 'Use separate VAE' with Automatic and "
+                "'Use separate text encoder' with \"None (use detailer "
+                "checkpoint's own)\"."
+            )
+            # Automatic takes out the main model's VAE files that
+            # _forge_wanted_modules tells by their folder ("VAE"). One kept
+            # anywhere else (--vae-dirs) would stay, and the tab would still
+            # be skipped: a VAE file picked in the tab is read after it.
+            where = str(kept_vae).replace("\\", "/").lower()
+            if (
+                not stuck_vae
+                and "/vae/" not in where
+                and Path(where).parent.name.lower() != "vae"
+            ):
+                advice = (
+                    f"Pick an {_FAMILY_NAMES.get(tab, tab)} VAE file (4 latent "
+                    "channels) in the tab's 'Use separate VAE' (Automatic would "
+                    "keep the main model's file, which is not in a folder named "
+                    "VAE), and set 'Use separate text encoder' to \"None (use "
+                    "detailer checkpoint's own)\"."
+                )
+        if stuck_vae or take_out:
+            first = f"First {_MOVE_MAIN_VAE}: {_NO_CHOICE_TAKES_OUT_VAE}" if stuck_vae else ""
+            advice = " ".join(
+                text for text in (first, take_out, f"Then {advice[0].lower()}{advice[1:]}") if text
+            )
+        if own_vae is None:
+            line = (
+                f"[-] ADetailer: tab {n + 1} skipped: its checkpoint {own!a} "
+                f"({_FAMILY_NAMES.get(tab, tab)}) cannot be loaded with the main "
+                f"model's ({_FAMILY_NAMES.get(main, main)}) VAE file "
+                f"({Path(str(kept_vae)).name}), which the pass would keep, and the "
+                f"whole generation would fail with it. {advice}"
+            )
+        else:
+            name = _FAMILY_NAMES.get(tab, tab)
+            which = f"{own!a} ({name})" if own is not None else f"(the main one, {name})"
+            line = (
+                f"[-] ADetailer: tab {n + 1} skipped: its checkpoint {which} "
+                "cannot be loaded with the VAE file chosen in the tab "
+                f"({Path(str(own_vae)).name}: {own_channels} latent channels), "
+                f"and the whole generation would fail with it. {advice}"
+            )
+        line = line.encode("ascii", "replace").decode("ascii")
+        warned = getattr(p, "_ad_family_warned", None)
+        if not isinstance(warned, set):
+            warned = set()
+            p._ad_family_warned = warned
+        if n not in warned:
+            warned.add(n)
+            sys.stderr.write(line + "\n")
+            # And in the WebUI's own notes under the results of txt2img and
+            # img2img, where the picture came out without the tab's work and
+            # only the console said why. Once too: the next pictures of the
+            # generation do not repeat it.
+            try:
+                p.comment(line[len("[-] "):])
+            except Exception:  # noqa: BLE001 — the note must never cost the skip
+                pass
+        return line
+    except Exception:  # noqa: BLE001 — in doubt the pass runs, as before
+        return ""
+
+
 def _is_forge_modules() -> bool:
     """True on Forge / Forge Neo, where VAE + text encoders are unified into the
     ``forge_additional_modules`` opts list (so the classic ``sd_vae`` key is
@@ -4538,6 +6144,77 @@ def _is_forge_modules() -> bool:
         return "forge_additional_modules" in shared.opts.data
     except Exception:  # noqa: BLE001
         return False
+
+
+def _lora_names() -> list[str]:
+    """The LoRA names the WebUI lists now, for the panel's subject guide.
+
+    The built-in LoRA extension of AUTOMATIC1111, Forge, Forge Neo and
+    reForge is the module ``networks``, with ``available_networks`` keyed by
+    the name a ``<lora:name:weight>`` tag takes. Found in sys.modules, never
+    imported, and only read (no disk scan). Without it, or with another
+    module of that name, the list is empty. Never raises."""
+    try:
+        available = getattr(sys.modules.get("networks"), "available_networks", None)
+        if not isinstance(available, dict):
+            return []
+        return [name for name in list(available) if isinstance(name, str) and name]
+    except Exception:  # noqa: BLE001 — a guide's menu is not worth an error
+        return []
+
+
+def _lora_aliases() -> dict[str, str]:
+    """The other names a ``<lora:name:weight>`` tag can take on this WebUI,
+    for the subject guide: the keys of ``available_network_aliases`` of the
+    module ``networks`` (a LoRA's alias, by default the name written in its
+    file), without the ones the WebUI refuses as an alias because two files
+    share them (``forbidden_network_aliases``, lower case). The guide does
+    not warn about such a name. Each with the name of the file it stands for
+    (``.name`` of the LoRA it gives, the key of ``available_networks``), or
+    itself when the WebUI does not tell it: the guide then knows that an
+    alias and the file name are one LoRA. Only read; without them, empty.
+    Never raises."""
+    try:
+        module = sys.modules.get("networks")
+        aliases = getattr(module, "available_network_aliases", None)
+        if not isinstance(aliases, dict):
+            return {}
+        forbidden = getattr(module, "forbidden_network_aliases", None)
+        if not isinstance(forbidden, (dict, set, frozenset, list, tuple)):
+            forbidden = ()
+        found = {}
+        for name in list(aliases):
+            if isinstance(name, str) and name and name.lower() not in forbidden:
+                file = getattr(aliases.get(name), "name", None)
+                found[name] = file if isinstance(file, str) and file else name
+        return found
+    except Exception:  # noqa: BLE001 — then the guide compares with the list alone
+        return {}
+
+
+def _reads_lyco_tags() -> bool:
+    """True when this WebUI surely reads a ``<lyco:name:weight>`` tag as a
+    LoRA tag, for the subject guide: AUTOMATIC1111 (and reForge) registers
+    "lyco" as another name of the LoRA network in ``modules.extra_networks``;
+    Forge and Forge Neo do not, and skip such a tag. Found in sys.modules, as
+    _repeated_lora_note asks it, and only read. False when it cannot tell.
+    Never raises."""
+    try:
+        host = sys.modules.get("modules.extra_networks")
+        known = {**host.extra_network_aliases, **host.extra_network_registry}
+        return known.get("lora") is not None and known.get("lyco") is known["lora"]
+    except Exception:  # noqa: BLE001 — unknown: the guide tells the lyco tag
+        return False
+
+
+def _sort_order_settings() -> tuple[Any, Any]:
+    """Settings > ADetailer "Sort bounding boxes by" and "More sort orders",
+    as sort_bboxes reads them. Only read: the subject guide's status says
+    when the detections will not be taken from left to right."""
+    return (
+        opts.data.get("ad_bbox_sortby", BBOX_SORTBY[0]),
+        opts.data.get("ad_bbox_sortby_more", BBOX_SORTBY_MORE[0]),
+    )
 
 
 def _get_forge_text_encoders() -> list:
@@ -4572,10 +6249,11 @@ def _get_forge_text_encoders() -> list:
     return names
 
 
-def _forge_wanted_modules(args: ADetailerArgs) -> "list | None":
+def _forge_wanted_modules(args: ADetailerArgs, base: "list | None" = None) -> "list | None":
     """Target ``forge_additional_modules`` for this detailer pass, or ``None`` if
     not on Forge / nothing to change. Forge unifies VAE + text encoders into one
-    module list; start from the live list and swap only the requested pieces."""
+    module list; start from the live list (or ``base``, the hires fix modules)
+    and swap only the requested pieces."""
     te_choice = args.ad_text_encoder
     want_te = bool(
         args.ad_use_text_encoder and te_choice and te_choice != "Use same text encoder"
@@ -4593,7 +6271,10 @@ def _forge_wanted_modules(args: ADetailerArgs) -> "list | None":
     except Exception:  # noqa: BLE001
         return None
 
-    base = list(getattr(shared.opts, "forge_additional_modules", []) or [])
+    if base is None:
+        base = list(getattr(shared.opts, "forge_additional_modules", []) or [])
+    else:
+        base = list(base)
     module_list = getattr(_fme, "module_list", {}) or {}
 
     def _resolve(name: str):
@@ -4647,12 +6328,24 @@ def _forge_wanted_modules(args: ADetailerArgs) -> "list | None":
 
 def on_after_component(component, **_kwargs):
     global txt2img_submit_button, img2img_submit_button
+    global txt2img_prompt_box, img2img_prompt_box
     if getattr(component, "elem_id", None) == "txt2img_generate":
         txt2img_submit_button = component
         return
 
     if getattr(component, "elem_id", None) == "img2img_generate":
         img2img_submit_button = component
+        return
+
+    # The main prompt boxes, for the subject guide: an input of its button,
+    # so that it can tell when a LoRA is in the main prompt too. Never an
+    # output. A WebUI without these ids leaves them None.
+    if getattr(component, "elem_id", None) == "txt2img_prompt":
+        txt2img_prompt_box = component
+        return
+
+    if getattr(component, "elem_id", None) == "img2img_prompt":
+        img2img_prompt_box = component
 
 
 def _reset_adetailer_settings() -> str:
@@ -4899,6 +6592,28 @@ def on_ui_settings():
     )
 
     shared.opts.add_option(
+        "ad_apply_prompt_from_image",
+        shared.OptionInfo(
+            default=False,
+            label="Run ADetailer on an image uses the prompt saved in the image",
+            section=section,
+        ).info(
+            "For every picture of 'Run ADetailer on an image', also in a folder batch, the main prompt and negative prompt become the ones the WebUI saved in that picture, so an empty tab prompt or [PROMPT] reuses them as in a normal generation. Only the two prompts are taken, not the seed, sampler or size. A picture without saved parameters, or pasted from the clipboard, keeps an empty main prompt. Off = the main prompt is always empty"
+        ),
+    )
+
+    shared.opts.add_option(
+        "ad_apply_keep_transparency",
+        shared.OptionInfo(
+            default=False,
+            label="Run ADetailer on an image and Skip img2img keep the transparency of the picture",
+            section=section,
+        ).info(
+            "For a picture with transparent parts, such as a character on an empty background, also in a folder batch, the result gets the picture's transparency back. The same in the img2img tab with ADetailer's Skip img2img ticked, also in its Batch tab; on Forge Neo, a Batch tab file whose sides are not multiples of the WebUI's Resolution Step setting (64 by default) is resized by the WebUI first and comes out without its transparency. ADetailer still works on the picture with its transparent parts filled with the img2img background color. The saved file keeps the transparency only in a file format that has it, such as PNG: a JPEG has none, and AUTOMATIC1111 also saves WebP without it. Off = the transparent parts stay filled"
+        ),
+    )
+
+    shared.opts.add_option(
         "ad_only_selected_scripts",
         shared.OptionInfo(
             default=True,
@@ -5018,6 +6733,17 @@ def on_ui_settings():
             section=section,
         ).info(
             "Enlarges the area ADetailer inpaints when it is smaller than the inpaint size (the crop of 'Inpaint only masked', or the whole picture with a larger 'Use separate width/height'), and with 'Inpaint only masked' the result back to the crop's size when the crop is bigger. The first choice uses the WebUI's 'Upscaler for img2img', as before"
+        ),
+    )
+
+    shared.opts.add_option(
+        "ad_hires_checkpoint",
+        shared.OptionInfo(
+            default=False,
+            label="With hires fix, detail with the hires checkpoint",
+            section=section,
+        ).info(
+            "When txt2img uses hires fix with a 'Hires checkpoint' other than 'Use same checkpoint', the tabs without their own checkpoint detail the upscaled picture with that hires checkpoint instead of the main one. On Forge and Forge Neo its hires VAE / text encoder choices come with it, and a tab's own VAE or text encoder still replaces them. Tabs with their own checkpoint keep it. No effect without hires fix, in img2img and in 'Run ADetailer on an image'. Off = the main checkpoint, as before"
         ),
     )
 

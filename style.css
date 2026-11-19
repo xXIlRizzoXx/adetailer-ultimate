@@ -71,6 +71,62 @@ button[id*="adetailer_ad_preset_import_btn"] {
     color: #ffffff !important;
 }
 
+/* ---------- Tab sections: coloured bar and leading emoji ----------
+ * aaaaaa/ui.py gives every section of a tab the class `ad-sec` plus its kind:
+ * `ad-sec-setting` (blue: options of the pass), `ad-sec-tool` (amber: tools
+ * that work on an image) or `ad-sec-library` (grey: the preset file).
+ * The header `.label-wrap` is a direct child of the section block on Gradio 3
+ * (AUTOMATIC1111, a <div>) and Gradio 4 (Forge / Forge Neo, a <button>), and
+ * its first <span> holds the title. The emoji is drawn here, so the titles
+ * stay word for word: translations and saved keys are unchanged. The main
+ * "ADetailer" panel has no `ad-sec`, so its "Nx Tabs" pill is left alone.
+ * If a later Gradio changes this markup, only the bar and the emoji go.
+ * Blue is the theme's secondary hue (blue in the Default theme of both
+ * WebUIs); `--color-accent` is orange there, too close to the tools' amber. */
+.ad-sec-setting {
+    --ad-sec-bar: var(--secondary-500, #3b82f6);
+}
+.dark .ad-sec-setting {
+    --ad-sec-bar: var(--secondary-400, #60a5fa);
+}
+.ad-sec-tool {
+    --ad-sec-bar: #f59e0b;
+}
+.dark .ad-sec-tool {
+    --ad-sec-bar: #fbbf24;
+}
+.ad-sec-library {
+    --ad-sec-bar: var(--body-text-color-subdued, #9ca3af);
+}
+.ad-sec > .label-wrap {
+    border-left: 3px solid var(--ad-sec-bar, transparent) !important;
+    padding-left: 8px !important;
+}
+.ad-sec > .label-wrap > span:first-child::before {
+    margin-right: 0.35em;
+}
+.ad-sec[id*="_ad_preset_io_accordion"] > .label-wrap > span:first-child::before {
+    content: "\1F4E6";  /* package */
+}
+.ad-sec[id*="_ad_prompts_accordion"] > .label-wrap > span:first-child::before {
+    content: "\270D\FE0F";  /* writing hand */
+}
+.ad-sec[id*="_ad_detection_accordion"] > .label-wrap > span:first-child::before {
+    content: "\1F3AF";  /* direct hit */
+}
+.ad-sec[id*="_ad_preview_accordion"] > .label-wrap > span:first-child::before {
+    content: "\1F50D";  /* magnifying glass */
+}
+.ad-sec[id*="_ad_apply_accordion"] > .label-wrap > span:first-child::before {
+    content: "\2728";  /* sparkles */
+}
+.ad-sec[id*="_ad_mask_preprocessing_accordion"] > .label-wrap > span:first-child::before {
+    content: "\1F3AD";  /* performing arts */
+}
+.ad-sec[id*="_ad_inpainting_accordion"] > .label-wrap > span:first-child::before {
+    content: "\1F3A8";  /* artist palette */
+}
+
 /* ---------- Brighten placeholder text in our textboxes (dark theme) ---------- */
 .dark [id*="adetailer_ad_preset_name"] textarea::placeholder,
 .dark .ad-prompt-row textarea::placeholder {

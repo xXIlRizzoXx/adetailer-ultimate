@@ -23,7 +23,17 @@ from types import ModuleType, SimpleNamespace
 import pytest
 from PIL import Image, ImageFilter
 
-from aaaaaa.p_method import merge_network_hashes, restore_network_hashes
+from aaaaaa.p_method import (
+    add_model_hashes,
+    drop_resolved_prompts,
+    end_resolved_prompts,
+    keep_resolved_prompts,
+    merge_network_hashes,
+    note_used_prompts,
+    restore_network_hashes,
+    start_resolved_prompts,
+)
+from adetailer.classes import is_yoloe_model
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "!adetailer.py"
 
@@ -31,6 +41,14 @@ _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "!adetailer.py"
 _NETWORK_HASHES = {
     "merge_network_hashes": merge_network_hashes,
     "restore_network_hashes": restore_network_hashes,
+    # The "ADetailer resolved prompt" parameters.
+    "drop_resolved_prompts": drop_resolved_prompts,
+    "end_resolved_prompts": end_resolved_prompts,
+    "keep_resolved_prompts": keep_resolved_prompts,
+    "note_used_prompts": note_used_prompts,
+    "start_resolved_prompts": start_resolved_prompts,
+    # The "ADetailer model hash" and "ADetailer checkpoint hash" parameters.
+    "add_model_hashes": add_model_hashes,
 }
 
 # The pass gives a tab's __name__ wildcards the main prompt's values.
@@ -41,6 +59,22 @@ _MAIN_WILDCARD_FUNCTIONS = {
 }
 
 
+# The pass warns when a tab's own checkpoint kept another family's files.
+_FAMILY_WARNING_FUNCTIONS = {
+    "_main_model_family", "_warn_other_family_modules", "_model_family",
+    "_own_checkpoint",
+    # And skips a tab whose checkpoint cannot be loaded with those files.
+    "_unloadable_tab_checkpoint", "_model_file_facts", "_family_status_note",
+    # The main model's files no choice of the tab takes out, in both.
+    "_main_file_folder", "_stuck_main_files",
+}
+_FAMILY_WARNING_ASSIGNS = {
+    "_CLIP_FAMILIES", "_FAMILY_NAMES", "_MAIN_FAMILY_SEEN",
+    "_VAE_CHANNELS", "_FILE_FACTS_SEEN", "_PREFIXED_VAES",
+    "_MOVE_MAIN_VAE", "_NO_CHOICE_TAKES_OUT_VAE",
+}
+
+
 def _load_runtime(**host_globals):
     tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
     selected = ast.parse("from __future__ import annotations").body
@@ -48,12 +82,15 @@ def _load_runtime(**host_globals):
         if isinstance(node, ast.FunctionDef) and node.name in {
             "_forge_wanted_modules", "_parse_class_prompts", "_class_prompt_for",
             "_empty_prompt_note", "_strip_host_comments", "_without_dynamic_prompts",
+            "_repeated_lora_note",
             *(_MAIN_WILDCARD_FUNCTIONS - set(host_globals)),
+            *(_FAMILY_WARNING_FUNCTIONS - set(host_globals)),
         }:
             selected.append(node)
         elif isinstance(node, ast.Assign) and any(
             getattr(target, "id", "")
-            in ("_PROMPT_TOKEN_RE", "_WILDCARD_TOKEN_RE", "_DYNAMIC_PROMPTS_MARKS")
+            in ("_PROMPT_TOKEN_RE", "_WILDCARD_TOKEN_RE", "_DYNAMIC_PROMPTS_MARKS",
+                "_LORA_NAME_RE", *_FAMILY_WARNING_ASSIGNS)
             for target in node.targets
         ):
             selected.append(node)
@@ -560,6 +597,11 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
     if "get_override_settings" in methods or "_crop_upscaler_usable" in functions:
         functions = {*functions, "_setting_frozen"}
         assigns = {*assigns, "_FROZEN_REPORTED"}
+    # And the checkpoint of the pass: the tab's own, or the hires fix one.
+    if "get_override_settings" in methods:
+        functions = {*functions, "_own_checkpoint", "_hires_checkpoint", "_hires_modules"}
+    if "get_i2i_p" in methods:
+        functions = {*functions, "_own_checkpoint"}
     # And those that read Settings > ADetailer "Max inpaint size".
     if {"fix_p2", "extra_params"} & set(methods):
         functions = {*functions, "_max_inpaint_side", "_cap_inpaint_size"}
@@ -579,6 +621,16 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
         # And leaves Dynamic Prompts out of a region with nothing to draw.
         functions = {*functions, "_without_dynamic_prompts"}
         assigns = {*assigns, "_DYNAMIC_PROMPTS_MARKS"}
+        # And warns about a tab's checkpoint of another model family.
+        functions = {*functions, *(_FAMILY_WARNING_FUNCTIONS - set(host_globals))}
+        assigns = {*assigns, *_FAMILY_WARNING_ASSIGNS}
+        # And says when a region's final prompt names a LoRA more than once.
+        functions = {*functions, "_repeated_lora_note"}
+        assigns = {*assigns, "_LORA_NAME_RE"}
+    # And the hook that learns the main model's family when the generation starts.
+    if "process" in methods:
+        functions = {*functions, *(_FAMILY_WARNING_FUNCTIONS - set(host_globals))}
+        assigns = {*assigns, *_FAMILY_WARNING_ASSIGNS}
     # And the "applied ad_prompt" line, which ignores the removed comments.
     if "compare_prompt" in methods:
         functions = {*functions, "_strip_host_comments"}
@@ -588,6 +640,32 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
         assigns = {*assigns, "_XYZ_MODEL_LIST"}
     if "make_axis_on_xyz_grid" in functions:
         assigns = {*assigns, "_XYZ_MODEL_LIST"}
+    # And the standalone run, which can read the prompts saved in the picture.
+    if "run_detailer_on_image" in methods:
+        functions = {
+            *functions, "_prompts_saved_in_image", "_with_prompts_saved_in_image",
+            "_family_status_note",
+        }
+        # And can give the result the picture's transparency back.
+        functions = {
+            *functions, "_transparency_of", "_with_transparency",
+            "_host_format_keeps_transparency",
+        }
+        host_globals.setdefault("Image", Image)
+    # And the Skip img2img hooks, which can give the result the init image's
+    # transparency back too.
+    if {"get_i2i_init_image", "postprocess_image_after_composite"} & set(methods):
+        functions = {
+            *functions, "_transparency_of", "_with_transparency",
+            "_host_format_keeps_transparency",
+        }
+        host_globals.setdefault("Image", Image)
+        # The WebUI's options, which the script always has: here without any.
+        host_globals.setdefault("opts", SimpleNamespace())
+    # And the reading of the prompts, which reads the EXIF comment itself
+    # when the WebUI's reader fails.
+    if "_prompts_saved_in_image" in functions:
+        functions = {*functions, "_exif_comment_saved_in_image"}
     # And the hook that gives Soft Inpainting back the main image's overlay.
     if "postprocess_image" in methods:
         functions = {*functions, "_save_soft_inpaint_state", "_restore_soft_inpaint_state"}
@@ -624,6 +702,179 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_SCRIPT_PATH), "exec"), namespace)
     return SimpleNamespace(**namespace)
+
+
+# What ultralytics_predict answers for a detector it cannot use at all.
+_UNUSABLE_DETECTOR = (
+    "the detector 'planes-ü.pt' is an OBB model (rotated boxes); ADetailer "
+    "needs a detection or segmentation model."
+)
+
+
+class _PassArgs(SimpleNamespace):
+    def copy(self, update):
+        return _PassArgs(**{**vars(self), **update})
+
+
+def _detector_note_runtime(tmp_path, pred, data=None):
+    """The real pass and the real standalone run of a tab whose detector
+    answers `pred`: (script, the tab's args). No detector and no WebUI.
+    ``data``: the host's saved options."""
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, stopping_generation=False,
+        job_count=0, assign_current_image=lambda _image: None,
+    )
+    runtime = _load_script(
+        methods={
+            "_postprocess_image_inner", "run_detailer_on_image",
+            "read_params_txt", "write_params_txt", "get_seed", "get_each_tab_seed",
+        },
+        paths=SimpleNamespace(data_path=str(tmp_path)),
+        PARAMS_TXT="params.txt",
+        shared=SimpleNamespace(
+            sd_model=None, state=state,
+            opts=SimpleNamespace(data={"ad_same_seed_for_each_tab": False}),
+        ),
+        state=state, all_samplers=[], images=None,
+        opts=SimpleNamespace(
+            samples_format="png", **({} if data is None else {"data": data})
+        ),
+        pause_total_tqdm=nullcontext,
+        ensure_pil_image=lambda image, _mode: image,
+        AD_APPLY_SUBDIR="ADetailer-Inpaint",
+        time=time, copy=copy, get_i=lambda _p: 0, ordinal=str,
+        parse_csv=lambda text: [c for c in text.split(",") if c],
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda *_args: SimpleNamespace(close=lambda: None)
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "planes-ü.pt"
+    args = _PassArgs(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="", ad_prompt="",
+        ad_model="planes-ü.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+    )
+    return script, args
+
+
+def test_a_detector_that_cannot_be_used_is_said_once_per_tab_and_generation(
+    tmp_path, capsys
+):
+    # A model that is not a detector (or a YOLO-World / YOLOE that could not
+    # take its typed classes) gives an empty result with a note: the console
+    # says it instead of "nothing detected", once per tab and generation, in
+    # ASCII, and the generation goes on.
+    pred = SimpleNamespace(preview=None, note=_UNUSABLE_DETECTOR)
+    script, args = _detector_note_runtime(tmp_path, pred)
+    pp = SimpleNamespace(image=Image.new("RGB", (8, 8)))
+    line = (
+        "[-] ADetailer: tab {} inpaints nothing: the detector 'planes-\\xfc.pt' is "
+        "an OBB model (rotated boxes); ADetailer needs a detection or "
+        "segmentation model."
+    )
+
+    p = SimpleNamespace(extra_generation_params={})
+    # Two images of one generation, then another tab of it.
+    results = [
+        script._postprocess_image_inner(p, pp, args, n=n) for n in (0, 0, 2, 0)
+    ]
+
+    assert results == [False] * 4
+    said = capsys.readouterr()
+    assert said.err.splitlines() == [line.format(1), line.format(3)]
+    assert said.err.isascii()
+    assert "nothing detected" not in said.out
+    assert script._ad_detector_note == _UNUSABLE_DETECTOR
+
+    # The next generation says it again.
+    script._postprocess_image_inner(
+        SimpleNamespace(extra_generation_params={}), pp, args, n=0
+    )
+    assert capsys.readouterr().err.splitlines() == [line.format(1)]
+
+
+@pytest.mark.parametrize("pred", [SimpleNamespace(preview=None), None])
+def test_a_detector_that_found_nothing_still_says_nothing_detected(
+    tmp_path, capsys, pred
+):
+    # Without a note (also a result of before, which has none): as before.
+    from adetailer.common import PredictOutput
+
+    script, args = _detector_note_runtime(tmp_path, pred or PredictOutput())
+    pp = SimpleNamespace(image=Image.new("RGB", (8, 8)))
+
+    assert script._postprocess_image_inner(SimpleNamespace(), pp, args, n=1) is False
+
+    said = capsys.readouterr()
+    assert "nothing detected on image 1 with 2 settings" in said.out
+    assert said.err == ""
+    assert not getattr(script, "_ad_detector_note", "")
+
+
+def test_standalone_run_says_why_its_detector_could_not_be_used(tmp_path, capsys):
+    # "Run ADetailer on an image" answered "Nothing detected - image
+    # unchanged" (or failed with the detector's own error): the answer now
+    # gives the reason, with no image, like any other failed run.
+    pred = SimpleNamespace(preview=None, note=_UNUSABLE_DETECTOR)
+    script, args = _detector_note_runtime(tmp_path, pred)
+
+    image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), args, save=False, tab=1
+    )
+
+    assert image is None
+    assert status == "⚠️ ADetailer run failed: " + _UNUSABLE_DETECTOR
+    err = capsys.readouterr().err
+    assert err.count("[-] ADetailer: tab 2 inpaints nothing: the detector") == 1
+
+    # A run that detects nothing afterwards does not repeat the reason.
+    pred.note = ""
+    image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), args, save=False
+    )
+    assert image is not None
+    assert status == "ℹ️ Nothing detected — image unchanged."
+
+
+def test_the_missing_clip_note_ends_its_sentence_before_the_next_one_of_the_status(
+    tmp_path, capsys
+):
+    # The note ended with the install command's address, and the status went
+    # on right after it: "...CLIP.git The prompt saved in the image...".
+    from adetailer.ultralytics import _typed_classes_note
+
+    note = _typed_classes_note(
+        "YOLO-World", "yolov8s-worldv2.pt",
+        ModuleNotFoundError("No module named 'clip'", name="clip"),
+    )
+    command = "python -m pip install git+https://github.com/ultralytics/CLIP.git"
+    pred = SimpleNamespace(preview=None, note=note)
+    script, args = _detector_note_runtime(
+        tmp_path, pred, data={"ad_apply_prompt_from_image": True}
+    )
+
+    image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), args, save=False
+    )
+
+    assert image is None
+    assert status == (
+        "⚠️ ADetailer run failed: the YOLO-World detector 'yolov8s-worldv2.pt' "
+        "could not take the typed classes: the Python package 'clip' is missing "
+        "and Ultralytics could not install it by itself (ModuleNotFoundError: No "
+        f"module named 'clip'). Run {command} with the WebUI's Python (its "
+        "virtual environment). The prompt saved in the image couldn't be read, "
+        "so the main prompt was empty."
+    )
+    # In the console too the command has a space on both sides.
+    assert f" {command} with the WebUI's Python" in capsys.readouterr().err
 
 
 def test_forge_automatic_vae_prints_no_missing_module_warning(forge_runtime, capsys):
@@ -972,6 +1223,8 @@ def _standalone_runtime(tmp_path, **host_globals):
         interrupted=False, skipped=False, stopping_generation=False
     )
     host_globals.setdefault("pause_total_tqdm", nullcontext)
+    host_globals.setdefault("opts", SimpleNamespace(samples_format="png"))
+    host_globals.setdefault("images", None)
     return _load_script(
         methods={
             "run_detailer_on_image", "read_params_txt", "write_params_txt",
@@ -984,10 +1237,8 @@ def _standalone_runtime(tmp_path, **host_globals):
             opts=SimpleNamespace(data={"ad_same_seed_for_each_tab": False}),
         ),
         state=state,
-        opts=SimpleNamespace(samples_format="png"),
         all_samplers=[],
         ensure_pil_image=lambda image, _mode: image,
-        images=None,
         AD_APPLY_SUBDIR="ADetailer-Inpaint",
         get_i=lambda _p: 0,
         **host_globals,
@@ -1042,6 +1293,952 @@ def test_standalone_run_names_the_tab_it_was_started_from(tmp_path, tab):
 
     assert status == "✅ ADetailer pass complete."
     assert tabs == [tab]
+
+
+# A picture's parameters as the WebUI writes them, with a tab's own prompt in
+# the last line.
+_SAVED_PARAMETERS = (
+    "a woman in a garden, smile\n"
+    "detailed eyes\n"
+    "Negative prompt: blurry, lowres\n"
+    'Steps: 20, Sampler: Euler a, CFG scale: 7, Seed: 1, Size: 64x64, '
+    'ADetailer model: face_yolov8n.pt, ADetailer prompt: "detailed face, smile", '
+    "ADetailer version: 26.2.0"
+)
+
+
+def _webui_info_reader(image):
+    """The WebUI's images.read_info_from_image, with Pillow instead of
+    piexif: the PNG "parameters" text, else the EXIF comment of a JPEG or
+    WebP (its "UNICODE" form), else the picture's own comment (a JPEG's COM
+    segment)."""
+    items = dict(image.info or {})
+    text = items.pop("parameters", None)
+    if "exif" in items:
+        exif = Image.Exif()
+        exif.load(items["exif"])
+        comment = exif.get_ifd(0x8769).get(0x9286, b"")
+        if comment.startswith(b"UNICODE\x00"):
+            comment = comment[8:].decode("utf-16-be")
+        if comment:
+            text = comment
+    elif "comment" in items:
+        comment = items["comment"]
+        if isinstance(comment, bytes):
+            comment = comment.decode("utf8", errors="ignore")
+        text = comment
+    return text, items
+
+
+def _picture_with_parameters(kind, text=_SAVED_PARAMETERS, mode="RGB"):
+    """A picture read back from the bytes of a file the WebUI saved."""
+    return Image.open(io.BytesIO(_saved_picture_bytes(kind, text, mode)))
+
+
+def _saved_picture_bytes(kind, text=_SAVED_PARAMETERS, mode="RGB"):
+    """The file of a picture with its parameters saved as the WebUI saves
+    them: a PNG text chunk, the EXIF comment of a JPEG or WebP; "plain" is a
+    PNG without them."""
+    from PIL import PngImagePlugin
+
+    buf = io.BytesIO()
+    image = Image.new(mode, (64, 64), "white")
+    if kind == "png":
+        info = PngImagePlugin.PngInfo()
+        info.add_text("parameters", text)
+        image.save(buf, "PNG", pnginfo=info)
+    elif kind == "plain":
+        image.save(buf, "PNG")
+    else:
+        exif = Image.Exif()
+        exif[0x8769] = {0x9286: b"UNICODE\x00" + text.encode("utf-16-be")}
+        image.save(buf, kind, exif=exif)
+    return buf.getvalue()
+
+
+def _prompt_runtime(tmp_path, *, on, reader=_webui_info_reader, **host):
+    data = {"ad_apply_prompt_from_image": on} if on is not None else {}
+    reads = []
+
+    def read(image):
+        reads.append(image)
+        return reader(image)
+
+    host.setdefault(
+        "images", SimpleNamespace(read_info_from_image=read) if reader else None
+    )
+    host.setdefault("opts", SimpleNamespace(samples_format="png", data=data))
+    script = _standalone_runtime(tmp_path, **host).AfterDetailerScript()
+    shells = []
+
+    def inner(p, _pp, _args, n=0):
+        shells.append(p)
+        return True
+
+    script._postprocess_image_inner = inner
+    return script, shells, reads
+
+
+@pytest.mark.parametrize("on", [None, False])
+def test_image_prompt_option_off_keeps_an_empty_main_prompt(tmp_path, capsys, on):
+    # Off (or never saved): the pass is the one of before, and the picture's
+    # parameters are not even read.
+    script, shells, reads = _prompt_runtime(tmp_path, on=on)
+
+    _image, status = script.run_detailer_on_image(
+        _picture_with_parameters("png"), SimpleNamespace(), save=False
+    )
+
+    assert status == "✅ ADetailer pass complete."
+    (p,) = shells
+    assert (p.prompt, p.negative_prompt) == ("", "")
+    assert (p.all_prompts, p.all_negative_prompts) == ([""], [""])
+    assert reads == []
+    assert "saved prompt" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("kind", ["png", "JPEG", "WEBP"])
+def test_image_prompt_option_takes_the_prompts_saved_in_the_picture(tmp_path, kind):
+    # On: the main prompt and negative prompt are those of the picture, as in
+    # the generation that made it, so an empty tab prompt or [PROMPT] reuses
+    # them. The parameters line, with the tab's "ADetailer prompt", is not.
+    script, shells, _reads = _prompt_runtime(tmp_path, on=True)
+
+    _image, status = script.run_detailer_on_image(
+        _picture_with_parameters(kind), SimpleNamespace(), save=False
+    )
+
+    assert status == "✅ ADetailer pass complete."
+    (p,) = shells
+    main = "a woman in a garden, smile\ndetailed eyes"
+    assert (p.prompt, p.negative_prompt) == (main, "blurry, lowres")
+    assert (p.all_prompts, p.all_negative_prompts) == ([main], ["blurry, lowres"])
+    assert "ADetailer" not in p.prompt + p.negative_prompt
+
+
+def test_image_prompt_option_reads_a_cut_out_before_its_background_is_filled(
+    tmp_path,
+):
+    # The transparency is filled with a new picture, which has no parameters.
+    filled, reads = [], []
+
+    def flatten(image, _colour):
+        filled.append(image)
+        return Image.new("RGB", image.size, "white")
+
+    def read(image):
+        reads.append(image)
+        return _webui_info_reader(image)
+
+    script, shells, _reads = _prompt_runtime(
+        tmp_path, on=True,
+        images=SimpleNamespace(read_info_from_image=read, flatten=flatten),
+        opts=SimpleNamespace(
+            samples_format="png", img2img_background_color="#ffffff",
+            data={"ad_apply_prompt_from_image": True},
+        ),
+    )
+    cut_out = _picture_with_parameters("png", mode="RGBA").convert("RGBA")
+
+    script.run_detailer_on_image(cut_out, SimpleNamespace(), save=False)
+
+    assert filled
+    assert len(reads) == 1
+    assert reads[0] is cut_out
+    assert shells[0].prompt == "a woman in a garden, smile\ndetailed eyes"
+
+
+def test_image_prompt_option_without_saved_parameters_says_so(tmp_path, capsys):
+    script, shells, _reads = _prompt_runtime(tmp_path, on=True)
+
+    _image, status = script.run_detailer_on_image(
+        _picture_with_parameters("plain"), SimpleNamespace(), save=False
+    )
+
+    (p,) = shells
+    assert (p.prompt, p.negative_prompt, p.all_prompts) == ("", "", [""])
+    assert status == (
+        "✅ ADetailer pass complete. The image has no saved prompt, so the main "
+        "prompt was empty."
+    )
+    assert "the image has no saved prompt" in capsys.readouterr().err
+
+    # Also when the pass finds nothing to inpaint.
+    script._postprocess_image_inner = lambda *_args, **_kwargs: False
+    _image, status = script.run_detailer_on_image(
+        _picture_with_parameters("plain"), SimpleNamespace(), save=False
+    )
+    assert status.startswith("ℹ️ Nothing detected")
+    assert status.endswith("so the main prompt was empty.")
+
+
+# What the WebUI writes on the result of a region's img2img pass: its first
+# lines are the region's prompts, i.e. the tab's, not the picture's.
+_REGION_PARAMETERS = (
+    "detailed face\n"
+    "Negative prompt: bad face\n"
+    "Steps: 28, Sampler: Euler a, CFG scale: 7.0, Seed: 5, Size: 64x64, "
+    "Denoising strength: 0.4, ADetailer model: face_yolov8n.pt, "
+    'ADetailer prompt: "detailed face", ADetailer version: 26.2.0'
+)
+_REGION_PARAMETERS_LINE = _REGION_PARAMETERS.split("\n")[-1]
+
+
+def _region_pass_runtime(tmp_path, *, on, saved=None, reader=_webui_info_reader):
+    """_prompt_runtime whose inner pass returns, like the WebUI's, a new
+    picture with the region pass's parameters; `saved` collects the
+    keywords of each save to the ADetailer-Inpaint folder."""
+
+    def save_image(_image, _path, _basename, **kwargs):
+        saved.append(kwargs)
+
+    script, shells, reads = _prompt_runtime(
+        tmp_path, on=on,
+        images=SimpleNamespace(
+            read_info_from_image=reader, save_image=save_image
+        ),
+        opts=SimpleNamespace(
+            samples_format="png", outdir_samples=str(tmp_path / "out"),
+            data={"ad_apply_prompt_from_image": on} if on is not None else {},
+        ),
+    )
+    script._standalone_infotext_p = lambda p: p
+
+    def inner(p, pp, _args, n=0):
+        shells.append(p)
+        result = Image.new("RGB", (64, 64))
+        result.info["parameters"] = _REGION_PARAMETERS  # set by the WebUI's pass
+        pp.image = result
+        return True
+
+    script._postprocess_image_inner = inner
+    return script, shells
+
+
+@pytest.mark.parametrize("save", [False, True])
+def test_image_prompt_option_gives_the_result_the_pictures_own_prompts(tmp_path, save):
+    # The result recorded the region pass's prompt (the tab's) as its main
+    # prompt: a second run on it, with the hand tab and an empty prompt or
+    # [PROMPT], redrew the hands with the face tab's prompt.
+    saved = []
+    script, shells = _region_pass_runtime(tmp_path, on=True, saved=saved)
+
+    result, status = script.run_detailer_on_image(
+        _picture_with_parameters("png"), SimpleNamespace(), save=save
+    )
+
+    assert status.startswith("✅ ADetailer pass complete.")
+    expected = (
+        "a woman in a garden, smile\ndetailed eyes\n"
+        "Negative prompt: blurry, lowres\n" + _REGION_PARAMETERS_LINE
+    )
+    assert result.info["parameters"] == expected
+    assert [kwargs["info"] for kwargs in saved] == ([expected] if save else [])
+
+    # The next run on the result starts from the picture's prompts.
+    script.run_detailer_on_image(result, SimpleNamespace(), save=False)
+    main = "a woman in a garden, smile\ndetailed eyes"
+    assert (shells[1].prompt, shells[1].negative_prompt) == (main, "blurry, lowres")
+
+
+@pytest.mark.parametrize(("on", "kind"), [(None, "png"), (False, "png")])
+def test_image_prompt_option_off_or_unread_keeps_the_results_parameters(
+    tmp_path, on, kind
+):
+    # Off: the result keeps the pass's parameters exactly as the WebUI wrote
+    # them. (With the option on and no prompt read from the picture, it no
+    # longer does: see the test below.)
+    saved = []
+    script, _shells = _region_pass_runtime(tmp_path, on=on, saved=saved)
+
+    result, _status = script.run_detailer_on_image(
+        _picture_with_parameters(kind), SimpleNamespace(), save=True
+    )
+
+    assert result.info["parameters"] == _REGION_PARAMETERS
+    assert saved[0]["info"] == _REGION_PARAMETERS
+
+
+def _unreadable(_image):
+    msg = "bad EXIF data"
+    raise ValueError(msg)
+
+
+@pytest.mark.parametrize("reader", [_webui_info_reader, _unreadable], ids=["none", "unread"])
+@pytest.mark.parametrize("save", [False, True])
+def test_image_prompt_option_gives_a_result_without_a_read_prompt_an_empty_one(
+    tmp_path, reader, save
+):
+    # On, a picture without saved parameters (a camera photo) or whose
+    # parameters couldn't be read: the main prompt used was empty. The result
+    # used to keep the pass's parameters, whose main prompt is the region's
+    # img2img prompt, i.e. the face tab's: a second run on the result with
+    # the hand tab and an empty prompt or [PROMPT] took "detailed face" as
+    # the picture's own and redrew the hands with it. It records the empty
+    # main prompts used, without a negative, and the parameters line.
+    saved = []
+    script, shells = _region_pass_runtime(
+        tmp_path, on=True, saved=saved, reader=reader
+    )
+
+    result, status = script.run_detailer_on_image(
+        _picture_with_parameters("plain"), SimpleNamespace(), save=save
+    )
+
+    assert status.startswith("✅ ADetailer pass complete.")
+    assert "so the main prompt was empty" in status
+    assert result.info["parameters"] == _REGION_PARAMETERS_LINE
+    assert "ADetailer prompt" in result.info["parameters"]
+    assert [kwargs["info"] for kwargs in saved] == (
+        [_REGION_PARAMETERS_LINE] if save else []
+    )
+
+    # The next run on the result starts from the empty prompts, not the tab's.
+    if reader is _webui_info_reader:
+        script.run_detailer_on_image(result, SimpleNamespace(), save=False)
+        assert (shells[1].prompt, shells[1].negative_prompt) == ("", "")
+
+
+@pytest.mark.parametrize(
+    ("prompts", "expected"),
+    [
+        (("a cat\nsitting", "blurry"), "a cat\nsitting\nNegative prompt: blurry\n"),
+        (("a cat", ""), "a cat\n"),
+        (("", "blurry"), "Negative prompt: blurry\n"),
+        (("", ""), ""),
+    ],
+)
+def test_result_parameters_take_the_pictures_prompts_as_the_webui_writes_them(
+    prompts, expected
+):
+    runtime = _load_script(functions={"_with_prompts_saved_in_image"})
+
+    text = runtime._with_prompts_saved_in_image(_REGION_PARAMETERS, *prompts)
+
+    assert text == expected + _REGION_PARAMETERS_LINE
+
+
+@pytest.mark.parametrize("images", [None, SimpleNamespace()])
+def test_image_prompt_option_on_a_webui_without_the_reader(tmp_path, capsys, images):
+    # No reader of the saved parameters: the pass runs as with the option
+    # off, and the status says why the prompt is empty.
+    script, shells, _reads = _prompt_runtime(tmp_path, on=True, images=images)
+
+    image, status = script.run_detailer_on_image(
+        _picture_with_parameters("png"), SimpleNamespace(), save=False
+    )
+
+    assert image is not None
+    (p,) = shells
+    assert (p.prompt, p.negative_prompt, p.all_prompts) == ("", "", [""])
+    assert status == (
+        "✅ ADetailer pass complete. The prompt saved in the image couldn't be "
+        "read, so the main prompt was empty."
+    )
+    err = capsys.readouterr().err
+    assert "couldn't read the prompt saved in the image" in err
+    assert err.isascii()
+
+
+def _picture_with_unreadable_exif():
+    """A picture whose EXIF is not EXIF at all: Pillow can't read it."""
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), "white").save(buf, "PNG", exif=b"Exif\x00\x00garbage")
+    return Image.open(io.BytesIO(buf.getvalue()))
+
+
+def test_image_prompt_option_survives_a_reader_that_fails(tmp_path, capsys):
+    # The reader fails and the EXIF can't be read without it either: the
+    # pass runs with an empty main prompt, as before.
+    def broken(_image):
+        msg = "bad EXIF data"
+        raise ValueError(msg)
+
+    script, shells, _reads = _prompt_runtime(tmp_path, on=True, reader=broken)
+
+    image, status = script.run_detailer_on_image(
+        _picture_with_unreadable_exif(), SimpleNamespace(), save=False
+    )
+
+    assert image is not None
+    assert shells[0].prompt == ""
+    assert status.endswith("couldn't be read, so the main prompt was empty.")
+    err = capsys.readouterr().err
+    assert "couldn't read the prompt saved in the image (bad EXIF data)" in err
+    assert err.isascii()
+
+
+def test_image_prompt_option_reads_the_exif_comment_when_the_reader_fails(tmp_path):
+    # The reader fails, but the EXIF comment can be read without it: the
+    # picture's prompts are used. They used to be left out ("couldn't be
+    # read").
+    def broken(_image):
+        msg = "bad EXIF data"
+        raise ValueError(msg)
+
+    script, shells, _reads = _prompt_runtime(tmp_path, on=True, reader=broken)
+
+    _image, status = script.run_detailer_on_image(
+        _picture_with_parameters("JPEG"), SimpleNamespace(), save=False
+    )
+
+    assert (shells[0].prompt, shells[0].negative_prompt) == (
+        "a woman in a garden, smile\ndetailed eyes",
+        "blurry, lowres",
+    )
+    assert status == "✅ ADetailer pass complete."
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Only a prompt, no negative.
+        ("a cat\nSteps: 20, Sampler: Euler a, CFG scale: 7", ("a cat", "")),
+        # A negative prompt over two lines.
+        (
+            "a cat\nNegative prompt: blurry\nlowres\nSteps: 20, Seed: 1, Size: 64x64",
+            ("a cat", "blurry\nlowres"),
+        ),
+        # A prompt over two lines.
+        (
+            "a cat,\nsitting on a sofa\nNegative prompt: blurry\n"
+            "Steps: 20, Sampler: Euler a, CFG scale: 7",
+            ("a cat,\nsitting on a sofa", "blurry"),
+        ),
+        # No parameters line: not the WebUI's parameters.
+        ("a cat\nNegative prompt: blurry", None),
+        # An empty prompt saved with its parameters.
+        ("Negative prompt: blurry\nSteps: 20, Seed: 1, Size: 64x64", ("", "blurry")),
+    ],
+)
+def test_image_prompt_is_split_as_the_webui_splits_it(text, expected):
+    runtime = _load_script(
+        functions={"_prompts_saved_in_image"},
+        images=SimpleNamespace(read_info_from_image=lambda _image: (text, {})),
+    )
+
+    assert runtime._prompts_saved_in_image(object()) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # A camera's blank EXIF comment, read back as NUL characters.
+        ("\x00" * 264, None),
+        ("\x00" * 8 + "  \n\x00", None),
+        # Parameters padded with them.
+        ("a cat\nSteps: 20, Seed: 1, Size: 64x64\x00\x00\x00", ("a cat", "")),
+    ],
+    ids=["blank", "blank-with-spaces", "padded"],
+)
+def test_image_prompt_leaves_out_the_nul_characters_of_a_blank_comment(text, expected):
+    runtime = _load_script(
+        functions={"_prompts_saved_in_image"},
+        images=SimpleNamespace(read_info_from_image=lambda _image: (text, {})),
+    )
+
+    assert runtime._prompts_saved_in_image(object()) == expected
+
+
+def test_image_prompt_option_counts_a_camera_photo_as_without_a_prompt(tmp_path, capsys):
+    # The photo was taken as one with a prompt made of NUL characters: it was
+    # not counted among those without one, and the NULs reached the result.
+    script, shells, _reads = _prompt_runtime(
+        tmp_path, on=True, reader=lambda _image: ("\x00" * 264, {})
+    )
+
+    _image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), save=False
+    )
+
+    assert (shells[0].prompt, shells[0].negative_prompt) == ("", "")
+    assert status.endswith("The image has no saved prompt, so the main prompt was empty.")
+    assert "the image has no saved prompt" in capsys.readouterr().err
+
+
+_OTHER_PROGRAMS_COMMENTS = [
+    "Created with GIMP",
+    "CREATOR: gd-jpeg v1.0 (using IJG JPEG v62), quality = 90\n",
+    "OLYMPUS DIGITAL CAMERA",
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        *[(comment, None) for comment in _OTHER_PROGRAMS_COMMENTS],
+        # The WebUI's own parameters, with and without a negative prompt.
+        (
+            "a cat\nNegative prompt: blurry\nSteps: 20, Sampler: Euler a, CFG scale: 7",
+            ("a cat", "blurry"),
+        ),
+        ("a cat\nSteps: 20, Sampler: Euler a, CFG scale: 7", ("a cat", "")),
+        # A prompt over more lines.
+        (
+            "a cat,\nsitting\non a sofa\nSteps: 20, Sampler: Euler a, CFG scale: 7",
+            ("a cat,\nsitting\non a sofa", ""),
+        ),
+    ],
+    ids=["gimp", "gd-jpeg", "camera", "webui", "webui-no-negative", "webui-lines"],
+)
+def test_image_prompt_takes_only_the_webuis_parameters(text, expected):
+    # The WebUI's reader also gives back another program's comment: it was
+    # taken as the picture's prompt.
+    runtime = _load_script(
+        functions={"_prompts_saved_in_image"},
+        images=SimpleNamespace(read_info_from_image=lambda _image: (text, {})),
+    )
+
+    assert runtime._prompts_saved_in_image(object()) == expected
+
+
+def _jpeg_with_comment(comment):
+    """A JPEG without EXIF and with a COM comment, as GIMP or libgd save it."""
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), "white").save(buf, "JPEG", comment=comment.encode())
+    return Image.open(io.BytesIO(buf.getvalue()))
+
+
+@pytest.mark.parametrize(
+    "picture",
+    [
+        lambda: _jpeg_with_comment(_OTHER_PROGRAMS_COMMENTS[0]),
+        lambda: _jpeg_with_comment(_OTHER_PROGRAMS_COMMENTS[1]),
+        lambda: _picture_with_parameters("JPEG", _OTHER_PROGRAMS_COMMENTS[2]),
+    ],
+    ids=["gimp", "gd-jpeg", "camera"],
+)
+def test_image_prompt_option_counts_another_programs_comment_as_no_prompt(
+    tmp_path, capsys, picture
+):
+    # On and with an empty tab prompt, the pass inpainted with "Created with
+    # GIMP" as its prompt, the result recorded it and a folder didn't count
+    # the photo among those without a prompt.
+    script, shells, reads = _prompt_runtime(tmp_path, on=True)
+
+    _image, status = script.run_detailer_on_image(picture(), SimpleNamespace(), save=False)
+
+    assert len(reads) == 1
+    assert (shells[0].prompt, shells[0].negative_prompt) == ("", "")
+    assert shells[0].all_prompts == [""]
+    assert status.endswith("The image has no saved prompt, so the main prompt was empty.")
+    assert "the image has no saved prompt" in capsys.readouterr().err
+
+
+# A camera's EXIF comment with three "Name: value" pairs, as many as the
+# WebUI's rule for its parameters line asks.
+_CAMERA_PAIRS_COMMENT = "Make: Canon, Model: EOS, ISO: 100"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (_CAMERA_PAIRS_COMMENT, None),
+        ("ab: b, cd: d, ef: f", None),
+        ("a: b, c: d, e: f", None),
+        # "Steps" is not the first pair: not a line the WebUI writes.
+        ("Make: Canon, Steps: 3, ISO: 100", None),
+        ("a cat\nMake: Canon, Model: EOS, ISO: 100", None),
+        # The WebUI's own parameters, without and with Hires.
+        (
+            "a cat\nNegative prompt: blurry\n"
+            "Steps: 20, Sampler: Euler a, CFG scale: 7, Seed: 1, Size: 64x64",
+            ("a cat", "blurry"),
+        ),
+        (
+            "a cat\nNegative prompt: blurry\n"
+            "Steps: 20, Sampler: Euler a, CFG scale: 7, Seed: 1, Size: 64x64, "
+            'Denoising strength: 0.5, Hires prompt: "a cat, detailed eyes", '
+            "Hires upscale: 2, Hires steps: 10, Hires upscaler: Latent",
+            ("a cat", "blurry"),
+        ),
+        # With the "Template:" of Dynamic Prompts.
+        (
+            "a red car\nNegative prompt: ugly\n"
+            "Steps: 20, Sampler: Euler a, CFG scale: 7, Seed: 1, Size: 64x64, "
+            'Template: "a {red|blue} car", Negative Template: ugly',
+            ("a red car", "ugly"),
+        ),
+        # A prompt that has pairs itself.
+        (
+            "a: b, c: d, e: f\nSteps: 20, Sampler: Euler a, CFG scale: 7",
+            ("a: b, c: d, e: f", ""),
+        ),
+        # Only the parameters line: a picture made with an empty prompt.
+        ("Steps: 20, Sampler: Euler a, CFG scale: 7, Seed: 1", ("", "")),
+        # A NovelAI picture, as Forge Neo's reader turns it into parameters
+        # (lines indented).
+        (
+            "a cat\n    Negative prompt: blurry\n"
+            "    Steps: 28, Sampler: Euler a, CFG scale: 5, Seed: 1, Size: 64x64",
+            ("a cat", "blurry"),
+        ),
+    ],
+    ids=[
+        "camera", "two-letter-pairs", "one-letter-pairs", "steps-not-first",
+        "camera-two-lines", "webui", "webui-hires", "dynamic-prompts-template",
+        "prompt-with-pairs", "empty-prompt", "novelai-indented",
+    ],
+)
+def test_image_prompt_needs_the_webuis_steps_first(text, expected):
+    # A camera's comment with three "Name: value" pairs passed as the WebUI's
+    # parameters with an empty prompt: the photo was not counted as one
+    # without a saved prompt. The WebUI always writes "Steps" first.
+    runtime = _load_script(
+        functions={"_prompts_saved_in_image"},
+        images=SimpleNamespace(read_info_from_image=lambda _image: (text, {})),
+    )
+
+    assert runtime._prompts_saved_in_image(object()) == expected
+
+
+def test_image_prompt_option_counts_a_camera_comment_with_pairs_as_no_prompt(
+    tmp_path, capsys
+):
+    script, shells, _reads = _prompt_runtime(tmp_path, on=True)
+
+    _image, status = script.run_detailer_on_image(
+        _picture_with_parameters("JPEG", _CAMERA_PAIRS_COMMENT),
+        SimpleNamespace(),
+        save=False,
+    )
+
+    assert (shells[0].prompt, shells[0].negative_prompt) == ("", "")
+    assert status.endswith("The image has no saved prompt, so the main prompt was empty.")
+    assert "the image has no saved prompt" in capsys.readouterr().err
+
+
+def _webui_reader_of_any_exif_comment(image):
+    """_webui_info_reader with the WebUI's (piexif's) reading of an EXIF
+    comment in any form: "ASCII" text, "UNICODE" text, or, for any other
+    form (a blank comment of zero bytes too), the bytes as UTF-8."""
+    items = dict(image.info or {})
+    text = items.pop("parameters", None)
+    if "exif" in items:
+        exif = Image.Exif()
+        exif.load(items["exif"])
+        comment = exif.get_ifd(0x8769).get(0x9286, b"")
+        if comment.startswith(b"UNICODE\x00"):
+            comment = comment[8:].decode("utf-16-be")
+        elif comment.startswith(b"ASCII\x00\x00\x00"):
+            comment = comment[8:].decode("ascii")
+        else:
+            comment = comment.decode("utf8", errors="ignore")
+        if comment:
+            text = comment
+    return text, items
+
+
+def _png_with_parameters_and_exif_comment(text, comment):
+    """A PNG with the WebUI's "parameters" text and also an EXIF comment
+    (`comment`, raw bytes), as a camera or another program leaves it."""
+    from PIL import PngImagePlugin
+
+    info = PngImagePlugin.PngInfo()
+    info.add_text("parameters", text)
+    exif = Image.Exif()
+    exif[0x8769] = {0x9286: comment}
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), "white").save(buf, "PNG", pnginfo=info, exif=exif)
+    return Image.open(io.BytesIO(buf.getvalue()))
+
+
+_EXIF_WEBUI_PARAMETERS = (
+    "a dog\nNegative prompt: noisy\nSteps: 30, Sampler: Euler a, CFG scale: 5"
+)
+
+
+@pytest.mark.parametrize(
+    ("comment", "expected"),
+    [
+        # A camera's blank comment, read back as NUL characters.
+        (b"\x00" * 16, ("a woman in a garden, smile\ndetailed eyes", "blurry, lowres")),
+        (
+            b"ASCII\x00\x00\x00OLYMPUS DIGITAL CAMERA",
+            ("a woman in a garden, smile\ndetailed eyes", "blurry, lowres"),
+        ),
+        (
+            b"ASCII\x00\x00\x00" + _CAMERA_PAIRS_COMMENT.encode(),
+            ("a woman in a garden, smile\ndetailed eyes", "blurry, lowres"),
+        ),
+        # A comment that is the WebUI's parameters itself still comes first,
+        # as for the WebUI's reader.
+        (
+            b"UNICODE\x00" + _EXIF_WEBUI_PARAMETERS.encode("utf-16-be"),
+            ("a dog", "noisy"),
+        ),
+    ],
+    ids=["blank-exif", "camera-exif", "camera-pairs-exif", "webui-exif"],
+)
+def test_image_prompt_reads_a_pngs_parameters_under_another_exif_comment(
+    comment, expected
+):
+    # The WebUI's reader prefers any non-empty EXIF comment to a PNG's
+    # "parameters": a blank or a camera's one hid them, and the picture
+    # counted as one without a saved prompt.
+    picture = _png_with_parameters_and_exif_comment(_SAVED_PARAMETERS, comment)
+    assert "exif" in picture.info
+    runtime = _load_script(
+        functions={"_prompts_saved_in_image"},
+        images=SimpleNamespace(read_info_from_image=_webui_reader_of_any_exif_comment),
+    )
+
+    assert runtime._prompts_saved_in_image(picture) == expected
+
+
+@pytest.mark.parametrize(
+    "parameters", [None, b"a cat\nSteps: 20, Seed: 1, Size: 64x64", "Created with GIMP"]
+)
+def test_image_prompt_takes_a_pngs_parameters_only_as_the_webuis_text(parameters):
+    # Behind another program's comment, the "parameters" of the picture are
+    # taken only when they are a text that passes the same rule.
+    runtime = _load_script(
+        functions={"_prompts_saved_in_image"},
+        images=SimpleNamespace(
+            read_info_from_image=lambda _image: ("OLYMPUS DIGITAL CAMERA", {})
+        ),
+    )
+
+    picture = SimpleNamespace(info={"parameters": parameters})
+    assert runtime._prompts_saved_in_image(picture) is None
+
+
+def test_image_prompt_option_reads_a_png_under_a_blank_exif_comment(tmp_path, capsys):
+    script, shells, _reads = _prompt_runtime(
+        tmp_path, on=True, reader=_webui_reader_of_any_exif_comment
+    )
+
+    _image, status = script.run_detailer_on_image(
+        _png_with_parameters_and_exif_comment(_SAVED_PARAMETERS, b"\x00" * 16),
+        SimpleNamespace(),
+        save=False,
+    )
+
+    assert (shells[0].prompt, shells[0].negative_prompt) == (
+        "a woman in a garden, smile\ndetailed eyes",
+        "blurry, lowres",
+    )
+    assert status == "✅ ADetailer pass complete."
+    assert "saved prompt" not in capsys.readouterr().err
+
+
+def _webui_exif(orientation, comment):
+    """EXIF as the WebUI (piexif) or a camera writes it: the orientation and
+    the comment (raw bytes), stored with the comment's own type, UNDEFINED."""
+    import struct
+
+    exif_ifd = 8 + 2 + 2 * 12 + 4
+    data = exif_ifd + 2 + 12 + 4
+    value = comment.ljust(4, b"\x00") if len(comment) <= 4 else struct.pack(">I", data)
+    tiff = (
+        b"MM\x00\x2a" + struct.pack(">I", 8)
+        + struct.pack(">H", 2)
+        + struct.pack(">HHIHH", 0x0112, 3, 1, orientation, 0)
+        + struct.pack(">HHII", 0x8769, 4, 1, exif_ifd)
+        + struct.pack(">I", 0)
+        + struct.pack(">H", 1)
+        + struct.pack(">HHI", 0x9286, 7, len(comment)) + value
+        + struct.pack(">I", 0)
+        + (comment if len(comment) > 4 else b"")
+    )
+    return b"Exif\x00\x00" + tiff
+
+
+def _rotated_jpeg_bytes(comment, orientation=6):
+    """A JPEG file whose EXIF says to turn it (a camera's portrait photo, or
+    a picture rotated in a viewer), with an EXIF comment."""
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 32), "white").save(
+        buf, "JPEG", exif=_webui_exif(orientation, comment)
+    )
+    return buf.getvalue()
+
+
+def _upright(data):
+    """The picture of a file turned upright, as Gradio does on upload."""
+    from PIL import ImageOps
+
+    return ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+
+
+def _piexif_like_comment(data):
+    """The EXIF comment as piexif gives it: bytes, or a tuple of numbers when
+    it is stored as BYTE (as Pillow writes it back)."""
+    from PIL import TiffImagePlugin, TiffTags
+
+    fp = io.BytesIO(data[6:] if data.startswith(b"Exif\x00\x00") else data)
+    head = fp.read(8)
+    ifd = TiffImagePlugin.ImageFileDirectory_v2(head)
+    ifd.load(fp)
+    if 0x8769 not in ifd:
+        return b""
+    fp.seek(ifd[0x8769])
+    exif_ifd = TiffImagePlugin.ImageFileDirectory_v2(head)
+    exif_ifd.load(fp)
+    if 0x9286 not in exif_ifd:
+        return b""
+    comment = exif_ifd[0x9286]
+    return tuple(comment) if exif_ifd.tagtype[0x9286] == TiffTags.BYTE else comment
+
+
+def _piexif_like_load(data):
+    """piexif.helper.UserComment.load."""
+    encoding = {b"ASCII\x00\x00\x00": "ascii", b"UNICODE\x00": "utf_16_be"}.get(
+        data[:8]
+    )
+    if len(data) < 8 or encoding is None:
+        msg = "unable to determine appropriate encoding"
+        raise ValueError(msg)
+    return data[8:].decode(encoding, errors="replace")
+
+
+def _webui_reader_with_piexif(image):
+    """The WebUI's images.read_info_from_image (AUTOMATIC1111, Forge Neo),
+    with piexif when it is installed, else with piexif's types: on a JPEG
+    turned upright it stops ("'tuple' object has no attribute 'decode'")."""
+    items = dict(image.info or {})
+    text = items.pop("parameters", None)
+    if "exif" in items:
+        try:
+            import piexif
+            import piexif.helper
+        except ImportError:
+            comment = _piexif_like_comment(items["exif"])
+            load = _piexif_like_load
+        else:
+            try:
+                exif = piexif.load(items["exif"])
+            except OSError:
+                exif = None
+            comment = (exif or {}).get("Exif", {}).get(piexif.ExifIFD.UserComment, b"")
+            load = piexif.helper.UserComment.load
+        try:
+            comment = load(comment)
+        except ValueError:
+            comment = comment.decode("utf8", errors="ignore")
+        if comment:
+            text = comment
+    return text, items
+
+
+# EXIF comments: the WebUI's parameters, and a camera's blank or own one.
+_WEBUI_UNICODE_COMMENT = b"UNICODE\x00" + _SAVED_PARAMETERS.encode("utf-16-be")
+_BLANK_CAMERA_COMMENT = b"\x00" * 64
+_CAMERA_COMMENT = b"ASCII\x00\x00\x00OLYMPUS DIGITAL CAMERA         "
+_SAVED_PROMPTS = ("a woman in a garden, smile\ndetailed eyes", "blurry, lowres")
+
+
+@pytest.mark.parametrize("orientation", [6, 8])
+@pytest.mark.parametrize(
+    ("comment", "expected"),
+    [
+        (_WEBUI_UNICODE_COMMENT, _SAVED_PROMPTS),
+        (_BLANK_CAMERA_COMMENT, None),
+        (_CAMERA_COMMENT, None),
+    ],
+    ids=["webui", "blank-camera", "camera"],
+)
+def test_image_prompt_option_reads_a_jpeg_turned_upright(
+    tmp_path, capsys, orientation, comment, expected
+):
+    # A JPEG turned upright before it is read: Pillow writes its EXIF comment
+    # back as another type, the WebUI's reader stopped on it, and the status
+    # said "couldn't be read": a camera photo with a blank comment counted as
+    # unreadable, and a WebUI picture rotated in a viewer lost its prompt.
+    picture = _upright(_rotated_jpeg_bytes(comment, orientation))
+    assert picture.size == (32, 64)
+    with pytest.raises(AttributeError):
+        _webui_reader_with_piexif(picture)  # the WebUI's reader stops on it
+    script, shells, _reads = _prompt_runtime(
+        tmp_path, on=True, reader=_webui_reader_with_piexif
+    )
+
+    _image, status = script.run_detailer_on_image(picture, SimpleNamespace(), save=False)
+
+    err = capsys.readouterr().err
+    assert "couldn't" not in status + err
+    assert "tuple" not in err
+    if expected is None:
+        assert (shells[0].prompt, shells[0].negative_prompt) == ("", "")
+        assert status.endswith("The image has no saved prompt, so the main prompt was empty.")
+        assert "the image has no saved prompt" in err
+    else:
+        assert (shells[0].prompt, shells[0].negative_prompt) == expected
+        assert status == "✅ ADetailer pass complete."
+
+
+@pytest.mark.parametrize("piexif_installed", [True, False], ids=["as-installed", "no-piexif"])
+@pytest.mark.parametrize(
+    ("comment", "expected"),
+    [
+        (_WEBUI_UNICODE_COMMENT, _SAVED_PROMPTS),
+        (b"ASCII\x00\x00\x00" + _SAVED_PARAMETERS.encode(), _SAVED_PROMPTS),
+        # Without a prefix: as UTF-8 text, as the WebUI's reader reads it.
+        (_SAVED_PARAMETERS.encode(), _SAVED_PROMPTS),
+        # Little-endian UTF-16 is not what piexif reads: as for the WebUI.
+        (b"UNICODE\x00" + _SAVED_PARAMETERS.encode("utf-16-le"), None),
+        (_BLANK_CAMERA_COMMENT, None),
+        (_CAMERA_COMMENT, None),
+        (b"ab", None),
+    ],
+    ids=["unicode", "ascii", "no-prefix", "unicode-le", "blank", "camera", "short"],
+)
+def test_image_prompt_reads_the_exif_comment_as_the_webui_when_its_reader_fails(
+    monkeypatch, piexif_installed, comment, expected
+):
+    # With piexif (the WebUI's) or, on a WebUI without it, by piexif's rule.
+    if not piexif_installed:
+        monkeypatch.setitem(sys.modules, "piexif", None)
+        monkeypatch.setitem(sys.modules, "piexif.helper", None)
+    picture = _upright(_rotated_jpeg_bytes(comment))
+    runtime = _load_script(
+        functions={"_prompts_saved_in_image"},
+        images=SimpleNamespace(read_info_from_image=_unreadable),
+    )
+
+    assert runtime._prompts_saved_in_image(picture) == expected
+
+
+def test_image_prompt_option_is_a_settings_option_off_by_default():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    option = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_apply_prompt_from_image"
+    )
+    info_call = option.args[1]
+    assert info_call.func.attr == "info"
+    info = ast.literal_eval(info_call.args[0])
+    keywords = {k.arg: k.value for k in info_call.func.value.keywords}
+    assert ast.literal_eval(keywords["default"]) is False
+    assert ast.literal_eval(keywords["label"]) == (
+        "Run ADetailer on an image uses the prompt saved in the image"
+    )
+    assert "'Run ADetailer on an image'" in info
+    assert not any(mark in info for mark in ("**", "`", "]("))
+
+
+def test_image_prompt_option_is_in_the_readme_and_the_changelog():
+    # The README's Settings table lists the option in the order of the page,
+    # right after Manual mode; its guide for many pictures with their own
+    # prompts gives it before the img2img Batch recipe; and the newest
+    # CHANGELOG section, the release that added it, names it.
+    label = "Run ADetailer on an image uses the prompt saved in the image"
+    docs = _public_docs()
+    readme = docs["README.md"]
+    names = [
+        line.split(" | ")[0] for line in readme.splitlines() if line.startswith("| ")
+    ]
+    row = next(k for k, name in enumerate(names) if label in name)
+    assert "Manual mode" in names[row - 1]
+    guide = readme.split("### Many pictures, each with its own prompt\n")[1]
+    guide = guide.split("\n### ")[0]
+    assert label in guide
+    assert guide.index(label) < guide.index("**With the img2img Batch tab:**")
+    newest = docs["CHANGELOG.md"].split("\n## ")[1]
+    assert label in newest
 
 
 def test_standalone_run_gives_every_region_a_random_seed(tmp_path, monkeypatch):
@@ -1489,10 +2686,11 @@ def _start_up_class_filter(monkeypatch, saved):
         "partial": partial,
         "saved_tab_state": saved,
         "n": 0,
-        "model_choices": ["animals.pt", "custom-world.pt", "None"],
+        "model_choices": ["animals.pt", "custom-world.pt", "yoloe-11s-seg.pt", "None"],
         "webui_info": SimpleNamespace(model_mapping={"animals.pt": "animals.pt"}),
         "MEDIAPIPE_FACE_FEATURES_MODEL": "mediapipe_face_features",
         "get_model_class_names": lambda path: {"animals.pt": ["cat", "dog"]}.get(path, []),
+        "is_yoloe_model": is_yoloe_model,
     }
     buffer = io.BytesIO()
     monkeypatch.setattr(
@@ -1532,6 +2730,14 @@ def _start_up_class_filter(monkeypatch, saved):
         ),
         ({"ad_model": "custom-world.pt", "ad_model_classes": "顔"},
          b"classes[include]='\\u9854'"),
+        # A YOLOE detector with text prompts: the same, NOT mode off.
+        (
+            {
+                "ad_model": "yoloe-11s-seg.pt", "ad_model_classes": "face,hand",
+                "ad_model_classes_exclude": True, "ad_model_classes_excluded": "hand",
+            },
+            b"detector='yoloe-11s-seg.pt', classes[include]='face,hand'",
+        ),
         # NOT mode says that the classes are excluded.
         (
             {
@@ -1567,7 +2773,7 @@ def test_start_up_line_names_the_class_filter_each_tab_restored(monkeypatch, sav
     if " restored - " in line:
         # The line names what the class widgets really start with.
         assert ("[NOT/exclude]" in line) is shown["not"]
-        world = "-world" in saved["ad_model"]
+        world = "-world" in saved["ad_model"] or is_yoloe_model(saved["ad_model"])
         assert line.endswith(f"={(shown['classes'] if world else shown['selection'])!a}")
         if shown["not"]:
             assert ",".join(shown["selection"]) == shown["excluded"]
@@ -4905,6 +6111,252 @@ def test_the_selected_styles_reach_the_detailer_pass_once(prompt, negative, expe
         assert script.get_prompt(p, args)[0] == [prompt.replace("[PROMPT]", main) or main]
 
 
+class _MoreStyles(_StyleDatabase):
+    styles = {
+        "cinematic": ("cinematic still of {prompt}, 35mm film", "lowres, blurry"),
+        "lit": ("soft light <lora:detail:0.5>", "grainy"),
+        "negative only": ("", "watermark"),
+        "noted": ("soft light # warm", "grainy"),
+        "twice": ("{prompt}, close-up of {prompt}", ""),
+        "drawn": ("{prompt}, __lighting__", ""),
+        "framed": ("photo, {prompt}, photo", ""),
+    }
+
+
+def _rewritten_main(styles, typed, drawn, *, negative=("bad hands", None), strip=None):
+    """A generation whose main prompt another extension changed after the
+    host styled it: `typed` is what it left in p.prompt, `drawn` the image's
+    prompt in p.all_prompts (the same for the negative pair; None: only
+    styled). With the styles database and the script."""
+    db = _MoreStyles()
+    if strip is None:
+        runtime = _load_script(
+            methods=_INLINE_PROMPT_METHODS,
+            functions=_INLINE_PROMPT_FUNCTIONS,
+            assigns=_INLINE_PROMPT_ASSIGNS,
+            get_i=lambda p: getattr(p, "batch_index", 0),
+            shared=SimpleNamespace(prompt_styles=db),
+        )
+    else:
+        runtime = _comments_runtime(db, strip)
+    drawn_negative = negative[1]
+    if drawn_negative is None:
+        drawn_negative = db.apply_negative_styles_to_prompt(negative[0], styles)
+    p = SimpleNamespace(
+        prompt=typed, negative_prompt=negative[0], styles=list(styles),
+        all_prompts=list(drawn) if isinstance(drawn, list) else [drawn],
+        all_negative_prompts=[drawn_negative],
+    )
+    return db, runtime.AfterDetailerScript(), p
+
+
+_REWRITTEN_MAINS = [
+    # The "wildcards" extension: p.prompt as typed, the wildcard drawn in the
+    # styled all_prompts. A style that wraps the prompt, one appended to it.
+    (
+        ["cinematic"], "a woman, __hair__",
+        "cinematic still of a woman, long hair, 35mm film", "a woman, long hair",
+    ),
+    (
+        ["lit"], "a woman, __hair__",
+        "a woman, long hair, soft light <lora:detail:0.5>", "a woman, long hair",
+    ),
+    # Dynamic Prompts: p.prompt holds the styled text, with the wildcard...
+    (
+        ["cinematic"], "cinematic still of a woman, __hair__, 35mm film",
+        "cinematic still of a woman, long hair, 35mm film", "a woman, long hair",
+    ),
+    # ...and also when the prompt has nothing for it to draw.
+    (
+        ["cinematic"], "cinematic still of a woman, 35mm film",
+        "cinematic still of a woman, 35mm film", "a woman",
+    ),
+    (
+        ["lit"], "a woman, soft light <lora:detail:0.5>",
+        "a woman, soft light <lora:detail:0.5>", "a woman",
+    ),
+    # More styles at once, in both orders.
+    (
+        ["lit", "cinematic"], "a woman, __hair__",
+        "cinematic still of a woman, long hair, soft light <lora:detail:0.5>, 35mm film",
+        "a woman, long hair",
+    ),
+    (
+        ["cinematic", "lit"], "a woman, __hair__",
+        "cinematic still of a woman, long hair, 35mm film, soft light <lora:detail:0.5>",
+        "a woman, long hair",
+    ),
+    # An empty main prompt: the style alone, which Dynamic Prompts leaves in
+    # p.prompt.
+    (["lit"], "soft light <lora:detail:0.5>", "soft light <lora:detail:0.5>", ""),
+    (["cinematic"], "cinematic still of , 35mm film", "cinematic still of , 35mm film", ""),
+    (
+        ["lit", "cinematic"], "cinematic still of soft light <lora:detail:0.5>, 35mm film",
+        "cinematic still of soft light <lora:detail:0.5>, 35mm film", "",
+    ),
+    # The drawn value ends like the style: only the style's own text goes.
+    (
+        ["lit"], "a woman, __light__",
+        "a woman, soft light <lora:detail:0.5>, soft light <lora:detail:0.5>",
+        "a woman, soft light <lora:detail:0.5>",
+    ),
+]
+
+
+@pytest.mark.parametrize("ad_prompt", ["", "[PROMPT], detailed face", "[PROMPT=woman]"])
+@pytest.mark.parametrize(("styles", "typed", "drawn", "plain"), _REWRITTEN_MAINS)
+def test_the_styles_reach_the_pass_once_when_another_extension_changed_the_main_prompt(
+    styles, typed, drawn, plain, ad_prompt
+):
+    # The styles gave the host's main prompt back only from the prompt as
+    # typed: with a wildcard drawn by another extension, or with Dynamic
+    # Prompts just enabled, a blank or [PROMPT] tab took the styled main
+    # prompt and the host styled it again ("cinematic still of cinematic
+    # still of ...", a style's LoRA twice).
+    from adetailer.args import ADetailerArgs
+
+    db, script, p = _rewritten_main(styles, typed, drawn)
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt=ad_prompt)
+
+    prompts, negatives = script.get_prompt(p, args)
+
+    if ad_prompt == "[PROMPT=woman]":
+        # Only the main prompt's own parts are searched, not the style's.
+        assert prompts == (["a woman"] if plain else [""])
+        return
+    assert prompts == [ad_prompt.replace("[PROMPT]", plain) or plain]
+    # What the detailer pass gets once the host has applied the styles: for
+    # a blank prompt, the image's own prompt.
+    positive = db.apply_styles_to_prompt(prompts[0], styles)
+    if not ad_prompt:
+        assert positive == drawn
+    for name in styles:
+        for piece in db.styles[name][0].split("{prompt}"):
+            if piece.strip(", ") and piece.strip(", ") not in plain:
+                assert positive.count(piece.strip(", ")) == 1
+    assert db.apply_negative_styles_to_prompt(negatives[0], styles) == (
+        p.all_negative_prompts[0]
+    )
+
+
+def test_the_negative_styles_reach_the_pass_once_with_a_wildcard_in_the_negative_prompt():
+    from adetailer.args import ADetailerArgs
+
+    styles = ["cinematic", "negative only"]
+    db, script, p = _rewritten_main(
+        styles, "a woman", "cinematic still of a woman, 35mm film",
+        negative=("bad hands, __flaw__", "bad hands, extra fingers, lowres, blurry, watermark"),
+    )
+    for ad_negative, expected in (
+        ("", "bad hands, extra fingers"),
+        ("[PROMPT], ugly", "bad hands, extra fingers, ugly"),
+    ):
+        args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_negative_prompt=ad_negative)
+        prompts, negatives = script.get_prompt(p, args)
+        assert negatives == [expected]
+        styled = db.apply_negative_styles_to_prompt(negatives[0], styles)
+        assert styled.count("lowres, blurry") == 1
+        assert styled.count("watermark") == 1
+        # The prompt, which no extension changed, as before.
+        assert prompts == ["a woman"]
+
+
+def test_each_image_of_a_batch_gets_its_own_drawn_prompt_without_the_styles():
+    from adetailer.args import ADetailerArgs
+
+    styles = ["cinematic"]
+    drawn = [
+        "cinematic still of a woman, long hair, 35mm film",
+        "cinematic still of a woman, short hair, 35mm film",
+        "cinematic still of a woman, red hair, 35mm film",
+    ]
+    db, script, p = _rewritten_main(styles, "a woman, __hair__", drawn)
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt="[PROMPT], detailed face")
+    for index, hair in enumerate(("long", "short", "red")):
+        p.batch_index = index
+        prompts, _negatives = script.get_prompt(p, args)
+        assert prompts == [f"a woman, {hair} hair, detailed face"]
+        assert db.apply_styles_to_prompt(prompts[0], styles).count("cinematic still of") == 1
+
+
+def test_a_style_with_a_comment_is_taken_off_a_main_prompt_another_extension_changed():
+    # The WebUI removed the style's comment from the main prompt: the style
+    # is looked for without it, and the pass (which applies such a style
+    # itself, without the comment) gets the image's own prompt.
+    from adetailer.args import ADetailerArgs
+
+    styles = ["noted"]
+    db, script, p = _rewritten_main(
+        styles, "a woman, __hair__", "a woman, long hair, soft light",
+        strip=_neo_strip_comments,
+    )
+    prompts, _negatives = script.get_prompt(p, ADetailerArgs(ad_model="face_yolov8n.pt"))
+    assert prompts == ["a woman, long hair"]
+    styled = _neo_strip_comments(db.apply_styles_to_prompt(prompts[0], styles))
+    assert styled == p.all_prompts[0]
+
+
+@pytest.mark.parametrize(
+    ("styles", "typed", "drawn"),
+    [
+        # The main prompt no longer starts or ends with the style's text.
+        (["cinematic"], "a woman, __hair__", "a woman, long hair"),
+        (["cinematic"], "a woman, __hair__", "cinematic still of a woman, long hair"),
+        (["cinematic"], "a woman, __hair__", "a woman, long hair, 35mm film"),
+        (["cinematic"], "a woman, __hair__", "Cinematic still of a woman, 35mm film"),
+        (["lit"], "a woman, __hair__", "a woman, long hair, soft light"),
+        (["lit"], "a woman, __hair__", "a woman, long hair soft light <lora:detail:0.5>"),
+        # Shorter than the two ends of the style together.
+        (["framed"], "__all__", "photo, photo"),
+        # The extension drew something in the style's own text.
+        (["drawn"], "a woman, __hair__", "a woman, long hair, candle light"),
+        # A style that holds the prompt twice.
+        (["twice"], "a woman, __hair__", "a woman, long hair, close-up of a woman, red hair"),
+        # A text the styles would not give back as it is.
+        (["lit"], "a woman, __hair__", " a woman, long hair , soft light <lora:detail:0.5>"),
+    ],
+)
+@pytest.mark.parametrize("ad_prompt", ["", "[PROMPT], detailed face"])
+def test_a_main_prompt_the_styles_cannot_be_told_from_is_left_as_it_is(
+    styles, typed, drawn, ad_prompt
+):
+    # Not sure: the main prompt is used whole, as before, and never cut.
+    from adetailer.args import ADetailerArgs
+
+    _db, script, p = _rewritten_main(styles, typed, drawn)
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt=ad_prompt)
+    prompts, _negatives = script.get_prompt(p, args)
+    assert prompts == [ad_prompt.replace("[PROMPT]", drawn) or drawn]
+
+
+@pytest.mark.parametrize(
+    ("styles", "typed"),
+    [
+        (["cinematic"], "a woman in a park"),
+        (["lit"], "a woman in a park"),
+        (["lit", "cinematic", "negative only"], "a woman in a park"),
+        (["negative only"], "a woman in a park"),
+        # Typed like the style itself: the typed text is kept whole.
+        (["cinematic"], "cinematic still of a woman, 35mm film"),
+        (["lit"], "a woman, soft light <lora:detail:0.5>"),
+        (["cinematic"], ""),
+        (["lit"], "  a woman  "),
+    ],
+)
+@pytest.mark.parametrize("ad_prompt", ["", "[PROMPT], detailed face", "detailed face"])
+def test_without_another_extension_the_pass_prompts_are_the_typed_ones_as_before(
+    styles, typed, ad_prompt
+):
+    from adetailer.args import ADetailerArgs
+
+    db = _MoreStyles()
+    _db, script, p = _rewritten_main(styles, typed, db.apply_styles_to_prompt(typed, styles))
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_prompt=ad_prompt)
+    prompts, negatives = script.get_prompt(p, args)
+    assert prompts == [ad_prompt.replace("[PROMPT]", typed) or typed]
+    assert negatives == ["bad hands"]
+
+
 @pytest.mark.parametrize(
     ("ad_prompt", "main", "sr", "fields", "record"),
     [
@@ -6050,6 +7502,647 @@ def test_standalone_run_fills_a_transparent_image_like_the_host(tmp_path, host, 
         script.run_detailer_on_image(given, SimpleNamespace(), save=False)
         assert seen[-1].mode == "RGB"
         assert seen[-1].tobytes() == opaque.tobytes()
+
+
+def _a1111_writer(image, geninfo, filename, extension):
+    """AUTOMATIC1111's images.save_image_with_geninfo, without the EXIF: a
+    JPEG and a WebP are written without the alpha channel."""
+    image_format = Image.registered_extensions()[extension]
+    if extension.lower() == ".png":
+        from PIL import PngImagePlugin
+
+        info = PngImagePlugin.PngInfo()
+        info.add_text("parameters", str(geninfo))
+        image.save(filename, format=image_format, pnginfo=info)
+    elif extension.lower() in (".jpg", ".jpeg", ".webp"):
+        if image.mode == "RGBA":
+            image = image.convert("RGB")
+        image.save(filename, format=image_format, quality=95)
+    else:
+        image.save(filename, format=image_format)
+
+
+def _neo_writer(image, geninfo, filename, extension):
+    """Forge Neo's: only a JPEG is written without the alpha channel."""
+    if extension.lower() == ".webp":
+        image.save(filename, format="WEBP", lossless=True)
+    else:
+        _a1111_writer(image, geninfo, filename, extension)
+
+
+# A cut-out: transparent all around, half see-through at the top left, and
+# opaque in the middle, where the pass draws.
+def _cut_out(mode):
+    if mode == "P":
+        picture = Image.new("P", (64, 64), 0)
+        picture.putpalette([0, 255, 0, 200, 30, 30] + [0] * 762)
+        picture.paste(1, (8, 8, 56, 56))
+        picture.info["transparency"] = 0
+        return picture
+    alpha = Image.new("L", (64, 64), 0)
+    alpha.paste(255, (8, 8, 56, 56))
+    alpha.paste(128, (8, 8, 16, 16))
+    if mode == "LA":
+        return Image.merge("LA", (Image.new("L", (64, 64), 90), alpha))
+    picture = Image.new("RGB", (64, 64), (0, 255, 0))
+    picture.paste((200, 30, 30), (8, 8, 56, 56))
+    return Image.merge("RGBA", (*picture.split(), alpha))
+
+
+_PASS_PARAMETERS = (
+    "a person\nSteps: 28, Sampler: Euler a, CFG scale: 7.0, Seed: 5, "
+    "Size: 64x64, ADetailer model: face_yolov8n.pt"
+)
+
+
+def _keep_transparency_runtime(
+    tmp_path, *, on, fmt="png", writer=_a1111_writer, size=None, from_image=False
+):
+    """A standalone run whose inner pass, like the WebUI's, gives a new RGB
+    picture with its parameters and a blue square where it drew; the save
+    to the ADetailer-Inpaint folder writes a file with `writer`."""
+    from adetailer.common import ensure_pil_image
+
+    files, passes = [], []
+
+    def save_image(image, path, _basename, extension, p=None, info=None):
+        Path(path).mkdir(parents=True, exist_ok=True)
+        name = Path(path, f"{len(files):05}.{extension}")
+        writer(image, info, str(name), f".{extension}")
+        files.append(name)
+
+    data = {} if on is None else {"ad_apply_keep_transparency": on}
+    if from_image:
+        data["ad_apply_prompt_from_image"] = True
+    script = _load_script(
+        methods={
+            "run_detailer_on_image", "read_params_txt", "write_params_txt",
+            "get_seed", "get_each_tab_seed",
+        },
+        paths=SimpleNamespace(data_path=str(tmp_path)),
+        PARAMS_TXT="params.txt",
+        shared=SimpleNamespace(
+            sd_model=None,
+            opts=SimpleNamespace(data={"ad_same_seed_for_each_tab": False}),
+        ),
+        state=SimpleNamespace(interrupted=False, skipped=False, stopping_generation=False),
+        opts=SimpleNamespace(
+            samples_format=fmt, img2img_background_color="#ffffff",
+            outdir_samples=str(tmp_path / "out"), enable_pnginfo=True, data=data,
+        ),
+        all_samplers=[],
+        ensure_pil_image=ensure_pil_image,
+        images=SimpleNamespace(
+            flatten=_host_flatten, save_image=save_image,
+            save_image_with_geninfo=writer, read_info_from_image=_webui_info_reader,
+        ),
+        AD_APPLY_SUBDIR="ADetailer-Inpaint",
+        get_i=lambda _p: 0,
+        pause_total_tqdm=nullcontext,
+    ).AfterDetailerScript()
+    script._standalone_infotext_p = lambda p: p
+
+    def inner(_p, pp, _args, n=0):
+        passes.append(pp.image)
+        result = pp.image.copy().resize(size or pp.image.size)
+        result.paste((0, 0, 255), (24, 24, 40, 40))
+        result.info = {
+            "parameters": _REGION_PARAMETERS if from_image else _PASS_PARAMETERS
+        }
+        pp.image = result
+        return True
+
+    script._postprocess_image_inner = inner
+    return script, files, passes
+
+
+def _alpha(picture):
+    return picture.convert("RGBA").getchannel("A").tobytes()
+
+
+@pytest.mark.parametrize("mode", ["RGBA", "LA", "P"])
+def test_keep_transparency_option_puts_the_pictures_alpha_on_the_result(
+    tmp_path, capsys, mode
+):
+    # A cut-out run through "Run ADetailer on an image" came out filled with
+    # the img2img background colour. With the option on, the result and the
+    # PNG saved to the ADetailer-Inpaint folder have the picture's alpha
+    # channel back; the pass still worked on the filled picture.
+    script, files, passes = _keep_transparency_runtime(tmp_path, on=True)
+    cut_out = _cut_out(mode)
+
+    result, status = script.run_detailer_on_image(
+        cut_out, SimpleNamespace(), save=True
+    )
+
+    assert passes[0].mode == "RGB"
+    assert passes[0].getpixel((0, 0)) == (255, 255, 255)
+    assert result.mode == "RGBA"
+    assert _alpha(result) == _alpha(cut_out)
+    assert result.getpixel((30, 30)) == (0, 0, 255, 255)
+    # The parameters the pass gave the result stay as they were.
+    assert result.info["parameters"] == _PASS_PARAMETERS
+    assert status == (
+        "✅ ADetailer pass complete. Saved to the 'ADetailer-Inpaint' folder."
+    )
+    (saved,) = files
+    with Image.open(saved) as file:
+        assert file.mode == "RGBA"
+        assert _alpha(file) == _alpha(cut_out)
+        assert file.info["parameters"] == _PASS_PARAMETERS
+    assert "transparency" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("on", [None, False])
+def test_keep_transparency_option_off_gives_the_filled_result_as_before(tmp_path, on):
+    script, files, _passes = _keep_transparency_runtime(tmp_path, on=on)
+
+    result, status = script.run_detailer_on_image(
+        _cut_out("RGBA"), SimpleNamespace(), save=True
+    )
+
+    assert result.mode == "RGB"
+    assert result.getpixel((0, 0)) == (255, 255, 255)
+    assert status == (
+        "✅ ADetailer pass complete. Saved to the 'ADetailer-Inpaint' folder."
+    )
+    with Image.open(files[0]) as file:
+        assert file.mode == "RGB"
+
+
+def test_keep_transparency_option_leaves_a_picture_without_transparency_as_before(
+    tmp_path,
+):
+    # An RGB picture, and an opaque one as the input box gives it (RGBA):
+    # the same result as with the option off.
+    opaque = Image.new("RGB", (64, 64), (10, 20, 30))
+    opaque.paste((250, 240, 5), (8, 8, 20, 20))
+    results = []
+    for on in (False, True):
+        for given in (opaque, opaque.convert("RGBA")):
+            script, files, _passes = _keep_transparency_runtime(
+                tmp_path / f"{on}{given.mode}", on=on
+            )
+            result, status = script.run_detailer_on_image(
+                given, SimpleNamespace(), save=True
+            )
+            with Image.open(files[0]) as file:
+                results.append((result.mode, result.tobytes(), status, file.mode))
+    assert results[0][0] == "RGB"
+    assert results.count(results[0]) == 4
+
+
+@pytest.mark.parametrize(
+    ("fmt", "writer", "kept"),
+    [
+        ("jpg", _a1111_writer, False),
+        ("jpg", _neo_writer, False),
+        ("webp", _a1111_writer, False),
+        ("webp", _neo_writer, True),
+        ("png", _neo_writer, True),
+    ],
+)
+def test_keep_transparency_option_says_when_the_file_format_has_none(
+    tmp_path, capsys, fmt, writer, kept
+):
+    # The WebUI's file format is not changed: in a JPEG (and a WebP on
+    # AUTOMATIC1111) the saved file has no transparency, and the answer and
+    # the console say so. The result shown keeps it.
+    script, files, _passes = _keep_transparency_runtime(
+        tmp_path, on=True, fmt=fmt, writer=writer
+    )
+
+    result, status = script.run_detailer_on_image(
+        _cut_out("RGBA"), SimpleNamespace(), save=True
+    )
+
+    assert result.mode == "RGBA"
+    note = (
+        " The saved file has no transparency: the WebUI writes "
+        f"'{fmt}' files without it."
+    )
+    err = capsys.readouterr().err
+    with Image.open(files[0]) as file:
+        assert (file.mode == "RGBA") is kept
+    if kept:
+        assert status.endswith("folder.")
+        assert "transparency" not in err
+    else:
+        assert status.endswith("folder." + note)
+        assert err.count("saved without its transparency") == 1
+        # Within a folder the folder says it once, with the count.
+        script._ad_folder_run = True
+        _result, status = script.run_detailer_on_image(
+            _cut_out("RGBA"), SimpleNamespace(), save=True
+        )
+        assert status.endswith(note)
+        assert "transparency" not in capsys.readouterr().err
+
+
+def test_keep_transparency_option_stretches_the_alpha_to_a_smaller_result(tmp_path):
+    # "Inpaint only masked" off: the whole picture is inpainted at a capped
+    # size, which the pass stretched the picture to.
+    script, _files, _passes = _keep_transparency_runtime(
+        tmp_path, on=True, size=(32, 32)
+    )
+
+    result, status = script.run_detailer_on_image(
+        _cut_out("RGBA"), SimpleNamespace(), save=False
+    )
+
+    assert status == "✅ ADetailer pass complete."
+    assert (result.mode, result.size) == ("RGBA", (32, 32))
+    assert result.getpixel((0, 0))[3] == 0
+    assert result.getpixel((16, 16))[3] == 255
+
+
+def test_keep_transparency_option_gives_an_unchanged_picture_its_transparency(
+    tmp_path,
+):
+    script, _files, _passes = _keep_transparency_runtime(tmp_path, on=True)
+    script._postprocess_image_inner = lambda *_args, **_kwargs: False
+    cut_out = _cut_out("RGBA")
+
+    image, status = script.run_detailer_on_image(cut_out, SimpleNamespace(), save=True)
+
+    assert status == "ℹ️ Nothing detected — image unchanged."
+    assert image.mode == "RGBA"
+    assert _alpha(image) == _alpha(cut_out)
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_keep_transparency_option_keeps_the_parameters_of_the_prompt_option(
+    tmp_path, on
+):
+    # With "...uses the prompt saved in the image" on too, the result and its
+    # saved file record the picture's own prompts and the pass's parameters
+    # line, with the transparency or without it.
+    from PIL import PngImagePlugin
+
+    script, files, passes = _keep_transparency_runtime(
+        tmp_path, on=on, from_image=True
+    )
+    info = PngImagePlugin.PngInfo()
+    info.add_text("parameters", _SAVED_PARAMETERS)
+    buffer = io.BytesIO()
+    _cut_out("RGBA").save(buffer, "PNG", pnginfo=info)
+    cut_out = Image.open(io.BytesIO(buffer.getvalue()))
+
+    result, status = script.run_detailer_on_image(cut_out, SimpleNamespace(), save=True)
+
+    assert status.startswith("✅ ADetailer pass complete.")
+    expected = (
+        "a woman in a garden, smile\ndetailed eyes\n"
+        "Negative prompt: blurry, lowres\n" + _REGION_PARAMETERS_LINE
+    )
+    assert result.mode == ("RGBA" if on else "RGB")
+    assert result.info["parameters"] == expected
+    with Image.open(files[0]) as file:
+        assert file.info["parameters"] == expected
+        assert file.mode == result.mode
+
+
+def test_keep_transparency_option_is_a_settings_option_off_by_default():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    option = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_apply_keep_transparency"
+    )
+    info_call = option.args[1]
+    assert info_call.func.attr == "info"
+    info = ast.literal_eval(info_call.args[0])
+    keywords = {k.arg: k.value for k in info_call.func.value.keywords}
+    assert ast.literal_eval(keywords["default"]) is False
+    label = ast.literal_eval(keywords["label"])
+    assert label == (
+        "Run ADetailer on an image and Skip img2img keep the transparency of "
+        "the picture"
+    )
+    assert "JPEG" in info
+    # AUTOMATIC1111 writes a WebP without its transparency (see
+    # _host_format_keeps_transparency): the help line names it too. Not the
+    # folder: with Skip img2img the file goes to the img2img one.
+    assert "AUTOMATIC1111 also saves WebP without it. Off =" in info
+    assert "ADetailer-Inpaint" not in info
+    # It says that the option also holds for Skip img2img, and the limit of
+    # the Batch tab on Forge Neo: there the WebUI resizes a file whose sides
+    # are not multiples of its Resolution Step and makes it RGB before
+    # ADetailer sees it (modules/img2img.py process_batch, images.resize_image).
+    limit = (
+        "on Forge Neo, a Batch tab file whose sides are not multiples of the "
+        "WebUI's Resolution Step setting"
+    )
+    assert (
+        "The same in the img2img tab with ADetailer's Skip img2img ticked, "
+        f"also in its Batch tab; {limit} (64 by default) is resized by the "
+        "WebUI first and comes out without its transparency. ADetailer still "
+        "works" in info
+    )
+    assert "also in its Batch tab." not in info  # not promised without the limit
+    assert not any(mark in info for mark in ("**", "`", "]("))
+    # The Guide names the option by its label and says the same.
+    guide = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    line = next(x for x in guide.splitlines() if x.startswith("- Keep the transparency"))
+    assert f"Settings → ADetailer → {label}:" in line
+    assert (
+        f"in img2img with Skip img2img ticked (also in its Batch tab; {limit}, "
+        "64 by default, is resized by the WebUI first and comes out without its "
+        "transparency). The saved file" in line
+    )
+    assert "(also in its Batch tab)" not in line
+    assert not any(mark in line for mark in ("**", "`", "]("))
+
+
+def _skip_img2img_transparency_job(
+    *, on, fmt="png", writer=_a1111_writer, size=None, inpaint=False
+):
+    """An img2img job with ADetailer's hooks, as the WebUI calls them for
+    each image: process(), postprocess_image() on its own sample, then
+    postprocess_image_after_composite() on the image it is about to save.
+    The inner pass, like the WebUI's, gives a new RGB picture with a blue
+    square where it drew. `run(p, skip)` returns what postprocess_image left
+    and what the WebUI saves."""
+    from aaaaaa.p_method import is_skip_img2img, need_call_postprocess, need_call_process
+    from adetailer.args import SkipImg2ImgOrig
+    from adetailer.common import ensure_pil_image
+
+    data = {"ad_manual_mode": False}
+    if on is not None:
+        data["ad_apply_keep_transparency"] = on
+    script = _load_script(
+        methods={
+            "process", "set_skip_img2img", "postprocess_image",
+            "get_i2i_init_image", "postprocess_image_after_composite",
+        },
+        opts=SimpleNamespace(
+            data=data, samples_format=fmt, img2img_background_color="#ffffff"
+        ),
+        images=SimpleNamespace(flatten=_host_flatten, save_image_with_geninfo=writer),
+        is_img2img_inpaint=lambda _p: inpaint,
+        is_all_black=lambda _mask: False,
+        SkipImg2ImgOrig=SkipImg2ImgOrig,
+        is_skip_img2img=is_skip_img2img,
+        ensure_pil_image=ensure_pil_image,
+        copy=copy,
+        _verbose_gen_header=lambda *_args: None,
+        need_call_postprocess=need_call_postprocess,
+        need_call_process=need_call_process,
+        Processed=lambda *_args: "dummy",
+        preserve_prompts=lambda _p: nullcontext(),
+        CNHijackRestore=nullcontext,
+        pause_total_tqdm=nullcontext,
+        cn_allow_script_control=nullcontext,
+        _should_skip_for_hires_only=lambda _p, _args: False,
+    ).AfterDetailerScript()
+    tab = SimpleNamespace(need_skip=lambda: False)
+    script.is_ad_enabled = lambda *_args: True
+    script.get_args = lambda *_args: [tab]
+    script.extra_params = lambda _args: {}
+    script.read_params_txt = lambda: ""
+    script.write_params_txt = lambda _content: None
+    script._will_run_sequential = lambda _args: False
+    script.save_image = lambda *_args, **_kwargs: None
+    script.get_image_mask = lambda _p: "mask"
+    passes = []
+
+    def inner(_p, pp, _args, n=0):
+        passes.append(pp.image)
+        result = pp.image.copy().resize(size or pp.image.size)
+        result.paste((0, 0, 255), (24, 24, 40, 40))
+        pp.image = result
+        return True
+
+    script._postprocess_image_inner = inner
+
+    def run(p, skip=True):
+        script.process(p, True, skip, {})
+        pp = SimpleNamespace(image=Image.new("RGB", (128, 128), (9, 9, 9)))
+        script.postprocess_image(p, pp, True, skip, {})
+        after = SimpleNamespace(image=pp.image)
+        script.postprocess_image_after_composite(p, after, True, skip, {})
+        return pp.image, after.image
+
+    run.script = script
+    return run, passes
+
+
+def _img2img_p(*init_images, saved=True):
+    """The WebUI's img2img job, with its notes under the results."""
+    p = SimpleNamespace(
+        init_images=list(init_images), width=64, height=64, steps=30,
+        sampler_name="DPM++ 2M", extra_generation_params={},
+        batch_index=0, batch_size=1, seed=1, scripts=None, comments={},
+        save_samples=lambda: saved,
+    )
+    p.comment = lambda text: p.comments.__setitem__(text, 1)
+    return p
+
+
+@pytest.mark.parametrize("mode", ["RGBA", "LA", "P"])
+def test_keep_transparency_option_holds_for_skip_img2img(tmp_path, capsys, mode):
+    # A cut-out detailed in img2img with Skip img2img came out filled with the
+    # img2img background colour. With the option on, the image the WebUI
+    # saves gets the init image's alpha channel back; the pass, and the
+    # WebUI's own steps after ADetailer (colour correction), still get the
+    # filled RGB picture.
+    cut_out = _cut_out(mode)
+    run, passes = _skip_img2img_transparency_job(on=True)
+    p = _img2img_p(cut_out)
+
+    detailed, saved = run(p)
+
+    assert passes[0].mode == "RGB"
+    assert passes[0].getpixel((0, 0)) == (255, 255, 255)
+    assert detailed.mode == "RGB"
+    assert (saved.mode, saved.size) == ("RGBA", (64, 64))
+    assert _alpha(saved) == _alpha(cut_out)
+    assert saved.getpixel((32, 32)) == (0, 0, 255, 255)
+    # Under the alpha, the filled result: a JPEG of it shows the same picture.
+    assert saved.convert("RGB").tobytes() == detailed.tobytes()
+    # The WebUI reuses the init image for the next batches.
+    assert p.init_images == [cut_out]
+    assert cut_out.mode == mode
+    name = tmp_path / "saved.png"
+    _a1111_writer(saved, "", str(name), ".png")
+    with Image.open(name) as file:
+        assert _alpha(file) == _alpha(cut_out)
+    assert "transparency" not in capsys.readouterr().err
+    assert p.comments == {}
+
+
+@pytest.mark.parametrize("on", [None, False])
+def test_keep_transparency_option_off_leaves_skip_img2img_as_before(on):
+    # Off (the default): the image the WebUI saves is the very one the pass
+    # gave, filled, and nothing is kept on the job.
+    cut_out = _cut_out("RGBA")
+    run, _passes = _skip_img2img_transparency_job(on=on)
+    p = _img2img_p(cut_out)
+
+    detailed, saved = run(p)
+
+    assert saved is detailed
+    assert saved.mode == "RGB"
+    expected = _host_flatten(cut_out, "#ffffff")
+    expected.paste((0, 0, 255), (24, 24, 40, 40))
+    assert saved.tobytes() == expected.tobytes()
+    assert not hasattr(p, "_ad_skip_alpha")
+    assert p.comments == {}
+
+
+def test_keep_transparency_option_needs_skip_img2img_in_img2img():
+    # A normal img2img job (Skip img2img not ticked) is not touched: the
+    # WebUI made its image from the filled picture, which has no alpha.
+    run, passes = _skip_img2img_transparency_job(on=True)
+    p = _img2img_p(_cut_out("RGBA"))
+
+    detailed, saved = run(p, skip=False)
+
+    assert passes[0].size == (128, 128)
+    assert saved is detailed
+    assert saved.mode == "RGB"
+    assert not hasattr(p, "_ad_skip_alpha")
+
+
+def test_keep_transparency_option_is_not_for_skip_img2img_with_inpaint(capsys):
+    # In the inpaint tabs Skip img2img switches ADetailer off for the job
+    # (the WebUI's own inpaint runs): there is nothing to put back.
+    run, passes = _skip_img2img_transparency_job(on=True, inpaint=True)
+    p = _img2img_p(_cut_out("RGBA"))
+    p.image_mask = "mask"
+
+    detailed, saved = run(p)
+
+    assert "skip img2img is not supported" in capsys.readouterr().out
+    assert passes == []
+    assert saved is detailed
+    assert (saved.mode, saved.size) == ("RGB", (128, 128))
+    assert not hasattr(p, "_ad_skip_alpha")
+
+
+def test_keep_transparency_option_leaves_an_opaque_skip_img2img_image_rgb():
+    # The img2img box gives every picture as RGBA: one without transparent
+    # parts, and an RGB one, stay RGB.
+    opaque = Image.new("RGB", (64, 64), (10, 20, 30))
+    for given in (opaque.convert("RGBA"), opaque):
+        run, _passes = _skip_img2img_transparency_job(on=True)
+        p = _img2img_p(given)
+
+        detailed, saved = run(p)
+
+        assert saved is detailed
+        assert saved.mode == "RGB"
+        assert p._ad_skip_alpha is None
+
+
+@pytest.mark.parametrize(
+    ("fmt", "writer", "kept"),
+    [
+        ("jpg", _a1111_writer, False),
+        ("webp", _a1111_writer, False),
+        ("webp", _neo_writer, True),
+        ("png", _a1111_writer, True),
+    ],
+)
+def test_keep_transparency_option_says_when_skip_img2img_saves_without_it(
+    tmp_path, capsys, fmt, writer, kept
+):
+    # The WebUI's file format is not changed: in a JPEG (and a WebP on
+    # AUTOMATIC1111) the saved file has no transparency. The console and the
+    # WebUI's notes under the results say so once for the job (the img2img
+    # Batch tab runs every file on the same job).
+    run, _passes = _skip_img2img_transparency_job(on=True, fmt=fmt, writer=writer)
+    p = _img2img_p(_cut_out("RGBA"))
+
+    for n in range(2):
+        _detailed, saved = run(p)
+        # The image shown in the results keeps it.
+        assert saved.mode == "RGBA"
+        name = tmp_path / f"{n}.{fmt}"
+        writer(saved, "", str(name), f".{fmt}")
+        with Image.open(name) as file:
+            assert (file.mode == "RGBA") is kept
+
+    err = capsys.readouterr().err
+    note = (
+        "ADetailer: the Skip img2img result is saved without its transparency: "
+        f"the WebUI writes '{fmt}' files without it."
+    )
+    if kept:
+        assert "transparency" not in err
+        assert p.comments == {}
+    else:
+        assert err.count(f"[-] {note}\n") == 1
+        assert err.count("transparency") == 1
+        assert p.comments == {note: 1}
+
+
+def test_keep_transparency_option_has_no_note_when_skip_img2img_saves_nothing(capsys):
+    # "Always save all generated images" off: no file, no note.
+    run, _passes = _skip_img2img_transparency_job(on=True, fmt="jpg")
+    p = _img2img_p(_cut_out("RGBA"), saved=False)
+
+    _detailed, saved = run(p)
+
+    assert saved.mode == "RGBA"
+    assert "transparency" not in capsys.readouterr().err
+    assert p.comments == {}
+
+
+def test_keep_transparency_option_stretches_the_alpha_to_a_skip_img2img_result():
+    # "Inpaint only masked" off: the whole picture is inpainted at a size
+    # rounded down to a multiple of 8, which the pass stretched the picture to.
+    run, _passes = _skip_img2img_transparency_job(on=True, size=(32, 32))
+
+    _detailed, saved = run(_img2img_p(_cut_out("RGBA")))
+
+    assert (saved.mode, saved.size) == ("RGBA", (32, 32))
+    assert saved.getpixel((0, 0))[3] == 0
+    assert saved.getpixel((16, 16))[3] == 255
+
+
+def test_keep_transparency_option_gives_each_skip_img2img_image_its_own_alpha():
+    # The img2img Batch tab reuses the job for every file, and an API batch
+    # passes one init image per batch position: each result gets the alpha of
+    # its own init image, and a file without transparency none.
+    first, second = _cut_out("RGBA"), _cut_out("RGBA")
+    second.putalpha(Image.new("L", (64, 64), 77))
+    run, _passes = _skip_img2img_transparency_job(on=True)
+    p = _img2img_p(first, second)
+    p.batch_size = 2
+
+    _detailed, saved = run(p)
+    assert _alpha(saved) == _alpha(first)
+    p.batch_index = 1
+    _detailed, saved = run(p)
+    assert _alpha(saved) == _alpha(second)
+
+    # The next file of a Batch tab job, without transparency.
+    p.init_images = [Image.new("RGB", (64, 64), (10, 20, 30))] * 2
+    for index in (0, 1):
+        p.batch_index = index
+        detailed, saved = run(p)
+        assert saved is detailed
+        assert saved.mode == "RGB"
+
+
+def test_keep_transparency_option_never_costs_the_skip_img2img_result(capsys):
+    # The alpha that can't be put back (here: no image to put it on) leaves
+    # what the WebUI had, with a console line, and is not tried again.
+    run, _passes = _skip_img2img_transparency_job(on=True)
+    p = _img2img_p(_cut_out("RGBA"))
+    run(p)
+    hook = run.script.postprocess_image_after_composite
+    p._ad_skip_alpha = Image.new("L", (64, 64), 0)
+    pp = SimpleNamespace(image=None)
+
+    hook(p, pp, True, True, {})
+
+    assert pp.image is None
+    assert p._ad_skip_alpha is None
+    assert "couldn't put the transparency back on the result" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -8120,9 +10213,13 @@ def test_prompt_comments_leave_the_styles_check_alone_without_the_comments_scrip
     off = _comments_runtime(db, _a1111_strip_comments, {"enable_prompt_comments": False})
     assert off.AfterDetailerScript().get_prompt(p, args)[0] == [prompt]
     # No Comments script (WebUI before 1.8) and main prompts that the styles
-    # do not give back: the main prompts, as before.
+    # do not give back from the typed prompt, but still wrap: the text they
+    # wrap, so the host applies them once.
     p.all_prompts = [_a1111_strip_comments(p.all_prompts[0])]
     missing = _comments_runtime(db, None)
+    assert missing.AfterDetailerScript().get_prompt(p, args)[0] == ["a woman\nin a park"]
+    # Main prompts without the styles' text: the main prompts, as before.
+    p.all_prompts = ["a woman\nin a park"]
     assert missing.AfterDetailerScript().get_prompt(p, args)[0] == p.all_prompts
 
 
@@ -10515,6 +12612,103 @@ def test_install_announces_each_pip_command(monkeypatch, capsys):
     assert lines[3].startswith("[-] ADetailer: installed mediapipe>=0.10.13,<=0.10.99 (")
     assert len(lines) == 4
     assert len(calls) == 2
+
+
+def _script_statements():
+    return ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8")).body
+
+
+def _rich_import(statements):
+    """The script's guarded `from rich import print`, and its place."""
+    for index, node in enumerate(statements):
+        if isinstance(node, ast.Try) and any(
+            isinstance(inner, ast.ImportFrom) and inner.module == "rich"
+            for inner in node.body
+        ):
+            return index, node
+    msg = "the script no longer guards its import of rich"
+    raise AssertionError(msg)
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_script_without_rich_names_the_package_and_the_pip_command(
+    monkeypatch, capsys, installed
+):
+    # A WebUI started with --skip-install where rich is not installed: the
+    # script failed to load with only "No module named 'rich'" in a traceback.
+    # One plain line first (not through rich), then the same error.
+    _index, guard = _rich_import(_script_statements())
+    code = compile(ast.Module(body=[guard], type_ignores=[]), str(_SCRIPT_PATH), "exec")
+    namespace = {"sys": sys}
+    if installed:
+        exec(code, namespace)
+        import rich
+
+        assert namespace["print"] is rich.print
+        assert capsys.readouterr().err == ""
+        return
+    monkeypatch.setitem(sys.modules, "rich", None)
+
+    with pytest.raises(ModuleNotFoundError) as info:
+        exec(code, namespace)
+
+    assert info.value.name == "rich"
+    assert capsys.readouterr().err == (
+        "[-] ADetailer: the Python package 'rich' cannot be imported "
+        f"({info.value}), so ADetailer cannot load. Start the WebUI once without "
+        "--skip-install, or install it with the WebUI's Python: python -m pip "
+        'install "rich>=13.0.0"\n'
+    )
+    # The version install.py asks pip for.
+    install = _load_install(monkeypatch)
+    calls = []
+    monkeypatch.setattr(install, "run_pip", lambda *args: calls.append(args))
+    monkeypatch.setattr(install, "is_installed", lambda *a: False)
+    monkeypatch.setattr(install, "numpy_pin", lambda: [])
+    install.install()
+    assert "rich>=13.0.0" in calls[0]
+
+
+def test_script_guards_rich_before_anything_that_needs_it():
+    # The first import of rich is the guarded one: the extension's own
+    # packages (adetailer.common, aaaaaa.traceback) import rich too.
+    statements = _script_statements()
+    index, guard = _rich_import(statements)
+
+    assert [type(handler.body[-1]) for handler in guard.handlers] == [ast.Raise]
+    assert guard.handlers[0].body[-1].exc is None  # the same error goes on
+    for node in statements[:index]:
+        names = (
+            [node.module or ""] if isinstance(node, ast.ImportFrom)
+            else [alias.name for alias in node.names] if isinstance(node, ast.Import)
+            else []
+        )
+        for name in names:
+            assert name.split(".")[0] not in {"rich", "adetailer", "aaaaaa"}, name
+
+
+def test_script_says_at_startup_when_ultralytics_is_not_installed():
+    # Ultralytics is imported at the first detection only, so the script
+    # asks once it has loaded (adetailer.ultralytics.warn_missing_ultralytics
+    # is tested in test_ultralytics.py).
+    statements = _script_statements()
+    imported = [
+        node for node in statements
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "adetailer.ultralytics"
+        and [alias.name for alias in node.names] == ["warn_missing_ultralytics"]
+    ]
+    calls = [
+        node for node in statements
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and getattr(node.value.func, "id", "") == "warn_missing_ultralytics"
+        and not node.value.args
+        and not node.value.keywords
+    ]
+
+    assert len(imported) == 1
+    assert len(calls) == 1
 
 
 def test_install_says_nothing_when_everything_is_installed(monkeypatch, capsys):
@@ -14465,3 +16659,4126 @@ def test_the_verbose_log_says_when_dynamic_prompts_is_left_out(capsys):
     assert out.isascii()
     _dynamic_prompts_pass(ad_prompt="__eyecolor__ eyes", verbose=True)
     assert "Dynamic Prompts not run" not in capsys.readouterr().out
+
+
+# Settings > ADetailer "With hires fix, detail with the hires checkpoint".
+
+
+_HIRES_TITLE = "hires-model.safetensors [0123456789]"
+
+
+def _hires_p(*, enable_hr=True, title=_HIRES_TITLE, modules=None, **extra):
+    """A txt2img p after the host's init(): hr_checkpoint_info is set only for
+    a Hires checkpoint other than "Use same checkpoint"."""
+    p = _txt2img_p(enable_hr=enable_hr, **extra)
+    p.hr_checkpoint_info = None if title is None else SimpleNamespace(title=title)
+    if modules is not None:
+        p.hr_additional_modules = modules
+    return p
+
+
+def _hires_runtime(on=True, *, forge=False, flags=None, **host):
+    data = {"ad_hires_checkpoint": on} if on is not None else {}
+    labels = {"sd_model_checkpoint": SimpleNamespace(section=("sd", "Stable Diffusion"))}
+    host.setdefault("_is_forge_modules", lambda: forge)
+    host.setdefault("_forge_wanted_modules", lambda _args, _base=None: None)
+    runtime = _load_script(
+        methods={"get_override_settings"},
+        functions={"_crop_upscaler_usable"},
+        assigns={"AD_CROP_UPSCALER_WEBUI"},
+        shared=SimpleNamespace(cmd_opts=flags or SimpleNamespace()),
+        opts=SimpleNamespace(data=data, data_labels=labels),
+        **host,
+    )
+    runtime._FROZEN_REPORTED.clear()
+    return runtime
+
+
+@pytest.mark.parametrize(
+    ("on", "p", "tab", "expected"),
+    [
+        # On: a tab without its own checkpoint gets the hires one.
+        (True, "hires", {}, _HIRES_TITLE),
+        # "Use separate checkpoint" left on "Use same checkpoint" is no own one.
+        (
+            True, "hires",
+            {"ad_use_checkpoint": True, "ad_checkpoint": "Use same checkpoint"},
+            _HIRES_TITLE,
+        ),
+        # The tab's own checkpoint wins.
+        (
+            True, "hires",
+            {"ad_use_checkpoint": True, "ad_checkpoint": "own.safetensors"},
+            "own.safetensors",
+        ),
+        # Off (and never saved): the main checkpoint, as before.
+        (False, "hires", {}, None),
+        (None, "hires", {}, None),
+        # Hires fix with "Use same checkpoint", without hires fix, img2img and
+        # "Run ADetailer on an image" (no p): nothing changes.
+        (True, "same", {}, None),
+        (True, "no hires", {}, None),
+        (True, "img2img", {}, None),
+        (True, None, {}, None),
+    ],
+)
+def test_hires_checkpoint_option_gives_the_pass_the_hires_checkpoint(on, p, tab, expected):
+    from adetailer.args import ADetailerArgs
+
+    p = {
+        "hires": _hires_p(),
+        "same": _hires_p(title=None),
+        "no hires": _hires_p(enable_hr=False),
+        "img2img": _txt2img_p(),
+        None: None,
+    }[p]
+    runtime = _hires_runtime(on)
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", **tab)
+
+    override = runtime.AfterDetailerScript().get_override_settings(p, args)
+
+    assert override.get("sd_model_checkpoint") == expected
+
+
+def test_hires_checkpoint_with_frozen_settings_keeps_the_main_one(capsys):
+    # The host refuses to set a frozen option for the pass: every region
+    # failed. The main checkpoint is kept, and the console says so once.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _hires_runtime(flags=SimpleNamespace(freeze_settings=True))
+    args = ADetailerArgs(ad_model="face_yolov8n.pt")
+    script = runtime.AfterDetailerScript()
+
+    assert script.get_override_settings(_hires_p(), args) == {}
+    assert script.get_override_settings(_hires_p(), args) == {}
+    err = capsys.readouterr().err
+    assert err.count("hires fix checkpoint is not used") == 1
+    assert err.isascii()
+
+
+def test_hires_checkpoint_is_set_only_for_the_pass():
+    # The host sets override_settings before the pass and puts the main
+    # checkpoint back afterwards, also when the pass fails: ADetailer must not
+    # set the option itself, or the next generation keeps the hires model.
+    from adetailer.args import ADetailerArgs
+
+    runtime = _hires_runtime()
+    opts = SimpleNamespace(sd_model_checkpoint="main.safetensors")
+    seen = []
+
+    def host_process_images(override, fail):
+        stored = {k: getattr(opts, k) for k in override}
+        try:
+            for k, v in override.items():
+                setattr(opts, k, v)
+            seen.append(opts.sd_model_checkpoint)
+            if fail:
+                raise RuntimeError("out of memory")
+        finally:
+            for k, v in stored.items():
+                setattr(opts, k, v)
+
+    for fail in (False, True):
+        override = runtime.AfterDetailerScript().get_override_settings(
+            _hires_p(), ADetailerArgs(ad_model="face_yolov8n.pt")
+        )
+        assert opts.sd_model_checkpoint == "main.safetensors"
+        with pytest.raises(RuntimeError) if fail else nullcontext():
+            host_process_images(override, fail)
+        assert opts.sd_model_checkpoint == "main.safetensors"
+
+    assert seen == [_HIRES_TITLE, _HIRES_TITLE]
+
+
+@pytest.fixture
+def hires_forge_modules(monkeypatch):
+    forge = ModuleType("modules_forge")
+    entry = ModuleType("modules_forge.main_entry")
+    entry.module_list = {
+        "main-te.safetensors": "/models/text_encoder/main-te.safetensors",
+        "main-vae.safetensors": "/models/VAE/main-vae.safetensors",
+        "hires-te.safetensors": "/models/text_encoder/hires-te.safetensors",
+        "hires-vae.safetensors": "/models/VAE/hires-vae.safetensors",
+        "tab-vae.safetensors": "/models/VAE/tab-vae.safetensors",
+    }
+    forge.main_entry = entry
+    monkeypatch.setitem(sys.modules, "modules_forge", forge)
+    monkeypatch.setitem(sys.modules, "modules_forge.main_entry", entry)
+    main = ["/models/VAE/main-vae.safetensors", "/models/text_encoder/main-te.safetensors"]
+    wanted = _load_runtime(
+        shared=SimpleNamespace(opts=SimpleNamespace(forge_additional_modules=main))
+    )._forge_wanted_modules
+    return _hires_runtime(forge=True, _forge_wanted_modules=wanted)
+
+
+@pytest.mark.parametrize(
+    ("hires_modules", "tab", "expected"),
+    [
+        # "Use same choices": the main modules, as the WebUI's hires pass.
+        (["Use same choices"], {}, None),
+        # The hires pass's own choices, by name as the dropdown gives them.
+        (
+            ["hires-vae.safetensors", "hires-te.safetensors"],
+            {},
+            ["/models/VAE/hires-vae.safetensors", "/models/text_encoder/hires-te.safetensors"],
+        ),
+        # Empty = "Built-in": no module at all.
+        ([], {}, []),
+        # The tab's own VAE replaces the hires one; the hires text encoder stays.
+        (
+            ["hires-vae.safetensors", "hires-te.safetensors"],
+            {"ad_use_vae": True, "ad_vae": "tab-vae.safetensors"},
+            ["/models/text_encoder/hires-te.safetensors", "/models/VAE/tab-vae.safetensors"],
+        ),
+        # A tab with its own checkpoint keeps the main modules.
+        (
+            ["hires-vae.safetensors", "hires-te.safetensors"],
+            {"ad_use_checkpoint": True, "ad_checkpoint": "own.safetensors"},
+            None,
+        ),
+    ],
+)
+def test_hires_checkpoint_brings_the_hires_modules_on_forge(
+    hires_forge_modules, hires_modules, tab, expected
+):
+    from adetailer.args import ADetailerArgs
+
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", **tab)
+
+    override = hires_forge_modules.AfterDetailerScript().get_override_settings(
+        _hires_p(modules=hires_modules), args
+    )
+
+    assert override.get("forge_additional_modules") == expected
+
+
+@pytest.mark.parametrize(
+    ("on", "tab", "expected"),
+    [
+        # The hires checkpoint: the Distilled CFG the user gave the hires pass.
+        (True, {}, 5.0),
+        # Off: the main value, as before.
+        (False, {}, 9.0),
+        # The tab's own checkpoint keeps the host's default, as before.
+        (True, {"ad_use_checkpoint": True, "ad_checkpoint": "own.safetensors"}, 3.5),
+    ],
+)
+def test_hires_checkpoint_pass_takes_the_hires_distilled_cfg(on, tab, expected):
+    from adetailer.args import ADetailerArgs
+
+    script = _i2i_script(
+        _ForgeI2I,
+        methods={"get_override_settings"},
+        opts=SimpleNamespace(data={"ad_hires_checkpoint": on}),
+        shared=SimpleNamespace(cmd_opts=SimpleNamespace()),
+        _is_forge_modules=lambda: True,
+        _forge_wanted_modules=lambda _args, _base=None: None,
+    )
+    p = _hires_p(distilled_cfg_scale=9.0, hr_distilled_cfg=5.0)
+
+    i2i = script.get_i2i_p(p, ADetailerArgs(ad_model="face_yolov8n.pt", **tab), None)
+
+    assert i2i.distilled_cfg_scale == expected
+
+
+def test_hires_checkpoint_is_a_settings_checkbox_off_by_default():
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    settings = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "on_ui_settings"
+    )
+    calls = {
+        node.args[0].value: node
+        for node in ast.walk(settings)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+    }
+    info_call = calls["ad_hires_checkpoint"].args[1]
+    kwargs = {kw.arg: kw.value for kw in info_call.func.value.keywords}
+    assert ast.literal_eval(kwargs["default"]) is False
+    assert ast.unparse(kwargs["section"]) == "section"
+    label = ast.literal_eval(kwargs["label"])
+    info = ast.literal_eval(info_call.args[0])
+    assert label == "With hires fix, detail with the hires checkpoint"
+    # A tab with "Use separate checkpoint" ticked but left on "Use same
+    # checkpoint" has no own checkpoint and takes the hires one too.
+    assert "the tabs without their own checkpoint" in info
+    assert "without 'Use separate checkpoint'" not in info
+    for text in (label, info):
+        assert not any(mark in text for mark in ("**", "`", "[", "\n"))
+
+
+# Forge / Forge Neo: a tab's own checkpoint of another model family that keeps
+# the main model's VAE / text encoder files.
+
+
+def _engine(family, **flags):
+    """A model as Forge / Forge Neo loads it: an engine class of
+    backend.diffusion_engine.<family>, with the engine's own flags."""
+    cls = type("Engine", (), {"__module__": f"backend.diffusion_engine.{family}"})
+    model = cls()
+    for name, value in flags.items():
+        setattr(model, name, value)
+    return model
+
+
+_SDXL = {"family": "sdxl", "is_sdxl": True, "is_sd1": False}
+_FLUX = {"family": "flux", "is_sdxl": False, "is_sd1": False}
+_ZIMAGE = {"family": "zimage", "is_sdxl": False, "is_sd1": False}
+_MAIN_FILES = ["/models/VAE/ae.safetensors", "/models/text_encoder/t5xxl.safetensors"]
+
+
+class _ForgeModels:
+    """modules.sd_models.model_data of Forge / Forge Neo: the loading
+    parameters the settings ask for, and the model loaded with its hash."""
+
+    def __init__(self, main):
+        self.forge_loading_parameters = {
+            "checkpoint_info": SimpleNamespace(filename="/models/main.safetensors"),
+            "additional_modules": list(_MAIN_FILES),
+        }
+        self.load(main)
+
+    def load(self, model, *, as_settings_ask=True):
+        self.sd_model = model
+        self.forge_hash = str(self.forge_loading_parameters) if as_settings_ask else "other"
+
+
+def _family_runtime(main=_FLUX, main_files=_MAIN_FILES, **host):
+    data = _ForgeModels(_engine(**main))
+    host.setdefault("modules", SimpleNamespace(sd_models=SimpleNamespace(model_data=data)))
+    host.setdefault(
+        "shared", SimpleNamespace(opts=SimpleNamespace(forge_additional_modules=list(main_files)))
+    )
+    runtime = _load_script(
+        functions=_FAMILY_WARNING_FUNCTIONS, assigns=_FAMILY_WARNING_ASSIGNS, **host
+    )
+    runtime._MAIN_FAMILY_SEEN.clear()
+    return runtime, data
+
+
+def _own_tab(**extra):
+    from adetailer.args import ADetailerArgs
+
+    return ADetailerArgs(
+        ad_model="face_yolov8n.pt", ad_use_checkpoint=True,
+        ad_checkpoint="xl-model.safetensors", **extra,
+    )
+
+
+_OWN = {"sd_model_checkpoint": "xl-model.safetensors"}
+
+
+@pytest.mark.parametrize(
+    ("model", "family"),
+    [
+        (_engine(**_SDXL), "sdxl"),
+        (_engine("sd15", is_sd1=True, is_sdxl=False), "sd1"),
+        (_engine(**_FLUX), "flux"),
+        (_engine(**_ZIMAGE), "zimage"),
+        # AUTOMATIC1111 / reForge models, the placeholder of a model that
+        # failed to load, no model: unknown.
+        (type("LatentDiffusion", (), {"__module__": "ldm.models.diffusion.ddpm"})(), None),
+        (type("FakeInitialModel", (), {"__module__": "modules.sd_models"})(), None),
+        (None, None),
+    ],
+)
+def test_model_family_comes_from_the_engine_the_webui_loaded(model, family):
+    runtime, _data = _family_runtime()
+    assert runtime._model_family(model) == family
+
+
+def test_tab_checkpoint_of_another_family_warns_once_per_generation_and_tab(capsys):
+    runtime, data = _family_runtime()
+    p = SimpleNamespace()
+    runtime._main_model_family()  # before the pass: the main model is loaded
+    data.load(_engine(**_SDXL), as_settings_ask=False)  # the pass loaded the tab's
+
+    lines = [runtime._warn_other_family_modules(p, _own_tab(), 0, _OWN) for _ in range(3)]
+    second_tab = runtime._warn_other_family_modules(p, _own_tab(), 1, _OWN)
+    next_generation = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    assert lines[0] and lines[1:] == ["", ""]
+    assert second_tab and next_generation
+    err = capsys.readouterr().err
+    assert err.count("[-] ADetailer: tab 1 uses checkpoint") == 2
+    assert err.count("[-] ADetailer: tab 2 uses checkpoint") == 1
+    assert "(SDXL) but the main model is Flux" in lines[0]
+    assert "ae.safetensors, t5xxl.safetensors" in lines[0]
+    assert "/models" not in err  # file names only, never paths
+    assert err.isascii()
+
+
+def test_tab_with_its_own_text_encoder_but_the_main_vae_still_warns():
+    runtime, data = _family_runtime()
+    runtime._main_model_family()
+    data.load(_engine(**_SDXL), as_settings_ask=False)
+    override = {**_OWN, "forge_additional_modules": ["/models/VAE/ae.safetensors"]}
+
+    line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, override)
+
+    assert "(ae.safetensors)" in line
+
+
+def _failed_load(data):
+    """Forge / Forge Neo after a checkpoint that did not load: the placeholder
+    model and an empty hash (modules.sd_models.forge_model_reload)."""
+    data.sd_model = type("FakeInitialModel", (), {"__module__": "modules.sd_models"})()
+    data.forge_hash = ""
+
+
+def test_tab_checkpoint_that_does_not_load_with_the_main_files_warns_too(capsys):
+    # Found live on Forge Neo: main model Flux, a tab with an SDXL checkpoint
+    # and Flux's VAE / text encoders kept. The checkpoint does not load, the
+    # host leaves its placeholder, and the tab's family is unknown: the
+    # console still names the kept files and the fix, once per tab.
+    runtime, data = _family_runtime()
+    p = SimpleNamespace()
+    runtime._main_model_family()
+    _failed_load(data)
+
+    lines = [runtime._warn_other_family_modules(p, _own_tab(), 0, _OWN) for _ in range(3)]
+
+    assert lines[0] and lines[1:] == ["", ""]
+    err = capsys.readouterr().err
+    assert err.count("[-] ADetailer: tab 1's checkpoint 'xl-model.safetensors'") == 1
+    assert "could not be loaded while the pass kept the main model's (Flux)" in lines[0]
+    assert "(ae.safetensors, t5xxl.safetensors)" in lines[0]
+    assert "If the checkpoint is of another model family" in lines[0]
+    assert "uses checkpoint" not in err  # the family is not known: not claimed
+    assert "/models" not in err
+    assert err.isascii()
+
+
+@pytest.mark.parametrize("left", ["placeholder", "none"])
+def test_failed_load_warns_without_the_main_family_when_it_was_never_learnt(left, capsys):
+    # Forge Neo just started, "Run ADetailer on an image" before any
+    # generation: the main model's family was never learnt. And Forge, which
+    # leaves no model at all after a failed load and keeps the old hash, so
+    # the family cannot be read then either. The line leaves the family out.
+    runtime, data = _family_runtime()
+    if left == "none":
+        runtime._main_model_family()
+        data.sd_model = None  # the hash stays the main model's
+        runtime._MAIN_FAMILY_SEEN.clear()
+    else:
+        _failed_load(data)
+
+    line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    assert "could not be loaded while the pass kept the main model's VAE / text" in line
+    assert "(ae.safetensors, t5xxl.safetensors)" in line
+    assert capsys.readouterr().err.count("could not be loaded") == 1
+
+
+_AUTOMATIC_ADVICE = (
+    "'Use separate text encoder' with \"None (use detailer checkpoint's own)\" "
+    "and 'Use separate VAE' with Automatic."
+)
+# The advice of the skipped tab (_unloadable_tab_checkpoint), word for word.
+_FLUX_VAE_ADVICE = (
+    "Pick a Flux VAE file (16 latent channels, such as ae.safetensors) in "
+    "the tab's 'Use separate VAE'. A checkpoint file without text encoders "
+    "inside also needs its family's, and a tab can pick only one file: use "
+    "a checkpoint that holds them."
+)
+
+
+@pytest.mark.parametrize(
+    ("tab_file", "ending"),
+    [
+        # The header of the tab's file says SD 1.5 / SDXL: its own VAE and
+        # text encoders are inside, so Automatic and "None" are the remedy.
+        ("sdxl", "family, give the tab its own: " + _AUTOMATIC_ADVICE),
+        ("sd15", "family, give the tab its own: " + _AUTOMATIC_ADVICE),
+        # Flux: often the transformer alone. Never Automatic or "None".
+        ("flux", "family, give the tab that family's files. " + _FLUX_VAE_ADVICE),
+        # Unknown (another format, another family, no file, a host without
+        # the list of checkpoints): both, and Automatic not as the sure one.
+        ("ckpt", None), ("zimage", None), ("missing", None), ("no list", None),
+    ],
+    ids=["sdxl", "sd15", "flux", "ckpt", "another-family", "no-file", "no-list"],
+)
+def test_a_checkpoint_that_did_not_load_gets_the_advice_of_its_own_family(
+    tmp_path, capsys, tab_file, ending
+):
+    # The line still said 'Use separate VAE' with Automatic and the text
+    # encoder "None" for a tab that may hold a Flux checkpoint: with a file
+    # that is the transformer alone the load fails again.
+    files = {
+        "sdxl": lambda: _header_file(tmp_path / "xl.safetensors", _SDXL_KEYS),
+        "sd15": lambda: _header_file(tmp_path / "sd15.safetensors", _SD15_KEYS),
+        "flux": lambda: _header_file(tmp_path / "flux.safetensors", _FLUX_KEYS),
+        "ckpt": lambda: _header_file(tmp_path / "xl.ckpt", _SDXL_KEYS),
+        "zimage": lambda: _header_file(tmp_path / "other.safetensors", _T5_KEYS),
+        "missing": lambda: str(tmp_path / "gone.safetensors"),
+        "no list": lambda: None,
+    }
+    runtime, data = _family_runtime(main=_SDXL)
+    runtime._FILE_FACTS_SEEN.clear()
+    if tab_file != "no list":
+        runtime.modules.sd_models.checkpoint_aliases = {
+            "xl-model.safetensors": SimpleNamespace(filename=files[tab_file]()),
+        }
+    runtime._main_model_family()
+    _failed_load(data)
+
+    line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    start = (
+        "[-] ADetailer: tab 1's checkpoint 'xl-model.safetensors' could not be "
+        "loaded while the pass kept the main model's (SDXL) VAE / text encoder "
+        "files (ae.safetensors, t5xxl.safetensors). If the checkpoint is of "
+        "another model "
+    )
+    if ending is None:
+        ending = (
+            "family, give the tab that family's files. For an SD 1.5 / SDXL "
+            f"checkpoint: {_AUTOMATIC_ADVICE} For a Flux one, or any whose file "
+            "holds no VAE: a VAE file of its family in the tab's 'Use separate "
+            "VAE', not Automatic."
+        )
+    assert line == start + ending
+    if tab_file == "flux":
+        assert "Automatic" not in line
+        assert "None (use detailer" not in line
+    assert capsys.readouterr().err == line + "\n"
+    assert line.isascii()
+    assert str(tmp_path) not in line
+    # "Run ADetailer on an image" keeps its own short answer.
+    status = runtime._family_status_note(SimpleNamespace(_ad_family_note=line))
+    assert status.endswith("give the tab its own (see console).")
+    assert "Automatic" not in status
+
+
+# The words of the skipped tab (_unloadable_tab_checkpoint) for a main VAE
+# file that Automatic would keep.
+_PICKED_VAE_ADVICE = (
+    "VAE file (4 latent channels) in the tab's 'Use separate VAE' (Automatic "
+    "would keep the main model's file, which is not in a folder named VAE), and "
+    "set 'Use separate text encoder' to \"None (use detailer checkpoint's own)\"."
+)
+
+
+@pytest.mark.parametrize(
+    ("folder", "automatic_works"),
+    [
+        ("VAE", True), ("vae", True), ("VAE/flux", True),
+        # A folder of --vae-dirs, or a VAE file kept beside the checkpoints.
+        ("autoencoders", False), ("Stable-diffusion", False),
+    ],
+)
+@pytest.mark.parametrize("tab_file", ["sdxl", "sd15", "ckpt", "flux"])
+def test_a_failed_load_is_told_first_to_move_a_main_vae_outside_a_vae_folder(
+    tmp_path, capsys, folder, automatic_works, tab_file
+):
+    # The skipped tab's line no longer says Automatic when the main model's
+    # VAE file is not in a folder named VAE, where Automatic would keep it;
+    # the line of a load that failed (a tab checkpoint whose header cannot be
+    # read, such as a .ckpt) still did. Then it said to pick a VAE file in the
+    # tab, and to move the main model's file only once that was done: on
+    # Forge Neo the main model's file can be read after the tab's, and the
+    # load failed again with the whole generation. It now says first to move
+    # it, as the skipped tab's line does; then Automatic takes it out.
+    main_vae = _header_file(tmp_path / folder / "ae.safetensors", _FLUX_VAE_KEYS)
+    t5 = _header_file(tmp_path / "text_encoder" / "t5xxl.safetensors", _T5_KEYS)
+    name, keys = {
+        "sdxl": ("xl.safetensors", _SDXL_KEYS), "sd15": ("sd15.safetensors", _SD15_KEYS),
+        "ckpt": ("xl.ckpt", _SDXL_KEYS), "flux": ("flux.safetensors", _FLUX_KEYS),
+    }[tab_file]
+    runtime, data = _family_runtime(main_files=[main_vae, t5])
+    runtime._FILE_FACTS_SEEN.clear()
+    runtime.modules.sd_models.checkpoint_aliases = {
+        "xl-model.safetensors": SimpleNamespace(filename=_header_file(tmp_path / name, keys)),
+    }
+    runtime._main_model_family()
+    _failed_load(data)
+
+    line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    start = (
+        "[-] ADetailer: tab 1's checkpoint 'xl-model.safetensors' could not be "
+        "loaded while the pass kept the main model's (Flux) VAE / text encoder "
+        "files (ae.safetensors, t5xxl.safetensors). If the checkpoint is of "
+        "another model family, "
+    )
+    flux_one = (
+        " For a Flux one, or any whose file holds no VAE: a VAE file of its "
+        "family in the tab's 'Use separate VAE', not Automatic."
+    )
+    if tab_file == "flux":
+        # Unchanged: a VAE file picked in the tab was its advice already.
+        ending = "give the tab that family's files. " + _FLUX_VAE_ADVICE
+    elif tab_file == "ckpt":
+        ending = (
+            "give the tab that family's files. For an SD 1.5 / SDXL checkpoint: "
+            + _AUTOMATIC_ADVICE + flux_one
+        )
+    else:
+        ending = "give the tab its own: " + _AUTOMATIC_ADVICE
+    if not automatic_works and tab_file != "flux":
+        ending = "f" + _MOVE_MAIN_VAE_FIRST[1:] + ending
+    assert line == start + ending
+    assert "Automatic would keep" not in line
+    # "Run ADetailer on an image" says to move it too.
+    status = runtime._family_status_note(SimpleNamespace(_ad_family_note=line))
+    assert ("move them into the folder the console names" in status) is (
+        not automatic_works and tab_file != "flux"
+    )
+    assert capsys.readouterr().err == line + "\n"
+    assert line.isascii()
+    assert str(tmp_path) not in line
+
+
+_LOADED_AUTOMATIC_ADVICE = "Give the tab its own: " + _AUTOMATIC_ADVICE
+
+
+@pytest.mark.parametrize(
+    ("folder", "automatic_works"),
+    [
+        ("VAE", True), ("vae", True), ("VAE/flux", True),
+        # A folder of --vae-dirs, or a VAE file kept beside the checkpoints.
+        ("autoencoders", False), ("Stable-diffusion", False),
+    ],
+)
+@pytest.mark.parametrize(
+    ("tab", "family"),
+    [(_SDXL, "SDXL"), ({"family": "sd15", "is_sd1": True, "is_sdxl": False}, "SD 1.5")],
+)
+def test_a_loaded_checkpoint_is_not_told_automatic_for_a_main_vae_outside_a_vae_folder(
+    tmp_path, capsys, folder, automatic_works, tab, family
+):
+    # The tab's checkpoint DID load, with the main model's VAE kept: its line
+    # still said Automatic when that file is not in a folder named VAE,
+    # where Automatic would keep it. The skipped tab and the failed load
+    # were already told to pick a VAE file.
+    main_vae = _header_file(tmp_path / folder / "ae.safetensors", _FLUX_VAE_KEYS)
+    t5 = _header_file(tmp_path / "text_encoder" / "t5xxl.safetensors", _T5_KEYS)
+    runtime, data = _family_runtime(main_files=[main_vae, t5])
+    runtime._FILE_FACTS_SEEN.clear()
+    runtime._main_model_family()
+    data.load(_engine(**tab), as_settings_ask=False)  # the pass loaded the tab's
+
+    line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    start = (
+        f"[-] ADetailer: tab 1 uses checkpoint 'xl-model.safetensors' ({family}) "
+        "but the main model is Flux, and the pass kept the main model's VAE / "
+        "text encoder files (ae.safetensors, t5xxl.safetensors): the result can "
+        "be broken or fail. "
+    )
+    if automatic_works:
+        assert line == start + _LOADED_AUTOMATIC_ADVICE
+    else:
+        # The words of the skipped tab and of the failed load.
+        assert line == start + f"Pick an {family} {_PICKED_VAE_ADVICE}"
+        assert "with Automatic" not in line
+    assert capsys.readouterr().err == line + "\n"
+    assert line.isascii()
+    assert str(tmp_path) not in line
+
+
+def test_a_loaded_checkpoint_keeps_the_automatic_advice_when_no_main_vae_stays(tmp_path):
+    # Only a VAE file of the main model that the pass kept counts: a text
+    # encoder, a VAE the tab's pass does not keep, or a file whose header
+    # cannot be read, does not bring the advice to pick a VAE file.
+    main_vae = _header_file(tmp_path / "autoencoders" / "ae.safetensors", _FLUX_VAE_KEYS)
+    t5 = _header_file(tmp_path / "text_encoder" / "t5xxl.safetensors", _T5_KEYS)
+    for kept in ([t5], [t5, str(tmp_path / "VAE" / "missing.safetensors")]):
+        runtime, data = _family_runtime(main_files=[main_vae, t5, kept[-1]])
+        runtime._FILE_FACTS_SEEN.clear()
+        runtime._main_model_family()
+        data.load(_engine(**_SDXL), as_settings_ask=False)
+        override = {**_OWN, "forge_additional_modules": kept}
+
+        line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, override)
+
+        assert "(SDXL) but the main model is Flux" in line
+        assert line.endswith("the result can be broken or fail. " + _LOADED_AUTOMATIC_ADVICE)
+
+
+_NONE_CHOICE = "\"None (use detailer checkpoint's own)\""
+
+
+@pytest.mark.parametrize(
+    ("kept", "names", "advice"),
+    [
+        # A text encoder in a folder of --text-encoder-dirs that is not named
+        # text_encoder: "None" in the tab would leave it there.
+        (
+            ["clip/t5xxl.safetensors"], "t5xxl.safetensors",
+            "No choice of the tab takes out t5xxl.safetensors, not in a folder "
+            "named text_encoder: move it into a folder named text_encoder (such "
+            "as models/text_encoder) and pick it again in the WebUI's 'VAE / "
+            "Text Encoder' list. From there the tab's 'Use separate text "
+            f"encoder' with {_NONE_CHOICE} takes it out.",
+        ),
+        # With a file whose header cannot be read, which could be a VAE too.
+        (
+            ["clip/t5xxl.safetensors", "more/other.gguf"],
+            "t5xxl.safetensors, other.gguf",
+            "No choice of the tab takes out t5xxl.safetensors, other.gguf, not "
+            "in a folder named text_encoder or VAE: move them into a folder "
+            "named text_encoder (such as models/text_encoder; a VAE file into "
+            "models/VAE) and pick them again in the WebUI's 'VAE / Text "
+            "Encoder' list. From there the tab's 'Use separate text encoder' "
+            f"with {_NONE_CHOICE} takes them out (a VAE file: Use separate VAE "
+            "with Automatic or a file).",
+        ),
+        # Beside files that the tab's choices do take out: both are said.
+        (
+            ["text_encoder/clip_l.safetensors", "clip/t5xxl.safetensors"],
+            "clip_l.safetensors, t5xxl.safetensors",
+            _LOADED_AUTOMATIC_ADVICE + " No choice of the tab takes out "
+            "t5xxl.safetensors, not in a folder named text_encoder: move it "
+            "into a folder named text_encoder (such as models/text_encoder) and "
+            "pick it again in the WebUI's 'VAE / Text Encoder' list. From there "
+            f"the tab's 'Use separate text encoder' with {_NONE_CHOICE} takes "
+            "it out.",
+        ),
+    ],
+    ids=["text-encoder", "unread-file", "beside-one-in-its-folder"],
+)
+def test_a_loaded_checkpoint_is_told_to_move_a_file_no_choice_of_the_tab_takes_out(
+    tmp_path, capsys, kept, names, advice
+):
+    # The line said "None" and Automatic for a main model's file that neither
+    # takes out (the tab tells the files by their folder alone): followed,
+    # the advice changed nothing and the same line came at every generation.
+    kept = [
+        _header_file(tmp_path / name, _T5_KEYS) if name.endswith(".safetensors")
+        else str(tmp_path / name)
+        for name in kept
+    ]
+    runtime, data = _family_runtime(main_files=kept)
+    runtime._FILE_FACTS_SEEN.clear()
+    runtime._main_model_family()
+    data.load(_engine(**_SDXL), as_settings_ask=False)
+
+    line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    assert line == (
+        "[-] ADetailer: tab 1 uses checkpoint 'xl-model.safetensors' (SDXL) but "
+        "the main model is Flux, and the pass kept the main model's VAE / text "
+        f"encoder files ({names}): the result can be broken or fail. {advice}"
+    )
+    assert capsys.readouterr().err == line + "\n"
+    assert line.isascii()
+    assert "\n" not in line
+    assert str(tmp_path) not in line
+
+
+def test_a_loaded_checkpoint_of_a_family_without_a_vae_inside_is_told_its_family(tmp_path):
+    # The other way round: main model SDXL with its own VAE file outside a
+    # VAE folder, the tab a Flux checkpoint. No "4 latent channels" there.
+    main_vae = _header_file(tmp_path / "autoencoders" / "xl_vae.safetensors", _SDXL_VAE_KEYS)
+    runtime, data = _family_runtime(main=_SDXL, main_files=[main_vae])
+    runtime._FILE_FACTS_SEEN.clear()
+    runtime._main_model_family()
+    data.load(_engine(**_FLUX), as_settings_ask=False)
+
+    line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    assert line == (
+        "[-] ADetailer: tab 1 uses checkpoint 'xl-model.safetensors' (Flux) but "
+        "the main model is SDXL, and the pass kept the main model's VAE / text "
+        "encoder files (xl_vae.safetensors): the result can be broken or fail. "
+        "Pick a VAE file of the checkpoint's family in the tab's 'Use separate "
+        "VAE' (Automatic would keep the main model's file, which is not in a "
+        "folder named VAE), and set 'Use separate text encoder' to \"None (use "
+        "detailer checkpoint's own)\"."
+    )
+
+
+def test_a_failed_load_keeps_the_automatic_advice_when_no_main_vae_stays(tmp_path):
+    # Only a VAE file of the main model that the pass kept counts: a text
+    # encoder, or a VAE the tab's pass does not keep, does not change the
+    # advice.
+    main_vae = _header_file(tmp_path / "autoencoders" / "ae.safetensors", _FLUX_VAE_KEYS)
+    t5 = _header_file(tmp_path / "text_encoder" / "t5xxl.safetensors", _T5_KEYS)
+    runtime, data = _family_runtime(main_files=[main_vae, t5])
+    runtime._FILE_FACTS_SEEN.clear()
+    runtime.modules.sd_models.checkpoint_aliases = {
+        "xl-model.safetensors": SimpleNamespace(
+            filename=_header_file(tmp_path / "xl.safetensors", _SDXL_KEYS)
+        ),
+    }
+    runtime._main_model_family()
+    _failed_load(data)
+    override = {**_OWN, "forge_additional_modules": [t5]}
+
+    line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, override)
+
+    assert "text encoder files (t5xxl.safetensors). If the checkpoint" in line
+    assert line.endswith("family, give the tab its own: " + _AUTOMATIC_ADVICE)
+
+
+def test_the_flux_advice_of_a_failed_load_is_the_one_of_the_skipped_tab(tmp_path):
+    vae = _header_file(tmp_path / "VAE" / "sdxl_vae.safetensors", _SDXL_VAE_KEYS)
+    tab = _header_file(tmp_path / "flux.safetensors", _FLUX_KEYS)
+    runtime, _data, _files = _skip_runtime(
+        tmp_path, main=_SDXL, main_files=[vae], tab_file=tab
+    )
+
+    skipped = runtime._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    assert skipped.endswith("would fail with it. " + _FLUX_VAE_ADVICE)
+
+
+def test_no_model_left_on_a_webui_without_forge_loading_gives_no_warning(capsys):
+    # AUTOMATIC1111 / reForge: no Forge loading parameters, nothing is said.
+    host = {
+        "modules": SimpleNamespace(sd_models=SimpleNamespace(model_data=SimpleNamespace(sd_model=None))),
+        "shared": SimpleNamespace(opts=SimpleNamespace(forge_additional_modules=list(_MAIN_FILES))),
+    }
+    runtime, _data = _family_runtime(**host)
+
+    assert runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, _OWN) == ""
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "main without files", "tab gives its own files",
+        "tab without own checkpoint", "checkpoint dropped by the host",
+    ],
+)
+def test_failed_load_gives_no_family_warning_when_it_does_not_apply(case, capsys):
+    from adetailer.args import ADetailerArgs
+
+    files = [] if case == "main without files" else _MAIN_FILES
+    runtime, data = _family_runtime(main_files=files)
+    runtime._main_model_family()
+    _failed_load(data)
+    args = _own_tab()
+    override = dict(_OWN)
+    if case == "tab gives its own files":
+        override["forge_additional_modules"] = []
+    if case == "tab without own checkpoint":
+        args = ADetailerArgs(ad_model="face_yolov8n.pt")
+        override = {}
+    if case == "checkpoint dropped by the host":
+        override = {}
+
+    assert runtime._warn_other_family_modules(SimpleNamespace(), args, 0, override) == ""
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "same family", "main never seen", "tab of an unknown engine", "two new families",
+        "main without files", "tab gives its own files", "tab without own checkpoint",
+        "checkpoint dropped by the host",
+    ],
+)
+def test_no_family_warning_when_it_does_not_apply_or_is_unsure(case, capsys):
+    from adetailer.args import ADetailerArgs
+
+    main = {"same family": _SDXL, "two new families": _ZIMAGE}.get(case, _FLUX)
+    files = [] if case == "main without files" else _MAIN_FILES
+    runtime, data = _family_runtime(main=main, main_files=files)
+    if case != "main never seen":
+        runtime._main_model_family()
+    tab = {"two new families": _engine(**_FLUX)}.get(case, _engine(**_SDXL))
+    if case == "tab of an unknown engine":
+        tab = type("LatentDiffusion", (), {"__module__": "ldm.models.diffusion.ddpm"})()
+    data.load(tab, as_settings_ask=False)
+    args = _own_tab()
+    override = dict(_OWN)
+    if case == "tab gives its own files":
+        override["forge_additional_modules"] = []
+    if case == "tab without own checkpoint":
+        args = ADetailerArgs(ad_model="face_yolov8n.pt")
+        override = {}
+    if case == "checkpoint dropped by the host":
+        override = {}
+
+    assert runtime._warn_other_family_modules(SimpleNamespace(), args, 0, override) == ""
+    assert "uses checkpoint" not in capsys.readouterr().err
+
+
+def test_main_family_learnt_before_is_used_after_another_tabs_pass():
+    # Tab 1's pass left its own model loaded: the main family is the one learnt
+    # while the main model was loaded, not the model loaded now.
+    runtime, data = _family_runtime()
+    runtime._main_model_family()
+    data.load(_engine(**_ZIMAGE), as_settings_ask=False)
+
+    assert runtime._main_model_family() == "flux"
+
+
+@pytest.mark.parametrize("main_loaded", [True, False], ids=["main loaded", "other loaded"])
+def test_main_family_is_learnt_when_the_generation_starts(capsys, main_loaded):
+    # Forge Neo with a Hires checkpoint: the detailer passes run after the
+    # hires pass, with the hires model loaded and the loading parameters back
+    # on the main one. The hook the WebUI runs right after loading the main
+    # model learns its family; only when that model is the one the settings
+    # ask for (not after the hires fix quick button, which loads nothing).
+    data = _ForgeModels(_engine(**_FLUX))
+    if not main_loaded:
+        data.load(_engine(**_ZIMAGE), as_settings_ask=False)
+    runtime = _load_script(
+        methods={"process", "set_skip_img2img"},
+        opts=SimpleNamespace(data={}),
+        is_img2img_inpaint=lambda _p: False,
+        SkipImg2ImgOrig=SimpleNamespace,
+        modules=SimpleNamespace(sd_models=SimpleNamespace(model_data=data)),
+        shared=SimpleNamespace(
+            opts=SimpleNamespace(forge_additional_modules=list(_MAIN_FILES))
+        ),
+    )
+    runtime._MAIN_FAMILY_SEEN.clear()
+    script = runtime.AfterDetailerScript()
+    script.is_ad_enabled = lambda *_args: True
+    script.get_args = lambda *_args: []
+    script.extra_params = lambda _args: {}
+
+    script.process(SimpleNamespace(extra_generation_params={}), True, False, {})
+    data.load(_engine(**_ZIMAGE), as_settings_ask=False)  # the hires pass
+    data.load(_engine(**_SDXL), as_settings_ask=False)  # the tab's own checkpoint
+    line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    if main_loaded:
+        assert "(SDXL) but the main model is Flux" in line
+        assert capsys.readouterr().err.count("uses checkpoint") == 1
+    else:
+        assert line == ""
+        assert runtime._MAIN_FAMILY_SEEN == {}
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # AUTOMATIC1111: model_data without Forge's loading parameters.
+        {"modules": SimpleNamespace(sd_models=SimpleNamespace(model_data=SimpleNamespace(
+            sd_model=type("LatentDiffusion", (), {"__module__": "ldm.models.diffusion.ddpm"})()
+        ))), "shared": SimpleNamespace(opts=SimpleNamespace())},
+        # A WebUI without any of it.
+        {"modules": SimpleNamespace(), "shared": SimpleNamespace()},
+    ],
+    ids=["a1111", "bare"],
+)
+def test_family_warning_never_fails_on_other_webuis(host, capsys):
+    runtime, _data = _family_runtime(**host)
+
+    assert runtime._main_model_family() is None
+    assert runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, _OWN) == ""
+    assert capsys.readouterr().err == ""
+
+
+def test_pass_warns_once_for_a_tab_with_several_regions(capsys):
+    # The pass of each region checks after the host ran it: the console line
+    # comes once for the tab, not once per region.
+    data = _ForgeModels(_engine(**_FLUX))
+    calls = []
+
+    def process_images(p2):
+        calls.append(p2)
+        data.load(_engine(**_SDXL), as_settings_ask=False)  # the host loads the tab's
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")], infotexts=[""])
+
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    before = Image.new("RGB", (8, 8), "white")
+    pred = SimpleNamespace(preview=before)
+    runtime = _load_runtime(
+        state=state, shared=SimpleNamespace(
+            state=state, opts=SimpleNamespace(forge_additional_modules=list(_MAIN_FILES))
+        ),
+        modules=SimpleNamespace(sd_models=SimpleNamespace(model_data=data)),
+        re=re, time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda image, _mode: image,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+    )
+    runtime._MAIN_FAMILY_SEEN.clear()
+    script = runtime.AfterDetailerScript()
+    pp = SimpleNamespace(image=before)
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[pp.image], prompt="face", close=lambda: None,
+        override_settings=dict(_OWN),
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [before] * 3
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.fix_p2 = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    class Args(SimpleNamespace):
+        def copy(self, update):
+            return Args(**{**vars(self), **update})
+
+    args = Args(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_use_checkpoint=True, ad_checkpoint="xl-model.safetensors",
+    )
+
+    script._postprocess_image_inner(SimpleNamespace(extra_generation_params={}), pp, args)
+
+    assert len(calls) == 3
+    assert capsys.readouterr().err.count("uses checkpoint 'xl-model.safetensors'") == 1
+    assert "(SDXL) but the main model is Flux" in script._ad_family_note
+
+
+@pytest.mark.parametrize("left", ["placeholder", "none"])
+def test_pass_whose_checkpoint_does_not_load_warns_once_for_the_tab(left, capsys):
+    # The real pass, with the host failing to load the tab's checkpoint for
+    # each region: the warning is given after the failure too, once for the
+    # tab, on Forge Neo (placeholder left) and on Forge (no model left).
+    data = _ForgeModels(_engine(**_FLUX))
+    calls = []
+
+    def process_images(p2):
+        calls.append(p2)
+        if left == "placeholder":
+            _failed_load(data)
+        else:
+            data.sd_model = None
+        msg = "Error(s) in loading state_dict for IntegratedAutoencoderKL"
+        raise RuntimeError(msg)
+
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    before = Image.new("RGB", (8, 8), "white")
+    pred = SimpleNamespace(preview=before)
+    runtime = _load_runtime(
+        state=state, shared=SimpleNamespace(
+            state=state, opts=SimpleNamespace(forge_additional_modules=list(_MAIN_FILES))
+        ),
+        modules=SimpleNamespace(sd_models=SimpleNamespace(model_data=data)),
+        re=re, time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: pred,
+        ensure_pil_image=lambda image, _mode: image,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+    )
+    runtime._MAIN_FAMILY_SEEN.clear()
+    script = runtime.AfterDetailerScript()
+    pp = SimpleNamespace(image=before)
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[pp.image], prompt="face", close=lambda: None,
+        override_settings=dict(_OWN), denoising_strength=0.4, width=8, height=8,
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [before] * 3
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.fix_p2 = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    class Args(SimpleNamespace):
+        def copy(self, update):
+            return Args(**{**vars(self), **update})
+
+    args = Args(
+        ad_classes_sequential=False, ad_model_classes="",
+        ad_model_classes_exclude=False, ad_class_prompts="",
+        ad_model="model.pt", ad_confidence=0.3, ad_use_bbox_mask=False,
+        ad_detection_resolution=0, is_mediapipe=lambda: False,
+        ad_use_checkpoint=True, ad_checkpoint="xl-model.safetensors",
+    )
+
+    script._postprocess_image_inner(SimpleNamespace(extra_generation_params={}), pp, args)
+
+    assert len(calls) == 3
+    err = capsys.readouterr().err
+    assert err.count("could not be loaded while the pass kept") == 1
+    assert "tab 1's checkpoint 'xl-model.safetensors'" in script._ad_family_note
+
+
+@pytest.mark.parametrize("outcome", ["detailed", "error"])
+def test_standalone_run_answer_repeats_the_family_warning(tmp_path, outcome):
+    # "Run ADetailer on an image" answers in the page: the warning is there too.
+    script = _standalone_runtime(tmp_path).AfterDetailerScript()
+
+    def inner(_p, _pp, _args, n=0):
+        script._ad_family_note = "[-] ADetailer: tab 1 uses checkpoint ..."
+        if outcome == "error":
+            script._ad_error_regions = 1
+            return False
+        return True
+
+    script._postprocess_image_inner = inner
+
+    _image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), save=False
+    )
+
+    assert "another model family than the main model" in status
+    assert ("failed" in status) is (outcome == "error")
+    # A tab's checkpoint that did not load: the answer says that instead.
+    script._postprocess_image_inner = lambda *_args, **_kwargs: (
+        setattr(script, "_ad_family_note", "[-] ADetailer: tab 1's checkpoint 'x' could not be loaded while ..."),
+        setattr(script, "_ad_error_regions", 1),
+        False,
+    )[-1]
+    _image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), save=False
+    )
+    assert "run failed" in status
+    assert "could not be loaded while the pass kept the main model's" in status
+    assert "another model family than the main model" not in status
+    # The next run, without the warning, does not repeat it.
+    script._postprocess_image_inner = lambda *_args, **_kwargs: True
+    _image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), save=False
+    )
+    assert status == "✅ ADetailer pass complete."
+
+
+# Forge / Forge Neo: a tab whose own checkpoint cannot be loaded with the main
+# model's VAE file is skipped before its pass (found live on Forge Neo: main
+# model Flux, a tab with an SDXL checkpoint that kept Flux's files; the failed
+# load left the WebUI without a model and the whole generation was lost).
+
+
+def _header_file(path, shapes, raw=None):
+    """A .safetensors file that is only its header (8 bytes little-endian with
+    the length, then JSON with the tensor names and shapes): no model."""
+    import json
+
+    if raw is None:
+        raw = json.dumps({
+            "__metadata__": {"format": "pt"},
+            **{
+                name: {"dtype": "F16", "shape": list(shape), "data_offsets": [0, 0]}
+                for name, shape in shapes.items()
+            },
+        }).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(len(raw).to_bytes(8, "little") + raw)
+    return str(path)
+
+
+_UNET = "model.diffusion_model."
+_CROSS = _UNET + "input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight"
+_SDXL_KEYS = {
+    _UNET + "input_blocks.0.0.weight": (320, 4, 3, 3),
+    _UNET + "input_blocks.4.1.proj_in.weight": (640, 640),
+    _CROSS: (640, 2048),
+    _UNET + "label_emb.0.0.weight": (1280, 2816),
+    _UNET + "out.2.weight": (4, 320, 3, 3),
+    "first_stage_model.decoder.conv_in.weight": (512, 4, 3, 3),
+}
+_SD15_KEYS = {
+    _UNET + "input_blocks.0.0.weight": (320, 4, 3, 3),
+    _UNET + "input_blocks.4.1.proj_in.weight": (640, 640, 1, 1),
+    _CROSS: (640, 768),
+    _UNET + "out.2.weight": (4, 320, 3, 3),
+    "first_stage_model.decoder.conv_in.weight": (512, 4, 3, 3),
+}
+# A transformer-only file, as Flux checkpoints often are: bare names.
+_FLUX_KEYS = {
+    "double_blocks.0.img_attn.norm.key_norm.scale": (128,),
+    "img_in.weight": (3072, 64),
+    "guidance_in.in_layer.weight": (3072, 256),
+}
+_FLUX_VAE_KEYS = {
+    "decoder.conv_in.weight": (512, 16, 3, 3),
+    "encoder.conv_in.weight": (128, 3, 3, 3),
+}
+_SDXL_VAE_KEYS = {
+    "decoder.conv_in.weight": (512, 4, 3, 3),
+    "encoder.conv_in.weight": (128, 3, 3, 3),
+}
+# A VAE taken out of a checkpoint with its prefix ("VAE format 0").
+_PREFIXED_VAE_KEYS = {
+    "first_stage_model.decoder.conv_in.weight": (512, 4, 3, 3),
+    "first_stage_model.encoder.conv_in.weight": (128, 3, 3, 3),
+}
+_T5_KEYS = {
+    "encoder.block.0.layer.0.SelfAttention.k.weight": (4096, 4096),
+    "shared.weight": (32128, 4096),
+}
+_SD2_KEYS = {**_SD15_KEYS, _CROSS: (640, 1024)}
+
+
+def _without(keys, name):
+    return {key: shape for key, shape in keys.items() if key != name}
+
+
+@pytest.mark.parametrize(
+    ("keys", "facts"),
+    [
+        # A whole checkpoint holds its VAE with the "first_stage_model."
+        # prefix: 0, as for any file with a VAE saved that way.
+        (_SDXL_KEYS, ("sdxl", 0)),
+        (_SD15_KEYS, ("sd1", 0)),
+        (_FLUX_KEYS, ("flux", None)),
+        ({_UNET + name: shape for name, shape in _FLUX_KEYS.items()}, ("flux", None)),
+        # A bare SDXL UNet: the WebUI adds the prefix itself.
+        ({k[len(_UNET):]: v for k, v in _SDXL_KEYS.items() if k.startswith(_UNET)},
+         ("sdxl", None)),
+        # Not surely one of them: an SDXL UNet with 32 output channels (another
+        # engine, another VAE) or without the output layer, SD 2 (1024), the
+        # SDXL refiner (1280, 384 channels), SD 1.5 keys with SDXL's class
+        # embedding, Chroma, Flux.2.
+        ({**_SDXL_KEYS, _UNET + "out.2.weight": (32, 320, 3, 3)}, (None, 0)),
+        (_without(_SDXL_KEYS, _UNET + "out.2.weight"), (None, 0)),
+        (_SD2_KEYS, (None, 0)),
+        ({**_SDXL_KEYS, _UNET + "input_blocks.0.0.weight": (384, 4, 3, 3),
+          _CROSS: (768, 1280)}, (None, 0)),
+        ({**_SD15_KEYS, _UNET + "label_emb.0.0.weight": (1280, 2816)}, (None, 0)),
+        # SDXL's cross-attention with something else that is not SDXL's: the
+        # first layer's channels, the class embedding (none, another size),
+        # a convolution where SDXL has a linear layer.
+        ({**_SDXL_KEYS, _UNET + "input_blocks.0.0.weight": (384, 4, 3, 3)}, (None, 0)),
+        (_without(_SDXL_KEYS, _UNET + "label_emb.0.0.weight"), (None, 0)),
+        ({**_SDXL_KEYS, _UNET + "label_emb.0.0.weight": (1280, 2560)}, (None, 0)),
+        ({**_SDXL_KEYS, _UNET + "input_blocks.4.1.proj_in.weight": (640, 640, 1, 1)},
+         (None, 0)),
+        ({**_FLUX_KEYS, "distilled_guidance_layer.norms.0.scale": (5120,)}, (None, None)),
+        ({**_FLUX_KEYS, "double_stream_modulation_img.lin.weight": (1, 1)}, (None, None)),
+        # Additional modules: a VAE gives its latent channels, a VAE of
+        # another layout 0, a text encoder none.
+        (_FLUX_VAE_KEYS, (None, 16)),
+        (_SDXL_VAE_KEYS, (None, 4)),
+        ({"decoder.middle.0.residual.0.gamma": (384,)}, (None, 0)),
+        ({"decoder.conv_in.weight": (512, 16, 3, 3, 3)}, (None, 0)),
+        # A VAE saved with a checkpoint's prefix, alone or beside bare names:
+        # the WebUI lays it over the VAE of an SD 1.5 / SDXL checkpoint.
+        (_PREFIXED_VAE_KEYS, (None, 0)),
+        ({**_FLUX_VAE_KEYS, **_PREFIXED_VAE_KEYS}, (None, 0)),
+        (_T5_KEYS, (None, None)),
+    ],
+)
+def test_model_file_facts_come_from_the_header_alone(tmp_path, keys, facts):
+    runtime, _data = _family_runtime()
+    runtime._FILE_FACTS_SEEN.clear()
+    # ".sft" is the same format; the suffix is read in any case.
+    for name in ("model.safetensors", "model.SFT"):
+        assert runtime._model_file_facts(_header_file(tmp_path / name, keys)) == facts
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "ckpt", "gguf", "missing", "empty", "too short", "length past the file",
+        "not json", "json list", "no path",
+    ],
+)
+def test_model_file_facts_are_unknown_for_a_file_that_cannot_be_read(tmp_path, case):
+    import json
+
+    runtime, _data = _family_runtime()
+    runtime._FILE_FACTS_SEEN.clear()
+    good = json.dumps({
+        name: {"dtype": "F16", "shape": list(shape), "data_offsets": [0, 0]}
+        for name, shape in _SDXL_KEYS.items()
+    }).encode("utf-8")
+    # The control: the same header in a .safetensors file is read.
+    assert runtime._model_file_facts(
+        _header_file(tmp_path / "good.safetensors", None, raw=good)
+    ) == ("sdxl", 0)
+
+    path = tmp_path / "model.safetensors"
+    if case in ("ckpt", "gguf"):
+        path = Path(_header_file(tmp_path / f"model.{case}", None, raw=good))
+    elif case == "empty":
+        path.write_bytes(b"")
+    elif case == "too short":
+        path.write_bytes(b"\x05\x00\x00")
+    elif case == "length past the file":
+        path.write_bytes((len(good) + 1).to_bytes(8, "little") + good)
+    elif case == "not json":
+        _header_file(path, None, raw=b"x" * len(good))
+    elif case == "json list":
+        _header_file(path, None, raw=b"[1, 2, 3]")
+    target = None if case == "no path" else str(path)
+
+    assert runtime._model_file_facts(target) is None
+    assert runtime._model_file_facts(target) is None  # also from the memory
+
+
+def test_model_file_facts_are_kept_by_path_modification_time_and_size(tmp_path):
+    import os
+
+    runtime, _data = _family_runtime()
+    runtime._FILE_FACTS_SEEN.clear()
+    path = tmp_path / "vae.safetensors"
+    _header_file(path, {"decoder.conv_in.weight": (512, 16, 3, 3)})
+    before = path.stat()
+    assert runtime._model_file_facts(str(path)) == (None, 16)
+
+    # Another header of the same size, with the old modification time: the
+    # facts kept in memory answer, the file is not read again.
+    _header_file(path, {"decoder.conv_in.weight": (512, 32, 3, 3)})
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert path.stat().st_size == before.st_size
+    assert runtime._model_file_facts(str(path)) == (None, 16)
+    assert len(runtime._FILE_FACTS_SEEN) == 1
+
+    # A new modification time: read again.
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 5_000_000_000))
+    assert runtime._model_file_facts(str(path)) == (None, 32)
+    # A new size with the same modification time (the file was replaced by a
+    # text encoder and its time put back): read again too.
+    changed = path.stat()
+    _header_file(path, _T5_KEYS)
+    os.utime(path, ns=(changed.st_atime_ns, changed.st_mtime_ns))
+    assert path.stat().st_size != changed.st_size
+    assert runtime._model_file_facts(str(path)) == (None, None)
+    # The memory does not grow without end.
+    for k in range(70):
+        runtime._model_file_facts(_header_file(tmp_path / f"m{k}.safetensors", _T5_KEYS))
+    assert len(runtime._FILE_FACTS_SEEN) <= 64
+
+
+def _skip_files(tmp_path):
+    """The model files of the case found live, as headers only."""
+    return SimpleNamespace(
+        sdxl=_header_file(tmp_path / "Stable-diffusion" / "xl-model.safetensors", _SDXL_KEYS),
+        flux_vae=_header_file(tmp_path / "VAE" / "ae.safetensors", _FLUX_VAE_KEYS),
+        sdxl_vae=_header_file(tmp_path / "VAE" / "sdxl_vae.safetensors", _SDXL_VAE_KEYS),
+        t5=_header_file(tmp_path / "text_encoder" / "t5xxl.safetensors", _T5_KEYS),
+    )
+
+
+def _skip_runtime(tmp_path, main=_FLUX, main_files=None, tab_file=None):
+    """Forge / Forge Neo with the main model loaded and its files selected,
+    and a tab whose own checkpoint 'xl-model.safetensors' is ``tab_file``."""
+    files = _skip_files(tmp_path)
+    if main_files is None:
+        main_files = [files.flux_vae, files.t5]
+    runtime, data = _family_runtime(main=main, main_files=main_files)
+    runtime._FILE_FACTS_SEEN.clear()
+    runtime.modules.sd_models.checkpoint_aliases = {
+        "xl-model.safetensors": SimpleNamespace(filename=tab_file or files.sdxl),
+    }
+    runtime._main_model_family()  # the generation started: the main model is loaded
+    return runtime, data, files
+
+
+def test_tab_checkpoint_that_cannot_load_with_the_main_vae_is_skipped(tmp_path, capsys):
+    runtime, _data, _files = _skip_runtime(tmp_path)
+    p = SimpleNamespace()
+
+    # Three pictures of one generation, then another tab, another generation.
+    lines = [runtime._unloadable_tab_checkpoint(p, _own_tab(), 0, _OWN) for _ in range(3)]
+    second_tab = runtime._unloadable_tab_checkpoint(p, _own_tab(), 1, _OWN)
+    next_generation = runtime._unloadable_tab_checkpoint(
+        SimpleNamespace(), _own_tab(), 0, _OWN
+    )
+
+    # Every picture is skipped; the console says it once per generation and tab.
+    assert lines[0] and lines[1:] == [lines[0]] * 2
+    assert second_tab and next_generation
+    err = capsys.readouterr().err
+    assert err.count("[-] ADetailer: tab 1 skipped:") == 2
+    assert err.count("[-] ADetailer: tab 2 skipped:") == 1
+    assert "its checkpoint 'xl-model.safetensors' (SDXL) cannot be loaded" in lines[0]
+    assert "with the main model's (Flux) VAE file (ae.safetensors)" in lines[0]
+    assert "'Use separate VAE' with Automatic" in lines[0]
+    assert "'Use separate text encoder' with \"None (use detailer checkpoint's own)\"" in lines[0]
+    assert str(tmp_path) not in err  # file names only, never their folders
+    assert err.isascii()
+    assert "\n" not in lines[0]
+
+
+@pytest.mark.parametrize(
+    ("main", "main_vae", "tab_keys", "names"),
+    [
+        (_FLUX, _FLUX_VAE_KEYS, _SD15_KEYS,
+         "(SD 1.5) cannot be loaded with the main model's (Flux)"),
+        (_ZIMAGE, _FLUX_VAE_KEYS, _SDXL_KEYS,
+         "(SDXL) cannot be loaded with the main model's (Z-Image)"),
+        # The other way round: a Flux tab that would keep an SDXL VAE file.
+        (_SDXL, _SDXL_VAE_KEYS, _FLUX_KEYS,
+         "(Flux) cannot be loaded with the main model's (SDXL)"),
+    ],
+)
+def test_other_sure_combinations_are_skipped_too(tmp_path, main, main_vae, tab_keys, names):
+    vae = _header_file(tmp_path / "VAE" / "main-vae.safetensors", main_vae)
+    tab = _header_file(tmp_path / "tab.safetensors", tab_keys)
+    t5 = _header_file(tmp_path / "text_encoder" / "t5xxl.safetensors", _T5_KEYS)
+    runtime, _data, _files = _skip_runtime(
+        tmp_path, main=main, main_files=[vae, t5], tab_file=tab
+    )
+
+    line = runtime._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    assert names in line
+    assert "VAE file (main-vae.safetensors)" in line
+    # The remedy named is the one of the tab's family. For a Flux checkpoint
+    # it is a Flux VAE file, never Automatic or "None": a file that is the
+    # transformer alone would be left without a VAE and without text
+    # encoders, the tab would not be skipped any more and its load would fail.
+    automatic = "'Use separate VAE' with Automatic and 'Use separate text encoder' with"
+    flux_vae = (
+        "Pick a Flux VAE file (16 latent channels, such as ae.safetensors) in "
+        "the tab's 'Use separate VAE'. A checkpoint file without text encoders "
+        "inside also needs its family's, and a tab can pick only one file: use "
+        "a checkpoint that holds them."
+    )
+    if tab_keys is _FLUX_KEYS:
+        assert line.endswith("would fail with it. " + flux_vae)
+        assert "Automatic" not in line
+        assert "None (use detailer" not in line
+    else:
+        assert automatic in line
+        assert "Pick a " not in line
+    assert line.isascii()
+    assert "\n" not in line
+    # "Run ADetailer on an image" says the same remedy in its answer.
+    status = runtime._family_status_note(SimpleNamespace(_ad_family_note=line))
+    assert status.startswith(
+        " ⚠️ The tab was skipped: its checkpoint cannot be loaded with "
+        "the main model's VAE file, which the pass would keep. "
+    )
+    if tab_keys is _FLUX_KEYS:
+        assert status.endswith(
+            "Pick a VAE file of the checkpoint's family in the tab's Use "
+            "separate VAE (see console)."
+        )
+        assert "Automatic" not in status
+    else:
+        assert status.endswith(
+            "Give the tab its own: Use separate VAE with Automatic (see console)."
+        )
+
+
+@pytest.mark.parametrize(
+    ("folder", "automatic_works"),
+    [
+        ("VAE", True), ("vae", True), ("VAE/flux", True),
+        # A folder of --vae-dirs, or a VAE file kept beside the checkpoints.
+        ("autoencoders", False), ("Stable-diffusion", False),
+    ],
+)
+def test_the_remedy_of_a_skipped_tab_can_be_followed_wherever_the_main_vae_is(
+    tmp_path, monkeypatch, folder, automatic_works
+):
+    # "Automatic" in the tab takes out the main model's VAE only when the
+    # file is in a folder named VAE (_forge_wanted_modules): with the file
+    # anywhere else the tab stayed skipped, and its line still said Automatic.
+    files = _skip_files(tmp_path)
+    main_vae = _header_file(tmp_path / folder / "main-ae.safetensors", _FLUX_VAE_KEYS)
+    runtime, _data, _files = _skip_runtime(tmp_path, main_files=[main_vae, files.t5])
+    forge = ModuleType("modules_forge")
+    forge.main_entry = ModuleType("modules_forge.main_entry")
+    forge.main_entry.module_list = {
+        "main-ae.safetensors": main_vae, "sdxl_vae.safetensors": files.sdxl_vae,
+        "t5xxl.safetensors": files.t5,
+    }
+    monkeypatch.setitem(sys.modules, "modules_forge", forge)
+    monkeypatch.setitem(sys.modules, "modules_forge.main_entry", forge.main_entry)
+    wanted_modules = _load_runtime(shared=runtime.shared)._forge_wanted_modules
+
+    def skipped(**choices):
+        # The files the tab's pass really asks for with these choices.
+        tab = _own_tab(**choices)
+        wanted = wanted_modules(tab)
+        override = dict(_OWN) if wanted is None else {**_OWN, "forge_additional_modules": wanted}
+        return runtime._unloadable_tab_checkpoint(SimpleNamespace(), tab, 0, override)
+
+    none = {"ad_use_text_encoder": True, "ad_text_encoder": "None (use detailer checkpoint's own)"}
+    line = skipped()
+
+    assert "tab 1 skipped: its checkpoint 'xl-model.safetensors' (SDXL)" in line
+    assert bool(skipped(ad_use_vae=True, ad_vae="Automatic", **none)) is not automatic_works
+    assert skipped(ad_use_vae=True, ad_vae="sdxl_vae.safetensors", **none) == ""
+    # The line names a remedy that ends the skip.
+    automatic = (
+        "Give the tab its own: 'Use separate VAE' with Automatic and 'Use separate "
+        "text encoder' with \"None (use detailer checkpoint's own)\"."
+    )
+    # With the main model's VAE file outside a folder named VAE, a VAE file
+    # picked in the tab ends the skip (above) while that file stays, and Forge
+    # Neo can read it after the tab's: the load would fail and the whole
+    # generation with it. The line says first to move it, where Automatic
+    # takes it out (the folders named VAE above).
+    moved = (
+        "First move the main model's VAE file into a folder named VAE (such as "
+        "models/VAE) and pick it again in the WebUI's 'VAE / Text Encoder' list: "
+        "no choice of the tab takes out a file that is not in a folder named VAE, "
+        "and the WebUI can read it after the tab's. Then g" + automatic[1:]
+    )
+    assert line.endswith("would fail with it. " + (automatic if automatic_works else moved))
+    assert line.isascii()
+    assert str(tmp_path) not in line
+    # "Run ADetailer on an image" says the same remedy in its answer.
+    status = runtime._family_status_note(SimpleNamespace(_ad_family_note=line))
+    assert status.endswith(
+        "Give the tab its own: Use separate VAE with Automatic (see console)."
+        if automatic_works
+        else "First move them into the folder the console names and pick them "
+        "again (see console)."
+    )
+
+
+def _loaded_tab_lines(tmp_path, monkeypatch, own_vae_keys=_SDXL_VAE_KEYS):
+    """Main model Flux with its VAE in a folder not named VAE, a tab with an
+    SDXL checkpoint that loaded: the line of _warn_other_family_modules for
+    the files the tab's pass really asks for with the given choices."""
+    files = _skip_files(tmp_path)
+    main_vae = _header_file(tmp_path / "autoencoders" / "main-ae.safetensors", _FLUX_VAE_KEYS)
+    own_vae = _header_file(tmp_path / "VAE" / "own_vae.safetensors", own_vae_keys)
+    runtime, data, _files = _skip_runtime(tmp_path, main_files=[main_vae, files.t5])
+    forge = ModuleType("modules_forge")
+    forge.main_entry = ModuleType("modules_forge.main_entry")
+    forge.main_entry.module_list = {
+        "main-ae.safetensors": main_vae, "own_vae.safetensors": own_vae,
+        "t5xxl.safetensors": files.t5,
+    }
+    monkeypatch.setitem(sys.modules, "modules_forge", forge)
+    monkeypatch.setitem(sys.modules, "modules_forge.main_entry", forge.main_entry)
+    wanted_modules = _load_runtime(shared=runtime.shared)._forge_wanted_modules
+    data.load(_engine(**_SDXL), as_settings_ask=False)  # the pass loaded the tab's
+
+    def warned(**choices):
+        tab = _own_tab(**choices)
+        wanted = wanted_modules(tab)
+        override = dict(_OWN) if wanted is None else {**_OWN, "forge_additional_modules": wanted}
+        return runtime._warn_other_family_modules(SimpleNamespace(), tab, 0, override)
+
+    return warned
+
+
+_NONE_ENCODER = {
+    "ad_use_text_encoder": True, "ad_text_encoder": "None (use detailer checkpoint's own)",
+}
+_OWN_VAE = {"ad_use_vae": True, "ad_vae": "own_vae.safetensors"}
+
+
+def test_the_advice_of_a_loaded_checkpoint_can_be_followed(tmp_path, monkeypatch, capsys):
+    # The line told to pick an SDXL VAE file in the tab and "None" for the
+    # text encoder; with exactly that done the main model's VAE file is still
+    # in the list (Automatic and a picked file take out only a folder named
+    # VAE), and the same line with the same advice came at every generation.
+    warned = _loaded_tab_lines(tmp_path, monkeypatch)
+    advice = f"Pick an SDXL {_PICKED_VAE_ADVICE}"
+
+    assert warned().endswith("the result can be broken or fail. " + advice)
+    capsys.readouterr()
+    assert warned(**_OWN_VAE, **_NONE_ENCODER) == ""
+    assert capsys.readouterr().err == ""
+
+
+def test_a_loaded_checkpoint_with_its_own_vae_is_told_only_the_text_encoder(
+    tmp_path, monkeypatch, capsys
+):
+    # Half of the advice followed: the VAE picked, the text encoder still the
+    # main model's. The line names that file alone, and does not say to pick
+    # a VAE again, nor Automatic (which would bring back the main model's).
+    warned = _loaded_tab_lines(tmp_path, monkeypatch)
+
+    line = warned(**_OWN_VAE)
+
+    assert line == (
+        "[-] ADetailer: tab 1 uses checkpoint 'xl-model.safetensors' (SDXL) but "
+        "the main model is Flux, and the pass kept the main model's VAE / text "
+        "encoder files (t5xxl.safetensors): the result can be broken or fail. "
+        "Set the tab's 'Use separate text encoder' to \"None (use detailer "
+        "checkpoint's own)\"; its 'Use separate VAE' already has a VAE file of "
+        "the checkpoint's family."
+    )
+    assert capsys.readouterr().err == line + "\n"
+    assert line.isascii()
+    assert str(tmp_path) not in line
+
+
+@pytest.mark.parametrize(
+    "own_vae_keys",
+    [
+        _FLUX_VAE_KEYS,  # a VAE of another family: 16 latent channels
+        _PREFIXED_VAE_KEYS,  # a layout whose channels are not read
+        _T5_KEYS,  # not a VAE at all
+    ],
+)
+def test_a_loaded_checkpoint_with_a_vae_that_does_not_fit_keeps_its_line(
+    tmp_path, monkeypatch, own_vae_keys
+):
+    # Only a VAE file with the latent channels of the family that loaded
+    # takes the place of the main model's: any other choice changes nothing.
+    warned = _loaded_tab_lines(tmp_path, monkeypatch, own_vae_keys)
+
+    line = warned(**_OWN_VAE, **_NONE_ENCODER)
+
+    assert "text encoder files (main-ae.safetensors): the result can be" in line
+    assert line.endswith(f"Pick an SDXL {_PICKED_VAE_ADVICE}")
+
+
+def test_a_main_vae_read_after_the_tabs_own_keeps_the_line(tmp_path):
+    # The file read last is the one the checkpoint is left with.
+    files = _skip_files(tmp_path)
+    main_vae = _header_file(tmp_path / "autoencoders" / "main-ae.safetensors", _FLUX_VAE_KEYS)
+    runtime, data, _files = _skip_runtime(tmp_path, main_files=[main_vae, files.t5])
+    data.load(_engine(**_SDXL), as_settings_ask=False)
+    unread = str(tmp_path / "autoencoders" / "other.gguf")
+
+    # A file that cannot be read could be a VAE too.
+    for modules in ([files.sdxl_vae, main_vae], [main_vae, files.sdxl_vae, unread]):
+        override = {**_OWN, "forge_additional_modules": modules}
+        line = runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, override)
+        assert "text encoder files (main-ae.safetensors): the result can be" in line
+        assert line.endswith(f"Pick an SDXL {_PICKED_VAE_ADVICE}")
+    # The same files with the tab's own read last: nothing is left to say.
+    override = {**_OWN, "forge_additional_modules": [main_vae, files.sdxl_vae]}
+    assert runtime._warn_other_family_modules(SimpleNamespace(), _own_tab(), 0, override) == ""
+
+
+_SD15 = {"family": "sd15", "is_sd1": True, "is_sdxl": False}
+
+
+def _tab_lines(
+    tmp_path, monkeypatch, *, main, main_vae_keys, main_vae_folder,
+    encoder_folder="text_encoder", own_vae_keys=_SDXL_VAE_KEYS, tab_keys=_SDXL_KEYS,
+    loaded=_SDXL,
+):
+    """A main model with a VAE file and a text encoder in the given folders,
+    and a tab with its own checkpoint: the line of _warn_other_family_modules
+    for the files the tab's pass really asks for with the given choices, and
+    those files. ``loaded`` None: the tab's checkpoint did not load."""
+    main_vae = _header_file(tmp_path / main_vae_folder / "main-ae.safetensors", main_vae_keys)
+    own_vae = _header_file(tmp_path / "VAE" / "own_vae.safetensors", own_vae_keys)
+    encoder = _header_file(tmp_path / encoder_folder / "t5xxl.safetensors", _T5_KEYS)
+    tab_file = _header_file(tmp_path / "Stable-diffusion" / "tab.safetensors", tab_keys)
+    runtime, data, _files = _skip_runtime(
+        tmp_path, main=main, main_files=[main_vae, encoder], tab_file=tab_file
+    )
+    forge = ModuleType("modules_forge")
+    forge.main_entry = ModuleType("modules_forge.main_entry")
+    forge.main_entry.module_list = {
+        "main-ae.safetensors": main_vae, "own_vae.safetensors": own_vae,
+        "t5xxl.safetensors": encoder,
+    }
+    monkeypatch.setitem(sys.modules, "modules_forge", forge)
+    monkeypatch.setitem(sys.modules, "modules_forge.main_entry", forge.main_entry)
+    wanted_modules = _load_runtime(shared=runtime.shared)._forge_wanted_modules
+    if loaded is None:
+        _failed_load(data)
+    else:
+        data.load(_engine(**loaded), as_settings_ask=False)  # the pass loaded the tab's
+
+    def warned(*, order=None, **choices):
+        tab = _own_tab(**choices)
+        wanted = wanted_modules(tab)
+        if order is not None:
+            wanted = order(wanted)
+        override = dict(_OWN) if wanted is None else {**_OWN, "forge_additional_modules": wanted}
+        before = repr((override, runtime.shared.opts.forge_additional_modules,
+                       data.forge_loading_parameters, data.forge_hash))
+        line = runtime._warn_other_family_modules(SimpleNamespace(), tab, 0, override)
+        # The function only reads: the pass's files, the settings and the
+        # loading parameters are as they were, and so is the model.
+        assert before == repr((override, runtime.shared.opts.forge_additional_modules,
+                               data.forge_loading_parameters, data.forge_hash))
+        return line, wanted
+
+    return warned
+
+
+_MOVE_VAE_ADVICE = (
+    "The tab's 'Use separate VAE' already has a VAE file of the checkpoint's "
+    "family, but no choice of the tab takes out the main model's VAE file "
+    "(main-ae.safetensors), not in a folder named VAE, and the WebUI can read it "
+    "after the tab's. Move it into a folder named VAE (such as models/VAE) and "
+    "pick it again in the WebUI's 'VAE / Text Encoder' list: the tab's file "
+    "then takes its place."
+)
+
+
+@pytest.mark.parametrize(
+    "main_vae_keys",
+    [
+        _SDXL_VAE_KEYS,  # 4 latent channels, as the VAE of SD 1.5 has
+        _PREFIXED_VAE_KEYS,  # a layout whose channels are not read
+    ],
+    ids=["same-channels", "prefixed"],
+)
+def test_a_main_vae_the_checkpoint_loads_with_keeps_the_line_in_any_order(
+    tmp_path, monkeypatch, capsys, main_vae_keys
+):
+    # Main model SD 1.5 with its VAE in a folder not named VAE, a tab with an
+    # SDXL checkpoint, an SDXL VAE file picked and "None" for the text
+    # encoder. Forge Neo sorts the files by path before it reads them, so the
+    # last of the list is not the last one read: here the main model's VAE
+    # is, the checkpoint loads with it (4 latent channels both) and the
+    # picture comes out broken. The line was silent.
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_SD15, main_vae_keys=main_vae_keys,
+        main_vae_folder="autoencoders",
+    )
+
+    line, wanted = warned(**_OWN_VAE, **_NONE_ENCODER)
+
+    assert [Path(m).name for m in wanted] == ["main-ae.safetensors", "own_vae.safetensors"]
+    assert [Path(m).name for m in sorted(wanted)] == ["own_vae.safetensors", "main-ae.safetensors"]
+    assert line == (
+        "[-] ADetailer: tab 1 uses checkpoint 'xl-model.safetensors' (SDXL) but "
+        "the main model is SD 1.5, and the pass kept the main model's VAE / text "
+        "encoder files (main-ae.safetensors): the result can be broken or fail. "
+        + _MOVE_VAE_ADVICE
+    )
+    assert capsys.readouterr().err == line + "\n"
+    assert line.isascii()
+    assert "\n" not in line
+    assert str(tmp_path) not in line
+    # The same in the order Forge Neo reads them.
+    assert warned(order=sorted, **_OWN_VAE, **_NONE_ENCODER)[0] == line
+    # With the main model's text encoder kept too: that file is named, and
+    # "None", which takes it out, is still part of the advice.
+    line, _wanted = warned(**_OWN_VAE)
+    assert "files (main-ae.safetensors, t5xxl.safetensors): the result" in line
+    assert line.endswith(
+        _MOVE_VAE_ADVICE + " Also set the tab's 'Use separate text encoder' to "
+        f"{_NONE_CHOICE}."
+    )
+
+
+def test_the_advice_to_move_the_main_vae_ends_the_line_once_followed(
+    tmp_path, monkeypatch, capsys
+):
+    # The same main model with its VAE file moved into a folder named VAE:
+    # the tab's own file takes it out of the list, and nothing is said.
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_SD15, main_vae_keys=_SDXL_VAE_KEYS,
+        main_vae_folder="VAE",
+    )
+
+    line, wanted = warned(**_OWN_VAE, **_NONE_ENCODER)
+
+    assert [Path(m).name for m in wanted] == ["own_vae.safetensors"]
+    assert line == ""
+    assert capsys.readouterr().err == ""
+
+
+def test_a_tab_without_its_own_vae_is_still_told_to_pick_one(tmp_path, monkeypatch):
+    # Before any choice in the tab the advice is the one of c54fae6's line:
+    # a VAE file in the tab. Only once that is done the file must be moved.
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_SD15, main_vae_keys=_SDXL_VAE_KEYS,
+        main_vae_folder="autoencoders",
+    )
+
+    line, _wanted = warned()
+
+    assert line.endswith(f"Pick an SDXL {_PICKED_VAE_ADVICE}")
+
+
+def test_an_encoder_that_none_cannot_take_out_is_not_told_none_again(
+    tmp_path, monkeypatch, capsys
+):
+    # Main model Flux with a text encoder in a folder that is not named
+    # text_encoder (ComfyUI's "clip"): "None" in the tab does not take it
+    # out. With the VAE picked and "None" chosen the line still told to
+    # choose "None", at every generation.
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_FLUX, main_vae_keys=_FLUX_VAE_KEYS,
+        main_vae_folder="VAE", encoder_folder="clip",
+    )
+
+    line, wanted = warned(**_OWN_VAE, **_NONE_ENCODER)
+
+    assert [Path(m).name for m in wanted] == ["t5xxl.safetensors", "own_vae.safetensors"]
+    assert line == (
+        "[-] ADetailer: tab 1 uses checkpoint 'xl-model.safetensors' (SDXL) but "
+        "the main model is Flux, and the pass kept the main model's VAE / text "
+        "encoder files (t5xxl.safetensors): the result can be broken or fail. "
+        "No choice of the tab takes out t5xxl.safetensors, not in a folder "
+        "named text_encoder: move it into a folder named text_encoder (such as "
+        "models/text_encoder) and pick it again in the WebUI's 'VAE / Text "
+        "Encoder' list. From there the tab's 'Use separate text encoder' with "
+        f"{_NONE_CHOICE} takes it out."
+    )
+    assert "Set the tab's 'Use separate text encoder'" not in line
+    assert capsys.readouterr().err == line + "\n"
+    assert line.isascii()
+    assert str(tmp_path) not in line
+
+
+_MOVE_ENCODER_ADVICE = (
+    "No choice of the tab takes out t5xxl.safetensors, not in a folder named "
+    "text_encoder: move it into a folder named text_encoder (such as "
+    "models/text_encoder) and pick it again in the WebUI's 'VAE / Text "
+    "Encoder' list. From there the tab's 'Use separate text encoder' with "
+    f"{_NONE_CHOICE} takes it out."
+)
+
+
+@pytest.mark.parametrize(
+    ("tab_keys", "ending"),
+    [
+        (_SDXL_KEYS, "family, " + _MOVE_ENCODER_ADVICE[0].lower() + _MOVE_ENCODER_ADVICE[1:]),
+        (
+            _T5_KEYS,
+            "family, give the tab that family's files. For an SD 1.5 / SDXL "
+            f"checkpoint: {_MOVE_ENCODER_ADVICE} For a Flux one, or any whose file "
+            "holds no VAE: a VAE file of its family in the tab's 'Use separate "
+            "VAE', not Automatic.",
+        ),
+    ],
+    ids=["sdxl", "unknown"],
+)
+def test_a_failed_load_is_told_to_move_an_encoder_that_none_cannot_take_out(
+    tmp_path, monkeypatch, capsys, tab_keys, ending
+):
+    # Main model Flux with its text encoder in a folder not named
+    # text_encoder (ComfyUI's "clip"); the tab already has "None" and
+    # Automatic, which take that file out of nothing, and its checkpoint does
+    # not load. The line told "None" and Automatic again at every generation,
+    # while the line of a checkpoint that loaded told to move the file.
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_FLUX, main_vae_keys=_FLUX_VAE_KEYS,
+        main_vae_folder="VAE", encoder_folder="clip", tab_keys=tab_keys, loaded=None,
+    )
+
+    line, wanted = warned(ad_use_vae=True, ad_vae="Automatic", **_NONE_ENCODER)
+
+    assert [Path(m).name for m in wanted] == ["t5xxl.safetensors"]
+    assert line == (
+        "[-] ADetailer: tab 1's checkpoint 'xl-model.safetensors' could not be "
+        "loaded while the pass kept the main model's (Flux) VAE / text encoder "
+        "files (t5xxl.safetensors). If the checkpoint is of another model " + ending
+    )
+    assert capsys.readouterr().err == line + "\n"
+    assert line.isascii()
+    assert "\n" not in line
+    assert str(tmp_path) not in line
+    # Beside a file the tab's choices do take out (the main VAE, Automatic
+    # not chosen yet): both are said.
+    line, _wanted = warned(**_NONE_ENCODER)
+    assert "files (main-ae.safetensors, t5xxl.safetensors). If" in line
+    assert "'Use separate VAE' with Automatic." in line
+    assert line.endswith(" " + _MOVE_ENCODER_ADVICE)
+
+
+_MOVE_MAIN_VAE_FIRST = (
+    "First move the main model's VAE file into a folder named VAE (such as "
+    "models/VAE) and pick it again in the WebUI's 'VAE / Text Encoder' list: "
+    "no choice of the tab takes out a file that is not in a folder named VAE, "
+    "and the WebUI can read it after the tab's. Then "
+)
+
+
+@pytest.mark.parametrize("folder", ["VAE", "autoencoders", "Stable-diffusion"])
+@pytest.mark.parametrize("case", ["sdxl", "flux", "picked"])
+def test_a_skipped_tab_is_told_first_to_move_a_main_vae_no_choice_takes_out(
+    tmp_path, capsys, folder, case
+):
+    # A VAE file of the main model outside a folder named VAE stays whatever
+    # the tab picks. The skipped tab's line told only to pick a VAE file in
+    # the tab: that ends the skip while the main model's file stays, Forge
+    # Neo can read it after the tab's, and the load fails with the whole
+    # generation. The line now says first to move it, as the line of a
+    # checkpoint that could not be loaded does.
+    main, main_keys, tab_keys, tab_vae_keys = {
+        "sdxl": (_FLUX, _FLUX_VAE_KEYS, _SDXL_KEYS, None),
+        "flux": (_SDXL, _SDXL_VAE_KEYS, _FLUX_KEYS, None),
+        # A VAE file chosen in the tab that does not fit either.
+        "picked": (_FLUX, _FLUX_VAE_KEYS, _SDXL_KEYS, _FLUX_VAE_KEYS),
+    }[case]
+    main_vae = _header_file(tmp_path / folder / "main-vae.safetensors", main_keys)
+    t5 = _header_file(tmp_path / "text_encoder" / "t5xxl.safetensors", _T5_KEYS)
+    tab = _header_file(tmp_path / "checkpoints" / "tab.safetensors", tab_keys)
+    runtime, data, _files = _skip_runtime(
+        tmp_path, main=main, main_files=[main_vae, t5], tab_file=tab
+    )
+    override = dict(_OWN)
+    if tab_vae_keys is not None:
+        tab_vae = _header_file(tmp_path / "VAE" / "tab-vae.safetensors", tab_vae_keys)
+        # The tab's file takes out the main model's from a folder named VAE.
+        kept = [t5] if folder == "VAE" else [main_vae, t5]
+        override["forge_additional_modules"] = [*kept, tab_vae]
+    before = repr((override, runtime.shared.opts.forge_additional_modules,
+                   data.forge_loading_parameters, data.forge_hash))
+
+    line = runtime._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, override)
+
+    # Only read, and the tab is skipped as before: only the advice changes.
+    assert before == repr((override, runtime.shared.opts.forge_additional_modules,
+                           data.forge_loading_parameters, data.forge_hash))
+    assert line.startswith("[-] ADetailer: tab 1 skipped: its checkpoint 'xl-model")
+    assert line.isascii()
+    assert "\n" not in line
+    assert str(tmp_path) not in line
+    advice = line.split("would fail with it. ", 1)[1]
+    status = runtime._family_status_note(SimpleNamespace(_ad_family_note=line))
+    if folder == "VAE":
+        assert "First move" not in line
+        assert "choice of the tab" not in line
+        assert "First move" not in status
+        return
+    assert advice == _MOVE_MAIN_VAE_FIRST + {
+        "sdxl": "give the tab its own: 'Use separate VAE' with Automatic and 'Use "
+        f"separate text encoder' with {_NONE_CHOICE}.",
+        "flux": "p" + _FLUX_VAE_ADVICE[1:],
+        "picked": "choose a VAE file for SDXL (4 latent channels) in the tab's 'Use "
+        "separate VAE', or Automatic for the checkpoint's own.",
+    }[case]
+    assert "Automatic would keep" not in line
+    assert capsys.readouterr().err == line + "\n"
+    # "Run ADetailer on an image" says it in its answer too.
+    assert status == (
+        " ⚠️ The tab was skipped: its checkpoint cannot be loaded with the VAE "
+        "file of the pass, and no choice of the tab takes out some files of the "
+        "main model. First move them into the folder the console names and pick "
+        "them again (see console)."
+    )
+
+
+def test_a_skipped_tab_is_told_to_move_an_encoder_no_choice_takes_out(tmp_path):
+    # The text encoder of the main model in a folder not named text_encoder
+    # (ComfyUI's "clip") stays with "None" too: the line says to move it
+    # before the advice that ends the skip, with the words of the line of a
+    # checkpoint that could not be loaded.
+    main_vae = _header_file(tmp_path / "VAE" / "main-vae.safetensors", _FLUX_VAE_KEYS)
+    t5 = _header_file(tmp_path / "clip" / "t5xxl.safetensors", _T5_KEYS)
+    runtime, _data, _files = _skip_runtime(tmp_path, main_files=[main_vae, t5])
+
+    line = runtime._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    assert line.endswith(
+        "would fail with it. " + _MOVE_ENCODER_ADVICE + " Then give the tab its "
+        "own: 'Use separate VAE' with Automatic and 'Use separate text encoder' "
+        f"with {_NONE_CHOICE}."
+    )
+    assert "First move" not in line
+    assert "First move them into the folder the console names" in (
+        runtime._family_status_note(SimpleNamespace(_ad_family_note=line))
+    )
+
+
+@pytest.mark.parametrize("own", [False, True], ids=["main-checkpoint", "own-flux-checkpoint"])
+def test_a_wrong_vae_for_a_checkpoint_of_the_main_family_is_not_told_to_move_its_encoder(
+    tmp_path, own
+):
+    # Main model Flux, its VAE in a folder named VAE and its text encoder in
+    # ComfyUI's "clip" folder. The tab runs a Flux checkpoint (the main one
+    # again, or one of its own) and has a 4-channel VAE picked by mistake: it
+    # is rightly skipped and the remedy is another VAE file. The line also
+    # said to move the text encoder so that "None" takes it out, and the
+    # status "First move them": that text encoder is the checkpoint's own,
+    # and a Flux pass without it fails.
+    from adetailer.args import ADetailerArgs
+
+    ae = _header_file(tmp_path / "VAE" / "ae.safetensors", _FLUX_VAE_KEYS)
+    t5 = _header_file(tmp_path / "clip" / "t5xxl.safetensors", _T5_KEYS)
+    sdxl_vae = _header_file(tmp_path / "VAE" / "sdxl_vae.safetensors", _SDXL_VAE_KEYS)
+    flux_tab = _header_file(tmp_path / "Stable-diffusion" / "flux-tab.safetensors", _FLUX_KEYS)
+    runtime, data, _files = _skip_runtime(tmp_path, main_files=[ae, t5], tab_file=flux_tab)
+    data.forge_loading_parameters["checkpoint_info"] = SimpleNamespace(
+        filename=_header_file(tmp_path / "Stable-diffusion" / "flux1-dev.safetensors", _FLUX_KEYS)
+    )
+    override = {"forge_additional_modules": [t5, sdxl_vae]}
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_use_vae=True, ad_vae="sdxl_vae.safetensors")
+    if own:
+        args = _own_tab(ad_use_vae=True, ad_vae="sdxl_vae.safetensors")
+        override["sd_model_checkpoint"] = "xl-model.safetensors"
+
+    line = runtime._unloadable_tab_checkpoint(SimpleNamespace(), args, 0, override)
+    status = runtime._family_status_note(SimpleNamespace(_ad_family_note=line))
+
+    # Skipped as before: only the advice changes.
+    assert "cannot be loaded with the VAE file chosen in the tab" in line
+    assert line.endswith(
+        "would fail with it. Choose a VAE file for Flux (16 latent channels) in the "
+        "tab's 'Use separate VAE'."
+    )
+    assert "choice of the tab takes out" not in line
+    assert status == (
+        " ⚠️ The tab was skipped: its checkpoint cannot be loaded with the VAE file "
+        "chosen in the tab. Choose another one in Use separate VAE (see console)."
+    )
+    # A checkpoint of another family with the same choices is still told
+    # first to move the text encoder.
+    runtime.modules.sd_models.checkpoint_aliases["xl-model.safetensors"] = SimpleNamespace(
+        filename=_header_file(tmp_path / "Stable-diffusion" / "sd-tab.safetensors", _SDXL_KEYS)
+    )
+    other_ae = _header_file(tmp_path / "VAE" / "other-ae.safetensors", _FLUX_VAE_KEYS)
+    args = _own_tab(ad_use_vae=True, ad_vae="other-ae.safetensors")
+    override = {
+        "sd_model_checkpoint": "xl-model.safetensors",
+        "forge_additional_modules": [t5, other_ae],
+    }
+    line = runtime._unloadable_tab_checkpoint(SimpleNamespace(), args, 1, override)
+    assert line.endswith(
+        "would fail with it. " + _MOVE_ENCODER_ADVICE + " Then choose a VAE file for "
+        "SDXL (4 latent channels) in the tab's 'Use separate VAE', or Automatic for "
+        "the checkpoint's own."
+    )
+
+
+def test_a_failed_load_status_says_to_move_what_no_choice_takes_out(tmp_path, monkeypatch):
+    # The status of "Run ADetailer on an image" for a checkpoint that could
+    # not be loaded still said to give the tab its own, while the console
+    # line said to move a file of the main model that no choice of the tab
+    # takes out ("None" and Automatic would take out nothing).
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_FLUX, main_vae_keys=_FLUX_VAE_KEYS,
+        main_vae_folder="VAE", encoder_folder="clip", loaded=None,
+    )
+    status_of = _family_runtime()[0]._family_status_note
+
+    line, _wanted = warned(ad_use_vae=True, ad_vae="Automatic", **_NONE_ENCODER)
+    status = status_of(SimpleNamespace(_ad_family_note=line))
+
+    assert "could not be loaded" in line
+    assert "No choice of the tab takes out t5xxl" in _MOVE_ENCODER_ADVICE
+    assert line.endswith("family, n" + _MOVE_ENCODER_ADVICE[1:])
+    assert status == (
+        " ⚠️ The tab's checkpoint could not be loaded while the pass kept the "
+        "main model's VAE / text encoder files, and no choice of the tab takes "
+        "out some of them: if it is of another model family, move them into the "
+        "folder the console names and pick them again (see console)."
+    )
+    # Without such a file the status is as before.
+    plain = _tab_lines(
+        tmp_path / "plain", monkeypatch, main=_FLUX, main_vae_keys=_FLUX_VAE_KEYS,
+        main_vae_folder="VAE", loaded=None,
+    )
+    line, _wanted = plain()
+    assert "choice of the tab" not in line
+    assert status_of(SimpleNamespace(_ad_family_note=line)).endswith(
+        "model family, give the tab its own (see console)."
+    )
+
+
+def test_a_prefixed_main_vae_is_no_rival_for_a_family_of_other_channels(
+    tmp_path, monkeypatch, capsys
+):
+    # Main model SDXL with a VAE saved with a checkpoint's prefix ("VAE
+    # format 0") outside a folder named VAE; the tab a Flux checkpoint that
+    # loaded with its own Flux VAE picked and "None". Forge Neo lays such a
+    # file only over an SD 1.5 / SDXL checkpoint (backend/loader.py,
+    # replace_state_dict), so the Flux pass is right: the line said "can be
+    # broken" at every generation.
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_SDXL, main_vae_keys=_PREFIXED_VAE_KEYS,
+        main_vae_folder="autoencoders", own_vae_keys=_FLUX_VAE_KEYS,
+        tab_keys=_FLUX_KEYS, loaded=_FLUX,
+    )
+
+    line, wanted = warned(**_OWN_VAE, **_NONE_ENCODER)
+
+    assert [Path(m).name for m in wanted] == ["main-ae.safetensors", "own_vae.safetensors"]
+    assert line == ""
+    assert capsys.readouterr().err == ""
+
+
+def test_a_main_vae_of_a_layout_not_read_is_still_a_rival_for_any_family(
+    tmp_path, monkeypatch
+):
+    # A VAE whose channels are not read (another layout, without the prefix)
+    # is laid over any checkpoint: the line stays, as before.
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_SDXL,
+        main_vae_keys={"decoder.middle.0.residual.0.gamma": (384,)},
+        main_vae_folder="autoencoders", own_vae_keys=_FLUX_VAE_KEYS,
+        tab_keys=_FLUX_KEYS, loaded=_FLUX,
+    )
+
+    line, _wanted = warned(**_OWN_VAE, **_NONE_ENCODER)
+
+    assert "(Flux) but the main model is SDXL" in line
+    assert "Move it into a folder named VAE" in line
+
+
+def test_the_advice_to_move_the_encoder_ends_the_line_once_followed(
+    tmp_path, monkeypatch, capsys
+):
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_FLUX, main_vae_keys=_FLUX_VAE_KEYS,
+        main_vae_folder="VAE", encoder_folder="text_encoder",
+    )
+
+    line, wanted = warned(**_OWN_VAE, **_NONE_ENCODER)
+
+    assert [Path(m).name for m in wanted] == ["own_vae.safetensors"]
+    assert line == ""
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("case", "ending"),
+    [
+        (
+            "sdxl",
+            "family, move the main model's VAE file into a folder named VAE "
+            "(such as models/VAE) and pick it again in the WebUI's 'VAE / Text "
+            "Encoder' list: the tab's 'Use separate VAE' already has a VAE file "
+            "with 4 latent channels, but no choice of the tab takes out a file "
+            "that is not in a folder named VAE, and the WebUI can read it after "
+            "the tab's.",
+        ),
+        (
+            "unknown",
+            "family, give the tab that family's files. For an SD 1.5 / SDXL "
+            "checkpoint: move the main model's VAE file into a folder named VAE "
+            "(such as models/VAE) and pick it again in the WebUI's 'VAE / Text "
+            "Encoder' list: the tab's 'Use separate VAE' already has a VAE file "
+            "with 4 latent channels, but no choice of the tab takes out a file "
+            "that is not in a folder named VAE, and the WebUI can read it after "
+            "the tab's. For a Flux one, or any whose file holds no VAE: a VAE "
+            "file of its family in the tab's 'Use separate VAE', not Automatic.",
+        ),
+        (
+            "flux",
+            "family, move the main model's VAE file into a folder named VAE "
+            "(such as models/VAE) and pick it again in the WebUI's 'VAE / Text "
+            "Encoder' list: the tab's 'Use separate VAE' already has a VAE file "
+            "with 16 latent channels, but no choice of the tab takes out a file "
+            "that is not in a folder named VAE, and the WebUI can read it after "
+            "the tab's. A checkpoint file without text encoders inside also "
+            "needs its family's, and a tab can pick only one file: use a "
+            "checkpoint that holds them.",
+        ),
+    ],
+    ids=["sdxl", "unknown", "flux"],
+)
+def test_a_failed_load_with_the_vae_already_picked_is_told_to_move_the_main_one(
+    tmp_path, monkeypatch, capsys, case, ending
+):
+    # The line of a load that failed told to pick a VAE file in the tab when
+    # the tab already had one of the checkpoint's family: on Forge Neo the
+    # main model's file, outside a folder named VAE, can be read after it.
+    flux = case == "flux"
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_SDXL if flux else _FLUX,
+        main_vae_keys=_SDXL_VAE_KEYS if flux else _FLUX_VAE_KEYS,
+        main_vae_folder="autoencoders",
+        own_vae_keys=_FLUX_VAE_KEYS if flux else _SDXL_VAE_KEYS,
+        tab_keys={"sdxl": _SDXL_KEYS, "unknown": _T5_KEYS, "flux": _FLUX_KEYS}[case],
+        loaded=None,
+    )
+
+    line, wanted = warned(**_OWN_VAE, **_NONE_ENCODER)
+
+    assert [Path(m).name for m in wanted] == ["main-ae.safetensors", "own_vae.safetensors"]
+    main = "SDXL" if flux else "Flux"
+    assert line == (
+        "[-] ADetailer: tab 1's checkpoint 'xl-model.safetensors' could not be "
+        f"loaded while the pass kept the main model's ({main}) VAE / text encoder "
+        "files (main-ae.safetensors). If the checkpoint is of another model "
+        + ending
+    )
+    assert capsys.readouterr().err == line + "\n"
+    assert line.isascii()
+    assert str(tmp_path) not in line
+    # Without a VAE file of its own the tab is told first to move the main
+    # model's one (it was told to pick a VAE file in the tab first), then
+    # what to give the tab.
+    line, _wanted = warned(**_NONE_ENCODER)
+    assert line.split("If the checkpoint is of another model family, ")[1].startswith(
+        "f" + _MOVE_MAIN_VAE_FIRST[1:] + {
+            "sdxl": "give the tab its own: 'Use separate text encoder'",
+            "unknown": "give the tab that family's files. For an SD 1.5 / SDXL checkpoint: "
+            "'Use separate text encoder'",
+            "flux": "give the tab that family's files. Pick a Flux VAE file",
+        }[case]
+    )
+    assert "Automatic would keep" not in line
+
+
+@pytest.mark.parametrize("tab", ["sdxl", "flux"])
+def test_a_failed_load_is_told_to_move_files_first_only_for_another_family(
+    tmp_path, monkeypatch, tab
+):
+    # Main model Flux, its VAE file outside a folder named VAE and its text
+    # encoder in ComfyUI's "clip" folder, and a tab checkpoint that did not
+    # load. Of another family (SDXL): first move the VAE file, then the text
+    # encoder, then the tab's choices, in that order. Of the main model's
+    # family (Flux): those files are the checkpoint's own, so nothing is told
+    # to be moved, as for a skipped tab, and the status does not say it.
+    warned = _tab_lines(
+        tmp_path, monkeypatch, main=_FLUX, main_vae_keys=_FLUX_VAE_KEYS,
+        main_vae_folder="autoencoders", encoder_folder="clip",
+        tab_keys=_SDXL_KEYS if tab == "sdxl" else _FLUX_KEYS, loaded=None,
+    )
+
+    line, _wanted = warned(**_NONE_ENCODER)
+    advice = line.split("If the checkpoint is of another model family, ")[1]
+    status = _family_runtime()[0]._family_status_note(SimpleNamespace(_ad_family_note=line))
+
+    if tab == "sdxl":
+        assert advice == (
+            "f" + _MOVE_MAIN_VAE_FIRST[1:-len("Then ")] + _MOVE_ENCODER_ADVICE
+            + " Then give the tab its own: " + _AUTOMATIC_ADVICE
+        )
+        assert "move them into the folder the console names" in status
+    else:
+        assert advice == "give the tab that family's files. " + _FLUX_VAE_ADVICE
+        assert "choice of the tab" not in line
+        assert status.endswith("model family, give the tab its own (see console).")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "tab is a .ckpt", "tab header broken", "tab file missing",
+        "tab of an unknown family", "tab unknown to the host",
+        "checkpoint dropped by the host", "tab without own checkpoint",
+        "same family", "main never seen", "main of a family not checked",
+        "main without a VAE file", "tab gives its own VAE", "tab VAE Automatic",
+        "main VAE not readable", "main VAE of other channels than its family",
+        "tab adds a file that cannot be read", "tab keeps the VAE, adds its own too",
+        "tab's own VAE of another layout", "tab's own VAE fits, beside one that does not",
+        "tab's own VAE does not fit, a main file of the same channels cannot be read",
+        "tab's own VAE does not fit, a file of a main model never seen cannot be read",
+        "hires fix checkpoint with the tab's own VAE",
+        "main keeps a VAE saved with a checkpoint's prefix too",
+        "tab adds a VAE saved with a checkpoint's prefix",
+    ],
+)
+def test_tab_is_not_skipped_when_unsure_or_when_it_does_not_apply(tmp_path, case, capsys):
+    from adetailer.args import ADetailerArgs
+
+    files = _skip_files(tmp_path)
+    main = _FLUX
+    main_files = [files.flux_vae, files.t5]
+    tab_file = files.sdxl
+    args = _own_tab()
+    override = dict(_OWN)
+    if case == "tab is a .ckpt":
+        tab_file = _header_file(tmp_path / "xl-model.ckpt", _SDXL_KEYS)
+    elif case == "tab header broken":
+        tab_file = _header_file(tmp_path / "broken.safetensors", None, raw=b"{not json")
+    elif case == "tab file missing":
+        tab_file = str(tmp_path / "gone.safetensors")
+    elif case == "tab of an unknown family":
+        tab_file = _header_file(tmp_path / "sd2.safetensors", _SD2_KEYS)
+    elif case == "checkpoint dropped by the host":
+        override = {}
+    elif case == "tab without own checkpoint":
+        args = ADetailerArgs(ad_model="face_yolov8n.pt")
+        override = {}
+    elif case == "same family":
+        tab_file = _header_file(tmp_path / "flux.safetensors", _FLUX_KEYS)
+    elif case == "main of a family not checked":
+        main = {"family": "qwen", "is_sdxl": False, "is_sd1": False}
+    elif case == "main without a VAE file":
+        main_files = [files.t5]
+    elif case == "tab gives its own VAE":
+        override["forge_additional_modules"] = [files.sdxl_vae, files.t5]
+    elif case == "tab VAE Automatic":
+        override["forge_additional_modules"] = [files.t5]
+    elif case == "main VAE not readable":
+        main_files = [_header_file(tmp_path / "VAE" / "ae.gguf", _FLUX_VAE_KEYS), files.t5]
+    elif case == "main VAE of other channels than its family":
+        # An engine the WebUI flags as SDXL with a 32-channel VAE of its own.
+        main = _SDXL
+        main_files = [_header_file(
+            tmp_path / "VAE" / "other.safetensors", {"decoder.conv_in.weight": (512, 32, 3, 3)}
+        )]
+        tab_file = _header_file(tmp_path / "flux.safetensors", _FLUX_KEYS)
+    elif case == "tab adds a file that cannot be read":
+        override["forge_additional_modules"] = [files.flux_vae, str(tmp_path / "own.gguf")]
+    elif case == "tab keeps the VAE, adds its own too":
+        override["forge_additional_modules"] = [files.flux_vae, files.sdxl_vae]
+    elif case == "tab's own VAE of another layout":
+        other = _header_file(
+            tmp_path / "VAE" / "other.safetensors", {"decoder.middle.0.residual.0.gamma": (384,)}
+        )
+        override["forge_additional_modules"] = [other, files.t5]
+    elif case == "tab's own VAE fits, beside one that does not":
+        # Two files of the tab's (one outside the VAE folders): which one the
+        # WebUI lays last is its own business.
+        own_vae = _header_file(tmp_path / "VAE" / "own.safetensors", _FLUX_VAE_KEYS)
+        override["forge_additional_modules"] = [own_vae, files.sdxl_vae, files.t5]
+    elif case == "tab's own VAE does not fit, a main file of the same channels cannot be read":
+        # The file the SDXL main model loaded with could be a VAE that fits
+        # the tab's SDXL checkpoint too.
+        main = _SDXL
+        gguf = _header_file(tmp_path / "text_encoder" / "clip-q8.gguf", _T5_KEYS)
+        main_files = [gguf]
+        own_vae = _header_file(tmp_path / "VAE" / "own.safetensors", _FLUX_VAE_KEYS)
+        override["forge_additional_modules"] = [gguf, own_vae]
+    elif case == "tab's own VAE does not fit, a file of a main model never seen cannot be read":
+        gguf = _header_file(tmp_path / "text_encoder" / "t5-q8.gguf", _T5_KEYS)
+        main_files = [gguf]
+        own_vae = _header_file(tmp_path / "VAE" / "own.safetensors", _FLUX_VAE_KEYS)
+        override["forge_additional_modules"] = [gguf, own_vae]
+    elif case == "hires fix checkpoint with the tab's own VAE":
+        # A tab without its own checkpoint that details with the hires one.
+        args = ADetailerArgs(ad_model="face_yolov8n.pt")
+        own_vae = _header_file(tmp_path / "VAE" / "own.safetensors", _FLUX_VAE_KEYS)
+        override["forge_additional_modules"] = [own_vae, files.t5]
+    elif case == "main keeps a VAE saved with a checkpoint's prefix too":
+        # Flux ignores such a file, so the main model loads with it; over an
+        # SDXL checkpoint the WebUI lays it on top of Flux's VAE, in any
+        # order of the files that puts it later: the tab's checkpoint loads.
+        prefixed = _header_file(
+            tmp_path / "VAE" / "zz-extracted.safetensors", _PREFIXED_VAE_KEYS
+        )
+        main_files = [files.flux_vae, prefixed, files.t5]
+    elif case == "tab adds a VAE saved with a checkpoint's prefix":
+        prefixed = _header_file(
+            tmp_path / "VAE" / "zz-extracted.safetensors", _PREFIXED_VAE_KEYS
+        )
+        override["forge_additional_modules"] = [files.flux_vae, files.t5, prefixed]
+
+    # The control, on the same files: the sure combination is skipped.
+    control, _data, _files = _skip_runtime(tmp_path)
+    assert control._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, _OWN)
+    capsys.readouterr()
+
+    runtime, data, _files = _skip_runtime(
+        tmp_path, main=main, main_files=main_files, tab_file=tab_file
+    )
+    if case == "tab unknown to the host":
+        runtime.modules.sd_models.checkpoint_aliases = {}
+    if case in (
+        "main never seen",
+        "tab's own VAE does not fit, a file of a main model never seen cannot be read",
+    ):
+        runtime._MAIN_FAMILY_SEEN.clear()
+        data.load(_engine(**_SDXL), as_settings_ask=False)
+
+    assert runtime._unloadable_tab_checkpoint(SimpleNamespace(), args, 0, override) == ""
+    assert capsys.readouterr().err == ""
+
+
+def test_a_main_file_that_cannot_be_read_does_not_stop_the_skip(tmp_path):
+    # A GGUF text encoder among the main model's files (common with Flux): the
+    # main model was loaded with it, so whatever it holds, the VAE the tab
+    # would get has the main model's channels.
+    files = _skip_files(tmp_path)
+    gguf = _header_file(tmp_path / "text_encoder" / "t5-q8.gguf", _T5_KEYS)
+    runtime, _data, _files = _skip_runtime(tmp_path, main_files=[files.flux_vae, gguf])
+
+    # Also when the tab swapped the text encoder for a readable one of its own.
+    for override in (_OWN, {**_OWN, "forge_additional_modules": [files.flux_vae, files.t5]}):
+        line = runtime._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, override)
+        assert "tab 1 skipped" in line
+
+
+def _not_loaded_yet(runtime, data, main_file):
+    """The WebUI right after its start: the settings name the main checkpoint
+    ``main_file``, but no model was loaded in this session."""
+    data.forge_loading_parameters["checkpoint_info"] = SimpleNamespace(filename=main_file)
+    data.sd_model = type("FakeInitialModel", (), {"__module__": "modules.sd_models"})()
+    data.forge_hash = ""
+    runtime._MAIN_FAMILY_SEEN.clear()
+    assert runtime._main_model_family() is None
+
+
+def test_tab_is_skipped_before_the_main_model_was_ever_loaded(tmp_path, capsys):
+    # "Run ADetailer on an image" right after the WebUI started: the engine
+    # has not said the main model's family yet. The header of the main
+    # checkpoint's file says it, as the tab's own does.
+    runtime, data, files = _skip_runtime(tmp_path)
+    flux_main = _header_file(tmp_path / "Stable-diffusion" / "flux-main.safetensors", _FLUX_KEYS)
+    _not_loaded_yet(runtime, data, flux_main)
+
+    line = runtime._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, _OWN)
+
+    assert (
+        "tab 1 skipped: its checkpoint 'xl-model.safetensors' (SDXL) cannot be "
+        "loaded with the main model's (Flux) VAE file (ae.safetensors)" in line
+    )
+    assert capsys.readouterr().err.count("[-] ADetailer: tab 1 skipped:") == 1
+    # The header is not kept as what the engine said: once the main model is
+    # loaded, its engine is asked.
+    assert runtime._MAIN_FAMILY_SEEN == {}
+    assert runtime._main_model_family() is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "main checkpoint is a .ckpt", "main checkpoint of an unknown family",
+        "main checkpoint missing", "main file that cannot be read",
+        "main vae of other channels than the header's family",
+        "same channels as the tab's",
+    ],
+)
+def test_tab_is_not_skipped_before_the_first_load_when_unsure(tmp_path, case, capsys):
+    files = _skip_files(tmp_path)
+    main_keys, main_name = _FLUX_KEYS, "flux-main.safetensors"
+    main_files = [files.flux_vae, files.t5]
+    if case == "main checkpoint is a .ckpt":
+        main_name = "flux-main.ckpt"
+    elif case == "main checkpoint of an unknown family":
+        main_keys = {**_FLUX_KEYS, "distilled_guidance_layer.norms.0.scale": (5120,)}
+    elif case == "main file that cannot be read":
+        # Never loaded with it: what a file that cannot be read holds is not
+        # known, and it could be a VAE the tab's checkpoint loads with.
+        main_files = [files.flux_vae, _header_file(tmp_path / "text_encoder" / "t5.gguf", _T5_KEYS)]
+    elif case == "main vae of other channels than the header's family":
+        main_keys, main_name = _SD15_KEYS, "sd15-main.safetensors"
+    elif case == "same channels as the tab's":
+        main_keys, main_name = _SD15_KEYS, "sd15-main.safetensors"
+        main_files = [files.sdxl_vae]
+
+    # The control, on the same files: the sure combination is skipped.
+    control, control_data, _files = _skip_runtime(tmp_path)
+    _not_loaded_yet(
+        control, control_data,
+        _header_file(tmp_path / "Stable-diffusion" / "flux-control.safetensors", _FLUX_KEYS),
+    )
+    assert control._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, _OWN)
+    capsys.readouterr()
+
+    runtime, data, _files = _skip_runtime(tmp_path, main_files=main_files)
+    main_file = _header_file(tmp_path / "Stable-diffusion" / main_name, main_keys)
+    if case == "main checkpoint missing":
+        main_file = str(tmp_path / "Stable-diffusion" / "gone.safetensors")
+    _not_loaded_yet(runtime, data, main_file)
+
+    assert runtime._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, _OWN) == ""
+    assert capsys.readouterr().err == ""
+
+
+class _NotedP(SimpleNamespace):
+    """A processing object with the WebUI's notes under the results."""
+
+    def __init__(self, **fields):
+        super().__init__(comments={}, extra_generation_params={}, **fields)
+
+    def comment(self, text):
+        self.comments[text] = 1
+
+
+def test_skipped_tab_is_said_under_the_results_once_per_generation_and_tab(tmp_path, capsys):
+    # txt2img, img2img: the picture comes out without the tab's work, and
+    # only the console said why. The WebUI's notes under the results say it.
+    runtime, _data, _files = _skip_runtime(tmp_path)
+    p = _NotedP()
+
+    # Three pictures of one generation, with two tabs.
+    lines = [
+        runtime._unloadable_tab_checkpoint(p, _own_tab(), tab, _OWN)
+        for _picture in range(3) for tab in (0, 1)
+    ]
+
+    assert all(lines)
+    # The console line without its "[-] " mark, once for each tab.
+    assert list(p.comments) == [lines[0][4:], lines[1][4:]]
+    assert lines[0].startswith("[-] ADetailer: tab 1 skipped:")
+    assert list(p.comments)[0].startswith("ADetailer: tab 1 skipped: its checkpoint ")
+    assert "'Use separate VAE' with Automatic" in list(p.comments)[0]
+    assert capsys.readouterr().err.count("skipped:") == 2
+    # The next generation says it again.
+    again = _NotedP()
+    runtime._unloadable_tab_checkpoint(again, _own_tab(), 0, _OWN)
+    assert list(again.comments) == [lines[0][4:]]
+    # Nothing skipped: no note.
+    clean = _NotedP()
+    assert runtime._unloadable_tab_checkpoint(clean, _own_tab(), 0, {}) == ""
+    assert clean.comments == {}
+
+
+@pytest.mark.parametrize("notes", ["none", "broken"])
+def test_skipped_tab_note_never_costs_the_skip(tmp_path, notes, capsys):
+    # A WebUI without the notes, or whose notes raise: the tab is skipped all
+    # the same and the console says it.
+    runtime, _data, _files = _skip_runtime(tmp_path)
+    p = SimpleNamespace()
+    if notes == "broken":
+        def comment(_text):
+            raise RuntimeError("no notes here")
+
+        p.comment = comment
+
+    line = runtime._unloadable_tab_checkpoint(p, _own_tab(), 0, _OWN)
+
+    assert "tab 1 skipped" in line
+    assert capsys.readouterr().err.count("[-] ADetailer: tab 1 skipped:") == 1
+
+
+def test_pass_says_the_skipped_tab_under_the_results(tmp_path, capsys):
+    # The real pass of a generation with two pictures.
+    _script, run, _detections, _loads = _skip_pass(tmp_path, "forge")
+    p = _NotedP()
+
+    assert [run(p, 0, **_OWN_TAB), run(p, 1), run(p, 0, **_OWN_TAB), run(p, 1)] == [
+        False, True, False, True,
+    ]
+
+    assert len(p.comments) == 1
+    note = next(iter(p.comments))
+    assert note.startswith("ADetailer: tab 1 skipped: its checkpoint 'xl-model.safetensors'")
+    assert "[-] " + note + "\n" in capsys.readouterr().err
+    # Not in the picture's parameters.
+    assert not any("skipped" in str(value) for value in p.extra_generation_params.values())
+
+
+# The same failure when the VAE file was chosen in the tab itself ('Use
+# separate VAE'): an SDXL checkpoint with Flux's VAE file, or the reverse.
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "main flux", "main sdxl", "main never seen", "main of a family not checked",
+        "main file that cannot be read", "flux tab with an sdxl vae",
+        "beside the main model's vae",
+    ],
+)
+def test_tab_checkpoint_that_cannot_load_with_the_vae_chosen_in_the_tab_is_skipped(
+    tmp_path, case, capsys
+):
+    files = _skip_files(tmp_path)
+    own_vae = _header_file(tmp_path / "VAE" / "own-ae.safetensors", _FLUX_VAE_KEYS)
+    main, main_files, tab_file = _FLUX, [files.flux_vae, files.t5], files.sdxl
+    # As the tab's choice leaves the files: the main model's VAE dropped.
+    used = [files.t5, own_vae]
+    if case == "main sdxl":
+        # Another SDXL checkpoint than the main one, with Flux's VAE file.
+        main, main_files, used = _SDXL, [files.sdxl_vae], [own_vae]
+    elif case == "main of a family not checked":
+        main = {"family": "qwen", "is_sdxl": False, "is_sd1": False}
+    elif case == "main file that cannot be read":
+        # A GGUF text encoder the Flux main model loaded with: whatever it
+        # holds has Flux's channels, not those of the tab's SDXL checkpoint.
+        gguf = _header_file(tmp_path / "text_encoder" / "t5-q8.gguf", _T5_KEYS)
+        main_files, used = [files.flux_vae, gguf], [gguf, own_vae]
+    elif case == "flux tab with an sdxl vae":
+        main, main_files = _SDXL, []
+        tab_file = _header_file(tmp_path / "flux.safetensors", _FLUX_KEYS)
+        own_vae = files.sdxl_vae
+        used = [own_vae]
+    elif case == "beside the main model's vae":
+        # The main model's VAE file is outside the VAE folders, so the tab's
+        # choice did not drop it: neither of the two fits the checkpoint.
+        used = [files.flux_vae, files.t5, own_vae]
+    runtime, data, _files = _skip_runtime(
+        tmp_path, main=main, main_files=main_files, tab_file=tab_file
+    )
+    if case == "main never seen":
+        runtime._MAIN_FAMILY_SEEN.clear()
+        data.load(_engine(**_SDXL), as_settings_ask=False)
+    override = {**_OWN, "forge_additional_modules": used}
+    p = SimpleNamespace()
+
+    lines = [runtime._unloadable_tab_checkpoint(p, _own_tab(), 0, override) for _ in range(3)]
+    second_tab = runtime._unloadable_tab_checkpoint(p, _own_tab(), 1, override)
+
+    assert lines[0] and lines[1:] == [lines[0]] * 2
+    err = capsys.readouterr().err
+    assert err.count("[-] ADetailer: tab 1 skipped:") == 1
+    assert err.count("[-] ADetailer: tab 2 skipped:") == 1
+    assert second_tab == lines[0].replace("tab 1 skipped", "tab 2 skipped")
+    if case == "flux tab with an sdxl vae":
+        assert lines[0] == (
+            "[-] ADetailer: tab 1 skipped: its checkpoint 'xl-model.safetensors' "
+            "(Flux) cannot be loaded with the VAE file chosen in the tab "
+            "(sdxl_vae.safetensors: 4 latent channels), and the whole generation "
+            "would fail with it. Choose a VAE file for Flux (16 latent channels) "
+            "in the tab's 'Use separate VAE'."
+        )
+        # A Flux file is often the transformer alone: Automatic is no remedy.
+        assert "Automatic" not in lines[0]
+    else:
+        assert lines[0] == (
+            "[-] ADetailer: tab 1 skipped: its checkpoint 'xl-model.safetensors' "
+            "(SDXL) cannot be loaded with the VAE file chosen in the tab "
+            "(own-ae.safetensors: 16 latent channels), and the whole generation "
+            "would fail with it. Choose a VAE file for SDXL (4 latent channels) "
+            "in the tab's 'Use separate VAE', or Automatic for the checkpoint's own."
+        )
+    # Its own text: not the one of a file kept from the main model.
+    assert "main model" not in lines[0]
+    assert "which the pass would keep" not in lines[0]
+    assert str(tmp_path) not in err  # file names only, never their folders
+    assert err.isascii()
+    # "Run ADetailer on an image" names the tab's choice in its answer.
+    assert runtime._family_status_note(SimpleNamespace(_ad_family_note=lines[0])) == (
+        " ⚠️ The tab was skipped: its checkpoint cannot be loaded with the VAE "
+        "file chosen in the tab. Choose another one in Use separate VAE (see "
+        "console)."
+    )
+
+
+def _main_file_runtime(tmp_path, keys=_SDXL_KEYS, engine=_SDXL, name="main-xl.safetensors"):
+    """Forge / Forge Neo whose main checkpoint is a file with ``keys`` in its
+    header, loaded as ``engine``, with an SDXL VAE file among its own files."""
+    files = _skip_files(tmp_path)
+    runtime, data = _family_runtime(main=engine, main_files=[files.sdxl_vae, files.t5])
+    runtime._FILE_FACTS_SEEN.clear()
+    runtime.modules.sd_models.checkpoint_aliases = {}
+    data.forge_loading_parameters["checkpoint_info"] = SimpleNamespace(
+        filename=_header_file(tmp_path / "Stable-diffusion" / name, keys)
+    )
+    data.load(_engine(**engine))
+    runtime._main_model_family()  # the generation started: the main model is loaded
+    return runtime, data, files
+
+
+@pytest.mark.parametrize("main_loaded", [True, False])
+def test_tab_without_checkpoint_whose_vae_the_main_checkpoint_cannot_load_with_is_skipped(
+    tmp_path, main_loaded, capsys
+):
+    # No checkpoint of the tab's own, only 'Use separate VAE': the WebUI
+    # loads the main checkpoint again with the tab's files, and with Flux's
+    # VAE file an SDXL one fails the same way.
+    from adetailer.args import ADetailerArgs
+
+    runtime, data, files = _main_file_runtime(tmp_path)
+    if not main_loaded:
+        # "Run ADetailer on an image" before any generation: the header of
+        # the main checkpoint's file is enough.
+        runtime._MAIN_FAMILY_SEEN.clear()
+        data.load(type("FakeInitialModel", (), {})(), as_settings_ask=False)
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_use_vae=True, ad_vae="ae.safetensors")
+    override = {"forge_additional_modules": [files.t5, files.flux_vae]}
+    p = SimpleNamespace()
+
+    lines = [runtime._unloadable_tab_checkpoint(p, args, 0, override) for _ in range(2)]
+
+    assert lines[0] == lines[1] == (
+        "[-] ADetailer: tab 1 skipped: its checkpoint (the main one, SDXL) cannot "
+        "be loaded with the VAE file chosen in the tab (ae.safetensors: 16 latent "
+        "channels), and the whole generation would fail with it. Choose a VAE "
+        "file for SDXL (4 latent channels) in the tab's 'Use separate VAE', or "
+        "Automatic for the checkpoint's own."
+    )
+    assert capsys.readouterr().err.count("[-] ADetailer: tab 1 skipped:") == 1
+    # The marker "Run ADetailer on an image" tells a skipped tab by.
+    assert " skipped: its checkpoint " in lines[0]
+    assert "chosen in the tab. Choose another one" in runtime._family_status_note(
+        SimpleNamespace(_ad_family_note=lines[0])
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "the vae fits", "no file of the tab's own", "tab VAE Automatic",
+        "main checkpoint is a .ckpt", "main checkpoint of an unknown family",
+        "engine of another family than the header", "main vae kept beside it",
+        "a main file that cannot be read", "tab's vae of another layout",
+        "hires fix checkpoint", "a1111",
+    ],
+)
+def test_tab_without_checkpoint_is_not_skipped_when_unsure(tmp_path, case, capsys):
+    from adetailer.args import ADetailerArgs
+
+    # The control, on the same files: the sure combination is skipped.
+    control, _data, files = _main_file_runtime(tmp_path / "control")
+    sure = {"forge_additional_modules": [files.t5, files.flux_vae]}
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", ad_use_vae=True, ad_vae="ae.safetensors")
+    assert control._unloadable_tab_checkpoint(SimpleNamespace(), args, 0, sure)
+    capsys.readouterr()
+
+    keys, engine, name = _SDXL_KEYS, _SDXL, "main-xl.safetensors"
+    if case == "main checkpoint is a .ckpt":
+        name = "main-xl.ckpt"
+    elif case == "main checkpoint of an unknown family":
+        keys = _SD2_KEYS
+    elif case == "engine of another family than the header":
+        # An engine of the WebUI's own for a file that reads as SDXL.
+        engine = _ZIMAGE
+    runtime, data, files = _main_file_runtime(tmp_path, keys=keys, engine=engine, name=name)
+    override = {"forge_additional_modules": [files.t5, files.flux_vae]}
+    if case == "the vae fits":
+        own = _header_file(tmp_path / "VAE" / "other-xl-vae.safetensors", _SDXL_VAE_KEYS)
+        override = {"forge_additional_modules": [files.t5, own]}
+    elif case == "no file of the tab's own":
+        override = {}
+    elif case == "tab VAE Automatic":
+        override = {"forge_additional_modules": [files.t5]}
+    elif case == "main vae kept beside it":
+        # The main model loaded with it: in the WebUI's order it may be last.
+        override = {"forge_additional_modules": [files.sdxl_vae, files.t5, files.flux_vae]}
+    elif case == "a main file that cannot be read":
+        gguf = _header_file(tmp_path / "text_encoder" / "clip-q8.gguf", _T5_KEYS)
+        runtime.shared.opts.forge_additional_modules = [files.sdxl_vae, gguf]
+        override = {"forge_additional_modules": [gguf, files.flux_vae]}
+    elif case == "tab's vae of another layout":
+        other = _header_file(
+            tmp_path / "VAE" / "other.safetensors", {"decoder.middle.0.residual.0.gamma": (384,)}
+        )
+        override = {"forge_additional_modules": [files.t5, other]}
+    elif case == "hires fix checkpoint":
+        override["sd_model_checkpoint"] = "hires.safetensors"
+    elif case == "a1111":
+        # No loading parameters of Forge: nothing is read, nothing is skipped.
+        del data.forge_loading_parameters
+
+    assert runtime._unloadable_tab_checkpoint(SimpleNamespace(), args, 0, override) == ""
+    assert capsys.readouterr().err == ""
+    if case == "no file of the tab's own":
+        # An ordinary tab: not one file is opened for it.
+        assert runtime._FILE_FACTS_SEEN == {}
+
+
+def test_pass_skips_a_tab_whose_own_vae_choice_cannot_load(tmp_path, capsys):
+    # The real pass: nothing is detected, nothing is asked of the host.
+    script, run, detections, loads = _skip_pass(tmp_path, "forge")
+    files = _skip_files(tmp_path)
+    own_vae = _header_file(tmp_path / "VAE" / "own-ae.safetensors", _FLUX_VAE_KEYS)
+    script.get_i2i_p = lambda _p, _args, _image: SimpleNamespace(
+        init_images=[None], prompt="face", close=lambda: None,
+        override_settings={**_OWN, "forge_additional_modules": [files.t5, own_vae]},
+    )
+    p = SimpleNamespace(extra_generation_params={})
+
+    assert run(p, 0, **_OWN_TAB) is False
+    assert run(p, 0, **_OWN_TAB) is False  # the next picture of the generation
+
+    assert detections == []
+    assert loads == []
+    assert capsys.readouterr().err.count("[-] ADetailer: tab 1 skipped:") == 1
+    assert "with the VAE file chosen in the tab (own-ae.safetensors" in script._ad_family_note
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # AUTOMATIC1111 / reForge: model_data without Forge's loading parameters.
+        {"modules": SimpleNamespace(sd_models=SimpleNamespace(model_data=SimpleNamespace(
+            sd_model=type("LatentDiffusion", (), {"__module__": "ldm.models.diffusion.ddpm"})()
+        ))), "shared": SimpleNamespace(opts=SimpleNamespace())},
+        # A WebUI without any of it.
+        {"modules": SimpleNamespace(), "shared": SimpleNamespace()},
+    ],
+    ids=["a1111", "bare"],
+)
+def test_no_tab_is_skipped_on_other_webuis(tmp_path, host, capsys):
+    control, _data, files = _skip_runtime(tmp_path)
+    assert control._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, _OWN)
+    capsys.readouterr()
+
+    runtime, _data = _family_runtime(**host)
+    if hasattr(runtime.modules, "sd_models"):
+        runtime.modules.sd_models.checkpoint_aliases = {
+            "xl-model.safetensors": SimpleNamespace(filename=files.sdxl),
+        }
+        runtime.shared.opts.forge_additional_modules = [files.flux_vae, files.t5]
+
+    assert runtime._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, _OWN) == ""
+    assert capsys.readouterr().err == ""
+    # Nor for a VAE file of the tab's own that does not fit: without Forge's
+    # loading parameters nothing is decided, whatever the settings hold.
+    own_vae = _header_file(tmp_path / "VAE" / "own-ae.safetensors", _FLUX_VAE_KEYS)
+    own_choice = {**_OWN, "forge_additional_modules": [files.t5, own_vae]}
+    assert control._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 1, own_choice)
+    capsys.readouterr()
+    assert runtime._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, own_choice) == ""
+    assert capsys.readouterr().err == ""
+
+
+def _skip_pass(tmp_path, case):
+    """The real pass of a tab with its own SDXL checkpoint on a Flux main
+    model: (script, run, detections, what the host was asked to load)."""
+    files = _skip_files(tmp_path)
+    tab_file = files.sdxl
+    if case == "unsure":
+        tab_file = _header_file(tmp_path / "xl-model.ckpt", _SDXL_KEYS)
+    data = _ForgeModels(_engine(**_FLUX))
+    if case == "a1111":
+        data = SimpleNamespace(
+            sd_model=type("LatentDiffusion", (), {"__module__": "ldm.models.diffusion.ddpm"})()
+        )
+    loads, detections = [], []
+
+    def process_images(p2):
+        loads.append(p2.override_settings.get("sd_model_checkpoint"))
+        return SimpleNamespace(images=[Image.new("RGB", (8, 8), "red")], infotexts=[""])
+
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    before = Image.new("RGB", (8, 8), "white")
+    pred = SimpleNamespace(preview=before)
+    runtime = _load_runtime(
+        state=state, shared=SimpleNamespace(
+            state=state,
+            opts=SimpleNamespace(forge_additional_modules=[files.flux_vae, files.t5]),
+        ),
+        modules=SimpleNamespace(sd_models=SimpleNamespace(
+            model_data=data,
+            checkpoint_aliases={"xl-model.safetensors": SimpleNamespace(filename=tab_file)},
+        )),
+        re=re, time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: text.split(","),
+        is_skip_img2img=lambda _p: False,
+        _ad_verbose=lambda: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: detections.append(1) or pred,
+        ensure_pil_image=lambda image, _mode: image,
+        process_images=process_images,
+        NansException=type("NansException", (Exception,), {}),
+    )
+    runtime._MAIN_FAMILY_SEEN.clear()
+    runtime._FILE_FACTS_SEEN.clear()
+    runtime._main_model_family()  # the generation started with the main model
+    script = runtime.AfterDetailerScript()
+    pp = SimpleNamespace(image=before)
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda _p, args, _image: SimpleNamespace(
+        init_images=[pp.image], prompt="face", close=lambda: None,
+        override_settings=(
+            dict(_OWN) if getattr(args, "ad_use_checkpoint", False) else {}
+        ),
+    )
+    script.get_prompt = lambda *_args: (["face"], [""])
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda *_args: [before] * 2
+    script.save_image = lambda *_args, **_kwargs: None
+    script.i2i_prompts_replace = lambda *_args: None
+    script._apply_inline_class_prompts = lambda *_args: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.fix_p2 = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    class Args(SimpleNamespace):
+        def copy(self, update):
+            return Args(**{**vars(self), **update})
+
+    def run(p, n, **own):
+        args = Args(**{
+            "ad_classes_sequential": False, "ad_model_classes": "",
+            "ad_model_classes_exclude": False, "ad_class_prompts": "",
+            "ad_model": "model.pt", "ad_confidence": 0.3, "ad_use_bbox_mask": False,
+            "ad_detection_resolution": 0, "is_mediapipe": lambda: False,
+            "ad_use_checkpoint": False, "ad_checkpoint": "Use same checkpoint",
+            **own,
+        })
+        return script._postprocess_image_inner(p, pp, args, n=n)
+
+    return script, run, detections, loads
+
+
+_OWN_TAB = {"ad_use_checkpoint": True, "ad_checkpoint": "xl-model.safetensors"}
+
+
+def test_pass_skips_the_tab_and_the_other_tabs_still_run(tmp_path, capsys):
+    _script, run, detections, loads = _skip_pass(tmp_path, "forge")
+    p = SimpleNamespace(extra_generation_params={})
+
+    # Two pictures of one generation: tab 1 has the checkpoint, tab 2 has none.
+    results = [(run(p, 0, **_OWN_TAB), run(p, 1)) for _picture in range(2)]
+
+    # Tab 1 never detected or asked the host for anything; tab 2 did its work.
+    assert results == [(False, True), (False, True)]
+    assert len(detections) == 2
+    assert loads == [None] * 4  # two regions per picture, all of tab 2
+    err = capsys.readouterr().err
+    assert err.count("[-] ADetailer: tab 1 skipped:") == 1
+    assert "tab 2" not in err
+
+
+def test_pass_skips_every_class_of_a_sequential_tab_with_one_line(tmp_path, capsys):
+    script, run, detections, loads = _skip_pass(tmp_path, "forge")
+    p = SimpleNamespace(extra_generation_params={})
+
+    done = run(
+        p, 0, **_OWN_TAB, ad_classes_sequential=True, ad_model_classes="face,hand",
+        ad_mask_merge_invert="None", ad_inpaint_indices="",
+    )
+
+    assert done is False
+    assert detections == []
+    assert loads == []
+    assert capsys.readouterr().err.count("[-] ADetailer: tab 1 skipped:") == 1
+    assert "tab 1 skipped" in script._ad_family_note
+
+
+@pytest.mark.parametrize("case", ["a1111", "unsure"])
+def test_pass_runs_as_before_on_automatic1111_and_when_unsure(tmp_path, case, capsys):
+    # The control: on Forge with the sure combination the same pass is skipped.
+    _script, control, _detections, control_loads = _skip_pass(tmp_path / "control", "forge")
+    assert control(SimpleNamespace(extra_generation_params={}), 0, **_OWN_TAB) is False
+    assert control_loads == []
+    capsys.readouterr()
+
+    script, run, detections, loads = _skip_pass(tmp_path, case)
+
+    assert run(SimpleNamespace(extra_generation_params={}), 0, **_OWN_TAB) is True
+    assert len(detections) == 1
+    assert loads == ["xl-model.safetensors"] * 2
+    assert "skipped" not in capsys.readouterr().err
+    assert "skipped" not in getattr(script, "_ad_family_note", "")
+
+
+def test_standalone_run_answer_says_the_tab_was_skipped(tmp_path):
+    # "Run ADetailer on an image": the skipped tab is said in the page, not
+    # as "nothing detected", and no image comes back (a folder run counts
+    # the file as failed, with this answer as its reason).
+    runtime, _data, _files = _skip_runtime(tmp_path)
+    note = runtime._unloadable_tab_checkpoint(SimpleNamespace(), _own_tab(), 0, _OWN)
+    script = _standalone_runtime(tmp_path).AfterDetailerScript()
+    script._postprocess_image_inner = lambda *_args, **_kwargs: (
+        setattr(script, "_ad_family_note", note), False
+    )[-1]
+
+    image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), save=False
+    )
+
+    assert image is None
+    assert status.startswith("⚠️ ADetailer did not run.")
+    assert "The tab was skipped: its checkpoint cannot be loaded with the main" in status
+    assert "Use separate VAE with Automatic" in status
+    assert "Nothing detected" not in status
+    assert "another model family than the main model" not in status
+    # The next run, without a skipped tab, does not repeat it.
+    script._postprocess_image_inner = lambda *_args, **_kwargs: False
+    _image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), save=False
+    )
+    assert status.startswith("ℹ️ Nothing detected")
+
+
+# A region's final prompt that names the same LoRA more than once.
+
+
+def _lora_note_runtime(monkeypatch, lyco_alias=None, lora_network=True, data=None):
+    """_repeated_lora_note on a host whose extra networks cannot be asked,
+    or (``lyco_alias`` given) on one that can: True when "lyco" is another
+    name of its LoRA network (AUTOMATIC1111), False when it is not (Forge,
+    Forge Neo). ``lora_network`` False: the host has no LoRA network.
+    ``data``: the host's saved options."""
+    monkeypatch.delitem(sys.modules, "modules.extra_networks", raising=False)
+    if lyco_alias is not None:
+        lora = object()
+        monkeypatch.setitem(
+            sys.modules,
+            "modules.extra_networks",
+            SimpleNamespace(
+                extra_network_registry={"lora": lora} if lora_network else {},
+                extra_network_aliases={"lyco": lora} if lyco_alias else {},
+            ),
+        )
+    db = _StyleDatabase()
+    db.styles = {"lit": ("soft light <lora:detail:0.5>", "<lora:detail:0.5>")}
+    return _load_script(
+        functions={"_repeated_lora_note"}, assigns={"_LORA_NAME_RE"},
+        shared=SimpleNamespace(prompt_styles=db),
+        opts=SimpleNamespace(data=data or {}),
+    )
+
+
+def _region(prompt, styles=(), negative=""):
+    return SimpleNamespace(prompt=prompt, negative_prompt=negative, styles=list(styles))
+
+
+@pytest.mark.parametrize(
+    ("prompt", "listed"),
+    [
+        ("face, <lora:detail:0.8>, <lora:detail:0.8>", "'detail' (2 times)"),
+        # Other weights, and the text encoder and U-Net ones.
+        ("<lora:detail:0.8> face <lora:detail:0.3>", "'detail' (2 times)"),
+        (
+            "<lora:detail:0.8:0.5> face <lora:detail:te=1:unet=0.2> <lora:detail>",
+            "'detail' (3 times)",
+        ),
+        # Each one that is repeated, in the order of the prompt.
+        (
+            "<lora:skin:1> <lora:detail:1> <lora:eyes:1> <lora:detail:0.5> <lora:skin:1>",
+            "'skin' (2 times), 'detail' (2 times)",
+        ),
+    ],
+)
+def test_a_lora_named_more_than_once_in_a_regions_prompt_is_said(
+    monkeypatch, capsys, prompt, listed
+):
+    runtime = _lora_note_runtime(monkeypatch)
+    line = runtime._repeated_lora_note(SimpleNamespace(), _region(prompt), 1)
+    assert line == (
+        "[-] ADetailer: tab 2 names the same LoRA more than once in the prompt "
+        f"of its detailer pass: {listed}. The WebUI can apply a LoRA once per "
+        "tag (a stronger effect). Keep one tag: [PROMPT] and a blank prompt "
+        "already bring the main prompt's LoRAs; the append text and the styles "
+        "add their own."
+    )
+    assert capsys.readouterr().out == line + "\n"
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "",
+        "detailed face",
+        "detailed face, <lora:detail:0.8>",
+        # Two LoRAs, once each.
+        "<lora:detail:0.8> detailed face <lora:skin:0.8>",
+        # The host reads names and kinds as written: these are not the same
+        # LoRA, or not a LoRA tag at all.
+        "<lora:detail:1> <lora:Detail:1>",
+        "<lora:detail:1> <LORA:detail:1>",
+        "<lora:detail:1> <hypernet:detail:1>",
+        "<lora:detail:1> <lora:detail:1",
+        "<lora:detail:1> lora:detail:1",
+        # A host that cannot be asked: only "lora" tags are sure to load.
+        "<lora:detail:1> <lyco:detail:1>",
+        "<lyco:detail:1> <lyco:detail:1>",
+    ],
+)
+def test_a_lora_named_once_in_a_regions_prompt_is_not_said(monkeypatch, capsys, prompt):
+    runtime = _lora_note_runtime(monkeypatch)
+    p = SimpleNamespace()
+    assert runtime._repeated_lora_note(p, _region(prompt), 0) == ""
+    assert capsys.readouterr().out == ""
+    assert not hasattr(p, "_ad_repeated_lora_noted")
+
+
+@pytest.mark.parametrize(
+    ("lyco_alias", "prompt", "said"),
+    [
+        # AUTOMATIC1111: "lyco" is another name of the LoRA network.
+        (True, "<lora:detail:1> <lyco:detail:1>", True),
+        (True, "<lyco:detail:1> <lyco:detail:0.5>", True),
+        (True, "<lora:detail:1> <lyco:skin:1>", False),
+        # Forge, Forge Neo: a "lyco" tag is an unknown network, never loaded.
+        (False, "<lora:detail:1> <lyco:detail:1>", False),
+        (False, "<lyco:detail:1> <lyco:detail:0.5>", False),
+        (False, "<lora:detail:1> <lyco:detail:1> <lora:detail:1>", True),
+    ],
+)
+def test_a_lyco_tag_counts_only_where_the_host_loads_it_as_a_lora(
+    monkeypatch, lyco_alias, prompt, said
+):
+    runtime = _lora_note_runtime(monkeypatch, lyco_alias=lyco_alias)
+    line = runtime._repeated_lora_note(SimpleNamespace(), _region(prompt), 0)
+    assert bool(line) is said
+    if said:
+        assert "'detail' (2 times)" in line
+
+
+def test_no_repeated_lora_note_on_a_host_without_a_lora_network(monkeypatch):
+    # The built-in LoRA extension is off: the host loads no LoRA tag.
+    runtime = _lora_note_runtime(monkeypatch, lyco_alias=False, lora_network=False)
+    region = _region("<lora:detail:1> <lora:detail:1>")
+    assert runtime._repeated_lora_note(SimpleNamespace(), region, 0) == ""
+
+
+def test_the_repeated_lora_note_counts_the_styles_the_host_still_adds(monkeypatch):
+    runtime = _lora_note_runtime(monkeypatch)
+    # The style "lit" brings <lora:detail:0.5>.
+    styled = _region("detailed face <lora:detail:1>", styles=["lit"])
+    assert "'detail' (2 times)" in runtime._repeated_lora_note(SimpleNamespace(), styled, 0)
+    # The style alone, the tag alone (the pass applied the styles itself and
+    # left none), another LoRA.
+    for region in (
+        _region("detailed face", styles=["lit"]),
+        _region("detailed face <lora:detail:1>"),
+        _region("detailed face <lora:skin:1>", styles=["lit"]),
+    ):
+        assert runtime._repeated_lora_note(SimpleNamespace(), region, 0) == ""
+    # Styles that cannot be applied here: the prompt alone is read.
+    runtime.shared.prompt_styles = None
+    assert runtime._repeated_lora_note(SimpleNamespace(), styled, 0) == ""
+    twice = _region("<lora:detail:1> face <lora:detail:1>", styles=["lit"])
+    assert "'detail' (2 times)" in runtime._repeated_lora_note(SimpleNamespace(), twice, 0)
+
+
+def test_a_lora_named_twice_in_the_negative_prompt_is_not_said(monkeypatch, capsys):
+    # The host loads the LoRA tags of the prompt only: in the negative prompt
+    # they stay plain text. The negative part of a style is no different.
+    runtime = _lora_note_runtime(monkeypatch)
+    region = _region(
+        "detailed face", styles=["lit"],
+        negative="<lora:detail:1> blurry <lora:detail:1> <lora:skin:1> <lora:skin:1>",
+    )
+    assert runtime._repeated_lora_note(SimpleNamespace(), region, 0) == ""
+    assert capsys.readouterr().out == ""
+
+
+def test_the_repeated_lora_note_is_said_once_per_generation_tab_and_lora(
+    monkeypatch, capsys
+):
+    runtime = _lora_note_runtime(monkeypatch)
+    twice = "<lora:detail:1> face <lora:detail:0.5>"
+    p = SimpleNamespace()
+    assert "tab 1 names" in runtime._repeated_lora_note(p, _region(twice), 0)
+    # The next regions and the next images of the batch: the same p.
+    for _ in range(3):
+        assert runtime._repeated_lora_note(p, _region(twice), 0) == ""
+    # Another tab of the same generation.
+    assert "tab 2 names" in runtime._repeated_lora_note(p, _region(twice), 1)
+    assert runtime._repeated_lora_note(p, _region(twice), 1) == ""
+    # Another LoRA in a later region of the first tab: only that one.
+    later = _region(twice + " <lora:skin:1> <lora:skin:1>")
+    line = runtime._repeated_lora_note(p, later, 0)
+    assert "'skin' (2 times)" in line
+    assert "'detail'" not in line
+    # The next generation.
+    assert "tab 1 names" in runtime._repeated_lora_note(SimpleNamespace(), _region(twice), 0)
+    assert capsys.readouterr().out.count("names the same LoRA more than once") == 4
+
+
+def test_the_repeated_lora_note_is_ascii_and_never_breaks_the_pass(monkeypatch, capsys):
+    runtime = _lora_note_runtime(monkeypatch)
+    name = "café (soft [light])"
+    line = runtime._repeated_lora_note(
+        SimpleNamespace(), _region(f"<lora:{name}:1> <lora:{name}:0.4>"), 0
+    )
+    assert line.isascii()
+    assert "'caf\\xe9 (soft [light])' (2 times)" in line
+    assert capsys.readouterr().out == line + "\n"
+    # A region without a text prompt, a generation that takes no mark.
+    assert runtime._repeated_lora_note(SimpleNamespace(), SimpleNamespace(), 0) == ""
+    assert runtime._repeated_lora_note(SimpleNamespace(), _region(None), 0) == ""
+    assert runtime._repeated_lora_note(None, _region("<lora:a:1> <lora:a:1>"), 0) == ""
+
+
+_LORA_MAIN = "1girl, green eyes, <lora:detail:0.8>"
+
+
+def _repeated_lora_pass(  # noqa: PLR0913
+    monkeypatch, *, main=_LORA_MAIN, typed=None, classes=("face", "face"), styles=(),
+    images=1, p=None, n=0, **options,
+):
+    """The detailer passes of one tab on the ``images`` pictures of a
+    generation, with the real get_prompt, [CLASS=...] blocks, style step and
+    region loop: the prompt and styles each region was generated with, and
+    the generation's p (give it back as ``p`` for another tab)."""
+    from adetailer.args import ADetailerArgs
+
+    monkeypatch.delitem(sys.modules, "modules.extra_networks", raising=False)
+    state = SimpleNamespace(
+        interrupted=False, skipped=False, job_count=0,
+        assign_current_image=lambda _image: None,
+    )
+    image = Image.new("RGB", (8, 8), "white")
+    mask = Image.new("L", (8, 8), 255)
+    nans = type("NansException", (Exception,), {})
+    db = _StyleDatabase()
+    db.styles = {"lit": ("soft light <lora:detail:0.5>", "")}
+    host_opts = SimpleNamespace(data={})
+    sent = []
+
+    def process_images(p2):
+        sent.append((p2.prompt, p2.negative_prompt, list(p2.styles or [])))
+        return SimpleNamespace(images=[image])
+
+    runtime = _load_script(
+        methods=_INLINE_PROMPT_METHODS | {"_postprocess_image_inner"},
+        functions=_INLINE_PROMPT_FUNCTIONS,
+        assigns=_INLINE_PROMPT_ASSIGNS,
+        state=state,
+        shared=SimpleNamespace(state=state, prompt_styles=db, opts=host_opts),
+        opts=host_opts,
+        scripts=SimpleNamespace(scripts_data=[]),
+        time=time, copy=copy, get_i=lambda _p: 0,
+        parse_csv=lambda text: [c.strip() for c in text.split(",") if c.strip()],
+        is_skip_img2img=lambda _p: False,
+        _verbose_pass_header=lambda *_args: None,
+        _verbose_detection=lambda *_args: None,
+        disable_safe_unpickle=nullcontext,
+        ultralytics_predict=lambda *_args, **_kwargs: SimpleNamespace(
+            preview=image, bboxes=[], class_names=list(classes)
+        ),
+        ensure_pil_image=lambda im, _mode: im,
+        process_images=process_images,
+        NansException=nans,
+        ordinal=str,
+    )
+    script = runtime.AfterDetailerScript()
+    script.ultralytics_device = "cpu"
+    script.get_i2i_p = lambda *_args: SimpleNamespace(
+        init_images=[image], prompt="", negative_prompt="", styles=list(styles),
+        close=lambda: None, denoising_strength=0.4, width=512, height=512,
+    )
+    script.get_ad_model = lambda _name: "model.pt"
+    script.pred_preprocessing = lambda _p, pred, _args: [mask] * len(pred.class_names)
+    script.save_image = lambda *_args, **_kwargs: None
+    script._apply_auto_class_guard = lambda *_args: None
+    script.fix_p2 = lambda *_args: None
+    script.compare_prompt = lambda *_args, **_kwargs: None
+
+    if p is None:
+        p = SimpleNamespace(
+            prompt=main if typed is None else typed, negative_prompt="",
+            styles=list(styles),
+            all_prompts=[db.apply_styles_to_prompt(main, styles)],
+            all_negative_prompts=[""], extra_generation_params={},
+        )
+    args = ADetailerArgs(ad_model="face_yolov8n.pt", **options)
+    for _ in range(images):
+        assert script._postprocess_image_inner(
+            p, SimpleNamespace(image=image), args, n=n
+        ) is True
+    return sent, p
+
+
+_SAID = "names the same LoRA more than once"
+
+
+def _a_repeated_lora_is_said(monkeypatch, capsys, p):
+    """The same generation, in the same tab, does say a LoRA that a prompt
+    names twice: a pass that said nothing had nothing to say."""
+    _repeated_lora_pass(
+        monkeypatch, p=p, ad_prompt="detailed face <lora:skin:1> <lora:skin:0.5>"
+    )
+    out = capsys.readouterr().out
+    assert out.count(_SAID) == 1
+    assert "'skin' (2 times)" in out
+
+
+@pytest.mark.parametrize(
+    "tab",
+    [
+        # The tab's own tag next to the one the main prompt text brings.
+        {"ad_prompt": "[PROMPT], detailed face <lora:detail:1>"},
+        {"ad_prompt": "[PROMPT], detailed face <lora:detail:1>", "ad_use_main_loras": True},
+        # Only "-" words: the main prompt's LoRA tags all come along.
+        {"ad_prompt": "[PROMPT=-dress], <lora:detail:1>"},
+        # A blank prompt is the main prompt, and the append text adds to it.
+        {"ad_prompt_append": "<lora:detail:0.4>"},
+        {"ad_prompt": "[PROMPT]", "ad_prompt_append": "<lora:detail:0.4>"},
+        # The block of the class of these regions.
+        {"ad_prompt": "[PROMPT], [CLASS=face]<lora:detail:1>[/CLASS]"},
+        # Written twice in the tab itself.
+        {"ad_prompt": "detailed face <lora:skin:1>, <lora:skin:0.5>"},
+    ],
+)
+def test_the_pass_says_a_lora_its_final_prompt_names_twice(monkeypatch, capsys, tab):
+    sent, _p = _repeated_lora_pass(monkeypatch, **tab)
+    out = capsys.readouterr().out
+    # Two regions, one line; the prompts go to the host as they were.
+    assert out.count(_SAID) == 1
+    assert "[-] ADetailer: tab 1 names" in out
+    name = "skin" if "skin" in tab.get("ad_prompt", "") else "detail"
+    assert f"'{name}' (2 times)" in out
+    assert len(sent) == 2
+    for prompt, _negative, _styles in sent:
+        assert prompt.count(f"<lora:{name}:") == 2
+
+
+@pytest.mark.parametrize(
+    "tab",
+    [
+        # A blank prompt is the main prompt: its LoRA once.
+        {},
+        {"ad_use_main_loras": True},
+        # The tab's own prompt replaces the main one: the LoRA written in
+        # both is in the pass once, also with "Use LoRAs from main prompt".
+        {"ad_prompt": "detailed face <lora:detail:1>"},
+        {"ad_prompt": "detailed face <lora:detail:1>", "ad_use_main_loras": True},
+        {"ad_prompt": "detailed face", "ad_use_main_loras": True},
+        {"ad_prompt": "detailed face", "ad_prompt_append": "<lora:detail:0.4>"},
+        # Two different LoRAs.
+        {"ad_prompt": "[PROMPT], detailed face <lora:skin:1>"},
+        # A plain word: the main prompt's LoRA tags do not come along.
+        {"ad_prompt": "[PROMPT=eyes], <lora:detail:1>"},
+        # "Strip LoRAs" leaves none.
+        {"ad_prompt": "[PROMPT], <lora:detail:1>", "ad_strip_loras": True},
+        # The negative prompt's tags are never loaded.
+        {"ad_negative_prompt": "<lora:detail:1>, <lora:detail:1>"},
+        {"ad_negative_prompt": "[PROMPT], <lora:detail:1>"},
+        # [SEP]: each region has its own prompt, the LoRA once in each.
+        {"ad_prompt": "detailed face <lora:detail:1> [SEP] detailed eyes <lora:detail:0.5>"},
+        # The block of another class is not in these regions' prompt.
+        {"ad_prompt": "[PROMPT], [CLASS=hand]<lora:detail:1>[/CLASS]"},
+        {
+            "ad_prompt": (
+                "[CLASS=face]detailed face <lora:detail:1>[/CLASS]"
+                "[CLASS=hand]detailed hand <lora:detail:0.5>[/CLASS]"
+            ),
+        },
+    ],
+)
+def test_the_pass_says_nothing_when_its_final_prompt_names_each_lora_once(
+    monkeypatch, capsys, tab
+):
+    sent, p = _repeated_lora_pass(monkeypatch, **tab)
+    assert len(sent) == 2
+    assert _SAID not in capsys.readouterr().out
+    assert not hasattr(p, "_ad_repeated_lora_noted")
+    for prompt, _negative, _styles in sent:
+        assert prompt.count("<lora:detail:") <= 1
+    _a_repeated_lora_is_said(monkeypatch, capsys, p)
+
+
+def test_the_pass_says_the_repeated_lora_of_the_sep_part_that_has_it(monkeypatch, capsys):
+    # The first region gets its own text, the second one the main prompt too.
+    sent, _p = _repeated_lora_pass(
+        monkeypatch,
+        ad_prompt="detailed face <lora:detail:1> [SEP] [PROMPT], <lora:detail:1>",
+    )
+    assert [prompt.count("<lora:detail:") for prompt, *_rest in sent] == [1, 2]
+    assert capsys.readouterr().out.count(_SAID) == 1
+
+
+def test_the_pass_says_a_repeated_lora_once_per_generation_and_tab(monkeypatch, capsys):
+    tab = {"ad_prompt": "[PROMPT], <lora:detail:1>"}
+    # Three images of a batch, two regions each.
+    sent, p = _repeated_lora_pass(monkeypatch, images=3, **tab)
+    assert len(sent) == 6
+    out = capsys.readouterr().out
+    assert out.count(_SAID) == 1
+    assert "tab 1 names" in out
+    # The second tab of the same generation, then the first one again.
+    _repeated_lora_pass(monkeypatch, p=p, n=1, **tab)
+    out = capsys.readouterr().out
+    assert out.count(_SAID) == 1
+    assert "tab 2 names" in out
+    _repeated_lora_pass(monkeypatch, p=p, n=0, **tab)
+    assert _SAID not in capsys.readouterr().out
+    # The next generation says it again.
+    _repeated_lora_pass(monkeypatch, **tab)
+    assert capsys.readouterr().out.count(_SAID) == 1
+
+
+@pytest.mark.parametrize(
+    ("tab", "typed", "main", "said"),
+    [
+        # The styles give the main prompt back: the pass takes the prompt as
+        # typed and the host adds the style once.
+        ({}, None, "1girl", False),
+        ({"ad_prompt": "[PROMPT], detailed face"}, None, "1girl", False),
+        ({"ad_prompt": "detailed face"}, None, "1girl", False),
+        ({"ad_use_main_loras": True}, None, "1girl", False),
+        ({"ad_prompt": "detailed face", "ad_use_main_loras": True}, None, "1girl", False),
+        # The style's LoRA, written in the tab too.
+        ({"ad_prompt": "detailed face <lora:detail:1>"}, None, "1girl", True),
+        (
+            {"ad_prompt": "detailed face <lora:detail:1>", "ad_strip_loras": True},
+            None, "1girl", False,
+        ),
+        # The main prompt was drawn by another extension (the "wildcards"
+        # one, then Dynamic Prompts, which leaves the styled text in
+        # p.prompt): the pass takes it without the style, which the host
+        # adds once.
+        ({}, "1girl, __eyecolor__ eyes", "1girl, green eyes", False),
+        ({"ad_prompt": "[PROMPT]"}, "1girl, __eyecolor__ eyes", "1girl, green eyes", False),
+        ({}, "1girl, soft light <lora:detail:0.5>", "1girl", False),
+        (
+            {"ad_use_main_loras": True},
+            "1girl, __eyecolor__ eyes, soft light <lora:detail:0.5>", "1girl, green eyes",
+            False,
+        ),
+    ],
+)
+def test_the_pass_counts_the_lora_of_a_style(monkeypatch, capsys, tab, typed, main, said):
+    sent, p = _repeated_lora_pass(
+        monkeypatch, main=main, typed=typed, styles=["lit"], **tab
+    )
+    assert len(sent) == 2
+    assert capsys.readouterr().out.count(_SAID) == (1 if said else 0)
+    if typed is not None:
+        # The region's prompt as the host styles it: the image's own.
+        for prompt, _negative, styles in sent:
+            assert styles == ["lit"]
+            assert f"{prompt}, soft light <lora:detail:0.5>" == p.all_prompts[0]
+    _a_repeated_lora_is_said(monkeypatch, capsys, p)
+
+
+@pytest.mark.parametrize(
+    ("tab", "said"),
+    [
+        # The value of the shared wildcard next to the main prompt's.
+        ({"ad_prompt": "[PROMPT], __look__"}, True),
+        # Alone, also with "Use LoRAs from main prompt": once.
+        ({"ad_prompt": "__look__, detailed face"}, False),
+        ({"ad_prompt": "__look__, detailed face", "ad_use_main_loras": True}, False),
+    ],
+)
+def test_the_pass_counts_the_lora_of_a_reused_wildcard_value(
+    monkeypatch, capsys, tab, said
+):
+    sent, p = _repeated_lora_pass(
+        monkeypatch, typed="1girl, __look__",
+        main="1girl, <lora:detail:0.8> sharp focus", **tab,
+    )
+    assert capsys.readouterr().out.count(_SAID) == (1 if said else 0)
+    for prompt, *_rest in sent:
+        assert prompt.count("<lora:detail:") == (2 if said else 1)
+    _a_repeated_lora_is_said(monkeypatch, capsys, p)
+
+
+# Dynamic Prompts in the pass: it keeps one branch of a {a|b} block.
+
+_WITH_DYNAMIC_PROMPTS = ["dynamic_prompting", "wildcards"]
+
+
+@pytest.mark.parametrize(
+    ("prompt", "listed"),
+    [
+        # One of the two tags is kept: the LoRA is in the prompt once.
+        ("{<lora:detail:0.4>|<lora:detail:0.8>} face", ""),
+        ("{<lora:detail:0.4>|<lora:detail:0.8>|<lora:detail:1>} face", ""),
+        ("{0.3::<lora:detail:0.4>|0.7::<lora:detail:0.8>} face", ""),
+        ("{<lora:detail:0.4>|<lora:detail:0.8>} face, {<lora:skin:1>|<lora:skin:0.5>}", ""),
+        # Next to a tag outside the block: twice whatever branch is kept.
+        ("<lora:detail:1> {<lora:detail:0.4>|<lora:detail:0.8>}", "'detail' (2 times)"),
+        ("{<lora:detail:1>} face <lora:detail:0.5>", "'detail' (2 times)"),
+        # Only some branches hold it: once or twice, so nothing is said.
+        ("<lora:detail:1> {<lora:detail:0.4>|soft light}", ""),
+        # Twice in every branch, twice in one only.
+        (
+            "{<lora:detail:1> <lora:detail:0.5>|<lora:detail:0.3>, <lora:detail:0.2>}",
+            "'detail' (2 times)",
+        ),
+        ("{<lora:detail:1> <lora:detail:0.5>|<lora:detail:1>}", ""),
+        # Two blocks, each with the LoRA in every branch.
+        (
+            "{<lora:detail:0.4>|<lora:detail:0.8>} {<lora:detail:1>|<lora:detail:0.2>}",
+            "'detail' (2 times)",
+        ),
+        # Outside the blocks every tag counts, as without Dynamic Prompts.
+        ("<lora:detail:1> face <lora:detail:0.5>, {red|blue} eyes", "'detail' (2 times)"),
+        (
+            "<lora:skin:1> <lora:skin:1> {<lora:detail:1>|<lora:detail:1>}",
+            "'skin' (2 times)",
+        ),
+        # Not sure, so nothing is counted there: a block that can keep two
+        # branches, a block inside another, a variable, a wrap, an open block.
+        ("{2$$<lora:detail:0.4>|<lora:detail:0.8>|soft light}", ""),
+        ("<lora:detail:1> {2$$<lora:detail:0.4>|<lora:detail:0.8>}", ""),
+        ("<lora:detail:1> {1-2$$ and $$<lora:detail:0.4>|<lora:detail:0.8>}", ""),
+        ("{<lora:detail:1>|{<lora:detail:0.4>|soft} <lora:detail:1>}", ""),
+        ("<lora:detail:1> {{<lora:detail:0.4>|<lora:detail:0.8>}}", ""),
+        ("${look=<lora:detail:1>} ${look} face <lora:detail:1>", ""),
+        ("%{<lora:detail:1> $$ face} <lora:detail:1>", ""),
+        ("<lora:detail:1> {<lora:detail:0.4>|<lora:detail:0.8>", ""),
+    ],
+)
+def test_the_branches_of_a_dynamic_prompts_block_are_not_added_up(
+    monkeypatch, capsys, prompt, listed
+):
+    # "{<lora:detail:0.4>|<lora:detail:0.8>} face" was said to name the LoRA
+    # 2 times, while Dynamic Prompts, run in the pass, keeps one of the two.
+    runtime = _lora_note_runtime(monkeypatch)
+    runner = _PassRunner(_WITH_DYNAMIC_PROMPTS)
+    line = runtime._repeated_lora_note(SimpleNamespace(), _region(prompt), 0, runner)
+    if not listed:
+        assert line == ""
+        assert capsys.readouterr().out == ""
+        return
+    assert f"detailer pass: {listed}. The WebUI" in line
+
+
+@pytest.mark.parametrize(
+    "names", [None, ["wildcards"], [], "another"],
+    ids=["no-runner", "wildcards-only", "no-scripts", "another-runner"],
+)
+def test_a_block_is_plain_text_for_a_pass_without_dynamic_prompts(monkeypatch, names):
+    # Unchanged: without Dynamic Prompts among the scripts of the pass the
+    # host reads both tags, so they are both counted.
+    runtime = _lora_note_runtime(monkeypatch)
+    runner = _PassRunner(names) if isinstance(names, list) else names and SimpleNamespace()
+    region = _region("{<lora:detail:0.4>|<lora:detail:0.8>} face")
+    line = runtime._repeated_lora_note(SimpleNamespace(), region, 0, runner)
+    assert "'detail' (2 times)" in line
+    assert "'detail' (2 times)" in runtime._repeated_lora_note(SimpleNamespace(), region, 0)
+
+
+def test_a_block_brought_by_a_style_is_read_as_a_block_too(monkeypatch):
+    runtime = _lora_note_runtime(monkeypatch)
+    runtime.shared.prompt_styles.styles = {
+        "lit": ("{<lora:detail:0.5>|soft light}", ""),
+        "sharp": ("{<lora:detail:0.5>|<lora:detail:1>}", ""),
+    }
+    runner = _PassRunner(_WITH_DYNAMIC_PROMPTS)
+    for styles, said in ((["lit"], False), (["sharp"], True)):
+        region = _region("face <lora:detail:1>", styles=styles)
+        line = runtime._repeated_lora_note(SimpleNamespace(), region, 0, runner)
+        assert ("'detail' (2 times)" in line) is said
+
+
+def test_dynamic_prompts_own_variant_marker_is_not_guessed(monkeypatch):
+    # Settings > Dynamic Prompts can change the marker of its blocks: with
+    # that marker in the prompt nothing is said; without it, "{" is plain
+    # text there and every tag counts.
+    runtime = _lora_note_runtime(monkeypatch, data={"dp_parser_variant_start": " [[ "})
+    runner = _PassRunner(_WITH_DYNAMIC_PROMPTS)
+    own = _region("[[<lora:detail:0.4>|<lora:detail:0.8>]] <lora:skin:1> <lora:skin:1>")
+    assert runtime._repeated_lora_note(SimpleNamespace(), own, 0, runner) == ""
+    braces = _region("{<lora:detail:0.4>|<lora:detail:0.8>} face")
+    line = runtime._repeated_lora_note(SimpleNamespace(), braces, 0, runner)
+    assert "'detail' (2 times)" in line
+    # The default marker written out in the option: as without the option.
+    runtime = _lora_note_runtime(monkeypatch, data={"dp_parser_variant_start": "{"})
+    assert runtime._repeated_lora_note(SimpleNamespace(), braces, 0, runner) == ""
+
+
+@pytest.mark.parametrize(
+    ("prompt", "listed"),
+    [
+        # Each tag draws its own name: two LoRAs, or the same one twice.
+        ("<lora:{detail|skin}:1> face <lora:{eyes|hands}:0.5>", ""),
+        ("<lora:{detail|skin}:1> face <lora:{detail|skin}:0.5>", ""),
+        ("<lora:de{tail|pth}:1> face <lora:de{tail|pth}:1>", ""),
+        ("<lora:__style__:1> face <lora:__style__:0.5>", ""),
+        ("{<lora:__style__:1>|<lora:__style__:0.5>} <lora:__style__:1>", ""),
+        # A name that is sure, next to them, still counts.
+        (
+            "<lora:__style__:1> <lora:detail:1> <lora:{skin|eyes}:1> <lora:detail:0.5>",
+            "'detail' (2 times)",
+        ),
+        # A block in the weight leaves the name as written.
+        ("<lora:detail:{0.4|0.8}> face <lora:detail:1>", "'detail' (2 times)"),
+        ("<lora:detail:{0.4|0.8}> <lora:skin:{0.4|0.8}>", ""),
+    ],
+)
+def test_a_tag_whose_name_dynamic_prompts_still_draws_is_not_counted(
+    monkeypatch, capsys, prompt, listed
+):
+    # "<lora:{detail|skin}:1> face <lora:{eyes|hands}:0.5>" was said to name
+    # '' 2 times, and two "<lora:__style__:1>" tags to be the same LoRA.
+    runtime = _lora_note_runtime(monkeypatch)
+    runner = _PassRunner(_WITH_DYNAMIC_PROMPTS)
+    line = runtime._repeated_lora_note(SimpleNamespace(), _region(prompt), 0, runner)
+    assert "''" not in line
+    if not listed:
+        assert line == ""
+        assert capsys.readouterr().out == ""
+        return
+    assert f"detailer pass: {listed}. The WebUI" in line
+
+
+def test_dynamic_prompts_own_wildcard_marker_is_not_counted_either(monkeypatch):
+    runtime = _lora_note_runtime(monkeypatch, data={"dp_parser_wildcard_wrap": " @@ "})
+    runner = _PassRunner(_WITH_DYNAMIC_PROMPTS)
+    own = _region("<lora:@@style@@:1> face <lora:@@style@@:0.5>")
+    assert runtime._repeated_lora_note(SimpleNamespace(), own, 0, runner) == ""
+    # Unchanged without Dynamic Prompts in the pass: the name is plain text.
+    for name in ("@@style@@", "__style__", "{detail|skin}"):
+        region = _region(f"<lora:{name}:1> face <lora:{name}:0.5>")
+        line = runtime._repeated_lora_note(SimpleNamespace(), region, 0)
+        assert f"{name!a} (2 times)" in line
+
+
+@pytest.mark.parametrize(
+    "names", [["wildcards"], ["wildcard_recursive"], ["negpip", "wildcards"]],
+    ids=["wildcards", "wildcard-recursive", "with-another-script"],
+)
+@pytest.mark.parametrize(
+    ("prompt", "listed"),
+    [
+        # Each __name__ is drawn by itself: two LoRAs, or the same one twice.
+        ("<lora:__style__:1> face <lora:__style__:0.5>", ""),
+        ("<lora:de__tail__:1> <lora:de__tail__:1>", ""),
+        # A name that is sure, next to them, still counts.
+        (
+            "<lora:__style__:1> <lora:detail:1> <lora:__style__:1> <lora:detail:0.5>",
+            "'detail' (2 times)",
+        ),
+        # A wildcard in the weight leaves the name as written.
+        ("<lora:detail:__weight__> face <lora:detail:1>", "'detail' (2 times)"),
+        # Unchanged: a brace, or Dynamic Prompts' own wildcard marker, is plain
+        # text for this extension, and so is a block.
+        ("<lora:{detail|skin}:1> face <lora:{detail|skin}:0.5>", "'{detail|skin}' (2 times)"),
+        ("<lora:@@style@@:1> face <lora:@@style@@:0.5>", "'@@style@@' (2 times)"),
+        ("{<lora:detail:0.4>|<lora:detail:0.8>} face", "'detail' (2 times)"),
+    ],
+)
+def test_a_tag_whose_name_the_wildcards_extension_still_draws_is_not_counted(
+    monkeypatch, capsys, names, prompt, listed
+):
+    # With the "wildcards" extension among the scripts of the pass, and no
+    # Dynamic Prompts, two "<lora:__style__:1>" tags were still said to be
+    # the same LoRA 2 times.
+    runtime = _lora_note_runtime(monkeypatch, data={"dp_parser_wildcard_wrap": "@@"})
+    p = SimpleNamespace()
+    line = runtime._repeated_lora_note(p, _region(prompt), 0, _PassRunner(names))
+    if not listed:
+        assert line == ""
+        assert capsys.readouterr().out == ""
+        assert not hasattr(p, "_ad_repeated_lora_noted")
+        return
+    assert f"detailer pass: {listed}. The WebUI" in line
+
+
+def test_a_wildcard_name_is_plain_text_for_a_pass_without_a_wildcard_script(monkeypatch):
+    # Unchanged: no script of the pass draws it, so the host reads the same
+    # name in both tags.
+    runtime = _lora_note_runtime(monkeypatch)
+    region = _region("<lora:__style__:1> face <lora:__style__:0.5>")
+    for runner in (None, _PassRunner([]), _PassRunner(["negpip", "wildcards_manager"])):
+        line = runtime._repeated_lora_note(SimpleNamespace(), region, 0, runner)
+        assert "'__style__' (2 times)" in line
+
+
+@pytest.mark.parametrize("names", [None, _WITH_DYNAMIC_PROMPTS])
+@pytest.mark.parametrize(
+    "prompt",
+    ["<lora::1> face <lora::1>", "<lora: :1> <lora: :0.5>", "<lora::1> <lora:: > <lora::>"],
+)
+def test_a_lora_tag_without_a_name_is_never_counted(monkeypatch, capsys, names, prompt):
+    # It was said as: '' (2 times).
+    runtime = _lora_note_runtime(monkeypatch)
+    runner = _PassRunner(names) if names else None
+    p = SimpleNamespace()
+    assert runtime._repeated_lora_note(p, _region(prompt), 0, runner) == ""
+    assert capsys.readouterr().out == ""
+    assert not hasattr(p, "_ad_repeated_lora_noted")
+    # A named LoRA next to them is still said.
+    region = _region(prompt + " <lora:detail:1> <lora:detail:1>")
+    line = runtime._repeated_lora_note(SimpleNamespace(), region, 0, runner)
+    assert "detailer pass: 'detail' (2 times). The WebUI" in line
+
+
+@pytest.mark.parametrize(
+    ("ad_prompt", "said"),
+    [
+        ("{<lora:detail:0.4>|<lora:detail:0.8>} detailed face", False),
+        ("<lora:detail:1> {<lora:detail:0.4>|<lora:detail:0.8>} detailed face", True),
+    ],
+)
+def test_the_pass_with_dynamic_prompts_reads_a_variant_block_as_one_branch(
+    monkeypatch, capsys, ad_prompt, said
+):
+    monkeypatch.delitem(sys.modules, "modules.extra_networks", raising=False)
+    ran, seen, _runner = _dynamic_prompts_pass(main="1girl", ad_prompt=ad_prompt)
+    # Premise: Dynamic Prompts ran on both regions, on the block as typed.
+    assert ran == [tuple(_WITH_DYNAMIC_PROMPTS)] * 2
+    assert seen == [(ad_prompt, "")] * 2
+    assert capsys.readouterr().out.count(_SAID) == (1 if said else 0)
+
+
+def test_the_pass_without_dynamic_prompts_still_says_a_block_with_two_tags(
+    monkeypatch, capsys
+):
+    # No script runner here: the host reads the block as plain text.
+    sent, _p = _repeated_lora_pass(
+        monkeypatch, main="1girl",
+        ad_prompt="{<lora:detail:0.4>|<lora:detail:0.8>} detailed face",
+    )
+    assert len(sent) == 2
+    assert capsys.readouterr().out.count(_SAID) == 1
+
+
+# The documents of plus.10 beta 2 (README, CHANGELOG, Guide tab) for what came
+# after their first draft: the new label of the transparency option, the tab
+# skipped for its checkpoint, the new keys of the image parameters, the styles
+# applied once, the new console lines.
+
+
+def _newest_changelog_section():
+    return _public_docs()["CHANGELOG.md"].split("\n## ")[1]
+
+
+def _beta2_notes():
+    readme = _public_docs()["README.md"]
+    return readme.split("### Notes on plus.10 beta 2\n")[1].split("\n### ")[0]
+
+
+def _guide_line(start):
+    guide = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    return next(line for line in guide.splitlines() if line.startswith(start))
+
+
+def test_the_docs_name_the_keep_transparency_option_by_its_label():
+    # The option also holds for Skip img2img and its label says so: the
+    # documents still quoted the first label, for the tool alone.
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    label = next(
+        ast.literal_eval(keyword.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") == "add_option"
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "ad_apply_keep_transparency"
+        for keyword in node.args[1].func.value.keywords
+        if keyword.arg == "label"
+    )
+    old = "Run ADetailer on an image keeps the transparency of the picture"
+    readme, newest = _public_docs()["README.md"], _newest_changelog_section()
+    assert old not in readme
+    assert old not in newest
+    row = next(line for line in readme.splitlines() if line.startswith(f"| 🟡 {label} "))
+    assert 'in img2img with "Skip img2img" ticked' in row
+    assert "Resolution Step" in row
+    entry = next(line for line in newest.splitlines() if line.startswith(f'- **"{label}"'))
+    assert "Resolution Step" in entry
+    # The Skip img2img part was tried live on one WebUI only, with an API
+    # request: its Batch tab and Forge Neo are not promised.
+    assert "the Skip img2img part is tested live on AUTOMATIC1111 only, with an API request" in entry
+    assert "its Batch tab and Forge Neo are covered by the offline tests only." in entry
+    assert "the Skip img2img part is covered by the offline tests only" not in entry
+
+
+def test_the_docs_say_when_a_tab_is_skipped_for_its_checkpoint():
+    # The known issue said that on Forge Neo a tab's checkpoint that does not
+    # load always costs the generation. The tab is now skipped when the files
+    # tell for sure: the issue stays for the cases the check leaves alone.
+    old = "a tab's own checkpoint that does not load makes the whole generation fail**"
+    newest = _newest_changelog_section()
+    for text in (newest.split("**Known issues in this beta**")[1], _beta2_notes()):
+        assert old not in text
+        issue = next(
+            line for line in text.splitlines()
+            if "does not load still makes the whole generation fail" in line
+        )
+        for doubt in (
+            ".ckpt", "GGUF", "first_stage_model.", "the hires fix checkpoint",
+            "text encoder files that do not fit",
+        ):
+            assert doubt in issue
+        # Two recognised cases were tried live on Forge Neo; nothing is
+        # promised for the cases the check leaves alone.
+        assert "two of them were tested live on Forge Neo 2.32" in issue
+        assert "The cases left alone were not tested live, and nothing is promised for them." in issue
+        assert "the skip itself is covered by the offline tests only" not in issue
+    entry = next(
+        line for line in newest.splitlines()
+        if line.startswith("- **A tab whose checkpoint cannot be loaded with the VAE file")
+    )
+    # Every family whose VAE the check knows, by the name the console gives it.
+    assigns = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8")).body
+        if isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "id", "") in ("_VAE_CHANNELS", "_FAMILY_NAMES")
+    }
+    assert assigns["_VAE_CHANNELS"]
+    for family in assigns["_VAE_CHANNELS"]:
+        assert assigns["_FAMILY_NAMES"][family] in entry
+    assert "Tested live on Forge Neo 2.32 in two cases:" in entry
+    assert "Classic Forge and the other cases are covered by the offline tests only." in entry
+    assert "not tested live yet" not in entry
+    # The Guide tab said that the generation stops until the tab has its files.
+    guide = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    assert "the generation stops with an error until the tab has its own files" not in guide
+    assert "In any doubt" in _guide_line("- A tab skipped for its checkpoint")
+
+
+def test_the_docs_name_the_new_keys_of_the_image_parameters():
+    from aaaaaa import p_method
+
+    readme = _public_docs()["README.md"]
+    added = readme.split("#### Added in plus.10 beta 2\n")[1].split("\n#### ")[0]
+    for text in (_newest_changelog_section(), added):
+        for key in (*p_method.RESOLVED_PROMPT_KEYS, *p_method.MODEL_HASH_KEYS):
+            assert f'"{key}"' in text
+        assert f'"{p_method.RESOLVED_PROMPT_CUT}"' in text
+        assert f"{p_method.RESOLVED_PROMPT_MAX} bytes" in text
+        assert str(p_method.RESOLVED_PROMPTS_TOTAL_MAX) in text
+        # Said plainly: a site does not tell the models of a picture from them.
+        assert "Civitai does not read these two keys" in text
+
+
+def test_the_docs_say_that_the_styles_are_applied_once_from_beta_2():
+    # With another extension's wildcards the styles reached the pass twice, a
+    # known issue of plus.9 and plus.8: both lines now say where it is fixed,
+    # and the notes of beta 2 keep the three cases that are left.
+    readme = _public_docs()["README.md"]
+    known = [
+        line for line in readme.splitlines()
+        if line.startswith("- **Styles can still be applied twice.**")
+    ]
+    assert len(known) == 2
+    for line in known:
+        assert "[Fixed in plus.10 beta 2](#fixed-in-plus10-beta-2)" in line
+    assert "\n#### Fixed in plus.10 beta 2\n" in readme
+    issues = _newest_changelog_section().split("**Known issues in this beta**")[1]
+    for text in (issues, _beta2_notes()):
+        left = next(line for line in text.splitlines() if "hree rare cases" in line)
+        for case in ("holds a wildcard", "`{prompt}`", "Magic Prompt"):
+            assert case in left
+
+
+@pytest.mark.parametrize(
+    ("start", "words"),
+    [
+        ("- A tab skipped for its checkpoint", "Use separate VAE"),
+        ("- Models that are not detectors", "pose models work too"),
+        ("- The same LoRA twice", "once per generation, tab and LoRA"),
+        ("- Guide: several subjects, one LoRA each", "Fill the tabs"),
+    ],
+)
+def test_the_new_guide_lines_are_one_plain_block(start, words):
+    line = _guide_line(start)
+    assert words in line
+    # Translatable text: no inline markdown, no tag the renderer would eat.
+    assert not any(mark in line for mark in ("**", "`", "](", "<", "_"))
+
+
+def test_the_docs_quote_the_subject_guide_as_the_panel_shows_it():
+    # The guide "several subjects, one LoRA each" (plus.10 beta 2): the README
+    # section, the newest CHANGELOG section and the Guide tab name its box,
+    # its choices, its button and the settings it writes word for word, and
+    # the prompts and statuses the README quotes are the ones the guide gives.
+    import html
+
+    from adetailer import subject_guide as sg
+
+    ui = (_SCRIPT_PATH.parents[1] / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    title = "Guide: several subjects, one LoRA each"
+    button = "✨ Fill the tabs"
+    choices = ("What to redraw", "People in the picture")
+    for text in (title, button, *choices):
+        assert f'"{text}"' in ui
+    rows = ("LoRA", "weight", "words")
+    for field in rows:
+        assert f'label=f"Subject {{i}} {field}"' in ui
+    # Every setting the guide writes (GUIDE_ATTRS) and the label the README's
+    # table names it by: a setting added to the guide has to be added here
+    # and to the table. Two have no label to quote: the prompt box, and the
+    # hidden text behind "Exclude selected (NOT)".
+    written = {
+        "ad_tab_enable": "Enable this tab",
+        "ad_model": "ADetailer detector",
+        "ad_model_classes": "ADetailer detector CLASSES",
+        "ad_model_classes_exclude": "Exclude selected (NOT)",
+        "ad_classes_sequential": "Process classes sequentially",
+        "ad_strip_loras": "Strip LoRAs from the detailer prompt",
+        "ad_use_bbox_mask": "Use bbox as mask (segmentation models)",
+        "ad_mask_k": "Mask only the top k (0 to disable)",
+        "ad_mask_filter_method": "Method to filter top k masks by (confidence or area)",
+        "ad_mask_merge_invert": "Mask merge mode",
+        "ad_inpaint_indices": "Inpaint only these detections",
+        "ad_inpaint_only_masked": "Inpaint only masked",
+        "ad_denoising_strength": "Inpaint denoising strength",
+    }
+    unlabelled = {
+        "ad_model_classes_excluded": '"Exclude selected (NOT)"',
+        "ad_prompt": "The tab's prompt",
+    }
+    assert sorted([*written, *unlabelled]) == sorted(sg.GUIDE_ATTRS)
+    for attr, label in written.items():
+        # The label of that setting's own widget, from its start: each tab
+        # adds its number after it.
+        widget = ui[ui.index(f"w.{attr} = gr.") :]
+        assert re.match('f?"' + re.escape(label), widget.split("label=", 1)[1])
+
+    readme = _public_docs()["README.md"]
+    section = readme.split("### Several subjects, one LoRA each (guide)\n")[1]
+    section = section.split("\n### ")[0]
+    newest = _newest_changelog_section()
+    detectors = [*sg.PERSON_DETECTORS, *sg.FACE_DETECTORS]
+    for text in (section, newest):
+        for quoted in (title, button, *choices, *sg.GUIDE_MODES):
+            assert f'"{quoted}"' in text
+        for field in rows:
+            assert f'"Subject 1 {field}"' in text
+        for name in detectors:
+            assert f"`{name}`" in text
+        # Tried live on two WebUIs; what was not tried is said.
+        assert "Tested live on AUTOMATIC1111 1.10.1 and Forge Neo 2.32." in text
+        assert (
+            "Not tried live: LoRA aliases, `lyco` tags, a typed LoRA name that the "
+            "WebUI does not list and a translated interface, which are covered by "
+            "the offline tests only."
+        ) in text
+    guide_entry = next(
+        line for line in newest.splitlines() if line.startswith(f'- **"{title}", a guide')
+    )
+    for text in (section, guide_entry):
+        assert "Tested live on AUTOMATIC1111 1.10.1 and Forge Neo 2.32." in text
+        assert "not tested live yet" not in text
+    assert f'"{sg.PEOPLE_AUTO}"' in section
+    # The weight a row starts with: the slider's, said where the rows are
+    # explained (the example prompts below are written with it too).
+    weight = sg.format_weight(sg.DEFAULT_WEIGHT)
+    assert "value=DEFAULT_WEIGHT," in ui
+    assert f'set "Subject 1 weight" (it starts at {weight})' in section
+    assert f'"Subject 1 weight", {weight} at the start' in newest
+
+    people = [
+        ("my_lora_a", sg.DEFAULT_WEIGHT, "woman, red hair, green dress"),
+        ("my_lora_b", sg.DEFAULT_WEIGHT, "man, grey beard"),
+    ]
+
+    def fill(mode=sg.MODE_PERSON, subjects=people, **kwargs):
+        kwargs.setdefault("installed_models", detectors)
+        kwargs.setdefault("num_tabs", 4)
+        kwargs.setdefault("sort_order", sg.LEFT_TO_RIGHT)
+        result = sg.build_subject_guide(mode, subjects, **kwargs)
+        # The status is Markdown: a "_" of a LoRA name is written "&#95;".
+        return result, [html.unescape(line) for line in result.status.split("\n\n")]
+
+    done, lines = fill()
+    for text in (section, newest):
+        assert done.tabs[0]["ad_prompt"] in text
+    assert fill(subjects=people[:1], people="2")[0].tabs[0]["ad_prompt"] in section
+    assert f"[PROMPT], <lora:my_lora_a:{weight}>" in section
+    assert fill(subjects=[("my_lora_a", sg.DEFAULT_WEIGHT, "")])[0].tabs[0][
+        "ad_prompt"
+    ].startswith(f"[PROMPT], <lora:my_lora_a:{weight}> [SEP]")
+
+    # The table "What the button writes": one row for every setting the guide
+    # gives a tab, no row for another one, and each value in the table's
+    # words. The values are the guide's own (_tab_values), not a list kept
+    # here: one that changes, or a cell edited by hand, fails.
+    table = section.split("| Setting of the tab | Value |\n| --- | --- |\n")[1]
+    cells = {}
+    for row in table.split("\n\n")[0].splitlines():
+        setting, value = (cell.strip() for cell in row.strip("|").split("|"))
+        cells[setting] = value
+    named = {**{attr: f'"{label}"' for attr, label in written.items()}, **unlabelled}
+
+    def cell_of(attr):
+        (setting,) = [s for s in cells if named[attr] in s]
+        return setting, cells[setting]
+
+    assert {cell_of(attr)[0] for attr in sg.GUIDE_ATTRS} == set(cells)
+    person = done.tabs[0]
+    assert sorted(person) == sorted(sg.GUIDE_ATTRS)
+    in_words = {
+        "ad_model": "The first installed detector of the choice",
+        "ad_prompt": "One part per subject, separated by `[SEP]`, with a last `[SKIP]`",
+        "ad_mask_k": "The number of subjects",
+        "ad_denoising_strength": f"{sg.GUIDE_DENOISE:g}, whatever the tab had",
+    }
+    assert person["ad_model"] == sg.PERSON_DETECTORS[0]
+    assert person["ad_prompt"].split(" [SEP] ")[len(people) :] == ["[SKIP]"]
+    assert person["ad_mask_k"] == len(people)
+    assert person["ad_denoising_strength"] == sg.GUIDE_DENOISE
+    # Not in the list of what is left as it is any more.
+    assert '"Inpaint denoising strength", the confidence' not in section
+    assert "does not change \"Inpaint denoising strength\"" not in readme
+
+    def says(cell, word, flags=re.IGNORECASE):
+        return re.search(f"(?<![A-Za-z]){re.escape(word)}(?![A-Za-z])", cell, flags)
+
+    for attr in sg.GUIDE_ATTRS:
+        cell, value = cell_of(attr)[1], person[attr]
+        if attr in in_words:
+            assert in_words[attr] in cell
+        elif isinstance(value, bool):
+            assert says(cell, "On" if value else "Off")
+            assert not says(cell, "Off" if value else "On")
+        elif value == "":
+            assert says(cell, "Emptied")
+        else:
+            # A choice of the tab, by its name ("Area", "None").
+            assert says(cell, value, 0)
+    # A tab for faces gets the same values, without the one for the outline;
+    # without an installed detector the tab keeps its detector and classes.
+    face = fill(sg.MODE_FACE)[0].tabs[0]
+    assert face["ad_model"] == sg.FACE_DETECTORS[0]
+    assert {**face, "ad_model": person["ad_model"], "ad_use_bbox_mask": False} == person
+    assert "ad_use_bbox_mask" not in face
+    outline = cell_of("ad_use_bbox_mask")[1]
+    assert "in a tab that redraws the whole person" in outline
+    assert "not touched in a tab that redraws faces" in outline
+    bare = fill(installed_models=[])[0].tabs[0]
+    assert sorted(set(person) - set(bare)) == [
+        "ad_model", "ad_model_classes", "ad_model_classes_exclude",
+        "ad_model_classes_excluded",
+    ]
+    assert "the tab keeps its detector and its classes" in cell_of("ad_model")[1]
+
+    lines += fill(sort_order="None")[1][1:]
+    lines += fill(installed_models=[])[1][1:]
+    lines += fill(main_prompt="two people, <lora:my_lora_a:1>")[1][1:]
+    lines += fill(lora_names=["my_lora_a"])[1][1:]
+    # A tag typed in the words under a name the WebUI lists in another way,
+    # then one under the listed name: no second tag, and the status says it.
+    typed = [("My_Lora_A", sg.DEFAULT_WEIGHT, "woman, <lora:My_Lora_A:1>")]
+    kept = fill(subjects=typed, lora_names=["my_lora_a"])
+    assert kept[0].tabs[0]["ad_prompt"] == "woman, <lora:My_Lora_A:1> [SEP] [SKIP]"
+    lines += kept[1][1:2]
+    listed = [("my_lora_a", sg.DEFAULT_WEIGHT, "woman, <lora:my_lora_a:1>")]
+    lines += fill(subjects=listed, lora_names=["my_lora_a"])[1][1:]
+    lines += fill(old_prompts=["a portrait"])[1][1:]
+    lines += fill(enabled_tabs=[True, True])[1][1:]
+    lines += fill(sg.MODE_PERSON_FACE)[1][1:]
+    lines += fill(subjects=[])[1]
+    lines += fill(sg.MODE_PERSON_FACE, num_tabs=1)[1]
+    # The denoise line ends every status that fills tabs: quoted once, with
+    # the words of its two-tab form.
+    denoise = fill()[1][-1]
+    two_tabs = fill(sg.MODE_PERSON_FACE)[1][-1]
+    assert denoise.startswith(f"ℹ️ The guide set Inpaint denoising strength to {sg.GUIDE_DENOISE:g}")
+    assert two_tabs == denoise.replace("in the 1st tab.", "in the 1st tab and the 2nd tab.")
+    assert f'"{denoise}"' in section
+    assert '"in the 1st tab and the 2nd tab"' in section
+    lines = [line for line in lines if line not in (denoise, two_tabs)]
+    assert len(lines) == 12
+    for line in lines:
+        assert f'"{line}"' in section
+    assert f'"{lines[0]}"' in newest
+    one = fill(subjects=people[:1])[1][0]
+    assert one.endswith("Subject 1 is the biggest person.")
+    assert '"Subject 1 is the biggest person."' in section
+    # What the section says of a tag typed in the words. One in another
+    # letter case than both the menu and the list is the row's LoRA: no
+    # second tag. With a tag under the listed name next to it, no warning.
+    # An alias and the file name of one LoRA give one tag when the WebUI
+    # tells the file of each alias, two when it does not.
+    cased =[("my_lora_a", sg.DEFAULT_WEIGHT, "woman, <lora:MY_LORA_A:1>")]
+    result, status = fill(subjects=cased, lora_names=["my_lora_a"])
+    assert result.tabs[0]["ad_prompt"] == "woman, <lora:MY_LORA_A:1> [SEP] [SKIP]"
+    assert status[1] == kept[1][1].replace("My_Lora_A", "MY_LORA_A")
+    assert "counts as the row's LoRA too: no second tag is added." in section
+    assert "than both" not in section
+    both = [("my_lora_a", sg.DEFAULT_WEIGHT, "woman, <lora:MY_LORA_A:1> <lora:my_lora_a:1>")]
+    result, status = fill(subjects=both, lora_names=["my_lora_a"])
+    assert result.tabs[0]["ad_prompt"] == f"{both[0][2]} [SEP] [SKIP]"
+    assert not any("the WebUI lists that LoRA as" in line for line in status)
+    assert "when none of that LoRA's tags in the words has the name as the WebUI lists it" in section
+    alias = [("my_lora_a", sg.DEFAULT_WEIGHT, "woman, <lora:alias_a:1>")]
+    result, _ = fill(
+        subjects=alias, lora_names=["my_lora_a"],
+        lora_aliases={"my_lora_a": "my_lora_a", "alias_a": "my_lora_a"},
+    )
+    assert result.tabs[0]["ad_prompt"] == "woman, <lora:alias_a:1> [SEP] [SKIP]"
+    result, _ = fill(
+        subjects=alias, lora_names=["my_lora_a"], lora_aliases=["my_lora_a", "alias_a"]
+    )
+    assert result.tabs[0]["ad_prompt"] == (
+        f"woman, <lora:alias_a:1>, <lora:my_lora_a:{weight}> [SEP] [SKIP]"
+    )
+    assert (
+        "A tag under the LoRA's alias while the row's menu has its file name, or the other "
+        "way round, counts as the row's LoRA too" in section
+    )
+    # Every case the section lists where a second tag is still added, and
+    # each one true: no LoRA list, a LoRA the WebUI does not list, a tag that
+    # matches two listed names that differ only in letter case.
+    assert (
+        "A second tag is still added for a tag in the words that does not hold "
+        "exactly the row's name, when the guide cannot tell that it is the row's "
+        "LoRA: on a WebUI that gives no LoRA list, for a LoRA the WebUI does not "
+        "list (the status warns about it), for a tag that matches two names the "
+        "WebUI lists that differ only in letter case (such as `MY_LORA` with `my_lora` "
+        "and `My_Lora`), and for an alias on a WebUI that does not tell which file "
+        "it stands for." in section
+    )
+    for names, menu in (
+        (None, "my_lora"), (["my_lora_a"], "my_lora"), (["my_lora", "My_Lora"], "my_lora")
+    ):
+        two = [(menu, sg.DEFAULT_WEIGHT, "woman, <lora:MY_LORA:1>")]
+        result, _ = fill(subjects=two, lora_names=names)
+        assert result.tabs[0]["ad_prompt"] == (
+            f"woman, <lora:MY_LORA:1>, <lora:my_lora:{weight}> [SEP] [SKIP]"
+        )
+    # With one of the two names alone, the tag is the row's LoRA: no second tag.
+    one, _ = fill(
+        subjects=[("my_lora", sg.DEFAULT_WEIGHT, "woman, <lora:MY_LORA:1>")],
+        lora_names=["my_lora"],
+    )
+    assert one.tabs[0]["ad_prompt"] == "woman, <lora:MY_LORA:1> [SEP] [SKIP]"
+    assert "the two names still give two tags" not in section
+    assert "One case still gives two tags" not in section
+    assert "also its alias in one place and its file name in the other, when the WebUI" in newest
+    assert "still give two tags" not in newest
+    # A lyco tag: the line the section quotes, given where the WebUI is not
+    # known to read it, and the prompt the same where it is.
+    lyco = [("my_lora_a", sg.DEFAULT_WEIGHT, "woman, <lyco:my_lora_a:1>")]
+    told, status = fill(subjects=lyco, lora_names=["my_lora_a"])
+    (line,) = [line for line in status if "lyco tag" in line]
+    assert f'"{line}"' in section
+    read, status = fill(subjects=lyco, lora_names=["my_lora_a"], reads_lyco=True)
+    assert read.tabs == told.tabs
+    assert not any("lyco" in line for line in status)
+    assert (
+        "on a WebUI that reads lyco tags as LoRA tags (AUTOMATIC1111 and reForge) this line"
+        in section
+    )
+    assert "a `lyco` tag in the words, which Forge and Forge Neo skip" in newest
+    # The other forms of the 2nd tab's line, as the section quotes them: with
+    # another sort order, without a face detector to give the 2nd tab, with
+    # one subject, and the two pairs of them. Every quote is in the line the
+    # guide gives for its case, word for word, and in the line of no case it
+    # is not quoted for; no form of the line is left without a quote.
+    def second_tab(**case):
+        (line,) = [
+            line for line in fill(sg.MODE_PERSON_FACE, **case)[1]
+            if "The 2nd tab counts on its own" in line
+        ]
+        return line
+
+    other_order = {"sort_order": "None"}
+    no_face = {"installed_models": list(sg.PERSON_DETECTORS)}
+    single = {"subjects": people[:1]}
+    cases = {
+        "usual": {},
+        "order": other_order,
+        "no face": no_face,
+        "order, no face": {**other_order, **no_face},
+        "one": single,
+        "one, no face": {**single, **no_face},
+    }
+    forms = {name: second_tab(**case) for name, case in cases.items()}
+    assert forms["usual"] in lines
+    assert len(set(forms.values())) == len(forms)
+    # With one subject there is no order to follow: the line does not change.
+    assert second_tab(**single, **other_order) == forms["one"]
+    quotes = {
+        "it takes the 2 biggest faces": ("usual", "order"),
+        "from left to right": ("usual", "no face"),
+        "and sorts them with the same setting as the 1st tab sorts the people. "
+        "Their order can differ from the order of the people, and a face then "
+        "gets another person's part.": ("order",),
+        "it takes the 2 biggest regions its detector finds": ("no face", "order, no face"),
+        "With a face detector they are usually the faces of the same people": (
+            "no face", "order, no face",
+        ),
+        "a region then gets another person's part": ("order, no face",),
+        "it takes the biggest face. It is usually the face of the same person, "
+        "but not when another person has a bigger face or that face is not "
+        "found: check the result.": ("one",),
+        "it takes the biggest region its detector finds. With a face detector "
+        "that is usually the face of the same person": ("one, no face",),
+    }
+    for words, where in quotes.items():
+        assert f'"{words}"' in section
+        assert {name for name, line in forms.items() if words in line} == set(where)
+    for name in forms:
+        assert any(name in where for where in quotes.values())
+    assert "in the same order as the 1st tab" not in readme
+    # The limit that goes with the second form, where the section and the
+    # fixes speak of the 2nd tab (the notes and the known issues: below).
+    order_limit = f'With a sort order other than "{sg.LEFT_TO_RIGHT}"'
+    assert order_limit in section
+    assert order_limit in readme.split("a LoRA goes to the wrong person")[1].split("\n**")[0]
+    # The click reads the prompts of the first two tabs only.
+    assert "targets = tabs[:2]" in ui
+    assert "*(w.ad_prompt for w in targets)," in ui
+    assert "The prompts of the 3rd and later tabs are not read." in section
+    # The order warning is a line of its own, after the one that starts with
+    # "Filled": the fix quotes how that line starts.
+    head, order = fill(sort_order="None")[1][:2]
+    assert head.split(" ", 1)[1].startswith("Filled ")
+    fixes = readme.split("a LoRA goes to the wrong person")[1].split("\n**")[0]
+    assert f'one of its lines starts with "{order.split(", Sort")[0]}"' in fixes
+
+    # The by-hand way and the guided way point at each other.
+    by_hand = readme.split("### A different prompt or LoRA for each face\n")[1]
+    by_hand = by_hand.split("\n### ")[0]
+    assert "(#several-subjects-one-lora-each-guide)" in by_hand
+    assert "(#a-different-prompt-or-lora-for-each-face)" in section
+    # A limit of the face detector seen live, said where the choices are.
+    assert "**Animal-like characters:**" in section.split("**People in the picture:**")[0]
+    # What can go wrong is in the notes of the beta and in its known issues.
+    issues = newest.split("**Known issues in this beta**")[1]
+    for text in (_beta2_notes(), issues):
+        for limit in (
+            f'The guide "{title}" is tested live in part:** on AUTOMATIC1111 1.10.1',
+            "a translated interface are covered by the offline tests only.",
+            "The built-in face detectors can miss the face of an animal-like character",
+            'Pick "Whole person (outline)" for those characters.',
+            "The guide does not change the Settings.",
+            "by the area of their box",
+            "no setting ties a face to its person:** they are matched only by the order of their boxes",
+            f"{order_limit}, the 2nd tab sorts the faces with that same setting",
+            '"Inpaint area" on "Whole picture"',
+            "is also in the main prompt acts on the whole picture",
+            f"at most {sg.GUIDE_SUBJECTS} subjects",
+            "A LoRA name the WebUI does not list is written anyway",
+            "A second browser window that was already open keeps its old list",
+            "The guide's choices are not saved",
+        ):
+            assert limit in text
+    assert title in _guide_line(f"- {title}")
+
+
+def test_the_readme_and_the_changelog_give_the_same_number_of_tests():
+    readme = _public_docs()["README.md"]
+    beta = next(line for line in readme.splitlines() if line.startswith("**Beta 2** ("))
+    count = re.search(r"all (\d+) offline regression tests pass", beta).group(1)
+    assert f"All {count} offline regression tests pass" in _newest_changelog_section()

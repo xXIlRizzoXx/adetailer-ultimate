@@ -45,6 +45,10 @@ class PredictOutput(Generic[T]):
     # names and scores, for the "Show labels" switch of the Detection preview.
     # Only the preview asks for it; None otherwise or when it can't be drawn.
     preview_plain: Optional[Image.Image] = None
+    # Why the detector could not be used at all (for example a model that is
+    # not a detection model), as one sentence; the result is then empty. The
+    # caller says it, so it is not taken for an image with nothing to find.
+    note: str = ""
 
 
 def _short_reason(error: BaseException | None) -> str:

@@ -26,6 +26,14 @@ def wrap_adetailer_job(func):
             try:
                 return func(*args, **kwargs)
             finally:
+                # The detectors kept during this job, dropped before end()
+                # frees the video memory. Best effort.
+                try:
+                    from adetailer.ultralytics import release_kept_detectors
+
+                    release_kept_detectors()
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     shared.state.end()
                 finally:

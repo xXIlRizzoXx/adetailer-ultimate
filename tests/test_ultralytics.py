@@ -1,5 +1,5 @@
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -396,6 +396,291 @@ def test_other_detector_load_errors_are_raised_unchanged(
 
     assert info.value is error
     assert "newer Ultralytics" not in capsys.readouterr().err
+
+
+class _NoBoxesResult:
+    """What Ultralytics returns for a model that is not a detector: no boxes,
+    and the field of its own task instead (`semantic_mask` only exists in a
+    recent Ultralytics)."""
+
+    def __init__(self, **fields):
+        self.names = {0: "plane"}
+        self.boxes = None
+        self.masks = None
+        self.probs = None
+        self.obb = None
+        for name, value in fields.items():
+            setattr(self, name, value)
+
+    def plot(self, **_kwargs):
+        msg = "a result without boxes has no preview to draw"
+        raise AssertionError(msg)
+
+
+def _fake_task_model(monkeypatch, result, **attrs):
+    """Fake Ultralytics model with the given attributes (`task`, as the real
+    one sets from the loaded file) that returns `result`."""
+    calls = []
+    module = ModuleType("ultralytics")
+
+    class YOLO:
+        def __init__(self, path):
+            self.names = {0: "plane"}
+            for name, value in attrs.items():
+                setattr(self, name, value)
+
+        def __call__(self, image, **kwargs):
+            calls.append(kwargs)
+            return [result]
+
+    module.YOLO = YOLO
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("task", "kind"),
+    [
+        ("obb", "an OBB model (rotated boxes)"),
+        ("classify", "a classification model"),
+        ("semantic", "a semantic segmentation model"),
+    ],
+)
+def test_a_model_that_is_not_a_detector_detects_nothing_and_says_why(
+    tmp_path, monkeypatch, capsys, task, kind
+):
+    # An OBB or classification model as the detector ended in "'NoneType'
+    # object has no attribute 'xyxy'": its results have no boxes.
+    calls = _fake_task_model(monkeypatch, _NoBoxesResult(), task=task)
+    model = tmp_path / "planes-ü.pt"
+
+    result = ultralytics_predict(str(model), Image.new("RGB", (4, 4)))
+
+    assert result.bboxes == []
+    assert result.masks == []
+    assert result.preview is None
+    assert "'planes-ü.pt'" in result.note
+    assert f"is {kind}" in result.note
+    assert "needs a detection or segmentation model" in result.note
+    # Only the name of the file, never its folder.
+    assert tmp_path.name not in result.note
+    # Told from the loaded model: nothing is detected with it.
+    assert calls == []
+    # The caller says it, once: nothing is printed here.
+    said = capsys.readouterr()
+    assert said.out == ""
+    assert said.err == ""
+
+
+@pytest.mark.parametrize(
+    ("fields", "kind"),
+    [
+        ({"obb": object()}, "an OBB model (rotated boxes)"),
+        ({"probs": object()}, "a classification model"),
+        ({"semantic_mask": object()}, "a semantic segmentation model"),
+        ({}, "a model whose results have no boxes"),
+    ],
+    ids=["obb", "classify", "semantic", "unknown"],
+)
+@pytest.mark.parametrize("attrs", [{}, {"task": None}, {"task": "detect"}])
+def test_a_result_without_boxes_is_not_read_as_detections(
+    tmp_path, monkeypatch, fields, kind, attrs
+):
+    # The same when the model's task did not tell (none, or a wrong one).
+    calls = _fake_task_model(monkeypatch, _NoBoxesResult(**fields), **attrs)
+
+    result = ultralytics_predict(str(tmp_path / "planes.pt"), Image.new("RGB", (4, 4)))
+
+    assert len(calls) == 1
+    assert result.bboxes == []
+    assert result.preview is None
+    assert f"'planes.pt' is {kind}" in result.note
+    assert "needs a detection or segmentation model" in result.note
+
+
+@pytest.mark.parametrize("task", ["detect", "segment", "pose", None, "new-task"])
+def test_detection_segmentation_and_pose_models_detect_as_before(
+    tmp_path, monkeypatch, task
+):
+    # Their results have boxes (a pose model adds keypoints to them): no note.
+    names = {0: "face"}
+    calls = _fake_task_model(monkeypatch, _FakeResult(names, [0.0]), task=task)
+
+    result = ultralytics_predict(str(tmp_path / "face.pt"), Image.new("RGB", (4, 4)))
+
+    assert calls == [{"conf": 0.3, "device": ""}]
+    assert result.bboxes == [[1.0, 1.0, 3.0, 3.0]]
+    assert result.preview is not None
+    assert result.note == ""
+
+
+_MISSING_ULTRALYTICS = (
+    "[-] ADetailer: the Python package 'ultralytics' cannot be imported ({}), so "
+    "the YOLO detectors cannot run. Start the WebUI once without --skip-install, "
+    "or install it with the WebUI's Python: python -m pip install {}"
+)
+
+
+@pytest.mark.parametrize(
+    ("numpy_version", "specs"),
+    [
+        # AUTOMATIC1111: a plain install of Ultralytics can pull NumPy 2 in.
+        ("1.26.4", '"ultralytics>=8.3.75" "numpy<2"'),
+        ("2.1.3", '"ultralytics>=8.3.75"'),
+        (None, '"ultralytics>=8.3.75"'),
+    ],
+    ids=["numpy-1", "numpy-2", "no-numpy"],
+)
+def test_missing_ultralytics_line_gives_the_pip_command_of_install_py(
+    monkeypatch, numpy_version, specs
+):
+    from adetailer.ultralytics import missing_ultralytics_line
+    from tests.test_pipeline import _load_install
+
+    if numpy_version is None:
+        monkeypatch.setitem(sys.modules, "numpy", None)
+    else:
+        monkeypatch.setattr(np, "__version__", numpy_version)
+
+    line = missing_ultralytics_line()
+
+    assert line == _MISSING_ULTRALYTICS.format("it is not installed", specs)
+    assert line.isascii()
+    # The same packages and versions install.py asks pip for.
+    install = _load_install(monkeypatch)
+    calls = []
+    monkeypatch.setattr(install, "run_pip", lambda *args: calls.append(args))
+    monkeypatch.setattr(install, "is_installed", lambda *a: False)
+    install.install()
+    wanted = [arg for arg in calls[0] if not arg.startswith("rich")]
+    assert specs == " ".join(f'"{arg}"' for arg in wanted)
+
+
+@pytest.mark.parametrize(
+    ("found", "said"),
+    [(None, True), (object(), False), (ValueError("no spec"), False)],
+    ids=["not-installed", "installed", "cannot-tell"],
+)
+def test_startup_says_when_ultralytics_is_not_installed(
+    monkeypatch, capsys, found, said
+):
+    # Ultralytics is imported at the first detection only: a WebUI started
+    # with --skip-install loaded ADetailer without a word and failed at the
+    # first generation. Looked up without importing it.
+    import importlib.util
+
+    from adetailer.ultralytics import warn_missing_ultralytics
+
+    asked = []
+
+    def find_spec(name):
+        asked.append(name)
+        if isinstance(found, Exception):
+            raise found
+        return found
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    monkeypatch.setattr(np, "__version__", "2.1.3")
+
+    assert warn_missing_ultralytics() is said
+
+    assert asked == ["ultralytics"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    expected = _MISSING_ULTRALYTICS.format(
+        "it is not installed", '"ultralytics>=8.3.75"'
+    )
+    assert captured.err == (expected + "\n" if said else "")
+
+
+def _webui_job(monkeypatch, stamp):
+    state = SimpleNamespace(
+        job="txt2img", job_count=1, time_start=100.0, job_timestamp=stamp
+    )
+    monkeypatch.setitem(sys.modules, "modules.shared", SimpleNamespace(state=state))
+    return state
+
+
+def test_detection_without_ultralytics_names_the_package_and_the_pip_command(
+    tmp_path, monkeypatch, capsys
+):
+    # "No module named 'ultralytics'" came alone, in a long error report, for
+    # every image. One clear line first, once per WebUI job (each time in the
+    # Detection preview, which begins none); the error itself is unchanged.
+    import adetailer.ultralytics as ultra
+
+    monkeypatch.setitem(sys.modules, "ultralytics", None)
+    monkeypatch.setattr(ultra, "_MISSING_SAID_JOB", None)
+    monkeypatch.setattr(np, "__version__", "1.26.4")
+    image = Image.new("RGB", (4, 4))
+
+    def detect():
+        with pytest.raises(ModuleNotFoundError) as info:
+            ultralytics_predict(str(tmp_path / "face.pt"), image)
+        assert info.value.name == "ultralytics"
+        return capsys.readouterr().err, str(info.value)
+
+    state = _webui_job(monkeypatch, "20261114120000")
+    err, error = detect()
+    assert err == (
+        _MISSING_ULTRALYTICS.format(error, '"ultralytics>=8.3.75" "numpy<2"') + "\n"
+    )
+    assert err.isascii()
+    # The next images and tabs of the same job.
+    assert detect()[0] == ""
+    assert detect()[0] == ""
+    # The next job says it again.
+    state.job_timestamp = "20261114120500"
+    assert detect()[0].count("'ultralytics' cannot be imported") == 1
+    assert detect()[0] == ""
+    # No job (the Detection preview): each time.
+    state.job, state.job_count = "", 0
+    assert detect()[0].count("'ultralytics' cannot be imported") == 1
+    assert detect()[0].count("'ultralytics' cannot be imported") == 1
+    # And without a WebUI.
+    monkeypatch.delitem(sys.modules, "modules.shared")
+    assert detect()[0].count("'ultralytics' cannot be imported") == 1
+
+
+def test_a_missing_package_of_ultralytics_is_named_in_the_line(
+    tmp_path, monkeypatch, capsys
+):
+    # Ultralytics is there but a package it needs is not: the same command
+    # installs it.
+    import adetailer.ultralytics as ultra
+
+    module = ModuleType("ultralytics")
+
+    def lazy(name):
+        raise ModuleNotFoundError("No module named 'polars'", name="polars")
+
+    module.__getattr__ = lazy
+    monkeypatch.setitem(sys.modules, "ultralytics", module)
+    monkeypatch.setattr(ultra, "_MISSING_SAID_JOB", None)
+    monkeypatch.setattr(np, "__version__", "2.1.3")
+
+    with pytest.raises(ModuleNotFoundError, match="polars"):
+        ultralytics_predict(str(tmp_path / "face.pt"), Image.new("RGB", (4, 4)))
+
+    assert capsys.readouterr().err == (
+        _MISSING_ULTRALYTICS.format(
+            "No module named 'polars'", '"ultralytics>=8.3.75"'
+        )
+        + "\n"
+    )
+
+
+def test_another_import_error_of_ultralytics_is_raised_without_the_line(
+    tmp_path, monkeypatch, capsys
+):
+    # An Ultralytics that is installed but broken in another way: installing
+    # it again is not known to help, so no command is made up.
+    monkeypatch.setitem(sys.modules, "ultralytics", ModuleType("ultralytics"))
+
+    with pytest.raises(ImportError, match="cannot import name 'YOLO'"):
+        ultralytics_predict(str(tmp_path / "face.pt"), Image.new("RGB", (4, 4)))
+
+    assert capsys.readouterr().err == ""
 
 
 class TestMaskToPil:

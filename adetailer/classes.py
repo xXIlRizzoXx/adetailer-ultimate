@@ -10,6 +10,33 @@ def is_world_model(model_path: str | Path) -> bool:
     return "-world" in Path(model_path).stem
 
 
+# "yoloe" not followed by a letter ("yoloe-11s-seg", "yoloe-v8l-seg", "yoloe26",
+# but not "yoloeyes"), and the "-pf" (prompt-free) mark of the YOLOE models
+# that carry their own fixed vocabulary.
+_YOLOE = re.compile(r"yoloe(?![a-z])")
+_PROMPT_FREE = re.compile(r"[-_]pf(?![a-z0-9])")
+# A menu name of a copy in another folder: "name.pt (folder)".
+_MENU_COPY = re.compile(r"^(.+?\.pt) \(.*\)$", re.IGNORECASE | re.DOTALL)
+
+
+def is_yoloe_model(model: str | Path) -> bool:
+    """A YOLOE detector with text prompts, from its file name (any case), given
+    as a path or as its menu name. The prompt-free ones ("...-pf.pt") are not:
+    they detect the classes saved in them, like any other detector."""
+    text = str(model)
+    copy = _MENU_COPY.match(text)
+    if copy:
+        text = copy.group(1)
+    stem = Path(text).stem.lower()
+    return bool(_YOLOE.search(stem)) and not _PROMPT_FREE.search(stem)
+
+
+def is_open_vocab_model(model_path: str | Path) -> bool:
+    """YOLO-World or a YOLOE with text prompts: the classes to detect are the
+    words typed in the classes field, not names saved in the model."""
+    return is_world_model(model_path) or is_yoloe_model(model_path)
+
+
 def parse_csv(csv: str) -> list[str]:
     return [c.strip() for c in (csv or "").split(",") if c.strip()]
 
@@ -140,7 +167,8 @@ def _read_class_names(model_path: str, load_pt: bool = True) -> list[str]:
       2. model.names from a transient YOLO() load; where the WebUI does not
          let the panel load the .pt (load_pt=False), the names stored in the
          checkpoint, read without loading it (_names_from_checkpoint).
-      3. [] if unknown (YOLO-World, MediaPipe, missing file, or load failure).
+      3. [] if unknown (YOLO-World or YOLOE with text prompts, MediaPipe,
+         missing file, or load failure).
 
     Special case: the "mediapipe_face_features" pseudo-detector has a fixed,
     code-defined class list (facial parts). It is matched FIRST, before the
@@ -154,7 +182,7 @@ def _read_class_names(model_path: str, load_pt: bool = True) -> list[str]:
         return list(FACE_FEATURE_CLASSES)
 
     p = Path(model_path)
-    if is_world_model(p) or not p.exists() or p.suffix != ".pt":
+    if is_open_vocab_model(p) or not p.exists() or p.suffix != ".pt":
         return []
 
     for sidecar in (p.with_name(p.stem + ".names.json"), p.with_suffix(".json")):

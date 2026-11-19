@@ -20,7 +20,8 @@
  *                                         re_emoji skip; key-gated.
  *   (2) input[role=listbox] .value     — dropdown selected values (the
  *                                         ADetailer ones again after each
- *                                         value change).
+ *                                         value change), but not those of
+ *                                         a menu that takes typed text.
  *   (3) #setting_ad_reset_info block   — whole-block innerHTML swap, matched
  *                                         on the block's tag-stripped text.
  * It deliberately leaves everything Forge already handles (labels, accordion
@@ -59,6 +60,16 @@
         return tl;
     }
 
+    // The LoRA menus of the subject guide take typed text, and Gradio sends
+    // the server what such a menu's input shows as soon as the user touches
+    // it: a translated "None" would come back as the name of a LoRA and end
+    // up in a <lora:...> tag. Their value is never rewritten.
+    const FREE_TEXT_SEL = '[id*="ad_subject_guide_lora"]';
+
+    function takesTypedText(inp) {
+        return !!(inp.closest && inp.closest(FREE_TEXT_SEL));
+    }
+
     function translateInTree(root) {
         if (!window.localization) return;
 
@@ -88,13 +99,16 @@
         // (2) Gradio dropdown selected values. Forge's walker handles
         // `placeholder` and `title` but not `value`. Gradio's dropdown
         // <input> has no `type` attribute and carries `role="listbox"`; we
-        // target by that role so we never overwrite a free-text field the
-        // user is typing into. The lookup is a no-op for non-key values, so
-        // applying it broadly is safe.
+        // target by that role so we never overwrite a plain text box. A
+        // dropdown can take typed text too (allow_custom_value): the ones
+        // of FREE_TEXT_SEL are left out, since their text is their value.
+        // The lookup is a no-op for non-key values, so applying it to every
+        // other dropdown is safe.
         const inputs = (root.nodeType === 1 ? root : document).querySelectorAll(
             'input[role="listbox"]'
         );
         for (const inp of inputs) {
+            if (takesTypedText(inp)) continue;
             const tl = translateText(inp.value);
             if (tl !== null) {
                 inp.value = tl;
@@ -194,6 +208,7 @@
             for (const acc of document.querySelectorAll(ACCORDION_SEL)) {
                 for (const inp of acc.querySelectorAll('input[role="listbox"]')) {
                     if (inp === document.activeElement) continue;
+                    if (takesTypedText(inp)) continue;
                     const tl = translateText(inp.value);
                     if (tl !== null) {
                         inp.value = tl;

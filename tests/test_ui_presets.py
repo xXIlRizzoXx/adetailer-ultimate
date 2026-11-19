@@ -11,7 +11,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from adetailer.args import ALL_ARGS, INPAINT_MASKED_CONTENT
-from adetailer.classes import MEDIAPIPE_FACE_FEATURES_MODEL
+from adetailer.classes import MEDIAPIPE_FACE_FEATURES_MODEL, is_yoloe_model
 
 
 def _default_cn_module():
@@ -65,6 +65,7 @@ def callbacks():
         "weakref": weakref,
         "ALL_ARGS": ALL_ARGS,
         "MEDIAPIPE_FACE_FEATURES_MODEL": MEDIAPIPE_FACE_FEATURES_MODEL,
+        "is_yoloe_model": is_yoloe_model,
         "_COPY_EXCLUDE_ATTRS": frozenset(),
         "PRESET_NONE": "(none)",
         "get_model_class_names": lambda path: {
@@ -1356,6 +1357,8 @@ _WORLD_NOT = {
     "ad_model_classes_exclude": True,
     "ad_model_classes_excluded": "hand",
 }
+# A YOLOE detector with text prompts is handled like YOLO-World.
+_YOLOE_NOT = {**_WORLD_NOT, "ad_model": "yoloe-11s-seg.pt"}
 _FIXED_NOT = {
     "ad_model": "animals.pt",
     "ad_model_classes": "",
@@ -1365,7 +1368,8 @@ _FIXED_NOT = {
 
 
 @pytest.mark.parametrize(
-    ("state", "shown"), [(_WORLD_NOT, False), (_FIXED_NOT, True)]
+    ("state", "shown"),
+    [(_WORLD_NOT, False), (_YOLOE_NOT, False), (_FIXED_NOT, True)],
 )
 def test_detector_change_hides_not_mode_for_yolo_world(callbacks, state, shown):
     result = callbacks["on_ad_model_update"](
@@ -1383,7 +1387,8 @@ def test_detector_change_hides_not_mode_for_yolo_world(callbacks, state, shown):
 
 
 @pytest.mark.parametrize(
-    ("state", "shown"), [(_WORLD_NOT, False), (_FIXED_NOT, True)]
+    ("state", "shown"),
+    [(_WORLD_NOT, False), (_YOLOE_NOT, False), (_FIXED_NOT, True)],
 )
 def test_load_and_paste_hide_not_mode_for_yolo_world(callbacks, state, shown):
     attrs = list(ALL_ARGS.attrs)
@@ -1402,7 +1407,13 @@ def test_load_and_paste_hide_not_mode_for_yolo_world(callbacks, state, shown):
 
 
 @pytest.mark.parametrize(
-    ("model", "expected"), [("custom-world.pt", False), ("animals.pt", True)]
+    ("model", "expected"),
+    [
+        ("custom-world.pt", False),
+        ("yoloe-11s-seg.pt", False),
+        ("yoloe-11s-seg-pf.pt", True),
+        ("animals.pt", True),
+    ],
 )
 def test_png_info_paste_leaves_not_mode_off_for_yolo_world(callbacks, model, expected):
     w = widgets()
@@ -2754,6 +2765,9 @@ def test_guide_has_the_reference_face_and_own_prompt_recipes():
     # reference picture (Passthrough), and many pictures each with its own
     # prompt (img2img Batch + PNG info + Skip img2img), since "Run ADetailer
     # on an image" starts with an empty prompt. Plain text, as the newer lines.
+    # From plus.10 beta 2 the own-prompt line names first the Settings option
+    # that makes "Run ADetailer on an image" use the prompt saved in each
+    # picture, and keeps the img2img Batch recipe as the other way.
     _tree, sections = _guide_sections()
     problems = next(body for title, body in sections.items() if "Fixing" in title)
     tools = next(body for title, body in sections.items() if "run-on-image" in title)
@@ -2769,6 +2783,12 @@ def test_guide_has_the_reference_face_and_own_prompt_recipes():
     )
     for words in ("empty prompt", "Append png info to prompts", "Append PNG Info", "Skip img2img"):
         assert words in own
+    option = "Run ADetailer on an image uses the prompt saved in the image"
+    assert option in own
+    assert own.index(option) < own.index("img2img → Batch")
+    # Plain English: "run Run ADetailer on an image on a folder" read badly.
+    assert "use Run ADetailer on an image with a folder path" in own
+    assert "run Run ADetailer" not in own
     for line in (face, own):
         assert "**" not in line
         assert "`" not in line
@@ -3388,3 +3408,71 @@ def test_guide_says_which_loras_the_prompt_token_brings():
         "[PROMPT=] brings the whole main prompt, like [PROMPT].",
     ):
         assert words in line
+
+
+@pytest.mark.parametrize(
+    ("model", "typed"),
+    [
+        ("yoloe-11s-seg.pt", True),
+        ("YOLOE-v8l-seg.pt (pack)", True),
+        ("custom-world.pt", True),
+        ("yoloe-11s-seg-pf.pt", False),
+        ("faces.pt", False),
+    ],
+)
+def test_yoloe_detector_shows_the_typed_classes_field(callbacks, model, typed):
+    # A YOLOE detector with text prompts takes typed words like YOLO-World:
+    # the free-text field is shown, and the classes dropdown (empty for it)
+    # never writes over the typed words.
+    mapping = {"faces.pt": "faces.pt"}
+    result = callbacks["on_ad_model_update"](
+        model, [], mapping, current_include="face,hand",
+        current_exclude=False, current_excluded="",
+    )
+    assert result[0]["visible"] is typed
+    sync = callbacks["_sync_class_dropdown"]([], False, model)
+    assert sync == (({}, {}) if typed else ("", ""))
+    restored = callbacks["_restored_tab_updates"](
+        {"ad_model": model, "ad_model_classes": "face,hand"},
+        list(ALL_ARGS.attrs), mapping,
+    )
+    fields = dict(zip(ALL_ARGS.attrs, restored[:-1]))
+    assert fields["ad_model_classes"] == {"value": "face,hand", "visible": typed}
+
+
+@pytest.mark.parametrize("model", ["yoloe-11s-seg.pt", "custom-world.pt"])
+def test_typed_classes_field_texts_name_yoloe_too(callbacks, model):
+    # The typed classes field serves YOLO-World and YOLOE: its label, example
+    # and tooltip said "YOLO-World" only and "default: COCO 80 classes",
+    # while an empty field makes a YOLOE look for the classes saved in it.
+    root = Path(__file__).resolve().parents[1]
+    result = callbacks["on_ad_model_update"](
+        model, [], {}, current_include="", current_exclude=False, current_excluded="",
+    )
+    placeholder = result[0]["placeholder"]
+    assert "YOLO-World looks for its 80 COCO classes" in placeholder
+    assert "YOLOE for the classes saved in the model" in placeholder
+    ui = (root / "aaaaaa" / "ui.py").read_text(encoding="utf-8")
+    assert 'label="ADetailer detector CLASSES (YOLO-World / YOLOE)"' in ui
+    tooltips = (root / "javascript" / "option-tooltips.js").read_text(encoding="utf-8")
+    tip = next(
+        line for line in tooltips.splitlines() if line.strip().startswith('"YOLO-World')
+    )
+    assert "YOLO-World and YOLOE only" in tip
+    assert "YOLOE for the classes saved in the model" in tip
+    # No old text is left in the code that builds or describes the field.
+    for path in [
+        root / "aaaaaa" / "ui.py",
+        root / "scripts" / "!adetailer.py",
+        *sorted((root / "javascript").glob("*.js")),
+    ]:
+        text = path.read_text(encoding="utf-8")
+        for old in (
+            "default: COCO 80 classes",
+            'CLASSES (YOLO-World)"',
+            '"YOLO-World only:',
+        ):
+            assert old not in text, (path.name, old)
+    # Translatable texts: one plain block, no inline markdown.
+    for text in (placeholder, tip):
+        assert not any(mark in text for mark in ("**", "`", "]("))
