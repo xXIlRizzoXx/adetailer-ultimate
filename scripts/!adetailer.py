@@ -3227,6 +3227,12 @@ class AfterDetailerScript(scripts.Script):
         # Also on the answer of a pass that fails: a folder counts from it
         # the pictures without a saved prompt.
         prompt_note = ""
+        # The parameters the picture came with: a result that still has them
+        # was not given the pass's own, so its status reads no values from them.
+        try:
+            source_parameters = image.info.get("parameters")
+        except Exception:  # noqa: BLE001
+            source_parameters = None
         try:
             import random
             from types import SimpleNamespace
@@ -3344,6 +3350,23 @@ class AfterDetailerScript(scripts.Script):
                     sampler = all_samplers[0].name
             except Exception:  # noqa: BLE001
                 pass
+            # The base values the pass takes when the tab has no "Use separate
+            # ..." of its own. A model with an img2img preset in the WebUI
+            # (Forge Neo) gets its values, and a Flux model Flux's values
+            # anyway (CFG 7 ran it with a real negative pass: burnt and twice
+            # as slow, issue #9).
+            steps, cfg_scale, scheduler = 28, 7.0, "Automatic"
+            preset = _img2img_preset_values(_standalone_family(args))
+            steps = preset.get("steps", steps)
+            cfg_scale = preset.get("cfg_scale", cfg_scale)
+            try:
+                if preset.get("sampler") in {s.name for s in all_samplers}:
+                    sampler = preset["sampler"]
+                labels = {getattr(s, "label", None) for s in schedulers}
+                if preset.get("scheduler") in labels:
+                    scheduler = preset["scheduler"]
+            except Exception:  # noqa: BLE001
+                pass
 
             # Attribute access (not opts.data.get) so an UNCHANGED output dir
             # still resolves to its effective default (which lives in
@@ -3395,10 +3418,10 @@ class AfterDetailerScript(scripts.Script):
                 n_iter=1,
                 width=w8,
                 height=h8,
-                steps=28,
-                cfg_scale=7.0,
+                steps=steps,
+                cfg_scale=cfg_scale,
                 sampler_name=sampler,
-                scheduler="Automatic",
+                scheduler=scheduler,
                 styles=[],
                 tiling=False,
                 restore_faces=False,
@@ -3410,6 +3433,11 @@ class AfterDetailerScript(scripts.Script):
                 override_settings={},
                 _ad_standalone=True,
             )
+            # The preset's img2img Distilled CFG (Flux) or Shift (the models
+            # that use one), as Forge Neo's img2img tab passes it; get_i2i_p
+            # passes it on. Without it the host's default stays.
+            if "distilled_cfg_scale" in preset:
+                p.distilled_cfg_scale = preset["distilled_cfg_scale"]
             # A folder run warns about a tab's checkpoint of another model
             # family once for the whole folder, not once for every picture:
             # the tabs already warned stay on the script until the folder ends.
@@ -3523,6 +3551,9 @@ class AfterDetailerScript(scripts.Script):
                 return image, (
                     "ℹ️ Nothing detected — image unchanged." + prompt_note + back_note
                 )
+            # Before the picture's prompts are put back below, which would
+            # make a result that still has the picture's parameters look new.
+            used_note = _used_values_note(pp.image, source_parameters)
             if from_image:
                 # The WebUI wrote the region's img2img prompt (the tab's) as
                 # the result's main prompt: a next run on the result would
@@ -3537,7 +3568,12 @@ class AfterDetailerScript(scripts.Script):
                         )
                 except Exception:  # noqa: BLE001 — keep the pass's parameters
                     pass
-            status = "✅ ADetailer pass complete." + prompt_note + _family_status_note(self)
+            status = (
+                "✅ ADetailer pass complete."
+                + used_note
+                + prompt_note
+                + _family_status_note(self)
+            )
             restored = False
             if alpha is not None:
                 # After the parameters above, which the copy keeps.
@@ -5396,6 +5432,116 @@ def _model_family(model) -> "str | None":
         return {"sd15": "sd1", "sd20": "sd2"}.get(name, name) or None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _standalone_family(args: ADetailerArgs) -> "str | None":
+    """Forge / Forge Neo: family of the model "Run ADetailer on an image" runs
+    its pass with: the tab's own checkpoint (read from its file's header) or
+    the main one. None on the other WebUIs or when unknown."""
+    try:
+        own = _own_checkpoint(args)
+        if own is not None:
+            info = modules.sd_models.checkpoint_aliases.get(own)
+            facts = _model_file_facts(getattr(info, "filename", None))
+            return facts[0] if facts else None
+        family = _main_model_family()
+        if family:
+            return family
+        # The main checkpoint the settings ask for is not loaded yet (the
+        # WebUI loads it at the pass): not the model still loaded, which can
+        # be the one picked before, but the header of its file.
+        params = modules.sd_models.model_data.forge_loading_parameters
+        facts = _model_file_facts(getattr(params.get("checkpoint_info"), "filename", None))
+        return facts[0] if facts else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# What "Run ADetailer on an image" gives a Flux model when the WebUI has no
+# Flux img2img preset to read (Forge): Forge's own values for Flux. CFG 1
+# runs it without the negative pass, as Flux dev expects.
+_FLUX_STANDALONE = {"steps": 20, "cfg_scale": 1.0, "sampler": "Euler", "scheduler": "Simple"}
+# Forge Neo's preset (Settings > presets: one per model family, the values its
+# txt2img and img2img tabs take) of each model family, by the family's name.
+# SD 2, Chroma and the families without a preset keep the base values.
+_NEO_PRESETS = {
+    "sd1": "sd", "sdxl": "xl", "flux": "flux", "flux2": "klein",
+    "qwen": "qwen", "qwen21": "qwen21", "lumina": "lumina", "zimage": "zit",
+    "wan": "wan", "anima": "anima", "pid": "pid", "krea": "krea",
+    "moss_image": "moss",
+}
+# The img2img options of a preset, by value: "<preset>_i2i_<suffix>". The
+# Distilled CFG field is the Shift of the models that use one.
+_PRESET_I2I_OPTIONS = (
+    ("sampler", "sampler"),
+    ("scheduler", "scheduler"),
+    ("steps", "step"),
+    ("cfg_scale", "cfg"),
+    ("distilled_cfg_scale", "dcfg"),
+)
+
+
+def _img2img_preset_values(family) -> dict:
+    """The base values of a "Run ADetailer on an image" pass with a model of
+    ``family``: the img2img values of the WebUI's preset for that family
+    (Forge Neo, as its img2img tab gets them; a value of 0 or less there
+    means "keep"), and for a Flux model without one, Forge's values for
+    Flux. Only the values found: empty for any other model or WebUI."""
+    values = dict(_FLUX_STANDALONE) if family == "flux" else {}
+    preset = _NEO_PRESETS.get(family) if isinstance(family, str) else None
+    if not preset:
+        return values
+    for key, suffix in _PRESET_I2I_OPTIONS:
+        try:
+            value = getattr(opts, f"{preset}_i2i_{suffix}", None)
+        except Exception:  # noqa: BLE001
+            continue
+        if key in ("sampler", "scheduler"):
+            if isinstance(value, str) and value.strip():
+                values[key] = value.strip()
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            values[key] = int(value) if key == "steps" else float(value)
+    return values
+
+
+def _used_values_note(image, source=None) -> str:
+    """The values the pass of "Run ADetailer on an image" ran with, for its
+    status: " Used: denoise 0.6, 20 steps, CFG scale 1, Euler (Beta)." Read
+    from the parameters the WebUI wrote on the result (the last region
+    redrawn), so they are the real ones, the tab's own options included.
+    Empty when the result has none, or still has ``source``, the parameters
+    of the picture it started from (those are not the pass's)."""
+    try:
+        text = image.info.get("parameters")
+        if not isinstance(text, str) or not text or text == source:
+            return ""
+        line = text.strip().splitlines()[-1]
+
+        def field(key):
+            found = re.search(rf"(?:^|, ){re.escape(key)}: ([^,]+)", line)
+            return found.group(1).strip() if found else ""
+
+        def number(key):
+            value = field(key)
+            try:
+                return f"{float(value):g}"
+            except ValueError:
+                return value
+
+        parts = []
+        if field("Denoising strength"):
+            parts.append(f"denoise {number('Denoising strength')}")
+        if field("Steps"):
+            parts.append(f"{field('Steps')} steps")
+        if field("CFG scale"):
+            parts.append(f"CFG scale {number('CFG scale')}")
+        sampler, schedule = field("Sampler"), field("Schedule type")
+        if sampler:
+            show = schedule and schedule != "Automatic"
+            parts.append(f"{sampler} ({schedule})" if show else sampler)
+        return f" Used: {', '.join(parts)}." if parts else ""
+    except Exception:  # noqa: BLE001 — the status keeps its first sentence
+        return ""
 
 
 def _main_model_family() -> "str | None":

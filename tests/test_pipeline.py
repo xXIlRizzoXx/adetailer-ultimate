@@ -652,6 +652,14 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
             "_host_format_keeps_transparency",
         }
         host_globals.setdefault("Image", Image)
+        # And gives the model the img2img values of its preset (Flux, Flux's
+        # anyway), and says in its status the values the pass used.
+        functions = {
+            *functions, "_img2img_preset_values", "_used_values_note",
+            *({"_standalone_family"} - set(host_globals)),
+        }
+        assigns = {*assigns, "_FLUX_STANDALONE", "_NEO_PRESETS", "_PRESET_I2I_OPTIONS"}
+        host_globals.setdefault("schedulers", [])
     # And the Skip img2img hooks, which can give the result the init image's
     # transparency back too.
     if {"get_i2i_init_image", "postprocess_image_after_composite"} & set(methods):
@@ -1225,6 +1233,7 @@ def _standalone_runtime(tmp_path, **host_globals):
     host_globals.setdefault("pause_total_tqdm", nullcontext)
     host_globals.setdefault("opts", SimpleNamespace(samples_format="png"))
     host_globals.setdefault("images", None)
+    host_globals.setdefault("all_samplers", [])
     return _load_script(
         methods={
             "run_detailer_on_image", "read_params_txt", "write_params_txt",
@@ -1237,7 +1246,6 @@ def _standalone_runtime(tmp_path, **host_globals):
             opts=SimpleNamespace(data={"ad_same_seed_for_each_tab": False}),
         ),
         state=state,
-        all_samplers=[],
         ensure_pil_image=lambda image, _mode: image,
         AD_APPLY_SUBDIR="ADetailer-Inpaint",
         get_i=lambda _p: 0,
@@ -1293,6 +1301,235 @@ def test_standalone_run_names_the_tab_it_was_started_from(tmp_path, tab):
 
     assert status == "✅ ADetailer pass complete."
     assert tabs == [tab]
+
+
+def _standalone_base_values(tmp_path, family, opts=None, samplers=None, scheds=None):
+    """The base values the pass of "Run ADetailer on an image" gets, with the
+    model of `family`: (steps, cfg scale, sampler, scheduler, distilled cfg)."""
+    names = ["DPM++ 2M", "Euler a", "Euler"] if samplers is None else samplers
+    labels = ["Automatic", "Simple", "Beta"] if scheds is None else scheds
+    script = _standalone_runtime(
+        tmp_path,
+        _standalone_family=lambda _args: family,
+        all_samplers=[SimpleNamespace(name=name) for name in names],
+        schedulers=[SimpleNamespace(label=label) for label in labels],
+        opts=opts or SimpleNamespace(samples_format="png"),
+    ).AfterDetailerScript()
+    seen = []
+
+    def inner(p, _pp, _args, n=0):
+        seen.append(p)
+        return True
+
+    script._postprocess_image_inner = inner
+    _image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), save=False
+    )
+    assert status == "✅ ADetailer pass complete."
+    p = seen[0]
+    return (
+        p.steps, p.cfg_scale, p.sampler_name, p.scheduler,
+        getattr(p, "distilled_cfg_scale", None),
+    )
+
+
+@pytest.mark.parametrize("family", [None, "sdxl", "sd1", "chroma", "zimage", "sd2"])
+def test_standalone_run_keeps_its_base_values_for_other_models(tmp_path, family):
+    # Not a Flux model (or not known), and no preset to read (AUTOMATIC1111,
+    # Forge): CFG 7, 28 steps and the WebUI's first sampler, as before.
+    assert _standalone_base_values(tmp_path, family) == (
+        28, 7.0, "DPM++ 2M", "Automatic", None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("family", "preset"),
+    [
+        ("sdxl", "xl"), ("sd1", "sd"), ("flux2", "klein"), ("zimage", "zit"),
+        ("qwen", "qwen"), ("qwen21", "qwen21"), ("lumina", "lumina"),
+        ("wan", "wan"), ("anima", "anima"), ("pid", "pid"), ("krea", "krea"),
+        ("moss_image", "moss"),
+    ],
+)
+def test_standalone_run_reads_forge_neos_img2img_preset_of_every_model(tmp_path, family, preset):
+    # Forge Neo keeps img2img values for each model family in its presets;
+    # the run takes those of the family of its model, as Neo's img2img tab.
+    opts = SimpleNamespace(
+        samples_format="png",
+        **{
+            f"{preset}_i2i_sampler": "Euler", f"{preset}_i2i_scheduler": "Beta",
+            f"{preset}_i2i_step": 9, f"{preset}_i2i_cfg": 1.0, f"{preset}_i2i_dcfg": 3.0,
+        },
+    )
+    assert _standalone_base_values(tmp_path, family, opts) == (9, 1.0, "Euler", "Beta", 3.0)
+
+
+def test_standalone_run_reads_only_the_preset_of_its_model(tmp_path):
+    # An SDXL model takes the XL preset, not Flux's or another family's.
+    opts = SimpleNamespace(
+        samples_format="png", flux_i2i_step=20, flux_i2i_cfg=1.0,
+        xl_i2i_step=24, xl_i2i_cfg=4.5, xl_i2i_sampler="Euler a",
+        xl_i2i_scheduler="Automatic",
+    )
+    assert _standalone_base_values(tmp_path, "sdxl", opts) == (
+        24, 4.5, "Euler a", "Automatic", None,
+    )
+    # A family without a preset (Chroma) keeps the base values.
+    assert _standalone_base_values(tmp_path, "chroma", opts) == (
+        28, 7.0, "DPM++ 2M", "Automatic", None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("parameters", "note"),
+    [
+        (
+            "a face\nSteps: 20, Sampler: Euler, Schedule type: Beta, CFG scale: 1.0, "
+            "Seed: 1, Size: 832x1024, Denoising strength: 0.6, Version: neo-2.33",
+            " Used: denoise 0.6, 20 steps, CFG scale 1, Euler (Beta).",
+        ),
+        (
+            "a face\nNegative prompt: blurry\nSteps: 28, Sampler: DPM++ 2M, "
+            "Schedule type: Automatic, CFG scale: 7, Denoising strength: 0.4",
+            " Used: denoise 0.4, 28 steps, CFG scale 7, DPM++ 2M.",
+        ),
+        ("Steps: 12, Sampler: Euler a, CFG scale: 4.5", " Used: 12 steps, CFG scale 4.5, Euler a."),
+        ("", ""),
+        ("just a prompt", ""),
+    ],
+)
+def test_used_values_note_reads_the_values_the_pass_ran_with(parameters, note):
+    runtime = _load_script(functions={"_used_values_note"})
+    image = Image.new("RGB", (8, 8))
+    if parameters:
+        image.info["parameters"] = parameters
+    assert runtime._used_values_note(image) == note
+    assert runtime._used_values_note(None) == ""
+    # A result that still has the parameters of the picture it started from
+    # was not given the pass's: its values are not the pass's.
+    assert runtime._used_values_note(image, parameters or None) == ""
+
+
+def test_standalone_run_says_the_values_it_used(tmp_path):
+    # Issue #9: the status said only "pass complete", so a denoise too low
+    # to change a face, or the CFG 7 that burnt a Flux one, stayed unseen.
+    script = _standalone_runtime(tmp_path).AfterDetailerScript()
+
+    def inner(_p, pp, _args, n=0):
+        result = pp.image.copy()
+        result.info["parameters"] = (
+            "a face\nSteps: 20, Sampler: Euler, Schedule type: Beta, "
+            "CFG scale: 1.0, Denoising strength: 0.6"
+        )
+        pp.image = result
+        return True
+
+    script._postprocess_image_inner = inner
+    _image, status = script.run_detailer_on_image(
+        Image.new("RGB", (64, 64)), SimpleNamespace(), save=False
+    )
+    assert status == (
+        "✅ ADetailer pass complete. Used: denoise 0.6, 20 steps, CFG scale 1, Euler (Beta)."
+    )
+
+
+def test_standalone_run_gives_a_flux_model_flux_values(tmp_path):
+    # Issue #9: with Flux dev the pass ran a real CFG 7 (burnt, twice as slow).
+    # Without Forge Neo's FLUX preset: Forge's own values for Flux.
+    assert _standalone_base_values(tmp_path, "flux") == (
+        20, 1.0, "Euler", "Simple", None,
+    )
+
+
+def test_standalone_run_reads_forge_neos_flux_img2img_preset(tmp_path):
+    # Settings > presets > FLUX on Forge Neo: what its img2img tab gets.
+    opts = SimpleNamespace(
+        samples_format="png", flux_i2i_sampler="Euler a",
+        flux_i2i_scheduler="Beta", flux_i2i_step=12, flux_i2i_cfg=1.5,
+        flux_i2i_dcfg=3.0,
+    )
+    assert _standalone_base_values(tmp_path, "flux", opts) == (
+        12, 1.5, "Euler a", "Beta", 3.0,
+    )
+
+
+def test_standalone_run_keeps_flux_values_for_a_preset_set_to_keep(tmp_path):
+    # In the preset 0 means "keep" (the img2img tab skips it); not a value.
+    opts = SimpleNamespace(
+        samples_format="png", flux_i2i_step=0, flux_i2i_cfg=0.0,
+        flux_i2i_sampler="", flux_i2i_dcfg=0,
+    )
+    assert _standalone_base_values(tmp_path, "flux", opts) == (
+        20, 1.0, "Euler", "Simple", None,
+    )
+
+
+def test_standalone_run_with_flux_keeps_a_sampler_the_webui_lacks(tmp_path):
+    # A sampler or scheduler the WebUI does not have is not passed on.
+    assert _standalone_base_values(
+        tmp_path, "flux", samplers=["DPM++ 2M"], scheds=[]
+    ) == (20, 1.0, "DPM++ 2M", "Automatic", None)
+
+
+def test_standalone_run_still_lets_the_tab_choose(tmp_path):
+    # The tab's own "Use separate ..." values still win over the Flux ones:
+    # the pass reads them through get_steps / get_cfg_scale / get_sampler.
+    script = _load_script(methods={"get_steps", "get_cfg_scale", "get_sampler"})
+    tab = SimpleNamespace(
+        ad_use_steps=True, ad_steps=8, ad_use_cfg_scale=True, ad_cfg_scale=3.5,
+        ad_use_sampler=True, ad_sampler="DDIM",
+    )
+    p = SimpleNamespace(steps=20, cfg_scale=1.0, sampler_name="Euler")
+    s = script.AfterDetailerScript()
+    assert (s.get_steps(p, tab), s.get_cfg_scale(p, tab), s.get_sampler(p, tab)) == (
+        8, 3.5, "DDIM",
+    )
+
+
+@pytest.mark.parametrize(
+    ("own", "files", "main", "expected"),
+    [
+        # The main model, learnt while loaded.
+        (None, {}, "flux", "flux"),
+        # Not loaded yet (just started, or picked since): its file's header,
+        # not the model still loaded (live on Forge Neo: an SDXL main model
+        # picked after Flux ran with Flux's values).
+        (None, {"main-file": ("sdxl", None)}, None, "sdxl"),
+        (None, {"main-file": ("flux", None)}, None, "flux"),
+        (None, {}, None, None),
+        # The tab's own checkpoint, from its file.
+        ("flux1-dev.safetensors", {"tab-file": ("flux", None)}, "sdxl", "flux"),
+        ("sdxl.safetensors", {"tab-file": ("sdxl", None)}, "flux", "sdxl"),
+        ("unreadable.gguf", {}, "flux", None),
+    ],
+)
+def test_standalone_family_is_the_family_of_the_model_that_runs(own, files, main, expected):
+    runtime = _load_script(
+        functions={"_standalone_family"},
+        _own_checkpoint=lambda _args: own,
+        _model_file_facts=lambda path: files.get(path),
+        _main_model_family=lambda: main,
+        modules=SimpleNamespace(
+            sd_models=SimpleNamespace(
+                checkpoint_aliases={own: SimpleNamespace(filename="tab-file")},
+                model_data=SimpleNamespace(
+                    forge_loading_parameters={
+                        "checkpoint_info": SimpleNamespace(filename="main-file")
+                    }
+                ),
+            )
+        ),
+    )
+    assert runtime._standalone_family(SimpleNamespace()) == expected
+
+
+def test_standalone_family_is_unknown_when_the_webui_lacks_it():
+    runtime = _load_script(
+        functions={"_standalone_family"},
+        _own_checkpoint=lambda _args: "x.safetensors",
+        modules=SimpleNamespace(),
+    )
+    assert runtime._standalone_family(SimpleNamespace()) is None
 
 
 # A picture's parameters as the WebUI writes them, with a tab's own prompt in
@@ -2237,7 +2474,7 @@ def test_image_prompt_option_is_in_the_readme_and_the_changelog():
     guide = guide.split("\n### ")[0]
     assert label in guide
     assert guide.index(label) < guide.index("**With the img2img Batch tab:**")
-    newest = docs["CHANGELOG.md"].split("\n## ")[1]
+    newest = _beta2_changelog_section()
     assert label in newest
 
 
@@ -7553,6 +7790,8 @@ _PASS_PARAMETERS = (
     "a person\nSteps: 28, Sampler: Euler a, CFG scale: 7.0, Seed: 5, "
     "Size: 64x64, ADetailer model: face_yolov8n.pt"
 )
+# What the status of a run whose result has those parameters says it used.
+_PASS_USED = " Used: 28 steps, CFG scale 7, Euler a."
 
 
 def _keep_transparency_runtime(
@@ -7643,7 +7882,7 @@ def test_keep_transparency_option_puts_the_pictures_alpha_on_the_result(
     # The parameters the pass gave the result stay as they were.
     assert result.info["parameters"] == _PASS_PARAMETERS
     assert status == (
-        "✅ ADetailer pass complete. Saved to the 'ADetailer-Inpaint' folder."
+        "✅ ADetailer pass complete." + _PASS_USED + " Saved to the 'ADetailer-Inpaint' folder."
     )
     (saved,) = files
     with Image.open(saved) as file:
@@ -7664,7 +7903,7 @@ def test_keep_transparency_option_off_gives_the_filled_result_as_before(tmp_path
     assert result.mode == "RGB"
     assert result.getpixel((0, 0)) == (255, 255, 255)
     assert status == (
-        "✅ ADetailer pass complete. Saved to the 'ADetailer-Inpaint' folder."
+        "✅ ADetailer pass complete." + _PASS_USED + " Saved to the 'ADetailer-Inpaint' folder."
     )
     with Image.open(files[0]) as file:
         assert file.mode == "RGB"
@@ -7750,7 +7989,7 @@ def test_keep_transparency_option_stretches_the_alpha_to_a_smaller_result(tmp_pa
         _cut_out("RGBA"), SimpleNamespace(), save=False
     )
 
-    assert status == "✅ ADetailer pass complete."
+    assert status == "✅ ADetailer pass complete." + _PASS_USED
     assert (result.mode, result.size) == ("RGBA", (32, 32))
     assert result.getpixel((0, 0))[3] == 0
     assert result.getpixel((16, 16))[3] == 255
@@ -9595,10 +9834,24 @@ def test_the_changelog_dates_the_bbox_note_to_beta_2():
     assert not older.search("Earlier releases had the same problem.")
 
 
+# The CHANGELOG section of changes made after the last release, kept on top
+# until they are released: the release summaries skip it.
+_IN_DEVELOPMENT_HEADING = "## In development"
+
+
+def _released_headings(changelog):
+    """The ``## `` headings of ``changelog``, without the one of the changes
+    still in development."""
+    return [
+        line for line in changelog.splitlines()
+        if line.startswith("## ") and not line.startswith(_IN_DEVELOPMENT_HEADING)
+    ]
+
+
 def _changelog_beta_heading(changelog, beta, version=None):
     """The ``## `` heading of ``changelog`` for ``version``, or the top one,
     when it is a section of beta number ``beta``; None otherwise."""
-    headings = [line for line in changelog.splitlines() if line.startswith("## ")]
+    headings = _released_headings(changelog)
     if version is not None:
         headings = [h for h in headings if h.startswith(f"## {version} ")]
     if headings and re.match(rf"## v\S+\.beta\.{beta} ", headings[0]):
@@ -9610,7 +9863,7 @@ def _changelog_stable_heading(changelog, stable, version=None):
     """The ``## `` heading of ``changelog`` for ``version``, or the top one,
     when it is the section of the stable release ``stable`` (such as
     ``v1.0+plus.9``); None otherwise."""
-    headings = [line for line in changelog.splitlines() if line.startswith("## ")]
+    headings = _released_headings(changelog)
     if version is not None:
         headings = [h for h in headings if h.startswith(f"## {version} ")]
     if headings and headings[0].startswith(f"## {stable} "):
@@ -11120,19 +11373,37 @@ def test_the_readme_says_which_base_settings_a_standalone_run_uses():
         node for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef) and node.name == "run_detailer_on_image"
     )
-    shell = {
-        k.arg: k.value.value
-        for node in ast.walk(run)
-        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "SimpleNamespace"
-        for k in node.keywords
-        if k.arg in {"steps", "cfg_scale"} and isinstance(k.value, ast.Constant)
-    }
-    assert set(shell) == {"steps", "cfg_scale"}
+    # The base values: `steps, cfg_scale, scheduler = 28, 7.0, "Automatic"`.
+    shell = {}
+    for node in ast.walk(run):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Tuple)
+            and isinstance(node.value, ast.Tuple)
+        ):
+            names = [getattr(t, "id", "") for t in node.targets[0].elts]
+            constant = all(isinstance(v, ast.Constant) for v in node.value.elts)
+            if names[:2] == ["steps", "cfg_scale"] and constant:
+                shell = {
+                    name: value.value
+                    for name, value in zip(names, node.value.elts)
+                    if isinstance(value, ast.Constant)
+                }
+    assert {"steps", "cfg_scale"} <= set(shell)
     section = _readme_section("### Run ADetailer on an image", "### Manual mode")
     assert f"{shell['steps']} steps" in section
     assert f"CFG scale {shell['cfg_scale']:g}" in section
     for option in ("Use separate steps", "Use separate CFG scale", "Use separate sampler"):
         assert f'"{option}"' in section
+    # And the values a Flux model gets instead (issue #9).
+    tree_flux = next(
+        node.value for node in tree.body
+        if isinstance(node, ast.Assign)
+        and getattr(node.targets[0], "id", "") == "_FLUX_STANDALONE"
+    )
+    flux = ast.literal_eval(tree_flux)
+    assert f"{flux['steps']} steps, CFG scale {flux['cfg_scale']:g}, {flux['sampler']}" in section
+    assert f"the {flux['scheduler']} scheduler" in section
 
 
 def test_the_readme_says_when_the_styles_still_reach_the_pass_twice():
@@ -20266,7 +20537,16 @@ def test_the_pass_without_dynamic_prompts_still_says_a_block_with_two_tags(
 
 
 def _newest_changelog_section():
-    return _public_docs()["CHANGELOG.md"].split("\n## ")[1]
+    """The section of the newest release (not the changes in development)."""
+    sections = _public_docs()["CHANGELOG.md"].split("\n## ")[1:]
+    return next(s for s in sections if not ("## " + s).startswith(_IN_DEVELOPMENT_HEADING))
+
+
+def _beta2_changelog_section():
+    """The section of plus.10 beta 2, the release that added what these
+    tests check (it is no longer the newest from beta 3)."""
+    sections = _public_docs()["CHANGELOG.md"].split("\n## ")[1:]
+    return next(s for s in sections if s.startswith("v26.2.0+plus.10.beta.2 "))
 
 
 def _beta2_notes():
@@ -20294,7 +20574,7 @@ def test_the_docs_name_the_keep_transparency_option_by_its_label():
         if keyword.arg == "label"
     )
     old = "Run ADetailer on an image keeps the transparency of the picture"
-    readme, newest = _public_docs()["README.md"], _newest_changelog_section()
+    readme, newest = _public_docs()["README.md"], _beta2_changelog_section()
     assert old not in readme
     assert old not in newest
     row = next(line for line in readme.splitlines() if line.startswith(f"| 🟡 {label} "))
@@ -20314,7 +20594,7 @@ def test_the_docs_say_when_a_tab_is_skipped_for_its_checkpoint():
     # load always costs the generation. The tab is now skipped when the files
     # tell for sure: the issue stays for the cases the check leaves alone.
     old = "a tab's own checkpoint that does not load makes the whole generation fail**"
-    newest = _newest_changelog_section()
+    newest = _beta2_changelog_section()
     for text in (newest.split("**Known issues in this beta**")[1], _beta2_notes()):
         assert old not in text
         issue = next(
@@ -20359,7 +20639,7 @@ def test_the_docs_name_the_new_keys_of_the_image_parameters():
 
     readme = _public_docs()["README.md"]
     added = readme.split("#### Added in plus.10 beta 2\n")[1].split("\n#### ")[0]
-    for text in (_newest_changelog_section(), added):
+    for text in (_beta2_changelog_section(), added):
         for key in (*p_method.RESOLVED_PROMPT_KEYS, *p_method.MODEL_HASH_KEYS):
             assert f'"{key}"' in text
         assert f'"{p_method.RESOLVED_PROMPT_CUT}"' in text
@@ -20382,7 +20662,7 @@ def test_the_docs_say_that_the_styles_are_applied_once_from_beta_2():
     for line in known:
         assert "[Fixed in plus.10 beta 2](#fixed-in-plus10-beta-2)" in line
     assert "\n#### Fixed in plus.10 beta 2\n" in readme
-    issues = _newest_changelog_section().split("**Known issues in this beta**")[1]
+    issues = _beta2_changelog_section().split("**Known issues in this beta**")[1]
     for text in (issues, _beta2_notes()):
         left = next(line for line in text.splitlines() if "hree rare cases" in line)
         for case in ("holds a wildcard", "`{prompt}`", "Magic Prompt"):
@@ -20456,7 +20736,7 @@ def test_the_docs_quote_the_subject_guide_as_the_panel_shows_it():
     readme = _public_docs()["README.md"]
     section = readme.split("### Several subjects, one LoRA each (guide)\n")[1]
     section = section.split("\n### ")[0]
-    newest = _newest_changelog_section()
+    newest = _beta2_changelog_section()
     detectors = [*sg.PERSON_DETECTORS, *sg.FACE_DETECTORS]
     for text in (section, newest):
         for quoted in (title, button, *choices, *sg.GUIDE_MODES):
@@ -20779,6 +21059,6 @@ def test_the_docs_quote_the_subject_guide_as_the_panel_shows_it():
 
 def test_the_readme_and_the_changelog_give_the_same_number_of_tests():
     readme = _public_docs()["README.md"]
-    beta = next(line for line in readme.splitlines() if line.startswith("**Beta 2** ("))
+    beta = next(line for line in readme.splitlines() if line.startswith("**Beta 3** ("))
     count = re.search(r"all (\d+) offline regression tests pass", beta).group(1)
     assert f"All {count} offline regression tests pass" in _newest_changelog_section()
